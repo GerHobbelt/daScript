@@ -8,6 +8,7 @@ require dasllama/dasllama_lint public
 require math
 require daslib/archive
 require dasllama/dasllama_math
+require dasllama/dasllama_math_default   // matmul_kq: the portable K-quant GEMV over disk-order planes
 require dasllama/dasllama_par
 require dasllama/dasllama_plane
 require dasllama/dasllama_convert
@@ -134,6 +135,51 @@ def weight_slot_q8(var io : TtsBlobIo; var a : array<int8>; var span : TtsSpan) 
     }
 }
 
+//! `release_weight` for a byte plane (a K-quant quant or scale plane).
+def release_weight_u8(var a : array<uint8>) {
+    if (lock_count(a) != 0) {
+        unsafe {
+            _builtin_forget_temp_array(a)
+        }
+    } else {
+        delete a
+    }
+}
+
+//! `blob_push_q8` for a byte plane: it rides the int8 quant blob byte for byte.
+def blob_push_u8(var qblob : array<int8>; src : array<uint8>) : TtsSpan {
+    let n = long_length(src)
+    return TtsSpan() if (n == 0l)
+    let off = (long_length(qblob) + BLOB_ALIGN_FLOATS - 1l) / BLOB_ALIGN_FLOATS * BLOB_ALIGN_FLOATS
+    qblob |> ensure_capacity(off + n)
+    qblob |> resize(off + n)
+    for (i in range64(n)) {
+        qblob[off + i] = int8(src[i])
+    }
+    return TtsSpan(off = off, n = n)
+}
+
+//! `bind_span_q8` for a byte plane over the int8 quant plane.
+def bind_span_u8(qplane : PlaneI8; span : TtsSpan; var a : array<uint8>) {
+    return if (span.n == 0l)
+    if (span.off < 0l || span.n > qplane.n || span.off > qplane.n - span.n) {
+        panic("dasLLAMA tts: kq span {span.off}+{span.n} lies outside the {qplane.n}-byte quant blob")
+    }
+    unsafe {
+        _builtin_make_temp_array_i64(a, reinterpret<void?>(plane_at(qplane, span.off)), span.n)
+    }
+}
+
+//! `weight_slot` for a byte plane.
+def weight_slot_u8(var io : TtsBlobIo; var a : array<uint8>; var span : TtsSpan) {
+    if (io.staging) {
+        span = blob_push_u8(*io.qblob, a)
+        delete a
+    } else {
+        bind_span_u8(io.qplane, span, a)
+    }
+}
+
 //! A bare weight vector (an embedding table, a Snake alpha, the ISTFT window) with its span.
 struct TtsWeight {
     a : array<float>
@@ -144,7 +190,7 @@ struct TtsWeight {
 // overload; the counts below are the tripwires that catch a field added without a line.
 let private TTS_WEIGHT_META_FIELDS = 1
 let private TTS_CONV1D_META_FIELDS = 21
-let private TTS_LINEAR_META_FIELDS = 8
+let private TTS_LINEAR_META_FIELDS = 12
 let private TTS_NORM_META_FIELDS = 2
 let private TTS_LSTM_META_FIELDS = 5
 
@@ -247,15 +293,21 @@ struct TtsLinear {
     wt : array<float>
     wq : array<int8>     // [nout][nin] Q8_0 quants, repacked for the backend - the q8 rows form's W
     wqs : array<float>
+    kq : array<uint8>    // [nout][nin] as a K-quant plane pair (the file's own format), repacked for a backend that carries kq
+    ks : array<uint8>
     b : array<float>
     w_span : TtsSpan = TtsSpan()
     wt_span : TtsSpan = TtsSpan()
     wq_span : TtsSpan = TtsSpan()
     wqs_span : TtsSpan = TtsSpan()
+    kq_span : TtsSpan = TtsSpan()
+    ks_span : TtsSpan = TtsSpan()
     b_span : TtsSpan = TtsSpan()
     nout : int64
     nin : int64
     q8 : bool
+    kq_fmt : int         // the kernel-layer format id of the kq planes (4 = Q4_K), 0 = the layer has none
+    kq_repacked : bool   // the planes are in the active backend's layout (matmul_kq_active), else disk order (matmul_kq)
 }
 
 def serialize(var arch : Archive; var l : TtsLinear) {
@@ -264,10 +316,14 @@ def serialize(var arch : Archive; var l : TtsLinear) {
     arch |> serialize(l.wt_span)
     arch |> serialize(l.wq_span)
     arch |> serialize(l.wqs_span)
+    arch |> serialize(l.kq_span)
+    arch |> serialize(l.ks_span)
     arch |> serialize(l.b_span)
     arch |> serialize_raw(l.nout)
     arch |> serialize_raw(l.nin)
     arch |> serialize_raw(l.q8)
+    arch |> serialize_raw(l.kq_fmt)
+    arch |> serialize_raw(l.kq_repacked)
 }
 
 def finalize(var l : TtsLinear) {
@@ -275,6 +331,8 @@ def finalize(var l : TtsLinear) {
     release_weight(l.wt)
     release_weight_q8(l.wq)
     release_weight(l.wqs)
+    release_weight_u8(l.kq)
+    release_weight_u8(l.ks)
     release_weight(l.b)
 }
 
@@ -283,6 +341,8 @@ def weights_walk(var io : TtsBlobIo; var l : TtsLinear) {
     weight_slot(io, l.wt, l.wt_span)
     weight_slot_q8(io, l.wq, l.wq_span)
     weight_slot(io, l.wqs, l.wqs_span)
+    weight_slot_u8(io, l.kq, l.kq_span)
+    weight_slot_u8(io, l.ks, l.ks_span)
     weight_slot(io, l.b, l.b_span)
 }
 
@@ -1052,7 +1112,7 @@ def conv1d_rows_transposed_depthwise(c : TtsConv1d; x : array<float>; t_in : int
 
 //! Mint the tiled GEMM's B operand `wt` [nin][nout] when the width sits on the 16-column tile;
 //! a layer only `linear_rows` reads (`rows_only`) drops `w`, one with `q8` and per-32 widths takes
-//! the Q8_0 form (`repack` for the backend), and `vec_only` - `linear_vec` reads `w` - mints none.
+//! the Q8_0 form (`repack` for the backend), and `vec_only` mints none (`linear_vec` reads `w`, or the quant planes a reader handed the layer instead).
 def linear_prepare(var l : TtsLinear; rows_only : bool = false; q8 : bool = false; repack : bool = false;
                    vec_only : bool = false) {
     return if (vec_only)
@@ -1064,7 +1124,7 @@ def linear_prepare(var l : TtsLinear; rows_only : bool = false; q8 : bool = fals
             repack_q8q8_weight(l.wq, l.wqs, 0l, l.nin, l.nout)
         }
         l.q8 = true
-        delete l.w
+        release_weight(l.w)
         return
     }
     return if (l.nout % 16l != 0l)
@@ -1093,26 +1153,132 @@ def private linear_rows_q8(l : TtsLinear; x : array<float>; t : int64; var y : a
         invoke(g_mm_q8q8_batch, addr(y[0]), addr<int8 const?>(l.wq[0]), addr<float const?>(l.wqs[0]),
             addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), nin, nout, t)
     }
+    linear_rows_add_bias(l, t, y)
+}
+
+def private linear_rows_add_bias(l : TtsLinear; t : int64; var y : array<float>) {
     return if (empty(l.b))
+    let nout = l.nout
     var yp = unsafe(addr(y[0]))
     let b4 = unsafe(addr<float4 const?>(l.b[0]))
+    let bp = unsafe(addr<float const?>(l.b[0]))
     maybe_parallel_for(0, int(t), lanes_for_work(t * nout, 0)) $(rb, re) {
         unsafe {
             let n4 = nout / 4l
             for (r in range64(int64(rb), int64(re))) {
-                var y4 = reinterpret<float4?>(yp + r * nout)
+                var yrow = yp + r * nout
+                var y4 = reinterpret<float4?>(yrow)
                 for (j in range64(n4)) {
                     y4[j] += b4[j]
+                }
+                for (o in range64(n4 * 4l, nout)) {   // the tail past the last float4: a width off 4
+                    yrow[o] += bp[o]
                 }
             }
         }
     }
 }
 
+// ===== the K-quant lane: a layer whose weights are the file's own K-quant planes =====
+
+var @scratch g_kq_xq : array<int8>
+var @scratch g_kq_xs : array<float>
+var @scratch g_kq_xbs : array<int>
+
+//! Give a layer the K-quant planes of its [nout][nin] weight (`fmt` the kernel-layer id, 4 =
+//! Q4_K; the planes as the GGUF transcoder wrote them) and repack them for the active backend
+//! where it carries kq kernels; nin is a whole number of 256-superblocks by the format's rule.
+def linear_take_kq(var l : TtsLinear; fmt : int; var kq, ks : array<uint8>; repack : bool) {
+    if (l.nin % 256l != 0l) {
+        panic("dasLLAMA tts: a K-quant layer [{l.nout}][{l.nin}] needs nin on 256")
+    }
+    l.kq <- kq
+    l.ks <- ks
+    l.kq_fmt = fmt
+    l.kq_repacked = false
+    if (repack && kernel_backend_has_kq()) {
+        repack_kq_weight(fmt, l.kq, l.ks, 0l, l.nin, l.nout)
+        l.kq_repacked = true
+    }
+    release_weight(l.w)
+}
+
+// one row [nin] through the K-quant GEMV: the row requantized to the Q8_K form where it sits,
+// then the backend's core over repacked planes or the portable one over disk order
+def private kq_gemv_row(l : TtsLinear; x : array<float>; xoff : int64; var y : array<float>; yoff : int64) {
+    let nin = l.nin
+    var xq & = g_kq_xq
+    var xs & = g_kq_xs
+    var xbs & = g_kq_xbs
+    xq |> reserve_resize(nin)
+    xs |> reserve_resize(nin / 256l)
+    xbs |> reserve_resize(nin / 16l)
+    unsafe {
+        quantize_q8_k_into_ptr(addr<float const?>(x[xoff]), nin, addr(xq[0]), addr(xs[0]), addr(xbs[0]), 0l, 0l, 0l)
+    }
+    if (l.kq_repacked) {
+        matmul_kq_active(l.kq_fmt, y, l.kq, l.ks, 0l, xq, xs, xbs, nin, l.nout, yoff)
+    } else {
+        matmul_kq(l.kq_fmt, y, l.kq, l.ks, 0l, xq, xs, xbs, nin, l.nout, yoff)
+    }
+}
+
+// The K-quant lane of linear_rows: the rows requantized to the Q8_K form at once and one batched
+// kq GEMM where the backend carries the tile, else the GEMV per row; then the bias.
+[arch(at = "../ARCHITECTURE_POCKET.md#pocket-q8-file")]
+def private linear_rows_kq(l : TtsLinear; x : array<float>; t : int64; var y : array<float>) {
+    let nin = l.nin
+    if (l.kq_repacked && kernel_backend_has_kq_batch()) {
+        var xq & = g_kq_xq
+        var xs & = g_kq_xs
+        var xbs & = g_kq_xbs
+        xq |> reserve_resize(t * nin)
+        xs |> reserve_resize(t * nin / 256l)
+        xbs |> reserve_resize(t * nin / 16l)
+        requant_rows_q8k_bs(x, nin, t, xq, xs, xbs, t * nin >= g_requant_par_threshold)
+        matmul_kq_batch(l.kq_fmt, y, l.kq, l.ks, 0l, xq, xs, xbs, nin, l.nout, t)
+    } else {
+        for (r in range64(t)) {
+            kq_gemv_row(l, x, r * nin, y, r * l.nout)
+        }
+    }
+    linear_rows_add_bias(l, t, y)
+}
+
+//! y [1][nout] = x [1][nin] . w^T + b for one row - a decode step: the q8 lane's GEMV entry
+//! (`matmul_q8q8`) or the K-quant lane's, never a one-row batch; else `linear_rows` at t = 1.
+//! The continuous-audio family's frame loop calls this; the phoneme families' rows GEMMs never take it.
+def linear_rows_decode(l : TtsLinear; x : array<float>; @scratch @exact_size var y : array<float>) {
+    if (l.kq_fmt != 0) {
+        y |> reserve_resize(l.nout)
+        kq_gemv_row(l, x, 0l, y, 0l)
+        linear_rows_add_bias(l, 1l, y)
+        return
+    }
+    if (!l.q8) {
+        linear_rows(l, x, 1l, y)
+        return
+    }
+    let nin = l.nin
+    var xq & = g_q8_xq
+    var xs & = g_q8_xs
+    xq |> reserve_resize(nin)
+    xs |> reserve_resize(nin / 32l)
+    quantize_q8_0_into(x, nin, xq, xs, 0l, 0l)
+    y |> reserve_resize(l.nout)
+    matmul_q8q8(y, l.wq, l.wqs, xq, xs, nin, l.nout)
+    linear_rows_add_bias(l, 1l, y)
+}
+
 //! y [t][nout] = x [t][nin] . w^T + b: the tiled GEMM over row blocks when `wt` was minted,
-//! the batched dot form otherwise; a layer minted q8 runs the q8 lane.
+//! the batched dot form otherwise; a layer minted q8 runs the q8 lane, a layer holding the
+//! file's K-quant planes the kq lane.
 def linear_rows(l : TtsLinear; x : array<float>; t : int64; @scratch @exact_size var y : array<float>) {
     y |> reserve_resize(t * l.nout)
+    if (l.kq_fmt != 0) {
+        linear_rows_kq(l, x, t, y)
+        return
+    }
     if (l.q8) {
         linear_rows_q8(l, x, t, y)
         return
@@ -1155,6 +1321,10 @@ def linear_rows(l : TtsLinear; x : array<float>; t : int64; @scratch @exact_size
 
 //! y [nout] = w . x + b
 def linear_vec(l : TtsLinear; x : array<float>; @scratch @exact_size var y : array<float>) {
+    if (l.q8 || l.kq_fmt != 0) {   // a vector layer the file stores quantized takes the decode entry's GEMV
+        linear_rows_decode(l, x, y)
+        return
+    }
     y |> reserve_resize(l.nout)
     matmul(y, l.w, x, l.nin, l.nout)
     return if (empty(l.b))
@@ -1231,6 +1401,216 @@ def attention_rows(q, k, v : array<float>; t, hidden, heads : int64; @scratch @e
                     }
                 }
             }
+        }
+    }
+}
+
+// ===== causal attention with a key-value cache =====
+
+//! One layer's key-value memory for a causal cached attention: keys transposed per head
+//! [heads][dh][cap] (the Q.K^T GEMM's B operand), values [heads][cap][dh]; `n` of `cap` filled.
+struct TtsKvCache {
+    @scratch @exact_size k : array<float>
+    @scratch @exact_size v : array<float>
+    heads : int64
+    dh : int64
+    cap : int64
+    n : int64
+}
+
+//! Size a cache for `heads` heads of `dh` and `cap` positions, empty.
+def kv_cache_init(var kc : TtsKvCache; heads, dh, cap : int64) {
+    kc.heads = heads
+    kc.dh = dh
+    kc.cap = cap
+    kc.n = 0l
+    unsafe {
+        scratch_resize(kc.k, heads * dh * cap)
+        scratch_resize(kc.v, heads * cap * dh)
+    }
+}
+
+//! Append the `t` token-major rows of k and v [t][hidden] at positions kc.n .. kc.n + t - 1.
+def kv_cache_append(var kc : TtsKvCache; k, v : array<float>; t, hidden : int64) {
+    let hh = kc.heads
+    let dh = kc.dh
+    let cap = kc.cap
+    if (kc.n + t > cap) {
+        panic("dasLLAMA tts: kv cache of {cap} positions cannot take {kc.n} + {t}")
+    }
+    let p0 = kc.n
+    unsafe {
+        var kp = addr(kc.k[0])
+        var vp = addr(kc.v[0])
+        let ks = addr<float const?>(k[0])
+        let vs = addr<float const?>(v[0])
+        for (r in range64(t)) {
+            for (h in range64(hh)) {
+                for (j in range64(dh)) {
+                    kp[(h * dh + j) * cap + p0 + r] = ks[r * hidden + h * dh + j]
+                    vp[(h * cap + p0 + r) * dh + j] = vs[r * hidden + h * dh + j]
+                }
+            }
+        }
+    }
+    kc.n += t
+}
+
+//! Grow a cache to `cap2` positions, the `n` filled ones kept; a cache already that wide is left.
+def kv_cache_grow(var kc : TtsKvCache; cap2 : int64) {
+    return if (cap2 <= kc.cap)
+    let hh = kc.heads
+    let dh = kc.dh
+    let cap = kc.cap
+    var inscope k2 : array<float>
+    var inscope v2 : array<float>
+    k2 |> reserve_resize(hh * dh * cap2)
+    v2 |> reserve_resize(hh * cap2 * dh)
+    for (h in range64(hh)) {
+        for (p in range64(kc.n)) {
+            for (j in range64(dh)) {
+                k2[(h * dh + j) * cap2 + p] = kc.k[(h * dh + j) * cap + p]
+                v2[(h * cap2 + p) * dh + j] = kc.v[(h * cap + p) * dh + j]
+            }
+        }
+    }
+    kc.k <- k2
+    kc.v <- v2
+    kc.cap = cap2
+}
+
+var @scratch g_catt_heads : array<float>
+
+let private CATT_QUERY_BLOCK = 256l   // queries scored together: the scratch is this many rows by the widest window they see
+
+//! Causal multi-head attention of the `t` newest queries q [t][hidden] (positions kc.n - t ..
+//! kc.n - 1, keys and values already appended) over the cache into ctx [t][hidden]: a query sees
+//! the keys up to its own position, or the last `context` of them - in query blocks, each scored over the keys its rows can see.
+def attention_causal_rows(q : array<float>; t, hidden : int64; context : int64; kc : TtsKvCache; @scratch @exact_size var ctx : array<float>) {
+    let hh = kc.heads
+    let dh = kc.dh
+    let cap = kc.cap
+    let n = kc.n
+    if (t > n) {
+        panic("dasLLAMA tts: {t} queries against a cache of {n} positions")
+    }
+    let p0 = n - t
+    let bq = min(t, CATT_QUERY_BLOCK)
+    let wmax = context > 0l ? min(n, bq + context - 1l) : n   // the widest key range one block sees
+    let per_head = bq * dh + bq * wmax + bq * dh + dh * wmax   // qh, s, oh, the key slice
+    ctx |> reserve_resize(t * hidden)
+    var head_scratch & = g_catt_heads
+    head_scratch |> reserve_resize(hh * per_head)
+    let scale = 1.0 / sqrt(float(dh))
+    let qp = unsafe(addr<float const?>(q[0]))
+    let kp = unsafe(addr<float const?>(kc.k[0]))
+    let vp = unsafe(addr<float const?>(kc.v[0]))
+    var cp = unsafe(addr(ctx[0]))
+    var sp = unsafe(addr(head_scratch[0]))
+    maybe_parallel_for(0, int(hh), int(hh)) $(hb, he) {
+        unsafe {
+            for (hd in range64(int64(hb), int64(he))) {
+                let off = hd * dh
+                var qh = sp + hd * per_head
+                var s = qh + bq * dh
+                var oh = s + bq * wmax
+                var ks = oh + bq * dh
+                var i0 = 0l
+                while (i0 < t) {
+                    let i1 = min(t, i0 + bq)
+                    let rows = i1 - i0
+                    let lo = context > 0l ? max(0l, p0 + i0 - context + 1l) : 0l
+                    let hi = p0 + i1
+                    let w = hi - lo
+                    for (i in range64(rows)) {
+                        for (e in range64(dh)) {
+                            qh[i * dh + e] = qp[(i0 + i) * hidden + off + e]
+                        }
+                    }
+                    for (e in range64(dh)) {
+                        let krow = kp + (hd * dh + e) * cap + lo
+                        for (j in range64(w)) {
+                            ks[e * w + j] = krow[j]
+                        }
+                    }
+                    for (i in range64(rows * w)) {
+                        s[i] = 0.0
+                    }
+                    gemm_f32_jo(s, qh, ks, rows, dh, w)
+                    for (i in range64(rows)) {
+                        var row = s + i * w
+                        let last = p0 + i0 + i
+                        let first = context > 0l ? max(0l, last - context + 1l) : 0l
+                        for (j in range64(w)) {
+                            let key = lo + j
+                            row[j] = key >= first && key <= last ? row[j] * scale : -1e30
+                        }
+                        softmax(row, w)
+                    }
+                    for (i in range64(rows * dh)) {
+                        oh[i] = 0.0
+                    }
+                    gemm_f32_jo(oh, s, vp + (hd * cap + lo) * dh, rows, w, dh)
+                    for (i in range64(rows)) {
+                        for (e in range64(dh)) {
+                            cp[(i0 + i) * hidden + off + e] = oh[i * dh + e]
+                        }
+                    }
+                    i0 = i1
+                }
+            }
+        }
+    }
+}
+
+//! The scalar reference of `attention_causal_rows` over the same cache: every dot product in
+//! double, no tiles, no lanes - what the rows form is held to.
+def attention_causal_ref(q : array<float>; t, hidden : int64; context : int64; kc : TtsKvCache; @scratch @exact_size var ctx : array<float>) {
+    let hh = kc.heads
+    let dh = kc.dh
+    let cap = kc.cap
+    let p0 = kc.n - t
+    ctx |> reserve_resize(t * hidden)
+    var inscope s : array<double>
+    s |> resize(kc.n)
+    let scale = 1.0lf / sqrt(double(dh))
+    for (hd in range64(hh)) {
+        for (i in range64(t)) {
+            let last = p0 + i
+            let first = context > 0l ? max(0l, last - context + 1l) : 0l
+            var mx = -1e300lf
+            for (j in range64(first, last + 1l)) {
+                var acc = 0.0lf
+                for (e in range64(dh)) {
+                    acc += double(q[i * hidden + hd * dh + e]) * double(kc.k[(hd * dh + e) * cap + j])
+                }
+                s[j] = acc * scale
+                mx = max(mx, s[j])
+            }
+            var sum = 0.0lf
+            for (j in range64(first, last + 1l)) {
+                s[j] = exp(s[j] - mx)
+                sum += s[j]
+            }
+            for (e in range64(dh)) {
+                var acc = 0.0lf
+                for (j in range64(first, last + 1l)) {
+                    acc += s[j] * double(kc.v[(hd * cap + j) * dh + e])
+                }
+                ctx[i * hidden + hd * dh + e] = float(acc / sum)
+            }
+        }
+    }
+}
+
+//! Rotary position embedding on token-major rows [t][hidden] of `heads` heads: row r takes
+//! position `pos0 + r`, every adjacent pair (2j, 2j+1) of a head rotated by pos / period^(2j/dh)
+//! - the `rope` convention of dasllama_math, at the family's period.
+def rope_rows(var x : array<float>; t, hidden, dh : int64; pos0 : int64; period : float) {
+    unsafe {
+        var xp = addr(x[0])
+        for (r in range64(t)) {
+            rope_scaled(xp + r * hidden, pos0 + r, dh, hidden, period, 1.0, false, null)
         }
     }
 }
@@ -1691,6 +2071,62 @@ def sigmoid_inplace(var x : array<float>; n : int64) {
     }
 }
 
+//! ELU (alpha 1) over n floats in place: x where positive, exp(x) - 1 below; four a lane.
+def elu_rows(var x : array<float>; n : int64) {
+    rows_width_check(n, "elu_rows")
+    var xp = unsafe(addr(x[0]))
+    let n4 = int(n / 4l)
+    maybe_parallel_for(0, n4, lanes_for_work(n, 0)) $(rb, re) {
+        unsafe {
+            var x4 = reinterpret<float4?>(xp)
+            let one = float4(1.0)
+            let zero = float4(0.0)
+            for (i in range64(int64(rb), int64(re))) {
+                let v = x4[i]
+                x4[i] = max(v, zero) + min(exp(v) - one, zero)   // the two halves are disjoint: one of them is zero
+            }
+        }
+    }
+}
+
+//! x[j] *= alpha[j] / sqrt(var + eps) over one row of n, `var` the variance around the row's mean
+//! with N - 1 (the mean itself is not subtracted): the continuous-audio head's timestep norm.
+def var_scale_norm(var x : array<float>; alpha : array<float>; n : int64; eps : float) {
+    var mean = 0.0lf
+    for (j in range64(n)) {
+        mean += double(x[j])
+    }
+    mean /= double(n)
+    var variance = 0.0lf
+    for (j in range64(n)) {
+        let dv = double(x[j]) - mean
+        variance += dv * dv
+    }
+    variance /= double(max(n - 1l, 1l))
+    let inv = 1.0 / sqrt(float(variance) + eps)
+    for (j in range64(n)) {
+        x[j] = x[j] * alpha[j] * inv
+    }
+}
+
+//! x[r][j] *= scale[j] over token-major rows [t][c] - a transformer layer's per-channel layer scale.
+def layer_scale_rows(var x : array<float>; t, c : int64; scale : array<float>) {
+    rows_width_check(c, "layer_scale_rows")
+    var xp = unsafe(addr(x[0]))
+    let s4 = unsafe(addr<float4 const?>(scale[0]))
+    maybe_parallel_for(0, int(t), lanes_for_work(t * c, 0)) $(rb, re) {
+        unsafe {
+            let c4 = c / 4l
+            for (r in range64(int64(rb), int64(re))) {
+                var row4 = reinterpret<float4?>(xp + r * c)
+                for (j in range64(c4)) {
+                    row4[j] *= s4[j]
+                }
+            }
+        }
+    }
+}
+
 def tanh_inplace(var x : array<float>; n : int64) {
     for (i in range64(n)) {
         x[i] = tanh(x[i])
@@ -1876,8 +2312,12 @@ def rng_uniform(var r : TtsRng) : float {
     return float(rng_u32(r) >> 8u) * (1.0 / 16777216.0)
 }
 
-//! Standard normal (Marsaglia polar).
+//! Standard normal (Marsaglia polar). A generator nobody seeded is a stuck stream (an even
+//! increment of zero), and the rejection loop would spin on it forever, so it panics instead.
 def rng_normal(var r : TtsRng) : float {
+    if (r.inc == 0ul) {
+        panic("dasLLAMA tts: the noise generator was never seeded - call rng_seed first")
+    }
     if (r.has_spare) {
         r.has_spare = false
         return r.spare
@@ -2087,6 +2527,19 @@ def pad_reflect_left_rows_inplace(@scratch @exact_size var x : array<float>; t, 
         for (ci in range64(c)) {
             x[dst + ci] = x[src + ci]
         }
+    }
+}
+
+//! y [left + t][c] = x [t][c] with its first row repeated `left` times in front (replicate padding).
+def pad_edge_left_rows(x : array<float>; t, c, left : int64; @scratch @exact_size var y : array<float>) {
+    y |> reserve_resize((left + t) * c)
+    for (r in range64(left)) {
+        for (j in range64(c)) {
+            y[r * c + j] = x[j]
+        }
+    }
+    for (i in range64(t * c)) {
+        y[left * c + i] = x[i]
     }
 }
 

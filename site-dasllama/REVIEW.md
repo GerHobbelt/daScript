@@ -1,7 +1,7 @@
 # site-dasllama Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture doc:
-`README.md`. Planned work: `plans/dasllama_io_site.md`.
+`README.md`.
 
 In this checklist "a page" means a served `.html` file under this directory, the generated news
 region inside index.html, `feed.xml`, and `sitemap.xml`. Publish time is the deploy that
@@ -46,12 +46,14 @@ publish time is a defect.** A dated `_news` or `_stories` entry is read as a cla
 date; standing page copy - a masthead, section prose, a meta tag - is read as a claim about
 now. `README.md`'s copy rules say how a claim is checked.
 
-**A diff that falsifies standing page copy - a masthead, section prose, a meta tag - fixes it
+**A diff that falsifies standing page copy - a masthead, section prose, a meta tag - or a
+`_news/*.md` / `_stories/*.md` entry dated on or after the publish day of this change, fixes it
 in the same change.**
 
-**A PR whose copy describes what a linked download contains refreshes that download's release
-before the PR merges, or holds the copy until it does.** The rolling release republishes on its
-own trigger, never on a page's merge.
+**A PR whose copy describes what a linked download contains refreshes that artifact at its
+published location - a GitHub release, a Hugging Face repository - before the PR merges, or
+holds the copy until it does.** An artifact republishes on its own trigger, never on a page's
+merge.
 
 **A `_news/*.md` or `_stories/*.md` entry for something not yet shipped is a defect.** Shipped
 means a reader can have it at publish time: the code the entry describes is merged to this

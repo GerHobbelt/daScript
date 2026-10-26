@@ -1092,6 +1092,15 @@ namespace das {
         return *this;
     }
 
+    // a read no prerequisite walk precedes meets a deferred C++ module here (src/ast/ARCHITECTURE.md sec.2)
+    static Module * requireBuiltinModule ( const string & name ) {
+        auto m = Module::require(name);
+        if ( !m ) {
+            if ( auto loader = getDeferredModuleLoader(); loader && loader(name) ) m = Module::require(name);
+        }
+        return m;
+    }
+
     AstSerializer & AstSerializer::operator << ( Module * & module ) {
         bool is_null = module == nullptr;
         *this << is_null;
@@ -1495,7 +1504,7 @@ namespace das {
 
     void Variable::serialize ( AstSerializer & ser ) {
         ser.tag(HASH_TAG("Variable"));
-        ser << name << aka << type << init << source << at << index << stackTop
+        ser << name << aka << type << init << source << at << stackTop
             << extraLocalOffset << module
             << initStackSize << flags << access_flags << access_info << annotation;
     }
@@ -1561,7 +1570,7 @@ namespace das {
         } else {
             ser.serializePointer(fromGeneric);
         }
-        ser << index         << totalStackSize  << totalGenLabel;
+        ser << totalStackSize  << totalGenLabel;
         ser << at            << atDecl          << module;
         ser << hash          << aotHash;  // do not serialize inferStack
         ser << resultAliases << argumentAliases << resultAliasesGlobals;
@@ -3009,7 +3018,7 @@ namespace das {
                 string name; ser << name;
 
                 if ( builtin && !promoted ) {
-                    auto m = Module::require(name);
+                    auto m = requireBuiltinModule(name);
                     // a corrupted record can hand this arm a garbage name - require()
                     // answers null, and the deref was a SIGSEGV (recoverable throw now;
                     // the resume reparses the record in place)
@@ -3221,7 +3230,7 @@ namespace das {
         uint64_t size_builtin = 0; ser << size_builtin;
         for ( uint64_t i = 0; i < size_builtin; i++ ) {
             string name; ser << name;
-            Module * m = Module::require(name);
+            Module * m = requireBuiltinModule(name);
             library.addModule(m);
         }
 
@@ -3555,11 +3564,12 @@ namespace das {
         return !prog->failToCompile;
     }
 
-    void rtti_ast_serializer_deserialize_program (
-            AstSerializerState * state,
+    void rtti_ast_serializer_deserialize_program_ex (
+            AstSerializerState * state, smart_ptr<FileAccess> access,
             const TBlock<void,bool,smart_ptr<Program>,const string> & block,
             Context * context, LineInfoArg * at ) {
         auto prog = make_smart<Program>();
+        prog->access = access;      // the reader's: a stream carries none (src/ast/ARCHITECTURE.md sec.3)
         {
             gc_guard deserialize_gc_scope;
             // same-version streams can still be truncated/corrupt: the stream readers throw
@@ -3600,6 +3610,13 @@ namespace das {
         (void)prog->thisModule.release();
         prog->library.reset();
         bound.g_Program = savedProg;
+    }
+
+    void rtti_ast_serializer_deserialize_program (
+            AstSerializerState * state,
+            const TBlock<void,bool,smart_ptr<Program>,const string> & block,
+            Context * context, LineInfoArg * at ) {
+        rtti_ast_serializer_deserialize_program_ex(state, nullptr, block, context, at);
     }
 
     void rtti_ast_serializer_get_data (

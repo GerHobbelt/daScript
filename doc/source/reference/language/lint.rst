@@ -800,9 +800,9 @@ LINT025 — stray ``.md`` beside shipped code
 A folder rule, not a code rule: a folder whose ``.lint_config`` carries
 ``[docs] rule_docs_only = true`` may hold only rule documents —
 ``REVIEW*.md``, ``ARCHITECTURE*.md``. Any other ``.md`` there
-fires. Ledgers, plans, and notes live at the module root or in ``plans/``
-(repo root), where they cannot ride an install glob into the SDK or bury the
-documents a reviewer must read. The pass runs once per lint invocation over
+fires. Ledgers and notes live at the module root, where they cannot ride an
+install glob into the SDK or bury the documents a reviewer must read; plan
+documents stay out of the tree. The pass runs once per lint invocation over
 the directories being linted and the folders of the files being linted; it
 never fires in an untagged folder.
 
@@ -1193,6 +1193,60 @@ names and ``[unused_argument]`` are skipped.
         var r := xs
         r |> push(1)
         return <- r
+    }
+
+LINT030 — an argument reads what a sibling call writes
+======================================================
+
+The order a call's arguments are evaluated in is not defined, and it differs
+between tiers. A call whose argument list nests a call that writes a variable
+by reference — a ``var`` parameter on a ``&``, an array, a table or a struct —
+beside another argument that reads the same variable therefore answers
+differently per tier: with ``x`` at ``0``, the read of ``x`` in
+``pair(bump(x), x)`` sees ``1`` on one tier and ``0`` on another, and the call
+below returns ``11`` or ``10``. The rule fires on the outer call. The fix is to
+run the writing call as a statement of its own and pass its result.
+
+The rule ships **off**, like LINT029. Arm it on a file with
+``options _lint = "LINT030"``, or for a tree with ``LINT030 = true`` in
+``.lint_config``.
+
+A nested call counts as writing a variable only when its body writes that
+parameter during the call: a callee that takes ``var`` to hand a pointer out
+of a ``return`` writes nothing, one that reads or writes through a pointer the
+parameter holds touches the pointee and not the parameter, one that passes
+the parameter on is answered by the function it passes it to, and a builtin
+or an extern - no body to read - is taken as writing. A read inside a lambda body does not count, and neither
+does one inside a block the outer call itself takes — that body runs inside
+the callee, after every argument is evaluated. A block handed to a nested call
+in a sibling argument runs while that argument is evaluated, so its reads do
+count. A variable the outer call takes by reference - or a plain field of it,
+not one behind a pointer - is not a read either: the callee sees its final
+state whatever the order. A variable the nested call reaches through a field
+or an index is not seen; only a bare variable in a mutable by-reference slot
+is.
+
+.. das-doc: alt
+.. code-block:: das
+
+    def bump(var x : int&) : int {
+        x++
+        return x
+    }
+
+    def pair(a, b : int) : int {
+        return a * 10 + b
+    }
+
+    // Flagged — x is read beside the call that writes it
+    def order_dependent(var x : int) : int {
+        return pair(bump(x), x)   // LINT030
+    }
+
+    // The write is a statement of its own; the read follows it on every tier
+    def sequenced(var x : int) : int {
+        let bumped = bump(x)
+        return pair(bumped, x)
     }
 
 .. _perf_lint:
@@ -2853,7 +2907,9 @@ A non-public ``require X`` where no symbol from ``X`` (or any module it
 re-exports) is referenced anywhere in the file. Remove it. Skipped when ``X``
 provides any macro or an ``[init]``, when a lifecycle hook is reachable only
 through ``X`` (as for STYLE029), or when ``X`` only re-exports builtins used
-through it. Suppress a deliberate keep with ``// nolint:STYLE030``.
+through it. A ``require [group]`` is one unit: it is reported only when no
+member is used, and a member used through its re-export never draws STYLE029.
+Suppress a deliberate keep with ``// nolint:STYLE030``.
 
 .. das-doc: alt
 .. code-block:: das

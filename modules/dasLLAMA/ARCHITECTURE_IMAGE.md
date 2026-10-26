@@ -64,6 +64,11 @@ registered its carrier's `layout_fingerprint` alongside its tag gets the `STALE 
 for an image `parse_image` would refuse; without the registration a peek calls such an image
 CURRENT and the GC keeps it.
 
+A `.dlim` load that matched no lane peeks the file before it panics. An image whose version
+differs from `IMAGE_VERSION` declines in its own message, naming both numbers and the re-mint
+command - the one decline a reader can act on without reading the load log. Every other
+mismatch declines on the identity strings this build would accept.
+
 ### 2.1c Array payloads reach the archive in bulk {#image-bulk-serialize}
 
 Array payloads reach the archive in bulk - one stream call per array (`serialize_pod_array`),
@@ -195,10 +200,11 @@ The closure, per file in sorted name order: every `Archive` serializer body (a t
 layout helpers `pad_to_page`, `plane_end`, `image_total_bytes`, `w_append`, `w_zeros`,
 `w_header`, `store_u32` and `store_u64`, and the declaration lines of the layout constants
 `IMAGE_PAGE`, `IMAGE_HEADER_BYTES`, `SECTION_TABLE_SLACK`, `DWRITE_STAGING_BAND` and
-`METAL_BAND_BLOCKS`. Comments are stripped first, so re-wording one moves nothing. A body runs
-from its `def` line to the column-0 `}` that closes it, or, for a `def ... => expr` one-liner, to
-the end of that one line. Each piece folds into one FNV-1a hash keyed by its file name, so moving
-a serializer between files changes the stamp.
+`METAL_BAND_BLOCKS`. Comments are stripped first, so re-wording one moves nothing, and CRLF
+line ends fold to LF before anything is hashed, so a checkout under `autocrlf` stamps as the
+LF tree does. A body runs from its `def` line to the column-0 `}` that closes it, or, for a
+`def ... => expr` one-liner, to the end of that one line. Each piece folds into one FNV-1a hash
+keyed by its file name, so moving a serializer between files changes the stamp.
 
 The closure is wider than the byte-moving set on purpose. The two staging bands only decide how
 many bytes a writer stages per pass, and `store_u32` writes header scalars rather than plane

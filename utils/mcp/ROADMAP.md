@@ -334,3 +334,12 @@ Many complex tools are compositions of simpler ones:
 - `extract_function` = AST analysis + code generation + `compile_check`
 
 Building the foundational tools well creates a platform for everything else.
+
+## Follow-ups
+
+- **Back to an exe form.** `tests/_pretend_root` carries a descriptor that registers a C++
+  module and a require path, and `test_tools.das` proves `list_modules`, `find_symbol` and
+  `compile_check` see both under `project_root`, eager and plain; the watchdog's `--stdio` front
+  is what `.mcp.json` spawns, so an exe form of the server would be the front's child and run
+  every session. What remains is the build: the server as a `-exe` target beside the other
+  shipped utilities, and `setup.das` naming it as `--program` where it is built.

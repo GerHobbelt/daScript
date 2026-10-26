@@ -7,8 +7,11 @@
 #include "daScript/daScriptModule.h"
 #include "daScript/misc/handle_registry.h"
 #include "daScript/simulate/simulate_fusion.h"
+#include "daScript/ast/dyn_modules.h"
+#include "daScript/ast/ast_serializer.h"
 
 #include <atomic>
+#include <mutex>
 
 namespace das {
 
@@ -136,6 +139,7 @@ namespace das {
     }
 
     bool Module::InitializeDependencies ( string & notInitialized ) {
+        notInitialized.clear();
         // InitDependencies do not add new modules.
         vector<bool> mod_state;
         bool any = true;
@@ -191,6 +195,30 @@ namespace das {
         return g_deferredModuleLoader && g_deferredModuleLoader(name) && Module::requireEx(name, false);
     }
 
+    // ARCHITECTURE.md sec.2 - process-wide, like the native paths: a descriptor registers once per process
+    static das_map<string, vector<ModuleGroupMember>> g_moduleGroups;
+    static mutex g_moduleGroupsMutex;
+
+    void registerModuleGroupMember ( const string & group, const string & member, const string & guard ) {
+        lock_guard<mutex> guard_(g_moduleGroupsMutex);
+        auto & members = g_moduleGroups[group];
+        for ( auto & m : members ) {
+            if ( m.member == member ) return;
+        }
+        members.push_back({member, guard});
+    }
+
+    vector<ModuleGroupMember> getModuleGroupMembers ( const string & group ) {
+        lock_guard<mutex> guard(g_moduleGroupsMutex);
+        auto it = g_moduleGroups.find(group);
+        if ( it == g_moduleGroups.end() ) return vector<ModuleGroupMember>();
+        vector<ModuleGroupMember> members = it->second;
+        sort(members.begin(), members.end(), [](const ModuleGroupMember & a, const ModuleGroupMember & b){
+            return a.member < b.member;
+        });
+        return members;
+    }
+
     void Module::Initialize() {
         daScriptEnvironment::ensure();
         static bool atexit_registered = (atexit(daslang_atexit_audit), true);
@@ -203,7 +231,11 @@ namespace das {
 
         string notInitialized;
         if ( !InitializeDependencies(notInitialized) ) {
-            DAS_FATAL_ERROR("Unable to initialize some modules:%s\n", notInitialized.c_str());
+            // a half-warm tree: a descriptor compiled cold loaded its module, its dependency's replayed row waits (ARCHITECTURE.md sec.2)
+            load_all_deferred_dynamic_modules();
+            if ( !InitializeDependencies(notInitialized) ) {
+                DAS_FATAL_ERROR("Unable to initialize some modules:%s\n", notInitialized.c_str());
+            }
         }
         // Collect reachable TypeDecl from thread root into module roots, sweep the rest.
         auto & threadRoot = gc_root::gc_get_thread_root();
@@ -248,6 +280,8 @@ namespace das {
         if ( dumpHandleLeaks ) handleRegistry_dumpAll();
         // Free allocated structures for dynamic modules (unloads DLLs).
         delete daScriptEnvironment::getBound()->g_dyn_modules_resolve;
+        clear_deferred_dynamic_modules();
+        setDeferredModuleLoader(nullptr);
 
         clearGlobalAotLibrary();
         if ( resetFusion ) {

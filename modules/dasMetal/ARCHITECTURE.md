@@ -2,8 +2,7 @@
 
 **Read `ARCHITECTURE_COMMON.md` (repo root) first - its contract binds this document.** The
 checklists that bind a diff here are `REVIEW.md` (this folder) and
-`modules/REVIEW_SHADER_EMITTERS.md`. The plan sections and the implementation log this
-document grew from are archived at `history/dasMetal/MASTERPLAN_LOG.md`.
+`modules/REVIEW_SHADER_EMITTERS.md`.
 
 ## 1. Why
 
@@ -166,10 +165,17 @@ than a second GPU. Cross-GPU parity of one source is secondary. Current entries:
 - **Grid-literal validation is asymmetric; pending, not deliberate.** Vulkan rejects a
   non-int64 ceil-div grid parameter at macro apply; the Metal emitter accepts it and infers a
   type silently.
-- **cm2 decode-in-load is Vulkan-only by hardware.** `[spirv_decode]` lowers
+- **cm2 decode-in-load is Vulkan-only by hardware.** `[spirv_decode]`'s callback form lowers
   SPV_NV_cooperative_matrix2 tensor loads. Metal-4 tensors have no decode-callback analogue, so
   the Metal quant GEMMs stage dequant through threadgroup memory instead. Deliberate,
   target-specific - not a pending port.
+- **A kernel body calling a `[spirv_decode]` method directly is Vulkan-only; pending, not
+  deliberate.** dasSpirv emits the call as an ordinary function - on a plane element the
+  callee takes the element's index and chains through the plane, on a copy the struct
+  parameter spills to a local (`dasSpirv/ARCHITECTURE_COOPMAT.md` sec.3.5). An MSL function takes a
+  struct by value with its members addressable as written, so Metal needs no spill; the
+  direct-call form itself has no MSL fixture yet, and a Metal kernel wanting one decode body
+  for a staged tile is what would land it.
 - **Literal fixed-array hoisting is Metal-only; pending, not deliberate.** `msl_emit` lowers a
   `let` fixed-array local whose elements are all literals to a program-scope `constant` table
   (renamed on a same-name/different-content collision); `spirv_emit` keeps such a local in

@@ -1,16 +1,20 @@
 # dasLLVM Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture docs:
-`ARCHITECTURE.md`, `ARCHITECTURE_TARGET_FEATURES.md`. Planned work: `DEBUGGING.md` (sec. Roadmap),
-`fat_mode_plan.md`.
+`ARCHITECTURE.md`, `ARCHITECTURE_TARGET_FEATURES.md`, `ARCHITECTURE_DEBUG_INFO.md`,
+`ARCHITECTURE_JIT_ENTRY.md`. Planned work: `DEBUGGING.md` (sec. Roadmap), `fat_mode_plan.md`.
+
+**A `[test]` file under this module that carries a `require dasllama/...` line of its own answers
+to `modules/dasLLAMA/tests/REVIEW.md` (repo root) as well** - its out-of-folder ledger row lives
+there.
 
 - **A change under `modules/dasLLVM/` runs the module-owned suite** (command and build gate:
   `tests/README.md` here). The suite is outside the core `tests/` sweep, so no other lane
   covers it.
 
-- **A diff that adds or changes a branch on `get_platform_name()`, `get_architecture_name()`,
-  `cpu_supports()`, or `host_llvm_feature()` runs the module-owned suite on a machine that
-  takes the new branch.**
+- **A diff that adds or changes a branch keyed on what `get_platform_name()`,
+  `get_architecture_name()`, `cpu_supports()`, or `host_llvm_feature()` returns runs the
+  module-owned suite on a machine that takes the new branch.**
 
 - **A test under `tests/` (beside this file) never creates, overwrites, or deletes a
   git-tracked path.**
@@ -22,27 +26,47 @@
 - **A test under `tests/` here that spawns a daslang child keeps the child's artifacts inside
   the directory it created for this process: `-output <dir>/...` for a `-exe` build,
   `-no-module-cache` or `-module-cache <dir>/...` for a run that compiles through the front-end
-  cache, and `-jit-no-cache` or a pinned `jit_output_path` for a `-jit` run.** A child writes
-  its caches relative to the cwd otherwise, which is the tree two concurrent runs share.
+  cache, and `-jit-no-cache` or a pinned `jit_output_path` for a `-jit` run that executes the
+  script.** A child writes its caches relative to the cwd otherwise, which is the tree two
+  concurrent runs share.
 
 - **A diff that adds or changes a branch on the target triple records in its PR body the
   cross-compile (`write_exe`) for that target that exercised the behavior.** The suite runs on
   the host, so a target-triple branch is checked only by the artifact built for that target.
 
 - **A diff that adds work to, or moves work within, what `run_jit`
-  (`daslib/llvm_jit_run.das`) executes - its own body or any callee - also prints an
-  `LLVM JIT time:` number for that work: its own line, or the number of a phase that includes
-  it, while that phase's line still prints** (phase inventory: `ARCHITECTURE.md` sec.1).
-  Option resolution before the first timer, and log lines, are not work.
+  (`daslib/llvm_jit_run.das`) or `run_jit_linked` (`daslib/llvm_jit_link.das`) executes - its
+  own body or any callee - also prints an `LLVM JIT time:` number for that work on every path
+  that executes it: its own line, or the number of a phase that includes it, while that phase's
+  line still prints; a number a second, independent computation of the same work prints (the
+  emitter's plan after the link module's) does not cover the first** (phase inventory:
+  `ARCHITECTURE.md` sec.1). Only work on the path that reaches the report is timed: option
+  resolution before the first timer, log lines, and failure-path teardown are not.
 
 - **A change that can alter the machine code the JIT's DLL or split-obj cache serves back for
-  identical inputs bumps `LLVM_JIT_CODEGEN_VERSION`** (`daslib/llvm_jit_run.das`; what counts
-  as emitting: `ARCHITECTURE.md` sec.1.2). The constant folds only into those two keys;
-  selecting among existing generators' `[llvm_code]` arguments - the `[tune]` stamping - is not
-  such a change, because stamped arguments fold into the cache keys per function.
+  identical inputs - IR generation, target-machine setup, a `[llvm_code]` generator body, or the
+  call ABI the generated code binds: function signatures, the name scheme, the prologue, the
+  externs the install phase binds - bumps `LLVM_JIT_CODEGEN_VERSION`**
+  (`daslib/llvm_jit_plan.das`); selecting among existing generators' `[llvm_code]` arguments, the
+  `[tune]` stamping, is not such a change. The caches are addressed by the AST hashes and this
+  constant, so such a change without the bump serves the old machine code back
+  (`ARCHITECTURE.md` sec.1.2).
+
+- **A diff that adds a `require` line naming a `[llvm_code]` generator module outside this
+  module - a package's, dasLLAMA's - to `daslib/llvm_user_modules.das` is a defect; the package
+  joins the `llvm_code_generator` group from its own descriptor instead.** The wiring module
+  names no package, so a build that does not carry the package registers nothing and compiles
+  unchanged; the generators this module ships stay named.
+
+- **A das function the jit finalizer reaches - `free_jit_context` (`daslib/llvm_jit_link.das`)
+  and anything it calls - is `[no_jit]` and calls only externs or other `[no_jit]` das
+  functions; a das helper on that path (`macro_context_of` and the rest of
+  `daslib/cross_context`) is a defect - call the externs directly.** The finalizer is program
+  code, so a jittable function on its path joins every jitted program's DLL (the block-passing
+  helpers cannot be lowered: `ARCHITECTURE_JIT_ENTRY.md` sec.4).
 
 - **A diff that adds an environment or config input to a JIT cache key folds it inside
-  `jit_env_salt` (`daslib/llvm_jit_run.das`), never directly into either JIT key - the DLL
+  `jit_env_salt` (`daslib/llvm_jit_plan.das`), never directly into either JIT key - the DLL
   key or the split-obj key (`ARCHITECTURE.md` sec.2)** - salt feeds both keys, and a config
   folded into one but not the other links stale objects. Inputs that vary per function set
   (AOT hashes) fold into the key directly, not through the salt.
@@ -54,7 +78,8 @@
 
 - **A change to a `[tune]`-family annotation is reviewed with `skills/tune.md`.**
 
-- **A change to the tune framework - `daslib/llvm_tune.das` or its tests - is reviewed with
+- **A change to the tune framework - `daslib/llvm_tune.das`, its tests, or the descriptor and
+  C++ rows that join it to a program (`.das_module`, `src/dasLLVM.cpp`) - is reviewed with
   `skills/internal/llvm_tune_internals.md`.**
 
 - **A test under `tests/` here whose child compiles through the front-end module cache - any
@@ -96,6 +121,21 @@
   a diff passes to a filesystem call stays raw: no filesystem call resolves `~`.
   `tests/llvm_tune_manifest.das` here asserts a minted sidecar carries no home directory.
 
+- **A diff that emits an instruction into the entry block of a function whose body das
+  statements emit - the impl half of a pair, or a block body - gives it no debug location, and
+  one it emits into a loop's latch (the block that jumps back to the loop head) gives it the
+  loop's own line** (`daslib/llvm_jit.das`). Those are the two places the emitter fills out of
+  das statement order, and an instruction that keeps whatever location was current when it was
+  emitted moves a `break file:line` stop onto a statement that has not run
+  (`ARCHITECTURE_DEBUG_INFO.md` sec.12.2). The wrapper half's entry block is not such a place:
+  it holds no das statement at all and carries the declaration line on purpose, so a frame for
+  it prints a line.
+
+- **A diff that adds a teardown step to `reset_jit_globals_after_failure`
+  (`daslib/llvm_jit_run.das`) puts it after the `di_finalize()` call.** A DIBuilder writes into
+  the LLVM module it was created for, so finalizing one whose module an earlier step already
+  disposed of reads freed memory.
+
 - **Never call `LLVMSetIsInBounds` - build the GEP in-bounds with `LLVMBuildInBoundsGEP2` (the
   `llvm_boost` wrapper's `inbounds` default) instead.** A constant-folded GEP is a
   `ConstantExpr`, and the setter's cast writes through the wrong type into it
@@ -108,18 +148,24 @@
   every box, so every perm that requires it silently declines to its fallback and no error names
   the cause.
 
+- **An emitter under `daslib/` that uses a call's name as a KEY - an intrinsic-name fragment, a
+  lookup-table key, a branch on one spelling - reads `expr.func.name`, never `expr.name`;
+  `expr.name` stays only in a diagnostic or an LLVM value name, where it is what the user
+  wrote.** The dispatch tables key off the declaration, so a call site can still spell itself
+  module-qualified.
+
 - **A diff that adds or changes a `build_vector_*` emitter (`daslib/llvm_jit_intrin.das`) emits
   each Horner step unfused, through `vmath_poly_step`, and calls `vmath_fma` only for the steps
   vecmath itself writes fused** (`ARCHITECTURE.md#vector-poly-fusion`). One fused step in a
   sign-alternating chain moves the last few bits of the result, and the interpreter and AOT
   answers do not move with it.
 
-- **A diff that adds or changes an intrinsic emitter whose daslang body is the reference
-  implementation - a `build_vector_*` emitter, an `idot` lowering - also adds a cell comparing
-  the emitted result with the interpreted result over the operand range the emitter serves
-  (every vector width for `build_vector_*`, the full int8 lattice for a dot), and for a float
-  emitter one asserting both answer NaN in the same lanes; a lowering only a cross target runs
-  states in the PR body the artifact that compared them.** A clamp or a conversion written with
+- **A diff that changes what an emitter whose daslang body is the reference implementation
+  produces - the emitter itself, or which of its arms a call selects - also adds a cell
+  comparing the emitted result with the interpreted result over the operand range that emitter
+  serves (every vector width for a vector emitter, the full int8 lattice for a dot), and for a
+  float emitter one asserting both answer NaN in the same lanes; a lowering only a cross target
+  runs states in the PR body the artifact that compared them.** A clamp or a conversion written with
   ordered compares turns a NaN lane into a number, and an accuracy bound reads that as success;
   an IR-shape test names the instruction and never a number.
 

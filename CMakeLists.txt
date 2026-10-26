@@ -1154,6 +1154,8 @@ include/daScript/simulate/simulate_visit.h
 include/daScript/simulate/simulate_visit_op.h
 include/daScript/simulate/simulate_visit_op_undef.h
 include/daScript/simulate/sim_policy.h
+include/daScript/simulate/name_lookup.h
+src/simulate/name_lookup.cpp
 src/simulate/data_walker.cpp
 include/daScript/simulate/data_walker.h
 src/simulate/debug_print.cpp
@@ -1632,6 +1634,9 @@ if (NOT ${DAS_TOOLS_DISABLED})
     # test time + dasModuleSQLITE; both must already be defined as targets).
     add_subdirectory(tests/exe-paths)
 
+    # The probe library tests/dasbind binds through [extern] (lands in lib/).
+    add_subdirectory(tests/dasbind)
+
     # Build daslang utilities as standalone executables (-exe mode)
     add_subdirectory(utils)
 
@@ -1767,6 +1772,7 @@ SET(DAS_SIMULATE_INCLUDES
     include/daScript/simulate/simulate_fusion_op2_set_perm.h
     include/daScript/simulate/simulate_fusion_op2_vec_settings.h
     include/daScript/simulate/simulate.h
+    include/daScript/simulate/name_lookup.h
     include/daScript/simulate/simulate_nodes.h
     include/daScript/simulate/simulate_visit.h
     include/daScript/simulate/simulate_visit_op.h
@@ -1861,6 +1867,7 @@ install(FILES
     ${PROJECT_SOURCE_DIR}/src/simulate/debug_info.cpp
     ${PROJECT_SOURCE_DIR}/src/simulate/escape_string.cpp
     ${PROJECT_SOURCE_DIR}/src/simulate/heap.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/name_lookup.cpp
     ${PROJECT_SOURCE_DIR}/src/simulate/runtime_array.cpp
     ${PROJECT_SOURCE_DIR}/src/simulate/runtime_iterator.cpp
     ${PROJECT_SOURCE_DIR}/src/simulate/runtime_table.cpp
@@ -1972,7 +1979,6 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/
 #   setup.das       — bootstrap for a fresh tree; the installed README and the
 #                     shipped skills/mcp_tools.md both document running it, so it
 #                     must ship (it was missing through 0.6.4)
-#   mcp_supervisor.py — the stdio supervisor setup.das writes into .mcp.json
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/main.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_main.das
@@ -1982,7 +1988,6 @@ install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/registry_cpp.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_search_config.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/setup.das
-    ${PROJECT_SOURCE_DIR}/utils/mcp/mcp_supervisor.py
     ${PROJECT_SOURCE_DIR}/utils/mcp/daslang-mcp-msvc.cmd
     ${PROJECT_SOURCE_DIR}/utils/mcp/README.md
     DESTINATION utils/mcp
@@ -1995,8 +2000,8 @@ install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/test_tools.das
     DESTINATION utils/mcp
 )
-# The installed test_tools.das drives two non-.das fixtures — _fixture_cpp_outline.h
-# (cpp_outline) and _pretend_root/modules/pretend_mod/.das_module (project_root) — so a
+# The installed test_tools.das drives non-.das fixtures — _fixture_cpp_outline.h
+# (cpp_outline) and the _pretend_root/modules/*/.das_module descriptors (project_root) — so a
 # bare "*.das" filter ships the suite in a state where those cases cannot run.
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/mcp/tests/
     DESTINATION utils/mcp/tests
@@ -2147,6 +2152,7 @@ install(FILES ${PROJECT_SOURCE_DIR}/utils/dasllama-convert/main.das
 # beside daslang from utils/CMakeLists.txt, these are the library and the interpreter entry)
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/watchdog/watchdog.das
+    ${PROJECT_SOURCE_DIR}/utils/watchdog/stdio_front.das
     ${PROJECT_SOURCE_DIR}/utils/watchdog/main.das
     ${PROJECT_SOURCE_DIR}/utils/watchdog/README.md
     DESTINATION utils/watchdog

@@ -16,7 +16,12 @@ require ?vulkan dasllama/dasllama_vulkan_classes
 require ?vulkan dasllama/dasllama_vulkan_prefill
 require ?vulkan dasllama/dasllama_vulkan_seams
 require ?vulkan dasllama/dasllama_kqformat
+require ?vulkan dasllama/dasllama_gemm_schema   // kq_dev_ssb_i - the fixtures size their device scale planes per format
 require ?vulkan daslib/shader_lingua_franca   // gl_GlobalInvocationID — the CPU replay drives it per lane (only vulkan-guarded arms replay)
+require dasllama/dasllama_common   // MoeGate: the routing cells' select oracle takes the softmax router
+require dasllama/dasllama_moe   // moe_select_core: the host select the window's per-row top-k mirrors
+
+let private TILE_SLACK_ROWS = int(TILE_READ_SLACK)   //! the cm2 fixtures' rows past the last region, the engine's count: the s and m tiles load a partial column unclamped
 
 // The model-less Vulkan kernel-unit suite ([vk_dispatch] bring-up): a class kernel dispatched
 // through the GENERATED surface (ensure/set/enc — per-class layout, push constants, hazard rail)
@@ -83,6 +88,86 @@ def test_vkd_class_dispatch(t0 : T?) {
             }
         } else {
             feint("dasVulkan not present - skipping\n")
+        }
+    }
+}
+
+[test, arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default")]
+def test_vkd_direct_decode(t0 : T?) {
+    t0 |> run("a [spirv_decode] method called directly from the kernel body == the same method on the CPU") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!ensure_vkd_direct_decode()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            let n = 64   //! two q8-shaped blocks of 32 quants
+            var k = new VkdDirectDecode()
+            k.wq |> resize(2)
+            k.ws <- [float16(0.5), float16(-0.25)]
+            k.y |> resize(n)
+            k.pa = VdArgs(n = uint(n))
+            for (b in range(2)) {
+                for (i in range(16)) {
+                    let q0 = (b * 32 + i * 2) % 23 - 11
+                    let q1 = (b * 32 + i * 2 + 1) % 23 - 11
+                    k.wq[b].qs[i] = int16((q0 & 0xFF) | ((q1 & 0xFF) << 8))
+                }
+            }
+            for (i in range(n)) {
+                gl_GlobalInvocationID = uint3(uint(i), 0u, 0u)
+                k->run()
+            }
+            let wq_bytes = 2l * 32l
+            let ws_bytes = 2l * 2l
+            let y_bytes = int64(n) * 4l
+            let wqd = make_device_buf(wq_bytes)
+            let wsd = make_device_buf(ws_bytes)
+            let yd = make_device_buf(y_bytes)
+            var host = make_host_buf(y_bytes, true, [cached = true])
+            var gpu : array<float>
+            gpu |> resize(n)
+            unsafe {
+                upload_region_at(wqd, 0l, addr<uint8 const?>(k.wq[0].qs[0]), wq_bytes)
+                upload_region_at(wsd, 0l, addr<uint8 const?>(k.ws[0]), ws_bytes)
+                var s = set_vkd_direct_decode(fixed_array(wqd, wsd, yd), fixed_array(wq_bytes, ws_bytes, y_bytes), fixed_array(1u, 2u, 4u))
+                var raw = alloc_cmd()
+                let begin = VkCommandBufferBeginInfo()
+                vk_check(vkBeginCommandBuffer(raw, begin), null)
+                var h : VkHaz
+                var pc = VdArgs(n = uint(n))
+                enc_vkd_direct_decode(raw, h, s, pc, 1l)
+                vhz_dep(raw, h, 4u, 0u, true)
+                cmd_copy_whole(raw, yd, host.buf, y_bytes)
+                vk_check(vkEndCommandBuffer(raw), null)
+                submit_wait(raw)
+                memcpy(addr<void?>(gpu[0]), host.mapped, y_bytes)
+            }
+            var bad = 0
+            var nonzero = 0
+            for (i in range(n)) {
+                if (gpu[i] != k.y[i]) {
+                    bad++
+                }
+                if (k.y[i] != 0.0) {
+                    nonzero++
+                }
+            }
+            t |> success(nonzero > 48, "the oracle is non-trivial ({nonzero} of {n} lanes non-zero)")
+            t |> success(bad == 0, "GPU == CPU on all {n} lanes through the direct decode call ({bad} diverge)")
+            var poisoned = 0   // the control: one oracle lane pushed off must red the same compare
+            gpu[3]++
+            for (i in range(n)) {
+                if (gpu[i] != k.y[i]) {
+                    poisoned++
+                }
+            }
+            t |> success(poisoned == 1, "the exact compare reds a poisoned lane ({poisoned} diverge)")
+            delete gpu
+            unsafe {
+                delete k
+            }
+        } else {
+            t |> skip("dasVulkan not present")
         }
     }
 }
@@ -633,7 +718,7 @@ def test_vkd_kq_gemv_family(t0 : T?) {
                 let stride4 = stride4s[fi]
                 let nwsb = rows * nsb                       // region r's weights at r*d*nsb
                 let wq_words = nwsb * stride4
-                let ws_words_n = nwsb * 5
+                let ws_words_n = nwsb * int(kq_dev_ssb_i(fmt) / 4l)
                 var wqh : array<uint>
                 var wsh : array<uint>
                 var xqh : array<uint>
@@ -668,65 +753,69 @@ def test_vkd_kq_gemv_family(t0 : T?) {
                 var host = make_host_buf(y_bytes, true, [cached = true])
                 var y_cls : array<float>
                 y_cls |> resize(rows)
-                let wgs = (int64(rows) + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg
                 var regs : array<uint>
                 regs |> resize(nreg * 2)
                 for (r in range(nreg)) {
                     regs[r * 2] = uint(r * d * nsb)
                     regs[r * 2 + 1] = 0u
                 }
+                var y_ref <- kq_gemv_oracle(fmt, wqh, wsh, xqh, xsh, regs, 512, d, nreg)
                 unsafe {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsh[0]), ws_bytes)
                     upload_region_at(xqd, 0l, addr<uint8 const?>(xqh[0]), xq_bytes)
                     upload_region_at(xsd, 0l, addr<uint8 const?>(xsh[0]), xs_bytes)
                     upload_region_at(rgd, 0l, addr<uint8 const?>(regs[0]), int64(nreg) * 8l)
-                    // the class kernel — regions SSBO + push params (one family set serves all four)
                     let cb = fixed_array(wqd, wsd, rgd, xqd, xsd, yd2)
                     let cs = fixed_array(wq_bytes, ws_bytes, int64(nreg) * 8l, xq_bytes, xs_bytes, y_bytes)
                     let cg = fixed_array(1u, 2u, 4u, 8u, 16u, 32u)
-                    var s_cls = set_kq_gemv_cls(cb, cs, cg)
-                    var raw2 = alloc_cmd()
-                    let begin = VkCommandBufferBeginInfo()
-                    vk_check(vkBeginCommandBuffer(raw2, begin), null)
-                    var h2 : VkHaz
-                    var pc = GemvArgs(n = 512u, d = uint(d), nreg = uint(nreg), ybase = 0u)
-                    if (fmt == int(KqFmt.k4)) {
-                        enc_kq_gemv_k4_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.q40)) {
-                        enc_kq_gemv_q40_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.k5)) {
-                        enc_kq_gemv_k5_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.iq4xs)) {
-                        enc_kq_gemv_iq4xs_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.k3)) {
-                        enc_kq_gemv_k3_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.iq3s)) {
-                        enc_kq_gemv_iq3s_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.iq3xxs)) {
-                        enc_kq_gemv_iq3xxs_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.iq4nl)) {
-                        enc_kq_gemv_iq4nl_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.k2)) {
-                        enc_kq_gemv_k2_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.iq2s)) {
-                        enc_kq_gemv_iq2s_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.iq2xs)) {
-                        enc_kq_gemv_iq2xs_cls(raw2, h2, s_cls, pc, wgs)
-                    } elif (fmt == int(KqFmt.iq2xxs)) {
-                        enc_kq_gemv_iq2xxs_cls(raw2, h2, s_cls, pc, wgs)
-                    } else {
-                        enc_kq_gemv_k6_cls(raw2, h2, s_cls, pc, wgs)
+                    var s_cls = gemv_cls_set(fmt, cb, cs, cg)
+                    //! the three lane splits of a subgroup: one row, two rows, four rows (the 16-block row keeps every lane busy at eight)
+                    for (lanes_per_row in fixed_array(0u, 16u, 8u)) {
+                        let wgs = gemv_wgs(int64(rows), lanes_per_row)
+                        nan_sentinel_upload(yd2, y_bytes)   //! a lane split that stores no row leaves the sentinel, not the last split's rows
+                        var raw2 = alloc_cmd()
+                        let begin = VkCommandBufferBeginInfo()
+                        vk_check(vkBeginCommandBuffer(raw2, begin), null)
+                        var h2 : VkHaz
+                        var pc = GemvArgs(n = 512u, d = uint(d), nreg = uint(nreg), ybase = 0u, lanes_per_row = lanes_per_row)
+                        if (fmt == int(KqFmt.k4)) {
+                            enc_kq_gemv_k4_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.q40)) {
+                            enc_kq_gemv_q40_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.k5)) {
+                            enc_kq_gemv_k5_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.iq4xs)) {
+                            enc_kq_gemv_iq4xs_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.k3)) {
+                            enc_kq_gemv_k3_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.iq3s)) {
+                            enc_kq_gemv_iq3s_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.iq3xxs)) {
+                            enc_kq_gemv_iq3xxs_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.iq4nl)) {
+                            enc_kq_gemv_iq4nl_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.k2)) {
+                            enc_kq_gemv_k2_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.iq2s)) {
+                            enc_kq_gemv_iq2s_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.iq2xs)) {
+                            enc_kq_gemv_iq2xs_cls(raw2, h2, s_cls, pc, wgs)
+                        } elif (fmt == int(KqFmt.iq2xxs)) {
+                            enc_kq_gemv_iq2xxs_cls(raw2, h2, s_cls, pc, wgs)
+                        } else {
+                            enc_kq_gemv_k6_cls(raw2, h2, s_cls, pc, wgs)
+                        }
+                        vhz_dep(raw2, h2, 32u, 0u, true)
+                        cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
+                        vk_check(vkEndCommandBuffer(raw2), null)
+                        submit_wait(raw2)
+                        memcpy(addr<void?>(y_cls[0]), host.mapped, y_bytes)
+                        let bad = mismatch_approx(y_cls, y_ref)
+                        let lanes = lanes_per_row == 0u ? g_gpu.subgroup_size : int64(lanes_per_row)
+                        t |> success(bad == 0, "fmt {fmt} at {lanes} lanes per row: class kernel matches the CPU oracle ({bad} of {rows} rows off)")
                     }
-                    vhz_dep(raw2, h2, 32u, 0u, true)
-                    cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
-                    vk_check(vkEndCommandBuffer(raw2), null)
-                    submit_wait(raw2)
-                    memcpy(addr<void?>(y_cls[0]), host.mapped, y_bytes)
                 }
-                var y_ref <- kq_gemv_oracle(fmt, wqh, wsh, xqh, xsh, regs, 512, d, nreg)
-                let bad = mismatch_approx(y_cls, y_ref)
-                t |> success(bad == 0, "fmt {fmt}: class kernel matches the CPU oracle ({bad} of {rows} rows off)")
                 if (fmt == int(KqFmt.iq4xs)) {   // the codebook pack has an independent float witness
                     var y_flt <- iq4xs_gemv_float_oracle(wqh, wsh, xqh, xsh, regs, 512, d, nreg)
                     let badf = mismatch_approx(y_ref, y_flt)
@@ -975,12 +1064,20 @@ def test_vkd_rope_family(t0 : T?) {
                     csh[i] = 0.3 + float(i % 9) * 0.07          // cos row
                     csh[half + i] = 0.1 + float(i % 7) * 0.11   // sin row
                 }
+                let bpad = 64   // the bias rows sit past a pad, so boff is exercised off its default
+                var bh : array<float>
+                bh |> resize(bpad + qd + 2 * kvd)
+                for (i in range(bpad + qd + 2 * kvd)) {
+                    bh[i] = i < bpad ? 55.0 : float((i * 13) % 29) * 0.05 - 0.7
+                }
+                let b_bytes = long_length(bh) * 4l
                 let q_bytes = int64(qd) * 4l
                 let kv_bytes = int64(qd + 2 * kvd) * 4l
                 let m_bytes = int64(kvd) * 4l
                 let cs_bytes = int64(hs) * 4l
                 let kvd_dev = make_device_buf(kv_bytes)
                 let csd = make_device_buf(cs_bytes)
+                let bd = make_device_buf(b_bytes)
                 let q2 = make_device_buf(q_bytes)
                 let km2 = make_device_buf(m_bytes)
                 let vm2 = make_device_buf(m_bytes)
@@ -996,18 +1093,19 @@ def test_vkd_rope_family(t0 : T?) {
                     upload_region_at(kvd_dev, 0l, addr<uint8 const?>(kvh[0]), kv_bytes)
                     upload_region_at(csd, 0l, addr<uint8 const?>(csh[0]), cs_bytes)
                     upload_region_at(q2, 0l, addr<uint8 const?>(qh[0]), q_bytes)
-                    // the class kernel: q@0, kvsrc@1, kmir@2, vmir@3, cossin@4, tok@5 (pos 0 -> row 0)
+                    upload_region_at(bd, 0l, addr<uint8 const?>(bh[0]), b_bytes)
+                    //! the class kernel: q@0, kvsrc@1, kmir@2, vmir@3, cossin@4, tok@5 (pos 0 -> row 0), bias@6
                     var tokb = make_host_buf(16l, true)
                     var tm = reinterpret<TokMeta?>(tokb.mapped)
                     tm.pos = 0u
-                    var sc = set_rope_kv_cls(fixed_array(q2, kvd_dev, km2, vm2, csd, tokb.buf),
-                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, 16l),
-                        fixed_array(16u, 1u, 2u, 4u, 8u, 0u))
+                    var sc = set_rope_kv_cls(fixed_array(q2, kvd_dev, km2, vm2, csd, tokb.buf, bd),
+                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, 16l, b_bytes),
+                        fixed_array(16u, 1u, 2u, 4u, 8u, 0u, 0u))
                     var raw2 = alloc_cmd()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
                     var h2 : VkHaz
                     var pc = RopeKvArgs(qd = uint(qd), kvd = uint(kvd), hs = uint(hs), half = uint(half),
-                        neox = 1u, kpair0 = uint(kpair0), npairs = uint(npairs), layerbase = 0u)
+                        neox = 1u, kpair0 = uint(kpair0), npairs = uint(npairs), layerbase = 0u, boff = uint(bpad), hasb = 1u)
                     enc_rope_kv_cls(raw2, h2, sc, pc, wgs)
                     vhz_dep(raw2, h2, 2u | 4u | 16u, 0u, true)
                     cmd_copy_whole(raw2, q2, host.buf, q_bytes)
@@ -1027,8 +1125,7 @@ def test_vkd_rope_family(t0 : T?) {
                     submit_wait(raw2c)
                     memcpy(addr<void?>(cls_v[0]), host.mapped, m_bytes)
                 }
-                // oracle: the same per-pair rotation sequentially (NEOX pairs (j, j+half));
-                // v copies raw — approx bars ride out the device's fma contraction
+                //! oracle: bias first, then the sequential NEOX (j, j+half) rotation; v is raw plus bias — the approx bars ride out the device's fma contraction
                 var ref_q : array<float>
                 var ref_k : array<float>
                 var ref_v : array<float>
@@ -1036,7 +1133,7 @@ def test_vkd_rope_family(t0 : T?) {
                 ref_k |> resize(kvd)
                 ref_v |> resize(kvd)
                 for (i in range(qd)) {
-                    ref_q[i] = qh[i]
+                    ref_q[i] = qh[i] + bh[bpad + i]
                 }
                 for (gid in range(npairs)) {
                     let is_k = gid >= kpair0
@@ -1046,24 +1143,25 @@ def test_vkd_rope_family(t0 : T?) {
                     let fcr = csh[j]
                     let fci = csh[half + j]
                     if (is_k) {
-                        let a0 = kvh[qd + hh * hs + j]
-                        let a1 = kvh[qd + hh * hs + j + half]
+                        let a0 = kvh[qd + hh * hs + j] + bh[bpad + qd + hh * hs + j]
+                        let a1 = kvh[qd + hh * hs + j + half] + bh[bpad + qd + hh * hs + j + half]
                         ref_k[hh * hs + j] = a0 * fcr - a1 * fci
                         ref_k[hh * hs + j + half] = a0 * fci + a1 * fcr
-                        ref_v[hh * hs + j] = kvh[qd + kvd + hh * hs + j]
-                        ref_v[hh * hs + j + half] = kvh[qd + kvd + hh * hs + j + half]
+                        ref_v[hh * hs + j] = kvh[qd + kvd + hh * hs + j] + bh[bpad + qd + kvd + hh * hs + j]
+                        ref_v[hh * hs + j + half] = kvh[qd + kvd + hh * hs + j + half] + bh[bpad + qd + kvd + hh * hs + j + half]
                     } else {
-                        let a0 = qh[hh * hs + j]
-                        let a1 = qh[hh * hs + j + half]
+                        let a0 = qh[hh * hs + j] + bh[bpad + hh * hs + j]
+                        let a1 = qh[hh * hs + j + half] + bh[bpad + hh * hs + j + half]
                         ref_q[hh * hs + j] = a0 * fcr - a1 * fci
                         ref_q[hh * hs + j + half] = a0 * fci + a1 * fcr
                     }
                 }
                 let bad = mismatch_approx(cls_q, ref_q) + mismatch_approx(cls_k, ref_k) + mismatch_approx(cls_v, ref_v)
-                t |> success(bad == 0, "rope_kv_store matches the CPU oracle ({bad} elements off)")
+                t |> success(bad == 0, "rope_kv_store with the q/k/v bias matches the CPU oracle ({bad} elements off)")
                 delete qh
                 delete kvh
                 delete csh
+                delete bh
                 delete ref_q
                 delete ref_k
                 delete ref_v
@@ -1314,14 +1412,15 @@ def test_vkd_kq_batch_family(t0 : T?) {
                 var wsh : array<uint>
                 var xqh : array<uint>
                 var xsh : array<float>
+                let wswords = totsb * int(kq_dev_ssb_i(fmt) / 4l)
                 wqh |> resize(totsb * wstride)
-                wsh |> resize(totsb * 5)
+                wsh |> resize(wswords)
                 xqh |> resize(rows * nsb * 64)
                 xsh |> resize(rows * nsb)
                 for (i in range(totsb * wstride)) {
                     wqh[i] = hash_word(uint(i) + uint(fmt) * 131u)
                 }
-                for (i in range(totsb * 5)) {
+                for (i in range(wswords)) {
                     wsh[i] = ws_word(uint(i) + uint(fmt) * 17u)
                 }
                 for (i in range(rows * nsb * 64)) {
@@ -1331,7 +1430,7 @@ def test_vkd_kq_batch_family(t0 : T?) {
                     xsh[i] = 0.3 + float(i % 11) * 0.05
                 }
                 let wq_bytes = int64(totsb * wstride) * 4l
-                let ws_bytes = int64(totsb * 5) * 4l
+                let ws_bytes = int64(wswords) * 4l
                 let xq_bytes = int64(rows * nsb) * 256l
                 let xs_bytes = int64(rows * nsb) * 4l
                 let y_bytes = int64(rows * d) * 4l
@@ -1605,7 +1704,7 @@ def test_vkd_kq_q40_cm_batch(t0 : T?) {
                 feint("no Vulkan device - skipping\n")
                 return
             }
-            if (g_gpu.coopmat_mode != 1) {
+            if (g_gpu.coopmat_mode != COOPMAT_F16) {
                 feint("q40 rides the f16 coopmat twin only in mode 1 (DASLLAMA_COOPMAT=f16) - skipping\n")
                 return
             }
@@ -1719,7 +1818,7 @@ def test_vkd_cm2l_batch(t0 : T?) {
                 feint("no Vulkan device - skipping\n")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
+            if (!(g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2)) {
                 feint("the cm2 l-tile serves only in mode 4 on an NV_coopmat2 device (DASLLAMA_COOPMAT=cm2) - skipping\n")
                 return
             }
@@ -1824,7 +1923,7 @@ def test_vkd_cm2_decode_vector_pair(t0 : T?) {
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
+            if (!(g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2)) {
                 t |> skip("the cm2 l-tile serves only in mode 4 on an NV_coopmat2 device (DASLLAMA_COOPMAT=cm2)")
                 return
             }
@@ -1944,17 +2043,24 @@ def test_vkd_cm2_decode_vector_pair(t0 : T?) {
 
 [test]
 def test_vkd_k4_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 Q4_K l/m tiles == the CPU oracle (decode-in-load over the repacked planes)") <| @(t : T?) {
+    t0 |> run("cm2 Q4_K l/m/s tiles and the KHR tile == the CPU oracle (decode-in-load over the repacked planes; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 k4 tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the k4 tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_k4_cm2l_cls() && ensure_kq_batch_k4_cm2m_cls() && ensure_kq_batch_k4_cm2s_cls(), "k4 cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_k4_cm2l_cls() && ensure_kq_batch_k4_cm2m_cls() && ensure_kq_batch_k4_cm2s_cls(), "k4 cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_k4_khr_cls(), "the k4 KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -1967,7 +2073,7 @@ def test_vkd_k4_cm2_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totsb * 32)
             wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 32)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary nibble bytes
             }
@@ -1979,12 +2085,12 @@ def test_vkd_k4_cm2_batch(t0 : T?) {
                     wsuh[sb * 5 + 1 + wi] = hash_word(uint(sb * 4 + wi) + 613u)   // sc / mn bytes
                 }
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 128l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -1995,14 +2101,21 @@ def test_vkd_k4_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
                 let wgs = wgs0 + wgs1
+                //! two map words past the live workgroups carry the sentinel: the dispatch runs over them as the
+                //! device-written schedules' upper bound does, and a tile that reads one returns before its first store
+                let tail = 2
                 var sched : array<uint>
-                sched |> resize(2 * 4 + wgs)
+                sched |> resize(2 * 4 + wgs + tail)
                 sched[0] = 0u
                 sched[1] = 0u
                 sched[2] = uint(cnt0)
@@ -2014,35 +2127,37 @@ def test_vkd_k4_cm2_batch(t0 : T?) {
                 for (w in range(wgs)) {
                     sched[8 + w] = w < wgs0 ? 0u : 1u
                 }
+                for (w in range(wgs, wgs + tail)) {
+                    sched[8 + w] = SCHED_NONE
+                }
                 unsafe {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
-                    let sc_bytes = int64(2 * 4 + wgs) * 4l
+                    nan_sentinel_upload(yd2, y_bytes)
+                    let sc_bytes = int64(2 * 4 + wgs + tail) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_k4_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_k4_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_k4_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_k4_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_k4_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_k4_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.k4), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
                     var h2 : VkHaz
                     var pc = BatchArgs(n = uint(n), d = uint(d), map_off = uint(2 * 4))
                     if (ml == 0) {
-                        enc_kq_batch_k4_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
+                        enc_kq_batch_k4_cm2l_cls(raw2, h2, sc, pc, int64(wgs + tail))
                     } elif (ml == 1) {
-                        enc_kq_batch_k4_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
+                        enc_kq_batch_k4_cm2m_cls(raw2, h2, sc, pc, int64(wgs + tail))
+                    } elif (ml == 2) {
+                        enc_kq_batch_k4_cm2s_cls(raw2, h2, sc, pc, int64(wgs + tail))
                     } else {
-                        enc_kq_batch_k4_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                        khr_cls_enc(int(KqFmt.k4), raw2, h2, sc, pc, int64(wgs + tail))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -2052,8 +2167,8 @@ def test_vkd_k4_cm2_batch(t0 : T?) {
                 }
                 k4f16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 k4 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 k4 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "k4 {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "k4 {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the k4 bar reds a poisoned element")
@@ -2073,17 +2188,24 @@ def test_vkd_k4_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_k5_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 Q5_K l/m/s tiles == the CPU oracle (5th-bit compose decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 Q5_K l/m/s tiles and the KHR tile == the CPU oracle (5th-bit compose decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 k5 tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the k5 tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_k5_cm2l_cls() && ensure_kq_batch_k5_cm2m_cls() && ensure_kq_batch_k5_cm2s_cls(), "k5 cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_k5_cm2l_cls() && ensure_kq_batch_k5_cm2m_cls() && ensure_kq_batch_k5_cm2s_cls(), "k5 cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_k5_khr_cls(), "the k5 KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -2096,7 +2218,7 @@ def test_vkd_k5_cm2_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totsb * 40)
             wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 40)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary quant bytes
             }
@@ -2108,12 +2230,12 @@ def test_vkd_k5_cm2_batch(t0 : T?) {
                     wsuh[sb * 5 + 1 + wi] = hash_word(uint(sb * 4 + wi) + 613u)   // sc / mn bytes
                 }
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 160l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -2124,8 +2246,12 @@ def test_vkd_k5_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -2147,20 +2273,17 @@ def test_vkd_k5_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_k5_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_k5_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_k5_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_k5_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_k5_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_k5_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.k5), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -2170,8 +2293,10 @@ def test_vkd_k5_cm2_batch(t0 : T?) {
                         enc_kq_batch_k5_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_k5_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_k5_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.k5), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -2181,8 +2306,8 @@ def test_vkd_k5_cm2_batch(t0 : T?) {
                 }
                 k5f16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 k5 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 k5 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "k5 {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "k5 {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the k5 bar reds a poisoned element")
@@ -2202,17 +2327,24 @@ def test_vkd_k5_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_q40_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 Q4_0 l/m/s tiles == the CPU oracle (per-block f16 d decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 Q4_0 l/m/s tiles and the KHR tile == the CPU oracle (per-block f16 d decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 q40 tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the q40 tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_q40_cm2l_cls() && ensure_kq_batch_q40_cm2m_cls() && ensure_kq_batch_q40_cm2s_cls(), "q40 cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_q40_cm2l_cls() && ensure_kq_batch_q40_cm2m_cls() && ensure_kq_batch_q40_cm2s_cls(), "q40 cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_q40_khr_cls(), "the q40 KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -2225,7 +2357,7 @@ def test_vkd_q40_cm2_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totsb * 32)
             wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 32)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary quant bytes
             }
@@ -2236,12 +2368,12 @@ def test_vkd_q40_cm2_batch(t0 : T?) {
                 }
                 wsuh[sb * 5 + 4] = 0u
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 128l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -2252,8 +2384,12 @@ def test_vkd_q40_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -2275,20 +2411,17 @@ def test_vkd_q40_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_q40_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_q40_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_q40_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_q40_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_q40_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_q40_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.q40), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -2298,8 +2431,10 @@ def test_vkd_q40_cm2_batch(t0 : T?) {
                         enc_kq_batch_q40_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_q40_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_q40_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.q40), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -2309,8 +2444,8 @@ def test_vkd_q40_cm2_batch(t0 : T?) {
                 }
                 q40f16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 q40 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 q40 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "q40 {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "q40 {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the q40 bar reds a poisoned element")
@@ -2330,17 +2465,24 @@ def test_vkd_q40_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_k2_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 Q2_K l/m/s tiles == the CPU oracle (pair-byte nibble scales decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 Q2_K l/m/s tiles and the KHR tile == the CPU oracle (pair-byte nibble scales decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 k2 tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the k2 tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_k2_cm2l_cls() && ensure_kq_batch_k2_cm2m_cls() && ensure_kq_batch_k2_cm2s_cls(), "k2 cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_k2_cm2l_cls() && ensure_kq_batch_k2_cm2m_cls() && ensure_kq_batch_k2_cm2s_cls(), "k2 cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_k2_khr_cls(), "the k2 KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -2353,7 +2495,7 @@ def test_vkd_k2_cm2_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totsb * 16)
             wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 16)) {
                 wqh[i] = hash_word(uint(i) + 31u)     // arbitrary quant bytes
             }
@@ -2363,12 +2505,12 @@ def test_vkd_k2_cm2_batch(t0 : T?) {
                     wsuh[sb * 5 + 1 + wi] = hash_word(uint(sb * 4 + wi) + 91u)
                 }
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 7u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 64l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -2379,8 +2521,12 @@ def test_vkd_k2_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -2402,20 +2548,17 @@ def test_vkd_k2_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_k2_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_k2_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_k2_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_k2_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_k2_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_k2_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.k2), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -2425,8 +2568,10 @@ def test_vkd_k2_cm2_batch(t0 : T?) {
                         enc_kq_batch_k2_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_k2_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_k2_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.k2), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -2436,8 +2581,8 @@ def test_vkd_k2_cm2_batch(t0 : T?) {
                 }
                 k2f16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 k2 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 k2 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "k2 {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "k2 {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the k2 bar reds a poisoned element")
@@ -2457,17 +2602,24 @@ def test_vkd_k2_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_iq4nl_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 IQ4_NL l/m/s tiles == the CPU oracle (codebook + per-block f16 d decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 IQ4_NL l/m/s tiles and the KHR tile == the CPU oracle (codebook + per-block f16 d decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 iq4nl tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the iq4nl tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_iq4nl_cm2l_cls() && ensure_kq_batch_iq4nl_cm2m_cls() && ensure_kq_batch_iq4nl_cm2s_cls(), "iq4nl cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_iq4nl_cm2l_cls() && ensure_kq_batch_iq4nl_cm2m_cls() && ensure_kq_batch_iq4nl_cm2s_cls(), "iq4nl cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_iq4nl_khr_cls(), "the iq4nl KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -2480,7 +2632,7 @@ def test_vkd_iq4nl_cm2_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totsb * 32)
             wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 32)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary quant bytes
             }
@@ -2491,12 +2643,12 @@ def test_vkd_iq4nl_cm2_batch(t0 : T?) {
                 }
                 wsuh[sb * 5 + 4] = 0u
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 128l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -2507,8 +2659,12 @@ def test_vkd_iq4nl_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -2530,20 +2686,17 @@ def test_vkd_iq4nl_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_iq4nl_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_iq4nl_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_iq4nl_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_iq4nl_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_iq4nl_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_iq4nl_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.iq4nl), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -2553,8 +2706,10 @@ def test_vkd_iq4nl_cm2_batch(t0 : T?) {
                         enc_kq_batch_iq4nl_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_iq4nl_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_iq4nl_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.iq4nl), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -2564,8 +2719,8 @@ def test_vkd_iq4nl_cm2_batch(t0 : T?) {
                 }
                 iq4nlf16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 iq4nl {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 iq4nl {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "iq4nl {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "iq4nl {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the iq4nl bar reds a poisoned element")
@@ -2585,17 +2740,24 @@ def test_vkd_iq4nl_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_iq4xs_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 IQ4_XS l/m/s tiles == the CPU oracle (workgroup-staged codebook decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 IQ4_XS l/m/s tiles and the KHR tile == the CPU oracle (workgroup-staged codebook decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 iq4xs tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the iq4xs tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_iq4xs_cm2l_cls() && ensure_kq_batch_iq4xs_cm2m_cls() && ensure_kq_batch_iq4xs_cm2s_cls(), "iq4xs cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_iq4xs_cm2l_cls() && ensure_kq_batch_iq4xs_cm2m_cls() && ensure_kq_batch_iq4xs_cm2s_cls(), "iq4xs cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_iq4xs_khr_cls(), "the iq4xs KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -2607,24 +2769,21 @@ def test_vkd_iq4xs_cm2_batch(t0 : T?) {
             var wsuh : array<uint>
             var xfh : array<uint>
             wqh |> resize(totsb * 32)
-            wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            wsuh |> resize(totsb * 2)
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 32)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary quant bytes
             }
             for (sb in range(totsb)) {
-                wsuh[sb * 5] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0))   // cool d
-                wsuh[sb * 5 + 1] = hash_word(uint(sb * 2) + 613u)   // signed sub-scale bytes
-                wsuh[sb * 5 + 2] = hash_word(uint(sb * 2 + 1) + 613u)
-                wsuh[sb * 5 + 3] = 0u
-                wsuh[sb * 5 + 4] = 0u
+                wsuh[sb * 2] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0)) | (hash_word(uint(sb * 2) + 613u) << 16u)   //! cool d | the row's high bits
+                wsuh[sb * 2 + 1] = hash_word(uint(sb * 2 + 1) + 613u)   //! the eight 4-bit sub-scale fields
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 128l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -2635,8 +2794,12 @@ def test_vkd_iq4xs_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -2658,20 +2821,17 @@ def test_vkd_iq4xs_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_iq4xs_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_iq4xs_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_iq4xs_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_iq4xs_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_iq4xs_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_iq4xs_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.iq4xs), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -2681,8 +2841,10 @@ def test_vkd_iq4xs_cm2_batch(t0 : T?) {
                         enc_kq_batch_iq4xs_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_iq4xs_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_iq4xs_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.iq4xs), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -2692,8 +2854,8 @@ def test_vkd_iq4xs_cm2_batch(t0 : T?) {
                 }
                 iq4xsf16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 iq4xs {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 iq4xs {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "iq4xs {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "iq4xs {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the iq4xs bar reds a poisoned element")
@@ -2713,17 +2875,24 @@ def test_vkd_iq4xs_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_k3_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 Q3_K l/m/s tiles == the CPU oracle (2-bit + hmask compose decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 Q3_K l/m/s tiles and the KHR tile == the CPU oracle (2-bit + hmask compose decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 k3 tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the k3 tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_k3_cm2l_cls() && ensure_kq_batch_k3_cm2m_cls() && ensure_kq_batch_k3_cm2s_cls(), "k3 cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_k3_cm2l_cls() && ensure_kq_batch_k3_cm2m_cls() && ensure_kq_batch_k3_cm2s_cls(), "k3 cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_k3_khr_cls(), "the k3 KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -2736,7 +2905,7 @@ def test_vkd_k3_cm2_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totsb * 24)
             wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 24)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary quant bytes
             }
@@ -2746,12 +2915,12 @@ def test_vkd_k3_cm2_batch(t0 : T?) {
                 }
                 wsuh[sb * 5 + 4] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0))   // cool d
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 96l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -2762,8 +2931,12 @@ def test_vkd_k3_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -2785,20 +2958,17 @@ def test_vkd_k3_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_k3_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_k3_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_k3_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_k3_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_k3_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_k3_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.k3), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -2808,8 +2978,10 @@ def test_vkd_k3_cm2_batch(t0 : T?) {
                         enc_kq_batch_k3_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_k3_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_k3_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.k3), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -2819,8 +2991,8 @@ def test_vkd_k3_cm2_batch(t0 : T?) {
                 }
                 k3f16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 k3 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 k3 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "k3 {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "k3 {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the k3 bar reds a poisoned element")
@@ -2840,17 +3012,24 @@ def test_vkd_k3_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_iq3s_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 IQ3_S l/m/s tiles == the CPU oracle (workgroup-staged grid decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 IQ3_S l/m/s tiles and the KHR tile == the CPU oracle (workgroup-staged grid decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 iq3s tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the iq3s tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_iq3s_cm2l_cls() && ensure_kq_batch_iq3s_cm2m_cls() && ensure_kq_batch_iq3s_cm2s_cls(), "iq3s cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_iq3s_cm2l_cls() && ensure_kq_batch_iq3s_cm2m_cls() && ensure_kq_batch_iq3s_cm2s_cls(), "iq3s cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_iq3s_khr_cls(), "the iq3s KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -2862,24 +3041,21 @@ def test_vkd_iq3s_cm2_batch(t0 : T?) {
             var wsuh : array<uint>
             var xfh : array<uint>
             wqh |> resize(totsb * 26)
-            wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            wsuh |> resize(totsb * 2)
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 26)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary quant bytes
             }
             for (sb in range(totsb)) {
-                wsuh[sb * 5] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0))   // cool d
-                wsuh[sb * 5 + 1] = hash_word(uint(sb * 2) + 613u)   // signed sub-scale bytes
-                wsuh[sb * 5 + 2] = hash_word(uint(sb * 2 + 1) + 613u)
-                wsuh[sb * 5 + 3] = 0u
-                wsuh[sb * 5 + 4] = 0u
+                wsuh[sb * 2] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0)) | (hash_word(uint(sb * 2) + 613u) << 16u)   //! cool d | the row's high bits
+                wsuh[sb * 2 + 1] = hash_word(uint(sb * 2 + 1) + 613u)   //! the eight 4-bit sub-scale fields
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 104l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -2890,8 +3066,12 @@ def test_vkd_iq3s_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -2913,20 +3093,17 @@ def test_vkd_iq3s_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_iq3s_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_iq3s_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_iq3s_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_iq3s_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_iq3s_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_iq3s_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.iq3s), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -2936,8 +3113,10 @@ def test_vkd_iq3s_cm2_batch(t0 : T?) {
                         enc_kq_batch_iq3s_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_iq3s_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_iq3s_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.iq3s), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -2947,8 +3126,8 @@ def test_vkd_iq3s_cm2_batch(t0 : T?) {
                 }
                 iq3sf16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 iq3s {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 iq3s {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "iq3s {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "iq3s {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the iq3s bar reds a poisoned element")
@@ -2968,17 +3147,24 @@ def test_vkd_iq3s_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_iq2s_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 IQ2_S l/m/s tiles == the CPU oracle (workgroup-staged u64 grid decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 IQ2_S l/m/s tiles and the KHR tile == the CPU oracle (workgroup-staged u64 grid decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 iq2s tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the iq2s tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_iq2s_cm2l_cls() && ensure_kq_batch_iq2s_cm2m_cls() && ensure_kq_batch_iq2s_cm2s_cls(), "iq2s cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_iq2s_cm2l_cls() && ensure_kq_batch_iq2s_cm2m_cls() && ensure_kq_batch_iq2s_cm2s_cls(), "iq2s cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_iq2s_khr_cls(), "the iq2s KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -2991,7 +3177,7 @@ def test_vkd_iq2s_cm2_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totsb * 18)
             wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 18)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary quant bytes
             }
@@ -3002,12 +3188,12 @@ def test_vkd_iq2s_cm2_batch(t0 : T?) {
                 wsuh[sb * 5 + 3] = hash_word(uint(sb * 4 + 2) + 613u)
                 wsuh[sb * 5 + 4] = hash_word(uint(sb * 4 + 3) + 613u)
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 72l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -3018,8 +3204,12 @@ def test_vkd_iq2s_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -3041,20 +3231,17 @@ def test_vkd_iq2s_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_iq2s_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_iq2s_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_iq2s_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_iq2s_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_iq2s_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_iq2s_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.iq2s), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -3064,8 +3251,10 @@ def test_vkd_iq2s_cm2_batch(t0 : T?) {
                         enc_kq_batch_iq2s_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_iq2s_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_iq2s_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.iq2s), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -3075,8 +3264,8 @@ def test_vkd_iq2s_cm2_batch(t0 : T?) {
                 }
                 iq2sf16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 iq2s {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 iq2s {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "iq2s {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "iq2s {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the iq2s bar reds a poisoned element")
@@ -3096,17 +3285,24 @@ def test_vkd_iq2s_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_iq2xs_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 IQ2_XS l/m/s tiles == the CPU oracle (u64 grid + ksigns-by-parity decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 IQ2_XS l/m/s tiles and the KHR tile == the CPU oracle (u64 grid + ksigns-by-parity decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 iq2xs tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the iq2xs tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_iq2xs_cm2l_cls() && ensure_kq_batch_iq2xs_cm2m_cls() && ensure_kq_batch_iq2xs_cm2s_cls(), "iq2xs cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_iq2xs_cm2l_cls() && ensure_kq_batch_iq2xs_cm2m_cls() && ensure_kq_batch_iq2xs_cm2s_cls(), "iq2xs cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_iq2xs_khr_cls(), "the iq2xs KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -3119,7 +3315,7 @@ def test_vkd_iq2xs_cm2_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totsb * 16)
             wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 16)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary quant bytes
             }
@@ -3130,12 +3326,12 @@ def test_vkd_iq2xs_cm2_batch(t0 : T?) {
                 wsuh[sb * 5 + 3] = hash_word(uint(sb * 4 + 2) + 613u)
                 wsuh[sb * 5 + 4] = hash_word(uint(sb * 4 + 3) + 613u)
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 64l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -3146,8 +3342,12 @@ def test_vkd_iq2xs_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -3169,20 +3369,17 @@ def test_vkd_iq2xs_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_iq2xs_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_iq2xs_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_iq2xs_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_iq2xs_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_iq2xs_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_iq2xs_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.iq2xs), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -3192,8 +3389,10 @@ def test_vkd_iq2xs_cm2_batch(t0 : T?) {
                         enc_kq_batch_iq2xs_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_iq2xs_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_iq2xs_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.iq2xs), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -3203,8 +3402,8 @@ def test_vkd_iq2xs_cm2_batch(t0 : T?) {
                 }
                 iq2xsf16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 iq2xs {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 iq2xs {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "iq2xs {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "iq2xs {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the iq2xs bar reds a poisoned element")
@@ -3224,17 +3423,24 @@ def test_vkd_iq2xs_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_iq2xxs_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 IQ2_XXS l/m/s tiles == the CPU oracle (byte-grid + aux32 ksigns decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 IQ2_XXS l/m/s tiles and the KHR tile == the CPU oracle (byte-grid + aux32 ksigns decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 iq2xxs tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the iq2xxs tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_iq2xxs_cm2l_cls() && ensure_kq_batch_iq2xxs_cm2m_cls() && ensure_kq_batch_iq2xxs_cm2s_cls(), "iq2xxs cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_iq2xxs_cm2l_cls() && ensure_kq_batch_iq2xxs_cm2m_cls() && ensure_kq_batch_iq2xxs_cm2s_cls(), "iq2xxs cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_iq2xxs_khr_cls(), "the iq2xxs KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -3246,24 +3452,21 @@ def test_vkd_iq2xxs_cm2_batch(t0 : T?) {
             var wsuh : array<uint>
             var xfh : array<uint>
             wqh |> resize(totsb * 16)
-            wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            wsuh |> resize(totsb * 2)
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 16)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary quant bytes
             }
             for (sb in range(totsb)) {
-                wsuh[sb * 5] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0))   // cool d8
-                wsuh[sb * 5 + 1] = hash_word(uint(sb * 4) + 613u)   // 16 unsigned strip bytes
-                wsuh[sb * 5 + 2] = hash_word(uint(sb * 4 + 1) + 613u)
-                wsuh[sb * 5 + 3] = hash_word(uint(sb * 4 + 2) + 613u)
-                wsuh[sb * 5 + 4] = hash_word(uint(sb * 4 + 3) + 613u)
+                wsuh[sb * 2] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0)) | (hash_word(uint(sb * 2) + 613u) << 16u)   //! cool d8 | the row's high bits
+                wsuh[sb * 2 + 1] = hash_word(uint(sb * 2 + 1) + 613u)   //! the eight 4-bit (2ls + 1) fields
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 64l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -3274,8 +3477,12 @@ def test_vkd_iq2xxs_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -3297,20 +3504,17 @@ def test_vkd_iq2xxs_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_iq2xxs_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_iq2xxs_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_iq2xxs_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_iq2xxs_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_iq2xxs_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_iq2xxs_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.iq2xxs), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -3320,8 +3524,10 @@ def test_vkd_iq2xxs_cm2_batch(t0 : T?) {
                         enc_kq_batch_iq2xxs_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_iq2xxs_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_iq2xxs_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.iq2xxs), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -3331,8 +3537,8 @@ def test_vkd_iq2xxs_cm2_batch(t0 : T?) {
                 }
                 iq2xxsf16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 iq2xxs {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 iq2xxs {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "iq2xxs {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "iq2xxs {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the iq2xxs bar reds a poisoned element")
@@ -3352,17 +3558,24 @@ def test_vkd_iq2xxs_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_iq3xxs_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 IQ3_XXS l/m/s tiles == the CPU oracle (halved grid + parity signs decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 IQ3_XXS l/m/s tiles and the KHR tile == the CPU oracle (halved grid + parity signs decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 iq3xxs tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the iq3xxs tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_iq3xxs_cm2l_cls() && ensure_kq_batch_iq3xxs_cm2m_cls() && ensure_kq_batch_iq3xxs_cm2s_cls(), "iq3xxs cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_iq3xxs_cm2l_cls() && ensure_kq_batch_iq3xxs_cm2m_cls() && ensure_kq_batch_iq3xxs_cm2s_cls(), "iq3xxs cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_iq3xxs_khr_cls(), "the iq3xxs KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -3374,24 +3587,21 @@ def test_vkd_iq3xxs_cm2_batch(t0 : T?) {
             var wsuh : array<uint>
             var xfh : array<uint>
             wqh |> resize(totsb * 24)
-            wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            wsuh |> resize(totsb * 2)
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 24)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary quant bytes
             }
             for (sb in range(totsb)) {
-                wsuh[sb * 5] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0))   // cool d
-                wsuh[sb * 5 + 1] = hash_word(uint(sb * 2) + 613u)   // signed sub-scale bytes
-                wsuh[sb * 5 + 2] = hash_word(uint(sb * 2 + 1) + 613u)
-                wsuh[sb * 5 + 3] = 0u
-                wsuh[sb * 5 + 4] = 0u
+                wsuh[sb * 2] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0)) | (hash_word(uint(sb * 2) + 613u) << 16u)   //! cool d | the row's high bits
+                wsuh[sb * 2 + 1] = hash_word(uint(sb * 2 + 1) + 613u)   //! the eight 4-bit sub-scale fields
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)   // f16 activation pairs
             }
             let wq_bytes = int64(totsb) * 96l
             let ws_bytes = int64(length(wsuh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -3402,8 +3612,12 @@ def test_vkd_iq3xxs_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -3425,20 +3639,17 @@ def test_vkd_iq3xxs_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_iq3xxs_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_iq3xxs_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_iq3xxs_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_iq3xxs_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_iq3xxs_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_iq3xxs_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.iq3xxs), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -3448,8 +3659,10 @@ def test_vkd_iq3xxs_cm2_batch(t0 : T?) {
                         enc_kq_batch_iq3xxs_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_iq3xxs_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_iq3xxs_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.iq3xxs), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -3459,8 +3672,8 @@ def test_vkd_iq3xxs_cm2_batch(t0 : T?) {
                 }
                 iq3xxsf16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 iq3xxs {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 iq3xxs {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "iq3xxs {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "iq3xxs {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the iq3xxs bar reds a poisoned element")
@@ -3480,17 +3693,24 @@ def test_vkd_iq3xxs_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_k6_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 Q6_K l/m tiles == the CPU oracle (6-bit compose decode-in-load)") <| @(t : T?) {
+    t0 |> run("cm2 Q6_K l/m/s tiles and the KHR tile == the CPU oracle (6-bit compose decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
-                t |> skip("the cm2 k6 tiles serve only in mode 4 on an NV_coopmat2 device")
+            let cm2_on = g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2
+            let khr_on = khr_kq_tile_on()
+            if (!cm2_on && !khr_on) {
+                t |> skip("the k6 tiles need cooperative matrices (cm2 in mode 4 on an NV_coopmat2 device, or KHR coopmat at subgroup 32)")
                 return
             }
-            verify(ensure_kq_batch_k6_cm2l_cls() && ensure_kq_batch_k6_cm2m_cls() && ensure_kq_batch_k6_cm2s_cls(), "k6 cm2 class rails must engage in cm2 mode")
+            if (cm2_on) {
+                verify(ensure_kq_batch_k6_cm2l_cls() && ensure_kq_batch_k6_cm2m_cls() && ensure_kq_batch_k6_cm2s_cls(), "k6 cm2 class rails must engage in cm2 mode")
+            }
+            if (khr_on) {
+                verify(ensure_kq_batch_k6_khr_cls(), "the k6 KHR class rail must engage on a coopmat device")
+            }
             let n = 768                // one 512-unrolled pass + 4 tail steps crossing superblock bounds
             let nsb = n / 256
             let d = 160                // one full 128-tile + a 32 edge
@@ -3503,7 +3723,7 @@ def test_vkd_k6_cm2_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totsb * 48)
             wsuh |> resize(totsb * 5)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totsb * 48)) {
                 wqh[i] = hash_word(uint(i) + 41u)     // arbitrary ql/qh bytes
             }
@@ -3513,12 +3733,12 @@ def test_vkd_k6_cm2_batch(t0 : T?) {
                 }
                 wsuh[sb * 5 + 4] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0))   // cool d: the f16 acc must stay far from 65504
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 3u + 5u)
             }
             let wq_bytes = int64(totsb) * 192l
             let ws_bytes = int64(totsb * 5) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -3529,8 +3749,12 @@ def test_vkd_k6_cm2_batch(t0 : T?) {
             y_cls |> resize(rows * d)
             var y_ref : array<float>
             y_ref |> resize(rows * d)
-            for (ml in range(3)) {
-                let ttile = ml == 0 ? 256 : (ml == 1 ? 128 : 32)
+            for (ml in range(4)) {
+                if ((ml < 3 && !cm2_on) || (ml == 3 && !khr_on)) {
+                    continue
+                }
+                let tname = ml == 0 ? "l" : (ml == 1 ? "m" : (ml == 2 ? "s" : "khr"))
+                let ttile = ml == 0 ? 256 : (ml == 2 ? 32 : 128)
                 let wtiles = (d + 127) / 128
                 let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
                 let wgs1 = ((cnt1 + ttile - 1) / ttile) * wtiles
@@ -3552,20 +3776,17 @@ def test_vkd_k6_cm2_batch(t0 : T?) {
                     upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                     upload_region_at(wsd, 0l, addr<uint8 const?>(wsuh[0]), ws_bytes)
                     upload_region_at(xfd, 0l, addr<uint8 const?>(xfh[0]), xf_bytes)
+                    nan_sentinel_upload(yd2, y_bytes)
                     let sc_bytes = int64(2 * 4 + wgs) * 4l
                     let scd = make_device_buf(sc_bytes)
                     upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-                    var sc = (ml == 0
-                        ? set_kq_batch_k6_cm2l_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                            fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                            fixed_array(1u, 2u, 0u, 4u, 16u))
-                        : (ml == 1
-                            ? set_kq_batch_k6_cm2m_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))
-                            : set_kq_batch_k6_cm2s_cls(fixed_array(wqd, wsd, scd, xfd, yd2),
-                                fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes),
-                                fixed_array(1u, 2u, 0u, 4u, 16u))))
+                    let bufs = fixed_array(wqd, wsd, scd, xfd, yd2)
+                    let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
+                    let gbits = fixed_array(1u, 2u, 0u, 4u, 16u)
+                    var sc = (ml == 0 ? set_kq_batch_k6_cm2l_cls(bufs, sizes, gbits)
+                        : (ml == 1 ? set_kq_batch_k6_cm2m_cls(bufs, sizes, gbits)
+                            : (ml == 2 ? set_kq_batch_k6_cm2s_cls(bufs, sizes, gbits)
+                                : khr_cls_set(int(KqFmt.k6), bufs, sizes, gbits))))
                     var raw2 = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
@@ -3575,8 +3796,10 @@ def test_vkd_k6_cm2_batch(t0 : T?) {
                         enc_kq_batch_k6_cm2l_cls(raw2, h2, sc, pc, int64(wgs))
                     } elif (ml == 1) {
                         enc_kq_batch_k6_cm2m_cls(raw2, h2, sc, pc, int64(wgs))
-                    } else {
+                    } elif (ml == 2) {
                         enc_kq_batch_k6_cm2s_cls(raw2, h2, sc, pc, int64(wgs))
+                    } else {
+                        khr_cls_enc(int(KqFmt.k6), raw2, h2, sc, pc, int64(wgs))
                     }
                     vhz_dep(raw2, h2, 16u, 0u, true)
                     cmd_copy_whole(raw2, yd2, host.buf, y_bytes)
@@ -3586,8 +3809,8 @@ def test_vkd_k6_cm2_batch(t0 : T?) {
                 }
                 k6f16_gemm_oracle(wqh, wsuh, xfh, sched, 2, n, d, y_ref)
                 let bad = mismatch_bars(y_cls, y_ref, 2e-2, 4e-3 * max_abs(y_ref))
-                to_log(LOG_INFO, "cm2 k6 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
-                t |> success(bad == 0, "cm2 k6 {ml == 0 ? "l" : (ml == 1 ? "m" : "s")}-tile matches the CPU oracle ({bad} of {rows * d} off)")
+                to_log(LOG_INFO, "k6 {tname}-tile batch: {bad} of {rows * d} off the oracle, {g_gpu.decvec_on ? "four-wide twin" : "scalar callback"}\n")
+                t |> success(bad == 0, "k6 {tname}-tile matches the CPU oracle ({bad} of {rows * d} off)")
                 var y_poison := y_cls   // the bar's control: one element pushed past both bars must red
                 y_poison[0] += 1.0 + 2.0 * max_abs(y_ref)
                 t |> success(mismatch_bars(y_poison, y_ref, 2e-2, 4e-3 * max_abs(y_ref)) > 0, "the k6 bar reds a poisoned element")
@@ -3613,7 +3836,7 @@ def test_vkd_cm2m_batch(t0 : T?) {
                 feint("no Vulkan device - skipping\n")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
+            if (!(g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2)) {
                 feint("the cm2 m-tile serves only in mode 4 on an NV_coopmat2 device (DASLLAMA_COOPMAT=cm2) - skipping\n")
                 return
             }
@@ -3634,19 +3857,19 @@ def test_vkd_cm2m_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totblk * 8)
             wsh |> resize((totblk + 1) / 2)
-            xfh |> resize(rows * n / 2)
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totblk * 8)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary bytes — s8 quants
             }
             for (i in range((totblk + 1) / 2)) {
                 wsh[i] = ws_word(uint(i) + 733u)      // f16 scale pairs, finite halves
             }
-            for (i in range(rows * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 5u + 11u)  // f16 activation pairs
             }
             let wq_bytes = int64(totblk) * 32l
             let ws_bytes = int64(length(wsh)) * 4l
-            let xf_bytes = int64(rows * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -3717,7 +3940,7 @@ def test_vkd_cm2s_batch(t0 : T?) {
                 t |> skip("no Vulkan device - skipping")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
+            if (!(g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2)) {
                 t |> skip("the cm2 s-tile serves only in mode 4 on an NV_coopmat2 device (DASLLAMA_COOPMAT=cm2) - skipping")
                 return
             }
@@ -3738,19 +3961,19 @@ def test_vkd_cm2s_batch(t0 : T?) {
             var xfh : array<uint>
             wqh |> resize(totblk * 8)
             wsh |> resize((totblk + 1) / 2)
-            xfh |> resize((rows + 32) * n / 2)   // + the s tile's 32-row read slack
+            xfh |> resize((rows + TILE_SLACK_ROWS) * n / 2)
             for (i in range(totblk * 8)) {
                 wqh[i] = hash_word(uint(i) + 29u)     // arbitrary bytes — s8 quants
             }
             for (i in range((totblk + 1) / 2)) {
                 wsh[i] = ws_word(uint(i) + 733u)      // f16 scale pairs, finite halves
             }
-            for (i in range((rows + 32) * n / 2)) {
+            for (i in range((rows + TILE_SLACK_ROWS) * n / 2)) {
                 xfh[i] = ws_word(uint(i) * 5u + 11u)  // f16 activation pairs
             }
             let wq_bytes = int64(totblk) * 32l
             let ws_bytes = int64(length(wsh)) * 4l
-            let xf_bytes = int64((rows + 32) * n) * 2l
+            let xf_bytes = int64((rows + TILE_SLACK_ROWS) * n) * 2l
             let y_bytes = int64(rows * d) * 4l
             let wqd = make_device_buf(wq_bytes)
             let wsd = make_device_buf(ws_bytes)
@@ -3825,7 +4048,7 @@ def test_vkd_cm2l_split(t0 : T?) {
                 feint("no Vulkan device - skipping\n")
                 return
             }
-            if (!(g_gpu.coopmat_mode == 4 && g_gpu.has_coopmat2)) {
+            if (!(g_gpu.coopmat_mode == COOPMAT_CM2 && g_gpu.has_coopmat2)) {
                 feint("the cm2 l-tile serves only in mode 4 on an NV_coopmat2 device (DASLLAMA_COOPMAT=cm2) - skipping\n")
                 return
             }
@@ -5096,13 +5319,22 @@ def test_vkd_rope_b_pair(t0 : T?) {
                 q_cls |> resize(npos * qd)
                 m_cls |> resize(2 * mirn)
                 let wgs = (npos * ppp + 255) / 256
+                let bpad = 96   // the bias rows sit past a pad, so boff is exercised off its default
+                var bh : array<float>
+                bh |> resize(bpad + qd + 2 * kvd)
+                for (i in range(bpad + qd + 2 * kvd)) {
+                    bh[i] = i < bpad ? 77.0 : float((i * 19) % 31) * 0.02 - 0.3
+                }
+                let b_bytes = long_length(bh) * 4l
+                let bd = make_device_buf(b_bytes)
                 unsafe {
                     upload_region_at(kvdv, 0l, addr<uint8 const?>(kvh[0]), kv_bytes)
                     upload_region_at(csd, 0l, addr<uint8 const?>(csh[0]), cs_bytes)
                     upload_region_at(qd2, 0l, addr<uint8 const?>(q0h[0]), q_bytes)
-                    var sc = set_rope_kv_b_cls(fixed_array(qd2, kvdv, km2, vm2, csd),
-                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes),
-                        fixed_array(1u, 16u, 2u, 4u, 8u))
+                    upload_region_at(bd, 0l, addr<uint8 const?>(bh[0]), b_bytes)
+                    var sc = set_rope_kv_b_cls(fixed_array(qd2, kvdv, km2, vm2, csd, bd),
+                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, b_bytes),
+                        fixed_array(1u, 16u, 2u, 4u, 8u, 0u))
                     var raw = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw, begin), null)
@@ -5110,7 +5342,7 @@ def test_vkd_rope_b_pair(t0 : T?) {
                     var pc = RopeKvBArgs(qd = uint(qd), kvd = uint(kvd), hs = uint(hs),
                         half = uint(half), neox = uint(neox), kpair0 = uint(kpair0),
                         ppp = uint(ppp), layerbase = uint(layerbase), npos = uint(npos),
-                        pos0 = uint(pos0), voff = uint(voff), kstride = uint(kvd))
+                        pos0 = uint(pos0), voff = uint(voff), kstride = uint(kvd), boff = uint(bpad), hasb = 1u)
                     enc_rope_kv_b_cls(raw, h, sc, pc, int64(wgs))
                     vhz_dep(raw, h, 8u, 0u, true)
                     cmd_copy_whole(raw, qd2, host.buf, q_bytes)
@@ -5121,8 +5353,8 @@ def test_vkd_rope_b_pair(t0 : T?) {
                     memcpy(addr<void?>(q_cls[0]), host.mapped, q_bytes)
                     memcpy(addr<void?>(m_cls[0]), reinterpret<void?>(intptr(host.mapped) + uint64(q_bytes)), 2l * m_bytes)
                 }
-                // oracle: per-position NEOX pairs off per-position cos rows; k roped + v raw at
-                // absolute mirror rows — only the written region compares
+                // oracle: the bias row at boff first, then per-position NEOX pairs off per-position cos
+                // rows; k roped + v raw (plus bias) at absolute mirror rows — only the written region compares
                 var q_ref : array<float>
                 var mk_ref : array<float>
                 var mv_ref : array<float>
@@ -5142,17 +5374,20 @@ def test_vkd_rope_b_pair(t0 : T?) {
                         let fci = csh[p * hs + half + j]
                         if (is_k) {
                             let kb = p * kvd + hh * hs
-                            let a0 = kvh[kb + j]
-                            let a1 = kvh[kb + j + half]
+                            let bk = bpad + qd + hh * hs
+                            let bv = bpad + qd + kvd + hh * hs
+                            let a0 = kvh[kb + j] + bh[bk + j]
+                            let a1 = kvh[kb + j + half] + bh[bk + j + half]
                             let mo = layerbase + (pos0 + p) * kvd + hh * hs
                             mk_ref[mo + j] = a0 * fcr - a1 * fci
                             mk_ref[mo + j + half] = a0 * fci + a1 * fcr
-                            mv_ref[mo + j] = kvh[voff + kb + j]
-                            mv_ref[mo + j + half] = kvh[voff + kb + j + half]
+                            mv_ref[mo + j] = kvh[voff + kb + j] + bh[bv + j]
+                            mv_ref[mo + j + half] = kvh[voff + kb + j + half] + bh[bv + j + half]
                         } else {
                             let qb = p * qd + hh * hs
-                            let a0 = q0h[qb + j]
-                            let a1 = q0h[qb + j + half]
+                            let bq = bpad + hh * hs
+                            let a0 = q0h[qb + j] + bh[bq + j]
+                            let a1 = q0h[qb + j + half] + bh[bq + j + half]
                             q_ref[qb + j] = a0 * fcr - a1 * fci
                             q_ref[qb + j + half] = a0 * fci + a1 * fcr
                         }
@@ -5189,9 +5424,9 @@ def test_vkd_rope_b_pair(t0 : T?) {
                     upload_region_at(kvdv, 0l, addr<uint8 const?>(kvm_h[0]), kv_bytes)
                     upload_region_at(km2, 0l, addr<uint8 const?>(msent[0]), m_bytes)
                     upload_region_at(vm2, 0l, addr<uint8 const?>(msent[0]), m_bytes)
-                    var scm = set_rope_kv_b_cls(fixed_array(qd2, kvdv, km2, vm2, csd),
-                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes),
-                        fixed_array(1u, 16u, 2u, 4u, 8u))
+                    var scm = set_rope_kv_b_cls(fixed_array(qd2, kvdv, km2, vm2, csd, bd),
+                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, b_bytes),
+                        fixed_array(1u, 16u, 2u, 4u, 8u, 0u))
                     var raw = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw, begin), null)
@@ -5199,7 +5434,7 @@ def test_vkd_rope_b_pair(t0 : T?) {
                     var pc = RopeKvBArgs(qd = uint(qd), kvd = uint(kvd), hs = uint(hs),
                         half = uint(half), neox = uint(neox), kpair0 = uint(kpair0),
                         ppp = uint(ppp), layerbase = uint(layerbase), npos = uint(npos),
-                        pos0 = uint(pos0), voff = uint(kvd), kstride = uint(2 * kvd))
+                        pos0 = uint(pos0), voff = uint(kvd), kstride = uint(2 * kvd), boff = uint(bpad), hasb = 1u)
                     enc_rope_kv_b_cls(raw, h, scm, pc, int64(wgs))
                     vhz_dep(raw, h, 8u, 0u, true)
                     cmd_copy_whole(raw, qd2, host.buf, q_bytes)
@@ -5225,6 +5460,7 @@ def test_vkd_rope_b_pair(t0 : T?) {
                 delete q0h
                 delete kvh
                 delete csh
+                delete bh
                 delete q_ref
                 delete mk_ref
                 delete mv_ref
@@ -5278,17 +5514,26 @@ def test_vkd_rope_b_pair(t0 : T?) {
                 q_cls |> resize(qd)
                 m_cls |> resize(2 * mirn2)
                 let wgs = nh + nkvh
+                let bpad = 96   // the bias rows sit past a pad, so boff is exercised off its default
+                var bh : array<float>
+                bh |> resize(bpad + qd + 2 * kvd)
+                for (i in range(bpad + qd + 2 * kvd)) {
+                    bh[i] = i < bpad ? 77.0 : float((i * 17) % 29) * 0.02 - 0.28
+                }
+                let b_bytes = long_length(bh) * 4l
+                let bd = make_device_buf(b_bytes)
                 unsafe {
                     upload_region_at(kvdv, 0l, addr<uint8 const?>(kvh[0]), kv_bytes)
                     upload_region_at(csd, 0l, addr<uint8 const?>(csh[0]), cs_bytes)
                     upload_region_at(wnd, 0l, addr<uint8 const?>(wnh[0]), wn_bytes)
                     upload_region_at(qd2, 0l, addr<uint8 const?>(q0h[0]), q_bytes)
+                    upload_region_at(bd, 0l, addr<uint8 const?>(bh[0]), b_bytes)
                     var tokb = make_host_buf(16l, true)
                     var tmq = reinterpret<TokMeta?>(tokb.mapped)
                     tmq.pos = 0u   // mirror row = layerbase alone
-                    var sc = set_qkn_rope_cls(fixed_array(qd2, kvdv, km2, vm2, csd, wnd, tokb.buf),
-                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, wn_bytes, 16l),
-                        fixed_array(16u, 1u, 2u, 4u, 8u, 8u, 0u))
+                    var sc = set_qkn_rope_cls(fixed_array(qd2, kvdv, km2, vm2, csd, wnd, tokb.buf, bd),
+                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, wn_bytes, 16l, b_bytes),
+                        fixed_array(16u, 1u, 2u, 4u, 8u, 8u, 0u, 0u))
                     var raw = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw, begin), null)
@@ -5296,7 +5541,7 @@ def test_vkd_rope_b_pair(t0 : T?) {
                     var pc = QknRopeArgs(qd = uint(qd), kvd = uint(kvd), hs = uint(hs),
                         half = uint(half), neox = uint(neox), nh = uint(nh),
                         layerbase = uint(krow), qwoff = 0u,
-                        kwoff = uint(hs), eps = eps)
+                        kwoff = uint(hs), eps = eps, boff = uint(bpad), hasb = 1u)
                     enc_qkn_rope_cls(raw, h, sc, pc, int64(wgs))
                     vhz_dep(raw, h, 8u, 0u, true)
                     cmd_copy_whole(raw, qd2, host.buf, q_bytes)
@@ -5307,8 +5552,8 @@ def test_vkd_rope_b_pair(t0 : T?) {
                     memcpy(addr<void?>(q_cls[0]), host.mapped, q_bytes)
                     memcpy(addr<void?>(m_cls[0]), reinterpret<void?>(intptr(host.mapped) + uint64(q_bytes)), 2l * m_bytes)
                 }
-                // oracle: per-head rms-norm with its weight row, then NEOX rope off the normed
-                // row; k lands at the mirror row, v copies raw
+                // oracle: the bias row at boff, then per-head rms-norm with its weight row, then NEOX
+                // rope off the normed row; k lands at the mirror row, v copies raw plus its bias
                 var q_ref : array<float>
                 var mk_ref : array<float>
                 var mv_ref : array<float>
@@ -5321,14 +5566,14 @@ def test_vkd_rope_b_pair(t0 : T?) {
                     let sbase = is_k ? qd + hh * hs : hh * hs
                     var ss = 0.0
                     for (i in range(hs)) {
-                        let v = is_k ? kvh[sbase + i] : q0h[sbase + i]
+                        let v = (is_k ? kvh[sbase + i] : q0h[sbase + i]) + bh[bpad + sbase + i]
                         ss += v * v
                     }
                     let inv = 1.0 / sqrt(ss / float(hs) + eps)
                     var nrow : array<float>
                     nrow |> resize(hs)
                     for (i in range(hs)) {
-                        let v = is_k ? kvh[sbase + i] : q0h[sbase + i]
+                        let v = (is_k ? kvh[sbase + i] : q0h[sbase + i]) + bh[bpad + sbase + i]
                         nrow[i] = wnh[(is_k ? hs : 0) + i] * (v * inv)
                     }
                     for (j in range(half)) {
@@ -5346,7 +5591,7 @@ def test_vkd_rope_b_pair(t0 : T?) {
                     }
                     if (is_k) {
                         for (i in range(hs)) {
-                            mv_ref[krow + hh * hs + i] = kvh[qd + kvd + hh * hs + i]
+                            mv_ref[krow + hh * hs + i] = kvh[qd + kvd + hh * hs + i] + bh[bpad + qd + kvd + hh * hs + i]
                         }
                     }
                     delete nrow
@@ -5379,7 +5624,7 @@ def test_vkd_rope_b_pair(t0 : T?) {
 
 [test]
 def test_vkd_at_prep(t0 : T?) {
-    t0 |> run("attention prep class (q+k collapse) == the CPU oracle (gated+qknorm+partial rope)") <| @(t : T?) {
+    t0 |> run("attention prep class (q+k collapse) == the CPU oracle (gated+qknorm+partial rope+projection bias)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!vk_moe_init()) {
                 feint("no Vulkan device - skipping\n")
@@ -5409,9 +5654,11 @@ def test_vkd_at_prep(t0 : T?) {
             var srcqh : array<float>
             var srckh : array<float>
             var smh : array<float>
+            var bh : array<float>   //! the projection bias: [q (qd) | k (kvd)], the k pass reads at boff = qd
             srcqh |> resize(rows * 2 * qd)
             srckh |> resize(rows * kvd)
             smh |> resize(sm_n)
+            bh |> resize(qd + kvd)
             for (i in range(rows * 2 * qd)) {
                 srcqh[i] = float((i * 19) % 79) * 0.045 - 1.7
             }
@@ -5421,15 +5668,20 @@ def test_vkd_at_prep(t0 : T?) {
             for (i in range(sm_n)) {
                 smh[i] = float((i * 11) % 37) * 0.05 - 0.8
             }
+            for (i in range(qd + kvd)) {
+                bh[i] = float((i * 7) % 23) * 0.03 - 0.3
+            }
             smh[0] = eps
             let srcq_bytes = int64(rows * 2 * qd) * 4l
             let srck_bytes = int64(rows * kvd) * 4l
             let sm_bytes = int64(sm_n) * 4l
+            let b_bytes = int64(qd + kvd) * 4l
             let qp_bytes = int64(rows * qd) * 4l
             let kp_bytes = int64((w0 + rows) * kvd) * 4l
             let srcqd = make_device_buf(srcq_bytes)
             let srckd = make_device_buf(srck_bytes)
             let smd = make_device_buf(sm_bytes)
+            let bd = make_device_buf(b_bytes)
             let qp2 = make_device_buf(qp_bytes)
             let g2 = make_device_buf(qp_bytes)
             let kp2 = make_device_buf(kp_bytes)
@@ -5440,13 +5692,14 @@ def test_vkd_at_prep(t0 : T?) {
                 upload_region_at(srcqd, 0l, addr<uint8 const?>(srcqh[0]), srcq_bytes)
                 upload_region_at(srckd, 0l, addr<uint8 const?>(srckh[0]), srck_bytes)
                 upload_region_at(smd, 0l, addr<uint8 const?>(smh[0]), sm_bytes)
+                upload_region_at(bd, 0l, addr<uint8 const?>(bh[0]), b_bytes)
                 // the class collapse: ONE kernel, two dispatches with different push values
-                var scq = set_at_prep_cls(fixed_array(srcqd, qp2, g2, smd),
-                    fixed_array(srcq_bytes, qp_bytes, qp_bytes, sm_bytes),
-                    fixed_array(8u, 1u, 2u, 4u))
-                var sck = set_at_prep_cls(fixed_array(srckd, kp2, g2, smd),
-                    fixed_array(srck_bytes, kp_bytes, qp_bytes, sm_bytes),
-                    fixed_array(8u, 16u, 0u, 4u))
+                var scq = set_at_prep_cls(fixed_array(srcqd, qp2, g2, smd, bd),
+                    fixed_array(srcq_bytes, qp_bytes, qp_bytes, sm_bytes, b_bytes),
+                    fixed_array(8u, 1u, 2u, 4u, 32u))
+                var sck = set_at_prep_cls(fixed_array(srckd, kp2, g2, smd, bd),
+                    fixed_array(srck_bytes, kp_bytes, qp_bytes, sm_bytes, b_bytes),
+                    fixed_array(8u, 16u, 0u, 4u, 32u))
                 var raw = alloc_cmd()
                 let begin = VkCommandBufferBeginInfo()
                 vk_check(vkBeginCommandBuffer(raw, begin), null)
@@ -5454,12 +5707,12 @@ def test_vkd_at_prep(t0 : T?) {
                 var pcq = AtPrepArgs(d = uint(qd), nh = uint(nh), hs = uint(hs),
                     half = uint(half), flags = uint(flags), rms_off = uint(rmsq_off),
                     cos_off = uint(cos_off), sin_off = uint(sin_off), obase = 0u,
-                    qsrc = 1u, eps = eps)
+                    qsrc = 1u, boff = 0u, hasb = 1u, eps = eps)
                 enc_at_prep_cls(raw, h, scq, pcq, int64(rows))
                 var pck = AtPrepArgs(d = uint(kvd), nh = uint(nkvh), hs = uint(hs),
                     half = uint(half), flags = uint(flags), rms_off = uint(rmsk_off),
                     cos_off = uint(cos_off), sin_off = uint(sin_off), obase = uint(w0),
-                    qsrc = 0u, eps = eps)
+                    qsrc = 0u, boff = uint(qd), hasb = 1u, eps = eps)
                 enc_at_prep_cls(raw, h, sck, pck, int64(rows))
                 vhz_dep(raw, h, 1u | 2u | 16u, 0u, true)
                 cmd_copy_whole(raw, qp2, host.buf, qp_bytes)
@@ -5469,8 +5722,7 @@ def test_vkd_at_prep(t0 : T?) {
                 submit_wait(raw)
                 memcpy(addr<void?>(o_cls[0]), host.mapped, 2l * qp_bytes + kp_bytes)
             }
-            // oracle: deinterleave (gated q), per-head rms with the pass's weight row, partial
-            // NEOX rope over dims [0, 2*half), panel rows at obase + p
+            //! oracle: deinterleave (gated q), bias, per-head rms with the pass's weight row, partial NEOX rope over dims [0, 2*half), panel rows at obase + p
             var o_ref : array<float>
             o_ref |> resize(2 * rows * qd + (w0 + rows) * kvd)
             let kb0 = 2 * rows * qd + w0 * kvd
@@ -5480,16 +5732,17 @@ def test_vkd_at_prep(t0 : T?) {
                     let d = isq ? qd : kvd
                     let nhh = isq ? nh : nkvh
                     let rms_off = isq ? rmsq_off : rmsk_off
+                    let boff = isq ? 0 : qd
                     var rrow : array<float>
                     rrow |> resize(d)
                     for (i in range(d)) {
                         let hh = i / hs
                         let j = i % hs
                         if (isq) {
-                            rrow[i] = srcqh[p * 2 * qd + hh * 2 * hs + j]
+                            rrow[i] = srcqh[p * 2 * qd + hh * 2 * hs + j] + bh[i]
                             o_ref[rows * qd + p * qd + i] = srcqh[p * 2 * qd + hh * 2 * hs + hs + j]
                         } else {
-                            rrow[i] = srckh[p * kvd + i]
+                            rrow[i] = srckh[p * kvd + i] + bh[boff + i]
                         }
                     }
                     for (hh in range(nhh)) {
@@ -5536,6 +5789,7 @@ def test_vkd_at_prep(t0 : T?) {
             delete srcqh
             delete srckh
             delete smh
+            delete bh
             delete o_ref
             delete o_cls
         } else {
@@ -5695,6 +5949,8 @@ def test_vkd_dn_family(t0 : T?) {
                 let sm2 = make_device_buf(sm_bytes)
                 let scd2 = make_device_buf(sc_bytes)
                 let qd2 = make_device_buf(q_bytes)
+                let of_bytes = int64(nvh * ds) * 4l
+                let ofd2 = make_device_buf(of_bytes)
                 var host = make_host_buf(st_bytes + sm_bytes + sc_bytes + q_bytes, true, [cached = true])
                 var st_cls : array<float>
                 var sm_cls : array<float>
@@ -5711,9 +5967,9 @@ def test_vkd_dn_family(t0 : T?) {
                     var tokb = make_host_buf(16l, true)
                     var tmd = reinterpret<TokMeta?>(tokb.mapped)
                     tmd.parity = uint(par)
-                    var sc = set_dn_step_cls(fixed_array(projd, st2, sm2, scd2, qd2, tokb.buf),
-                        fixed_array(proj_bytes, st_bytes, sm_bytes, sc_bytes, q_bytes, 16l),
-                        fixed_array(16u, 2u, 8u, 1u, 4u, 0u))
+                    var sc = set_dn_step_cls(fixed_array(projd, st2, sm2, scd2, qd2, tokb.buf, ofd2),
+                        fixed_array(proj_bytes, st_bytes, sm_bytes, sc_bytes, q_bytes, 16l, of_bytes),
+                        fixed_array(16u, 2u, 8u, 1u, 4u, 0u, 32u))
                     var raw = alloc_cmd()
                     let begin = VkCommandBufferBeginInfo()
                     vk_check(vkBeginCommandBuffer(raw, begin), null)
@@ -5834,6 +6090,50 @@ def test_vkd_dn_family(t0 : T?) {
                 let bad = (mismatch_approx(st_cls, st_ref) + mismatch_approx(sm_cls, sm_ref)
                     + mismatch_approx(sc_cls, s_ref) + mismatch_qbytes(q_cls, q_ref, 1))
                 t |> success(bad == 0, "dn_step_fused matches the CPU oracle ({bad} elements off)")
+                //! the f32 arm (oform 1): the same step leaves the o row as floats - the pre-quant oracle row - and advances state and ring alike
+                var of_f32 : array<float>
+                var st_f32 : array<float>
+                var sm_f32 : array<float>
+                of_f32 |> resize(nvh * ds)
+                st_f32 |> resize(nvh * ds * ds)
+                sm_f32 |> resize(sm_n)
+                unsafe {
+                    upload_region_at(st2, 0l, addr<uint8 const?>(sth[0]), st_bytes)
+                    upload_region_at(sm2, 0l, addr<uint8 const?>(smh[0]), sm_bytes)
+                    nan_sentinel_upload(ofd2, of_bytes)
+                    var tokf = make_host_buf(16l, true)
+                    var tmf = reinterpret<TokMeta?>(tokf.mapped)
+                    tmf.parity = uint(par)
+                    var scf = set_dn_step_cls(fixed_array(projd, st2, sm2, scd2, qd2, tokf.buf, ofd2),
+                        fixed_array(proj_bytes, st_bytes, sm_bytes, sc_bytes, q_bytes, 16l, of_bytes),
+                        fixed_array(16u, 2u, 8u, 1u, 4u, 0u, 32u))
+                    var hostf = make_host_buf(of_bytes + st_bytes + sm_bytes, true, [cached = true])
+                    var rawf = alloc_cmd()
+                    let beginf = VkCommandBufferBeginInfo()
+                    vk_check(vkBeginCommandBuffer(rawf, beginf), null)
+                    var hf : VkHaz
+                    var pcf = DnStepArgs(cd = uint(cd), kd = uint(kd), nkh = uint(nkh),
+                        ds = uint(ds), dconv = uint(dconv), beta_off = uint(beta_off),
+                        g_off = uint(g_off), taps_off = uint(taps_off),
+                        wnorm_off = uint(wnorm_off), a_off = uint(a_off),
+                        dt_off = uint(dt_off), hist_off = uint(hist_off),
+                        eps = eps, qscale = qscale, out_f32 = 1u)
+                    enc_dn_step_cls(rawf, hf, scf, pcf, int64(nvh))
+                    vhz_dep(rawf, hf, 2u | 8u | 32u, 0u, true)
+                    cmd_copy_whole(rawf, ofd2, hostf.buf, of_bytes)
+                    cmd_copy_range(rawf, st2, 0l, hostf.buf, of_bytes, st_bytes)
+                    cmd_copy_range(rawf, sm2, 0l, hostf.buf, of_bytes + st_bytes, sm_bytes)
+                    vk_check(vkEndCommandBuffer(rawf), null)
+                    submit_wait(rawf)
+                    memcpy(addr<void?>(of_f32[0]), hostf.mapped, of_bytes)
+                    memcpy(addr<void?>(st_f32[0]), reinterpret<void?>(intptr(hostf.mapped) + uint64(of_bytes)), st_bytes)
+                    memcpy(addr<void?>(sm_f32[0]), reinterpret<void?>(intptr(hostf.mapped) + uint64(of_bytes + st_bytes)), sm_bytes)
+                }
+                let badf = mismatch_approx(of_f32, out_ref) + mismatch_approx(st_f32, st_ref) + mismatch_approx(sm_f32, sm_ref)
+                t |> success(badf == 0, "dn_step_fused's f32 o row (oform 1) matches the pre-quant oracle with state and ring advanced alike ({badf} elements off)")
+                delete of_f32
+                delete st_f32
+                delete sm_f32
                 delete projh
                 delete sth
                 delete smh
@@ -6517,9 +6817,9 @@ def test_vkd_kv16_writers(t0 : T?) {
                     var tokb = make_host_buf(16l, true)
                     var tm = reinterpret<TokMeta?>(tokb.mapped)
                     tm.pos = 0u
-                    var sc = set_rope_kv_f16_cls(fixed_array(q2, kvd_dev, km2, vm2, csd, tokb.buf),
-                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, 16l),
-                        fixed_array(16u, 1u, 2u, 4u, 8u, 0u))
+                    var sc = set_rope_kv_f16_cls(fixed_array(q2, kvd_dev, km2, vm2, csd, tokb.buf, csd),
+                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, 16l, cs_bytes),
+                        fixed_array(16u, 1u, 2u, 4u, 8u, 0u, 0u))
                     var raw2 = alloc_cmd()
                     vk_check(vkBeginCommandBuffer(raw2, begin), null)
                     var h2 : VkHaz
@@ -6625,9 +6925,9 @@ def test_vkd_kv16_writers(t0 : T?) {
                     upload_region_at(kvdv, 0l, addr<uint8 const?>(kvh[0]), kv_bytes)
                     upload_region_at(csd, 0l, addr<uint8 const?>(csh[0]), cs_bytes)
                     upload_region_at(qd2, 0l, addr<uint8 const?>(q0h[0]), q_bytes)
-                    var sc = set_rope_kv_b_f16_cls(fixed_array(qd2, kvdv, km2, vm2, csd),
-                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes),
-                        fixed_array(1u, 16u, 2u, 4u, 8u))
+                    var sc = set_rope_kv_b_f16_cls(fixed_array(qd2, kvdv, km2, vm2, csd, csd),
+                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, cs_bytes),
+                        fixed_array(1u, 16u, 2u, 4u, 8u, 0u))
                     var raw = alloc_cmd()
                     vk_check(vkBeginCommandBuffer(raw, begin), null)
                     var h : VkHaz
@@ -6700,9 +7000,9 @@ def test_vkd_kv16_writers(t0 : T?) {
                     upload_region_at(kvdv, 0l, addr<uint8 const?>(kvm_h[0]), kv_bytes)
                     upload_region_at(km2, 0l, addr<uint8 const?>(msent[0]), m_bytes)
                     upload_region_at(vm2, 0l, addr<uint8 const?>(msent[0]), m_bytes)
-                    var scm = set_rope_kv_b_f16_cls(fixed_array(qd2, kvdv, km2, vm2, csd),
-                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes),
-                        fixed_array(1u, 16u, 2u, 4u, 8u))
+                    var scm = set_rope_kv_b_f16_cls(fixed_array(qd2, kvdv, km2, vm2, csd, csd),
+                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, cs_bytes),
+                        fixed_array(1u, 16u, 2u, 4u, 8u, 0u))
                     var raw = alloc_cmd()
                     vk_check(vkBeginCommandBuffer(raw, begin), null)
                     var h : VkHaz
@@ -6791,9 +7091,9 @@ def test_vkd_kv16_writers(t0 : T?) {
                     var tokb = make_host_buf(16l, true)
                     var tmq = reinterpret<TokMeta?>(tokb.mapped)
                     tmq.pos = 0u
-                    var sc = set_qkn_rope_f16_cls(fixed_array(qd2, kvdv, km2, vm2, csd, wnd, tokb.buf),
-                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, wn_bytes, 16l),
-                        fixed_array(16u, 1u, 2u, 4u, 8u, 8u, 0u))
+                    var sc = set_qkn_rope_f16_cls(fixed_array(qd2, kvdv, km2, vm2, csd, wnd, tokb.buf, csd),
+                        fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, wn_bytes, 16l, cs_bytes),
+                        fixed_array(16u, 1u, 2u, 4u, 8u, 8u, 0u, 0u))
                     var raw = alloc_cmd()
                     vk_check(vkBeginCommandBuffer(raw, begin), null)
                     var h : VkHaz
@@ -7394,7 +7694,13 @@ def test_vk_coopmat_default_and_tile_pick(t0 : T?) {
                 return
             }
             let saved_sm = g_gpu.sm_count
+            let saved_mode = g_gpu.coopmat_mode
             g_gpu.sm_count = 36
+            g_gpu.coopmat_mode = COOPMAT_MM
+            t |> equal(cm2_tile_cols(8192l, 512l), 128l)                       // the KHR arm has one tile geometry
+            t |> equal(cm2_tile_cols(768l, 32l), 128l)                         // ... the bucket rule included
+            t |> equal(cm2_split_k(512l, 512l, 2048l, 128l).nsplit, 1l)        // ... and no split-k scratch
+            g_gpu.coopmat_mode = COOPMAT_CM2
             t |> equal(cm2_tile_cols(3072l, 128l), 128l)    // a short window never takes the half-empty l column
             t |> equal(cm2_tile_cols(3072l, 512l), 128l)    // the 3B q/down shape: m on a strict wave win (96 tiles in 3 waves vs 48 in 2)
             t |> equal(cm2_tile_cols(8192l, 512l), 256l)    // the 3B gate/up shape: a wave tie goes to l
@@ -7417,6 +7723,7 @@ def test_vk_coopmat_default_and_tile_pick(t0 : T?) {
             t |> equal(cm2_tile_cols(3072l, 100l), 128l)    // unknown SM count: the short-window rule still fires
             t |> equal(cm2_tile_cols(3072l, 512l), 256l)    // unknown SM count: l, never a split
             g_gpu.sm_count = saved_sm
+            g_gpu.coopmat_mode = saved_mode
         } else {
             t |> skip("dasVulkan not present")
         }
@@ -7529,6 +7836,627 @@ def test_vkd_ar_f16_fused(t0 : T?) {
             delete xh
             delete aah
             delete wnh
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+// ===== the resident MoE block's routing kernels (router GEMM, per-row top-k, the bucket schedule, the gated combine) =====
+
+let private MR_NPOS = 37
+let private MR_NE = 20
+let private MR_K = 3
+let private MR_DIM = 2 * 64   //! two of the router tile's 64-wide K steps
+let private MR_NER = MR_NE + 1   //! the shared expert's gate row rides past the experts
+let private MR_SENT = 0x5A5A5A5Au   //! the schedule planes' fill: a word the kernel never writes stays this on both sides
+
+//! one 32-bit word to a float in [-2, 2)
+def private hash_unit(i : uint) : float => float(hash_word(i) % 4096u) / 1024.0 - 2.0
+
+//! the device: the recorded dispatches over `raw`, then `bytes` of `dev` back into `host`
+def private vkd_run_copy(var raw : VkCommandBuffer; var h : VkHaz; dev : uint64; host : HostBuf; bytes : int64; bits : uint) {
+    vhz_dep(raw, h, bits, 0u, true)
+    cmd_copy_whole(raw, dev, host.buf, bytes)
+    vk_check(vkEndCommandBuffer(raw), null)
+    submit_wait(raw)
+}
+
+//! the schedule's bounds and map offsets for the sched cells: the s dispatch one tile per expert, the
+//! m dispatch every expert's whole columns plus a partial one; the records of both lists precede the maps
+struct private SchedShape {
+    map_off : int
+    map_off_mgu : int
+    map_off_mdn : int
+    bound_gu : int
+    bound_dn : int
+    bound_mgu : int
+    bound_mdn : int
+}
+
+def private sched_shape(nk, ne, wt_gu, wt_dn : int) : SchedShape {
+    let rt_m = nk / int(SCHED_M_ROWS) + ne
+    var s = SchedShape(map_off = 2 * 4 * ne, bound_gu = ne * wt_gu, bound_dn = ne * wt_dn, bound_mgu = rt_m * wt_gu, bound_mdn = rt_m * wt_dn)
+    s.map_off_mgu = s.map_off + s.bound_gu
+    s.map_off_mdn = s.map_off + s.bound_dn
+    return s
+}
+
+//! expert e's bucket: its first row (the slots of the experts before it) and its row count
+def private bucket_start(idx : array<uint>; e : int) : int {
+    var run = 0
+    for (r in idx) {
+        if (int(r) < e) {
+            run++
+        }
+    }
+    return run
+}
+
+def private bucket_rows(idx : array<uint>; e : int) : int {
+    var n = 0
+    for (r in idx) {
+        if (int(r) == e) {
+            n++
+        }
+    }
+    return n
+}
+
+//! one piece's record `ri` and its map words on the three planes (the CPU twin of MoeSched.write_piece)
+def private oracle_piece(var s1, s3, s2 : array<uint>; bases : uint[6]; e : int; ri : uint; row0, rows, rt, wt_gu, wt_dn, wg_gu, wg_dn, map_gu, map_dn : int) {
+    let rb = int(ri) * 4
+    s1[rb] = bases[0] + uint(e) * bases[1]
+    s3[rb] = bases[2] + uint(e) * bases[3]
+    s2[rb] = bases[4] + uint(e) * bases[5]
+    s1[rb + 1] = uint(row0)
+    s3[rb + 1] = uint(row0)
+    s2[rb + 1] = uint(row0)
+    s1[rb + 2] = uint(rows)
+    s3[rb + 2] = uint(rows)
+    s2[rb + 2] = uint(rows)
+    s1[rb + 3] = uint(wg_gu)
+    s3[rb + 3] = uint(wg_gu)
+    s2[rb + 3] = uint(wg_dn)
+    for (g in range(rt * wt_gu)) {
+        s1[map_gu + wg_gu + g] = ri
+        s3[map_gu + wg_gu + g] = ri
+    }
+    for (g in range(rt * wt_dn)) {
+        s2[map_dn + wg_dn + g] = ri
+    }
+}
+
+//! the CPU twin of MoeSched: the s pieces' records at [0, ne) and the m pieces' at [ne, 2 ne), each in
+//! expert order (empty pieces skipped), the two dispatches' per-wg maps, the sentinel tails past the
+//! real workgroup counts, and inv in slot order
+def private sched_oracle(idx : array<uint>; ne, wt_gu, wt_dn : int; sh : SchedShape; bases : uint[6];
+                         var inv : array<uint>; var s1, s3, s2 : array<uint>) {
+    let nk = length(idx)
+    var cnt : array<int>
+    cnt |> resize(ne)
+    for (r in range(nk)) {
+        cnt[int(idx[r])]++
+    }
+    var start : array<int>
+    start |> resize(ne)
+    var run = 0
+    for (e in range(ne)) {
+        start[e] = run
+        run += cnt[e]
+    }
+    inv |> resize(nk)
+    var cursor := start
+    for (r in range(nk)) {
+        let e = int(idx[r])
+        inv[r] = uint(cursor[e])
+        cursor[e]++
+    }
+    let words = max(sh.map_off_mgu + sh.bound_mgu, sh.map_off_mdn + sh.bound_mdn)
+    s1 |> resize(words)
+    s3 |> resize(words)
+    s2 |> resize(words)
+    for (i in range(words)) {
+        s1[i] = MR_SENT
+        s3[i] = MR_SENT
+        s2[i] = MR_SENT
+    }
+    var ri_s = 0u
+    var ri_m = uint(ne)
+    var wg_gu_s = 0
+    var wg_dn_s = 0
+    var wg_gu_m = 0
+    var wg_dn_m = 0
+    let s_col = int(SCHED_S_ROWS)
+    let m_col = int(SCHED_M_ROWS)
+    for (e in range(ne)) {
+        continue if (cnt[e] == 0)
+        //! the ladder spelled out (the shipped rule is the thing under test): a bucket within the s column
+        //! takes it whole; past it, whole m columns, and a remainder past the s column joins the last as a partial
+        let c = cnt[e]
+        let mrows = c <= s_col ? 0 : ((c % m_col) > s_col ? c : (c / m_col) * m_col)
+        let srows = c - mrows
+        if (mrows > 0) {
+            let rt = (mrows + m_col - 1) / m_col
+            oracle_piece(s1, s3, s2, bases, e, ri_m, start[e], mrows, rt, wt_gu, wt_dn, wg_gu_m, wg_dn_m, sh.map_off_mgu, sh.map_off_mdn)
+            wg_gu_m += rt * wt_gu
+            wg_dn_m += rt * wt_dn
+            ri_m++
+        }
+        if (srows > 0) {
+            oracle_piece(s1, s3, s2, bases, e, ri_s, start[e] + mrows, srows, 1, wt_gu, wt_dn, wg_gu_s, wg_dn_s, sh.map_off, sh.map_off)
+            wg_gu_s += wt_gu
+            wg_dn_s += wt_dn
+            ri_s++
+        }
+    }
+    for (g in range(wg_gu_s, sh.bound_gu)) {
+        s1[sh.map_off + g] = SCHED_NONE
+        s3[sh.map_off + g] = SCHED_NONE
+    }
+    for (g in range(wg_dn_s, sh.bound_dn)) {
+        s2[sh.map_off + g] = SCHED_NONE
+    }
+    for (g in range(wg_gu_m, sh.bound_mgu)) {
+        s1[sh.map_off_mgu + g] = SCHED_NONE
+        s3[sh.map_off_mgu + g] = SCHED_NONE
+    }
+    for (g in range(wg_dn_m, sh.bound_mdn)) {
+        s2[sh.map_off_mdn + g] = SCHED_NONE
+    }
+    delete cnt
+    delete start
+    delete cursor
+}
+
+//! the router GEMM: two layers' [ner x dim] rows, the second layer's dispatched through woff; logits at the ner
+//! stride; `ner` past a half-tile exercises both rows of an invocation, under it the second row's guard alone
+def private moe_router_arm(t : T?; ner : int) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let nw = 2 * ner * MR_DIM
+        var wh : array<float>
+        var xh : array<float>
+        wh |> resize(nw)
+        xh |> resize(MR_NPOS * MR_DIM)
+        for (i in range(nw)) {
+            wh[i] = hash_unit(uint(i) + 11u) * 0.25
+        }
+        for (i in range(MR_NPOS * MR_DIM)) {
+            xh[i] = hash_unit(uint(i) + 7_777u)
+        }
+        let w_bytes = int64(nw) * 4l
+        let x_bytes = int64(MR_NPOS * MR_DIM) * 4l
+        let l_bytes = int64(MR_NPOS * ner) * 4l
+        let wd = make_device_buf(w_bytes)
+        let xd = make_device_buf(x_bytes)
+        let ld = make_device_buf(l_bytes)
+        var host = make_host_buf(l_bytes, true, [cached = true])
+        var got : array<float>
+        got |> resize(MR_NPOS * ner)
+        unsafe {
+            upload_region_at(wd, 0l, addr<uint8 const?>(wh[0]), w_bytes)
+            upload_region_at(xd, 0l, addr<uint8 const?>(xh[0]), x_bytes)
+            nan_sentinel_upload(ld, l_bytes)
+            var sc = set_router_gemm_cls(fixed_array(wd, xd, ld), fixed_array(w_bytes, x_bytes, l_bytes), fixed_array(0u, 1u, 2u))
+            var raw = alloc_cmd()
+            let begin = VkCommandBufferBeginInfo()
+            vk_check(vkBeginCommandBuffer(raw, begin), null)
+            var h : VkHaz
+            var pc = RouterGemmArgs(npos = uint(MR_NPOS), ne = uint(ner), dim = uint(MR_DIM), woff = uint(ner * MR_DIM), ostride = uint(ner))
+            enc_router_gemm_cls(raw, h, sc, pc, int64(((MR_NPOS + int(ROUTER_TP) - 1) / int(ROUTER_TP)) * ((ner + int(ROUTER_TE) - 1) / int(ROUTER_TE))))
+            vkd_run_copy(raw, h, ld, host, l_bytes, 2u)
+            memcpy(addr<void?>(got[0]), host.mapped, l_bytes)
+        }
+        var want : array<float>
+        want |> resize(MR_NPOS * ner)
+        for (p in range(MR_NPOS)) {
+            for (e in range(ner)) {
+                var acc = 0.0
+                for (c in range(MR_DIM)) {
+                    acc += wh[ner * MR_DIM + e * MR_DIM + c] * xh[p * MR_DIM + c]
+                }
+                want[p * ner + e] = acc
+            }
+        }
+        let bad = mismatch_rel(got, want, 1e-4)
+        t |> success(bad == 0, "router GEMM over {ner} rows matches the CPU oracle at the second layer's offset ({bad} of {MR_NPOS * ner} off)")
+        want[5 * ner + 3] += 0.5
+        t |> success(mismatch_rel(got, want, 1e-4) == 1, "router GEMM control ({ner} rows): the bar reds one poisoned element")
+        delete wh
+        delete xh
+        delete got
+        delete want
+    }
+}
+
+//! the per-row select against moe_select_core over the same rows: norm on with no scale, norm off with a scale
+def private moe_topk_rows_arm(t : T?; norm : bool; wscale : float) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        var lh : array<float>
+        lh |> resize(MR_NPOS * MR_NER)
+        for (i in range(MR_NPOS * MR_NER)) {
+            lh[i] = hash_unit(uint(i) * 3u + 101u) * 2.0 + float(i % 7) * 0.0625   //! spread past any near-tie
+        }
+        let l_bytes = int64(MR_NPOS * MR_NER) * 4l
+        let s_bytes = int64(MR_NPOS * MR_K) * 4l
+        let ld = make_device_buf(l_bytes)
+        let idxd = make_device_buf(s_bytes)
+        let wd = make_device_buf(s_bytes)
+        var hosti = make_host_buf(s_bytes, true, [cached = true])
+        var hostw = make_host_buf(s_bytes, true, [cached = true])
+        var gidx : array<uint>
+        var gw : array<float>
+        gidx |> resize(MR_NPOS * MR_K)
+        gw |> resize(MR_NPOS * MR_K)
+        unsafe {
+            upload_region_at(ld, 0l, addr<uint8 const?>(lh[0]), l_bytes)
+            nan_sentinel_upload(idxd, s_bytes)
+            nan_sentinel_upload(wd, s_bytes)
+            var sc = set_topk_rows_cls(fixed_array(ld, idxd, wd), fixed_array(l_bytes, s_bytes, s_bytes), fixed_array(1u, 2u, 4u))
+            var raw = alloc_cmd()
+            let begin = VkCommandBufferBeginInfo()
+            vk_check(vkBeginCommandBuffer(raw, begin), null)
+            var h : VkHaz
+            var pc = TopkRowsArgs(npos = uint(MR_NPOS), ne = uint(MR_NE), k = uint(MR_K), norm = norm ? 1u : 0u, lstride = uint(MR_NER), wscale = wscale)
+            enc_topk_rows_cls(raw, h, sc, pc, int64(MR_NPOS))
+            vhz_dep(raw, h, 2u | 4u, 0u, true)
+            cmd_copy_whole(raw, idxd, hosti.buf, s_bytes)
+            cmd_copy_whole(raw, wd, hostw.buf, s_bytes)
+            vk_check(vkEndCommandBuffer(raw), null)
+            submit_wait(raw)
+            memcpy(addr<void?>(gidx[0]), hosti.mapped, s_bytes)
+            memcpy(addr<void?>(gw[0]), hostw.mapped, s_bytes)
+        }
+        var widx : array<int64>
+        var ww : array<float>
+        widx |> resize(MR_NPOS * MR_K)
+        ww |> resize(MR_NPOS * MR_K)
+        var row : array<float>
+        row |> resize(MR_NE)
+        for (p in range(MR_NPOS)) {
+            for (e in range(MR_NE)) {
+                row[e] = lh[p * MR_NER + e]
+            }
+            unsafe {
+                moe_select_core(MoeGate.softmax, int64(MR_NE), int64(MR_K), norm, wscale, addr(row[0]), addr(widx[0]), addr(ww[0]), int64(p * MR_K))
+            }
+        }
+        var badi = 0
+        for (i in range(MR_NPOS * MR_K)) {
+            if (int64(gidx[i]) != widx[i]) {
+                badi++
+            }
+        }
+        let badw = mismatch_rel(gw, ww, 1e-4)
+        let arm = norm ? "renormalized" : "scaled by {wscale}"
+        t |> success(badi == 0, "per-row top-k picks the host select's experts ({arm}; {badi} of {MR_NPOS * MR_K} off)")
+        t |> success(badw == 0, "per-row top-k weights match the host select ({arm}; {badw} of {MR_NPOS * MR_K} off)")
+        ww[4] += 0.5
+        t |> success(mismatch_rel(gw, ww, 1e-4) == 1, "per-row top-k control: the bar reds one poisoned weight")
+        delete lh
+        delete gidx
+        delete gw
+        delete widx
+        delete ww
+        delete row
+    }
+}
+
+//! the bucket schedule against its CPU twin, word for word over the whole planes (three empty experts, a sentinel fill)
+def private moe_sched_arm(t : T?) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let nk = 4 * MR_NPOS * MR_K
+        let wt_gu = 3
+        let wt_dn = 2
+        let sh = sched_shape(nk, MR_NE, wt_gu, wt_dn)
+        var idx : array<uint>
+        idx |> resize(nk)
+        //! the ladder's four shapes: expert 0 a whole m column plus an s remainder, 1 and 2 one partial
+        //! m column each, 3 within the s column; the rest spread thin, the last three route nothing
+        let c0 = int(SCHED_M_ROWS) + int(SCHED_S_ROWS) - 10
+        let c1 = int(SCHED_M_ROWS) - 28
+        let c2 = int(SCHED_S_ROWS) + 8
+        let c3 = int(SCHED_S_ROWS) - 12
+        for (r in range(nk)) {
+            idx[r] = r < c0 ? 0u : (r < c0 + c1 ? 1u : (r < c0 + c1 + c2 ? 2u : (r < c0 + c1 + c2 + c3 ? 3u : 4u + hash_word(uint(r) + 55u) % uint(MR_NE - 7))))
+        }
+        let bases = fixed_array(1_000u, 96u, 2_000u, 96u, 3_000u, 48u)
+        var winv : array<uint>
+        var w1 : array<uint>
+        var w3 : array<uint>
+        var w2 : array<uint>
+        sched_oracle(idx, MR_NE, wt_gu, wt_dn, sh, bases, winv, w1, w3, w2)
+        let i_bytes = int64(nk) * 4l
+        let s_bytes = long_length(w1) * 4l
+        let idxd = make_device_buf(i_bytes)
+        let invd = make_device_buf(i_bytes)
+        let s1d = make_device_buf(s_bytes)
+        let s3d = make_device_buf(s_bytes)
+        let s2d = make_device_buf(s_bytes)
+        var fill : array<uint>
+        fill |> resize(length(w1))
+        for (f in fill) {
+            f = MR_SENT
+        }
+        var host = make_host_buf(i_bytes + 3l * s_bytes, true, [cached = true])
+        var ginv : array<uint>
+        var g1 : array<uint>
+        var g3 : array<uint>
+        var g2 : array<uint>
+        ginv |> resize(nk)
+        g1 |> resize(length(w1))
+        g3 |> resize(length(w1))
+        g2 |> resize(length(w1))
+        unsafe {
+            upload_region_at(idxd, 0l, addr<uint8 const?>(idx[0]), i_bytes)
+            nan_sentinel_upload(invd, i_bytes)
+            upload_region_at(s1d, 0l, addr<uint8 const?>(fill[0]), s_bytes)
+            upload_region_at(s3d, 0l, addr<uint8 const?>(fill[0]), s_bytes)
+            upload_region_at(s2d, 0l, addr<uint8 const?>(fill[0]), s_bytes)
+            var sc = set_moe_sched_cls(fixed_array(idxd, invd, s1d, s3d, s2d), fixed_array(i_bytes, i_bytes, s_bytes, s_bytes, s_bytes), fixed_array(1u, 2u, 2u, 2u, 2u))
+            var raw = alloc_cmd()
+            let begin = VkCommandBufferBeginInfo()
+            vk_check(vkBeginCommandBuffer(raw, begin), null)
+            var h : VkHaz
+            var pc = SchedArgs(nk = uint(nk), ne = uint(MR_NE), wt_gu = uint(wt_gu), wt_dn = uint(wt_dn),
+                map_off = uint(sh.map_off), map_off_mgu = uint(sh.map_off_mgu), map_off_mdn = uint(sh.map_off_mdn),
+                bound_gu = uint(sh.bound_gu), bound_dn = uint(sh.bound_dn), bound_mgu = uint(sh.bound_mgu), bound_mdn = uint(sh.bound_mdn),
+                base1 = bases[0], stride1 = bases[1], base3 = bases[2], stride3 = bases[3], base2 = bases[4], stride2 = bases[5])
+            enc_moe_sched_cls(raw, h, sc, pc, 1l)
+            vhz_dep(raw, h, 2u, 0u, true)
+            cmd_copy_range(raw, invd, 0l, host.buf, 0l, i_bytes)
+            cmd_copy_range(raw, s1d, 0l, host.buf, i_bytes, s_bytes)
+            cmd_copy_range(raw, s3d, 0l, host.buf, i_bytes + s_bytes, s_bytes)
+            cmd_copy_range(raw, s2d, 0l, host.buf, i_bytes + 2l * s_bytes, s_bytes)
+            vk_check(vkEndCommandBuffer(raw), null)
+            submit_wait(raw)
+            let hp = intptr(host.mapped)
+            memcpy(addr<void?>(ginv[0]), host.mapped, i_bytes)
+            memcpy(addr<void?>(g1[0]), reinterpret<void?>(hp + uint64(i_bytes)), s_bytes)
+            memcpy(addr<void?>(g3[0]), reinterpret<void?>(hp + uint64(i_bytes + s_bytes)), s_bytes)
+            memcpy(addr<void?>(g2[0]), reinterpret<void?>(hp + uint64(i_bytes + 2l * s_bytes)), s_bytes)
+        }
+        //! the atomic cursor fixes no order within a bucket, so the check is per bucket: a permutation of its rows
+        var inv_bad = 0
+        var seen : array<bool>
+        seen |> resize(nk)
+        for (r in range(nk)) {
+            let e = int(idx[r])
+            let base = uint(bucket_start(idx, e))
+            let rows = uint(bucket_rows(idx, e))
+            let row = ginv[r]
+            if (row < base || row >= base + rows || seen[int(row)]) {
+                inv_bad++
+            } else {
+                seen[int(row)] = true
+            }
+        }
+        t |> success(inv_bad == 0, "the schedule's slot -> bucket row map is a permutation of each bucket's rows ({nk} slots, {inv_bad} off)")
+        delete seen
+        t |> success(mismatch_qbytes(g1, w1, 0) == 0, "the gate plane's s and m records, maps and sentinel tails match the CPU twin word for word ({length(w1)} words)")
+        t |> success(mismatch_qbytes(g3, w3, 0) == 0, "the up plane's schedule matches")
+        t |> success(mismatch_qbytes(g2, w2, 0) == 0, "the down plane's schedule matches (its own tile counts and tails)")
+        w2[sh.map_off_mdn + sh.bound_mdn - 1] = 0u
+        t |> success(mismatch_qbytes(g2, w2, 0) > 0, "schedule control: the m map's last sentinel word flipped reds the compare")
+        delete idx
+        delete winv
+        delete w1
+        delete w3
+        delete w2
+        delete fill
+        delete ginv
+        delete g1
+        delete g3
+        delete g2
+    }
+}
+
+//! the residual step with the combine folded in: x += [g *] shared row + the k weighted expert rows
+//! through the slot map, then the next norm - the f32 and the f16 normed-row forms against one CPU
+//! oracle; `with_sh` = the layer has a shared expert (its rows ride the add partner)
+def private moe_ar_comb_arm(t : T?; gated, with_sh : bool) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let n = 64
+        let k = 3
+        let npos = 5
+        let nrows = npos * k
+        let eps = 1.0e-6
+        var sidx : array<uint>
+        var sw : array<float>
+        var rows : array<float>
+        var xs : array<float>
+        var sh : array<float>
+        var wn : array<float>
+        var lg : array<float>
+        sidx |> resize(nrows)
+        sw |> resize(nrows)
+        rows |> resize(nrows * n)
+        xs |> resize(npos * n)
+        sh |> resize(npos * n)
+        wn |> resize(n)
+        lg |> resize(npos * MR_NER)
+        for (i in range(nrows)) {
+            sidx[i] = uint((i * 7) % nrows)   //! a permutation of the bucket rows
+            sw[i] = 0.125 + float(i % 5) * 0.25
+        }
+        for (i in range(nrows * n)) {
+            rows[i] = float((i * 7) % 93) * 0.13 - 5.5
+        }
+        for (i in range(npos * n)) {
+            xs[i] = float((i * 11) % 37) * 0.1 - 1.7
+            sh[i] = float((i * 5) % 41) * 0.2 - 3.0
+        }
+        for (i in range(n)) {
+            wn[i] = 0.5 + float(i % 7) * 0.125
+        }
+        for (i in range(npos * MR_NER)) {
+            lg[i] = hash_unit(uint(i) + 9u)
+        }
+        let si_bytes = int64(nrows) * 4l
+        let x_bytes = int64(npos * n) * 4l
+        let ro_bytes = int64(nrows * n) * 4l
+        let wn_bytes = int64(n) * 4l
+        let lg_bytes = int64(npos * MR_NER) * 4l
+        let sid = make_device_buf(si_bytes)
+        let swd = make_device_buf(si_bytes)
+        let rod = make_device_buf(ro_bytes)
+        let xd = make_device_buf(x_bytes)
+        let shd = make_device_buf(x_bytes)
+        let wnd = make_device_buf(wn_bytes)
+        let lgd = make_device_buf(lg_bytes)
+        let yod = make_device_buf(x_bytes)
+        let yhd = make_device_buf(x_bytes / 2l)
+        var host = make_host_buf(3l * x_bytes, true, [cached = true])
+        var got_x : array<float>
+        var got_y : array<float>
+        var got_h : array<uint>
+        got_x |> resize(npos * n)
+        got_y |> resize(npos * n)
+        got_h |> resize(npos * n / 2)
+        var pc = ArArgs(dim = uint(n), add_on = with_sh ? 1u : 0u, woff = 0u, eps = eps, ascale = 1.0, row0 = 0u,
+            slots = uint(k), lstride = uint(MR_NER), gated = gated ? 1u : 0u)
+        unsafe {
+            upload_region_at(sid, 0l, addr<uint8 const?>(sidx[0]), si_bytes)
+            upload_region_at(swd, 0l, addr<uint8 const?>(sw[0]), si_bytes)
+            upload_region_at(rod, 0l, addr<uint8 const?>(rows[0]), ro_bytes)
+            upload_region_at(shd, 0l, addr<uint8 const?>(sh[0]), x_bytes)
+            upload_region_at(wnd, 0l, addr<uint8 const?>(wn[0]), wn_bytes)
+            upload_region_at(lgd, 0l, addr<uint8 const?>(lg[0]), lg_bytes)
+            nan_sentinel_upload(yod, x_bytes)
+            nan_sentinel_upload(yhd, x_bytes / 2l)
+            //! the f32 form: x updated in place, the normed row to yo
+            upload_region_at(xd, 0l, addr<uint8 const?>(xs[0]), x_bytes)
+            var sc = set_cls_ar_comb(fixed_array(xd, shd, wnd, yod, sid, swd, rod, lgd),
+                fixed_array(x_bytes, x_bytes, wn_bytes, x_bytes, si_bytes, si_bytes, ro_bytes, lg_bytes),
+                fixed_array(1u, 2u, 0u, 4u, 8u, 8u, 16u, 32u))
+            var raw = alloc_cmd()
+            let begin = VkCommandBufferBeginInfo()
+            vk_check(vkBeginCommandBuffer(raw, begin), null)
+            var h : VkHaz
+            enc_cls_ar_comb(raw, h, sc, pc, int64(npos))
+            vhz_dep(raw, h, 1u | 4u, 0u, true)
+            cmd_copy_range(raw, xd, 0l, host.buf, 0l, x_bytes)
+            cmd_copy_range(raw, yod, 0l, host.buf, x_bytes, x_bytes)
+            vk_check(vkEndCommandBuffer(raw), null)
+            submit_wait(raw)
+            memcpy(addr<void?>(got_x[0]), host.mapped, x_bytes)
+            memcpy(addr<void?>(got_y[0]), reinterpret<void?>(intptr(host.mapped) + uint64(x_bytes)), x_bytes)
+            //! the f16 form over a fresh x
+            upload_region_at(xd, 0l, addr<uint8 const?>(xs[0]), x_bytes)
+            var sc16 = set_cls_ar_comb_f16_b(fixed_array(xd, shd, wnd, yhd, sid, swd, rod, lgd),
+                fixed_array(x_bytes, x_bytes, wn_bytes, x_bytes / 2l, si_bytes, si_bytes, ro_bytes, lg_bytes),
+                fixed_array(1u, 2u, 0u, 4u, 8u, 8u, 16u, 32u))
+            var raw2 = alloc_cmd()
+            vk_check(vkBeginCommandBuffer(raw2, begin), null)
+            var h2 : VkHaz
+            enc_cls_ar_comb_f16_b(raw2, h2, sc16, pc, int64(npos))
+            vkd_run_copy(raw2, h2, yhd, host, x_bytes / 2l, 4u)
+            memcpy(addr<void?>(got_h[0]), host.mapped, x_bytes / 2l)
+        }
+        var want_x : array<float>
+        var want_y : array<float>
+        want_x |> resize(npos * n)
+        want_y |> resize(npos * n)
+        for (p in range(npos)) {
+            let g = with_sh && gated ? 1.0 / (1.0 + exp(-lg[p * MR_NER + MR_NE])) : 1.0
+            var ss = 0.0
+            for (i in range(n)) {
+                var v = xs[p * n + i]
+                if (with_sh) {
+                    v += g * sh[p * n + i]
+                }
+                for (j in range(k)) {
+                    v += sw[p * k + j] * rows[int(sidx[p * k + j]) * n + i]
+                }
+                want_x[p * n + i] = v
+                ss += v * v
+            }
+            let inv = 1.0 / sqrt(ss / float(n) + eps)
+            for (i in range(n)) {
+                want_y[p * n + i] = wn[i] * (want_x[p * n + i] * inv)
+            }
+        }
+        let arm = (with_sh ? (gated ? "gated shared" : "ungated shared") : "no shared") + " expert"
+        t |> success(mismatch_approx(got_x, xs) > 0, "the combine-folded residual step ({arm}): the in-place residual rows moved off their input")
+        let bad_x = mismatch_approx(got_x, want_x)
+        t |> success(bad_x == 0, "the combine-folded residual step ({arm}): the residual rows match the CPU oracle ({bad_x} of {npos * n} off)")
+        let bad_y = mismatch_approx(got_y, want_y)
+        t |> success(bad_y == 0, "the combine-folded residual step ({arm}): the f32 normed rows match the CPU oracle ({bad_y} of {npos * n} off)")
+        var got_yf : array<float>
+        got_yf |> resize(npos * n)
+        for (i in range(npos * n / 2)) {
+            let pr = unpackHalf2x16(got_h[i])
+            got_yf[2 * i] = pr.x
+            got_yf[2 * i + 1] = pr.y
+        }
+        //! the f16 bar: a half rounds to 2^-11 of the value (4.9e-4 relative); the bar is four halves of
+        //! that, and the same fraction of the row's largest value as the floor the near-zero elements read
+        let f16_bar = 2.0e-3
+        let bad_h = mismatch_bars(got_yf, want_y, f16_bar, f16_bar * max_abs(want_y))
+        t |> success(bad_h == 0, "the combine-folded residual step ({arm}): the f16 normed rows within the half's rounding of the oracle ({bad_h} off)")
+        want_x[2 * n + 9] += 0.5
+        t |> success(mismatch_approx(got_x, want_x) == 1, "combine-folded residual control: the residual bar reds one poisoned element")
+        want_y[3 * n + 5] += 0.5
+        t |> success(mismatch_approx(got_y, want_y) == 1, "combine-folded residual control: the f32 normed-row bar reds one poisoned element")
+        t |> success(mismatch_bars(got_yf, want_y, f16_bar, f16_bar * max_abs(want_y)) == 1, "combine-folded residual control: the f16 normed-row bar reds one poisoned element")
+        delete sidx
+        delete sw
+        delete rows
+        delete xs
+        delete sh
+        delete wn
+        delete lg
+        delete got_x
+        delete got_y
+        delete got_h
+        delete got_yf
+        delete want_x
+        delete want_y
+    }
+}
+
+[test]
+def test_vkd_moe_routing(t0 : T?) {
+    t0 |> run("the resident MoE block's routing kernels == the CPU oracles: router GEMM, per-row top-k, the bucket schedule, the combine-folded residual step") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!(ensure_router_gemm_cls() && ensure_topk_rows_cls() && ensure_moe_sched_cls() && ensure_cls_ar_comb() && ensure_cls_ar_comb_f16_b())) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            moe_router_arm(t, MR_NER)
+            moe_router_arm(t, 9)   //! fewer rows than the tile's half: the second row of every invocation is guarded off
+            moe_topk_rows_arm(t, true, 0.0)
+            moe_topk_rows_arm(t, false, 2.5)
+            moe_sched_arm(t)
+            moe_ar_comb_arm(t, true, true)
+            moe_ar_comb_arm(t, false, true)
+            moe_ar_comb_arm(t, false, false)
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+//! the GEMV family's lanes-per-row rule, pinned per (format, row length): the codebook and grid formats
+//! take fewer lanes than the k-lattice formats at the same length, the q8 GEMV always the whole subgroup
+[test]
+def test_vkd_gemv_lane_rule(t0 : T?) {
+    t0 |> run("gemv_lanes_per_row: the measured lane split per format class and row length") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let grid = fixed_array(KqFmt.iq2s, KqFmt.iq2xs, KqFmt.iq2xxs, KqFmt.iq3xxs, KqFmt.iq4xs, KqFmt.iq4nl)
+            let lattice = fixed_array(KqFmt.k2, KqFmt.k3, KqFmt.k4, KqFmt.k5, KqFmt.k6, KqFmt.q40, KqFmt.iq3s)
+            //! row length -> (the grid formats' lanes, the k-lattice formats' lanes); 0 = the whole subgroup
+            let rows = fixed_array((n = 768l, g = 8u, l = 8u), (n = 1024l, g = 8u, l = 16u), (n = 1536l, g = 8u, l = 16u),
+                (n = 2048l, g = 16u, l = 16u), (n = 3072l, g = 16u, l = 16u), (n = 4096l, g = 16u, l = 0u), (n = 8192l, g = 16u, l = 0u))
+            for (r in rows) {
+                for (f in grid) {
+                    t |> equal(gemv_lanes_per_row(int(f), r.n), r.g, "{f} at K {r.n}: a grid format takes {r.g} lanes per row")
+                }
+                for (f in lattice) {
+                    t |> equal(gemv_lanes_per_row(int(f), r.n), r.l, "{f} at K {r.n}: a k-lattice format takes {r.l} lanes per row")
+                }
+                t |> equal(gemv_lanes_per_row(int(KqFmt.q8), r.n), 0u, "q8 at K {r.n}: the whole subgroup")
+            }
         } else {
             t |> skip("dasVulkan not present")
         }

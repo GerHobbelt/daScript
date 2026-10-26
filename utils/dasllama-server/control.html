@@ -395,7 +395,7 @@ button:disabled { opacity: 0.45; cursor: default; }
             <div class="controls" style="margin-top:10px">
                 <button id="s-run" type="button" disabled>speak</button>
                 <label class="knob">voice <select id="s-voice"></select></label>
-                <label class="knob">speed <input type="range" id="s-speed" min="0.3" max="1.5" step="0.05" value="1"><span id="s-speed-v">1.00×</span></label>
+                <label class="knob" id="s-speed-knob">speed <input type="range" id="s-speed" min="0.3" max="1.5" step="0.05" value="1"><span id="s-speed-v">1.00×</span></label>
                 <span class="ctl-note" id="s-count">0 / 4096 characters</span>
                 <span class="ctl-note" id="s-note">type a line and press speak — the waveform plays once, click it to replay</span>
             </div>
@@ -1806,6 +1806,9 @@ function applySpeech(tts) {
     $("tts-section").style.display = on ? "block" : "none";
     syncSpeakButtons();
     if (!on) return;
+    // a model with no speed control refuses any speed but 1.0, so the knob goes away with it
+    // (the slider keeps its 1.0, which is what the request then carries)
+    $("s-speed-knob").style.display = tts.speed ? "" : "none";
     const voices = tts.voices || [];
     if (voices.join(" ") !== ttsVoices.join(" ")) {
         ttsVoices = voices.slice();
@@ -2118,6 +2121,7 @@ const FIELDS = [
     { k: "asr", t: "path", wide: true }, { k: "mmproj", t: "path", wide: true },
     { k: "tts", t: "path", wide: true },
     { k: "tts_lane", t: "sel", o: ["q8", "f32"] },
+    { k: "tts_voices_dir", t: "path", wide: true },
     { k: "image_mmproj", t: "path", wide: true },
     { k: "asr_workers", t: "int" },
     { k: "lcpp_bin", t: "path", wide: true },
@@ -3234,10 +3238,12 @@ function ttsEnableArm(strip, label, present, kept) {
     strip.append(b, label);
 }
 
-// the download ladder over /catalog's `tts` list: the two front-end packs first (every speech
-// model loads them), then the models, then the enable. The rail runs one download at a time,
-// so an absent pack pair is one button and the card re-offers what is still missing.
-// False back = the catalog has no tts list to offer from, and the caller says so instead.
+// the download ladder over /catalog's `tts` list: a model on disk that can speak - a Pocket file
+// stands alone, a phoneme family reads the two front-end packs beside it - goes straight to the
+// enable; otherwise the packs first (every phoneme family loads them), then the models. The rail
+// runs one download at a time, so an absent pack pair is one button and the card re-offers what
+// is still missing. False back = the catalog has no tts list to offer from, and the caller says
+// so instead.
 function ttsOfferArm(strip, dl, kept) {
     const items = (catState && catState.tts) || [];
     if (!items.length) return false;
@@ -3249,30 +3255,31 @@ function ttsOfferArm(strip, dl, kept) {
         return true;
     }
     const missingPacks = items.filter(i => i.pack && !i.present);
+    const models = items.filter(i => !i.pack);
+    const present = models.filter(m => m.present && (!m.needs_packs || !missingPacks.length))
+        .sort((a, b) => a.bytes - b.bytes);
+    if (present.length) {
+        ttsEnableArm(strip, label, present, kept);
+        return true;
+    }
     if (missingPacks.length) {
         const bytes = missingPacks.reduce((a, p) => a + p.bytes, 0);
         const b = miniButton("download the front-end packs (" + fmtSize(bytes) + ")",
             () => startTtsDownload(missingPacks[0].file));
-        b.title = "the text normalizer and grapheme-to-phoneme tables every speech model loads";
+        b.title = "the text normalizer and grapheme-to-phoneme tables every phoneme family loads";
         b.disabled = dlBusy(dl);
         label.textContent = "add speech synthesis — /v1/audio/speech and the speech studio above";
         strip.append(b, label);
         return true;
     }
-    const models = items.filter(i => !i.pack);
-    const present = models.filter(m => m.present).sort((a, b) => a.bytes - b.bytes);
-    if (!present.length) {
-        label.textContent = "the front-end packs are here — pick a speech model";
-        for (const m of models) {
-            const b = miniButton("download " + ttsName(m.file) + " (" + fmtSize(m.bytes) + ")",
-                () => startTtsDownload(m.file));
-            b.disabled = dlBusy(dl);
-            strip.append(b);
-        }
-        strip.append(label);
-        return true;
+    label.textContent = "the front-end packs are here — pick a speech model";
+    for (const m of models) {
+        const b = miniButton("download " + ttsName(m.file) + " (" + fmtSize(m.bytes) + ")",
+            () => startTtsDownload(m.file));
+        b.disabled = dlBusy(dl);
+        strip.append(b);
     }
-    ttsEnableArm(strip, label, present, kept);
+    strip.append(label);
     return true;
 }
 
@@ -3295,7 +3302,7 @@ function renderTtsOffer() {
         chip.textContent = "speech ✓";
         chip.title = path || tts.id;
         label.textContent = "wired: " + tts.id + ", " + (tts.voices || []).length + " voices, " + tts.lane
-            + " — the speech studio above speaks through it";
+            + (tts.cloning ? ", clones a voice" : "") + " — the speech studio above speaks through it";
         strip.append(chip, label);
         return;
     }
@@ -3316,7 +3323,7 @@ function renderTtsOffer() {
     }
     if (ttsOfferArm(strip, dl, kept)) return;
     label.textContent = "no speech model configured — point the tts field in the config editor at a"
-        + " kitten or kokoro GGUF (tts_g2p.bin + tts_postag.bin sit beside it)";
+        + " kitten or kokoro GGUF (tts_g2p.bin + tts_postag.bin sit beside it), or at a pocket-tts file, which stands alone";
     strip.append(label);
 }
 

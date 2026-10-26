@@ -1,7 +1,8 @@
 # dasLLAMA GPU Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-docs: the `ARCHITECTURE_GPU*.md` companions that `ARCHITECTURE.md` indexes.
+docs: `ARCHITECTURE_GPU.md`, `ARCHITECTURE_GPU_VULKAN.md`. Planned work: `followup_metal.md`
+for Metal, `followup_vulkan.md` for Vulkan.
 
 **Routed from `REVIEW.md`: a diff that checklist routes here applies this list together with
 it.**
@@ -34,7 +35,7 @@ readiness, whether this window's rope tables are staged, is asked by `prefill_de
 already knows its answer as it picks the pipeline, is a defect - stamp the guard instead.**
 Stamped means the guard is carried by a `@template_constant` - a `static_if` block, or a value
 select on the constant. The instance stamped without the guard shows no guard in its generated
-`*_msl` global.
+`*_msl` global or its SPIR-V dump.
 
 **A `[metal_dispatch]` kernel whose main loop steps one fixed-size chunk at a time and never
 checks for a partial last chunk declares each alignment it assumes on a value the builder
@@ -131,41 +132,51 @@ twin, or shifts a shared field to a different binding number, is a defect - even
 twin ignores that field.** Kernel twins are kernel classes whose bodies differ on one stamp
 axis - one compile-time choice, such as single/batch, format, or single-pass/chunked.
 
-**A copy-pasted kernel twin, or a kernel split into hand instances where a `static_if` on a
-`@template_constant` serves, is a defect - kernel twins stamp one `class template`, whatever
-the stamp axis is.** Body divergence is carried by a `@template_constant`, or by an
-overridden method spliced flat at emission.
+**A copy-pasted kernel twin - one of two kernel classes whose bodies differ on one compile-time
+choice - or a kernel split into hand instances where a `static_if` on a `@template_constant`
+serves, is a defect - kernel twins stamp one `class template`, whatever that choice is.** Body
+divergence is carried by a `@template_constant`, or by an overridden method spliced flat at
+emission.
 
-**A kernel class template that binds a real buffer to a field the stamp's own body never
-reads - a dummy bind that exists only to fill the slot - is a defect: gate that field with
-`@template_gate` so the stamps whose bodies do not read it do not carry it.**
+**A kernel-family stamp - one stamp of a class template, or one of the classes deriving from a
+base shell that carry a `[vk_dispatch]` / `[metal_dispatch]` - that binds a real buffer to a
+binding whose fields its compiled body, inherited code included, never reads - a dummy bind that
+exists only to fill the slot - is a defect: gate the field with `@template_gate` where a
+template constant decides it, and where the family shares one set layout on purpose, name that
+case in `ARCHITECTURE_GPU.md` sec.1.5's ledgered kernel-binding asymmetries (Metal) or
+`ARCHITECTURE_GPU_VULKAN.md` sec.2.2ac (Vulkan).** Several fields, declared in the stamp or in
+the shell, may share one binding - `@role = "alias"` marks such a view - so the binding counts
+as read when the compiled body reads any of them. A field the body reads under a run-time flag
+is read, and its unread arm binds a placeholder the kernel never touches.
 
 **A diff that forks a kernel class out of a shared template shows that the bodies no longer
 differ on the compile-time choice the template carried, and names that choice in the
 surviving template's comment.**
 
-**A `[metal_dispatch]` / `[vk_dispatch]` field whose memory is load-once - a model plane, or
-an `upload_region` upload never written after arming - is a defect unless it carries
-`@role = "weight"`, even when the kernel compiles and passes parity.**
+**A `[metal_dispatch]` / `[vk_dispatch]` binding whose memory is never written after arming at
+every site that binds it - a model plane, an `upload_region` upload - is a defect unless a field
+at that binding carries `@role = "weight"`, even when the kernel compiles and passes parity.**
+A field the kernel reads under a run-time flag takes the role of its read arm; the placeholder
+its unread arm binds is never read, so its lifetime does not decide the role.
 
-**`@role = "weight"` on per-encode data - a pooled buffer the host refills each encode - is a
-defect; a per-encode field either omits `@role` or names the access its body performs.**
-`weight` tells the generated builder the buffer needs no per-encode hazard tracking.
+**`@role = "weight"` on per-encode data the kernel reads - a pooled buffer the host refills
+each encode - is a defect; a per-encode field either omits `@role` or names the access its body
+performs.** `weight` tells the generated builder the buffer needs no per-encode hazard tracking.
 
 **A diff that adds a Metal kernel class under `dasllama/` - a `[metal_kernel]` def, or a new
 instance of a template carrying one - either adds a census row to
 `tests/test_kernel_coverage.das` that dispatches it, or names it in that file's
-`CENSUS_NEVER_DISPATCHED` with the reason no row can reach it.** The two lists together are the
-file's coverage claim.
+`CENSUS_NEVER_DISPATCHED` with the reason no row can reach it.**
 
 **A diff that adds a Vulkan kernel class under `dasllama/` - a `[vk_dispatch]` declaration, or a
-new instance of a template carrying one - adds a census row to `tests/test_kernel_coverage.das`
-that dispatches it; a class no census model reaches gets a census model that does.**
-`CENSUS_NEVER_DISPATCHED` covers Metal classes only.
+new instance of a template carrying one - shows a Vulkan serving-census row in
+`tests/test_kernel_coverage.das` that dispatches it, adding the row or the census model when
+none does.** A Vulkan class never joins `CENSUS_NEVER_DISPATCHED`, which takes Metal classes
+only.
 
-**Every field of a new kernel class declared in `dasllama/` carries at least one of the
-annotations its `[metal_dispatch]` / `[vk_dispatch]` builder reads - `@binding`, `@role`,
-`@off`, `@default`.** A field carrying none of them is dropped from the bind list with no error.
+**Weakening the `[metal_dispatch]` / `[vk_dispatch]` lens's refusal to compile an `@ssbo` field
+with no `@binding`, or an `@ssbo` field the kernel body never accesses that declares no `@role`,
+is a defect.**
 
 **Weakening `[metal_dispatch]`'s refusal to compile a `@workgroup` field with no `tgmem=` spec,
 or its gate `test_lens_tgmem_gate` (`tests/test_metal_misc_kernels.das`), is a defect.**
@@ -189,8 +200,9 @@ host-side never reaches the device, so it does not count.
 **Never bind a scalar that the other bound scalars already determine - derive it in the
 builder instead.** Binding it separately adds a second place to get it wrong.
 
-**Never key a cache on a host address alone - carry the span and the form, the element type and
-layout the upload produces, in the key too.** A hit must cover the request.
+**A cache key covers every input the cached result depends on: a host address, an offset, or a
+handle alone is not a key - carry the span and the form, the element type and layout the upload
+produces, in the key too.** A hit must cover the request.
 
 **A diff that lands a kernel class, driver arm, or backend capability in a `dasllama/` file
 whose `ARCHITECTURE_GPU.md` sec.1.5 role row does not sanction it extends that row's ledger in
@@ -211,25 +223,24 @@ own init/release pair.
 
 **A diff that adds or removes a Metal-only or Vulkan-only hook, role, served path, or
 backend-only capability - a hook in sec.1.5's per-driver registered-hook or borrowed-kernel
-lists included, a seat of the `dasllama_gpu_tier` cooperation SPI excluded (the closed list's
-standing entry sends those to the tier's role row) - lands its own entry in
-`ARCHITECTURE_GPU.md` sec.1.5's closed asymmetry list in the same change, even when that list
-already carries an asymmetry of the same class, and even when the diff also extends the file's
-sec.1.5 role row.** One backend serving the same path faster or slower is not such a change.
+lists included - lands its own entry in `ARCHITECTURE_GPU.md` sec.1.5's closed asymmetry list
+in the same change, even when that list already carries an asymmetry of the same class.** One
+backend serving the same path faster or slower is not such a change; a seat of the
+`dasllama_gpu_tier` cooperation SPI lands its entry in sec.1.5's tier role row instead, in the
+same change.
 
-**A change to code that a served GPU decode or prefill path executes ships GPU-vs-CPU parity
-on one q8 and one kq (K-quant) model the changed path serves.** That code is anything a
-served GPU decode or prefill call executes OR that selects what it
-executes - a driver, a kernel class it dispatches, that class's builder, a servability gate, a
-race that picks which kernel serves, a forwarder default, a weight-region or residency path,
-the tier forwarders and the Vulkan tier-dispatch seams (`dasllama/dasllama_vulkan_seams.das`)
-the call routes through; never the bake paths, never a comment.
+**A change that can alter what a served GPU decode or prefill path computes or selects ships
+GPU-vs-CPU parity on one q8 and one kq (K-quant) model the changed path serves.** That is
+anything a served GPU decode or prefill call executes or that selects what it executes - a
+driver, a kernel class it dispatches, that class's builder, a servability gate, a race that
+picks which kernel serves, a forwarder default, a weight-region or residency path, the tier
+forwarders and the Vulkan tier-dispatch seams (`dasllama/dasllama_vulkan_seams.das`) the call
+routes through; a rename, a comment or a bake path cannot.
 
 **Parity evidence counts only when it comes from `harness/parity.das`,
 `benchmarks/lcpp_bench.das --parity` (`performance/model_specs.das`'s fixed model list), or an
 in-suite parity instrument run through `tests/run.das` that feeds both sides the same fixed
-tokens and compares the logits against a fixed tolerance - Metal's
-`tests/test_metal_*_parity.das`, Vulkan's `tests/test_gpu_resident_hybrid.das`.**
+tokens and compares the logits against a fixed tolerance.**
 
 **Parity evidence counts only when its backend was armed: the Metal arm ran with `--ngl`; the
 Vulkan arm ran with `DASLLAMA_GPU=1` - never `--ngl` - and its log shows the tier that serves

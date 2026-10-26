@@ -1,7 +1,7 @@
 # Metal / mac-session follow-up - the M5 catch-up ledger
 
 **Status: OPEN (2026-08-31, unquirk pass).** The ledger for the parallel mac session that
-forks after PR-1 of `plans/unquirk_pass.md`. Metal-tier perf items move here from the
+forks after the unquirk pass's PR-1. Metal-tier perf items move here from the
 per-format notes during the Phase E doc split; the CPU items below are mac-session work too -
 the M-series CPU tiers are minted and raced from that box.
 
@@ -53,8 +53,8 @@ every format: `harness/parity.das -- -m <gguf> -n 40 --ids 128000,12805,5304,264
 ## 3. Metal tier perf items
 
 Placeholder - the per-format Metal notes (tg 0.78-0.93x tails, the IQ4_XS lane-map gap of
-followup_general #58, the Q22 dispatch-loop probe method) consolidate here in Phase E of
-`plans/unquirk_pass.md`; until then they live in `HOW_TO_ADD_A_FORMAT.md`'s per-format notes.
+followup_general #58, the Q22 dispatch-loop probe method) consolidate here in the unquirk
+pass's Phase E; until then they live in `HOW_TO_ADD_A_FORMAT.md`'s per-format notes.
 
 ## 4. The elementwise / activation-precision lane (the last M5 pp residual)
 
@@ -90,6 +90,44 @@ Measured ceiling of ALL remaining converts (`DASLLAMA_METAL_PREFILL_SKIP=act_cvt
   every elementwise kernel, attention, the CPU-fallback paths, logits/readback - and
   re-opens the numerics bars across the parity and prefill suites. ITS OWN ARC, planned;
   the acceptance bar is the existing parity suites plus a pp/tg board A/B per class.
+
+## 6. The Metal kernel twins - the census for the Mac session (Boris, 2026-09-07)
+
+Every `[metal_dispatch]` class has been read and the suspected twins compared line by line;
+this entry is the map so the research is not done twice.
+Boris: the Mac kernels are a follow-up done on the Mac, together with the Metal side of the Qwen
+zoo. Facts that decide the order:
+
+- 296 dispatch classes in `dasllama_metal_kernels.das` (175) + `dasllama_metal_prefill.das`
+  (121): 173 are template stamps, 14 ride a `def abstract` base, ~44 are hand-written twins
+  (~3000 lines addressable), ~65 singletons; 15 near-miss pairs must stay apart (listed there).
+- Two thirds of the debt is one family: the per-format GEMV, MvB2/B4 and MvB8 copies - 36
+  classes over 12 formats (`MetalKqGemv*` 7985-9319, `MetalKqMv*T` 8368-10970, `MetalKqMvB8*`
+  8477-11102) where iq4xs and iq4nl differ in ONE line and iq2s and iq2xs in eight; the shells
+  are byte-identical. One format-abstract shell per family with one `def abstract` decode per
+  format (`stage_w16` / `dot_block`) closes ~1930 lines; `MetalKqGemvIq2xxsFam` and
+  `MetalKqMulMmSplitTensorBase.stage16` already prove the shape in-tree. Keep the per-box crowns
+  (`K5C`, `Iq3sF4`, `Iq3xxsF4`) as separate stamps; the F4 forks bundled a second change
+  (`first_row * 2u` -> `* 4u`, `sumf[2]` -> `[4]`, `ib += 4u` -> `2u`) = two constants, F4 + ROWS;
+  the `TILED` arm duplicates the b-loop for a measured +2% (k4) - prove the generated MSL
+  byte-identical per stamp before and after.
+- Then: the SqAttn `BATCHED` axis (10 templates, ~250 lines; `MetalSqAttnCombT` ships the exact
+  pattern); the `MetalKqMulMmK45T` 12-bool `static_if` ladder into the `stage16` scaffold plus
+  the tensor K45/K6 x Db pair (~285; removes the coupled-bool trap where `MetalKqMulMmIq4nl`
+  must set `IQ4XS` and `IQ4NL`; the Db forms sit on the sanctioned float-A list); the four dense
+  mul_mm shells onto a `MetalMoeMulMmBase` twin (~145); the MoE GEMV `GATHERED` axis (~230, the
+  `float4` x view stays its own axis - a measured 2.25x); the zero-risk singles (CrossVx f16/f32,
+  Q8MvB2/B4 onto `MetalGemvB24T`, argmax rows, rope-store batched, Q8MulMmDb, DequantK6H,
+  G4aMag/Q3aPow, the bias pair; ~325).
+- Rules for every conversion: a stamp's `tgmem=` string is `<LeafClass>_<method>_msl_tgmem`, so a
+  hand class becoming a stamp changes it and drops its `[metal_kernel(name=..)]`; a
+  `@template_gate`d field may be named only inside a `static_if` arm on its own axis (a ternary
+  infers both arms); the kernel-unit gates (`tests/test_metal_gemv_kernels.das`,
+  `test_metal_gemm_kernels.das`) are the parity lock per format - green before and after, on the
+  M1 first, the M5 pass after.
+- Detect-dupe (`utils/detect-dupe`) over the two files finds the exact-clone shells and the
+  copied helpers; it does not see a twin whose bodies differ by a guard or an accumulator
+  count, which is why the census reads the bodies.
 
 ## 5. The dense-KQ tensor twins' missing stamps
 

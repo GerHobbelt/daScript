@@ -156,7 +156,7 @@ def test_areas_for_path(t : T?) {
 [test]
 def test_area_plan(t : T?) {
     let tts <- area_plan(["tts"])
-    t |> equal(length(tts.files), 9, "tts plans its eight files and the image file its kitten arm rides")
+    t |> equal(length(tts.files), 12, "tts plans its eleven files and the image file its kitten arm rides")
     t |> equal(tts.image_arms, "kitten", "tts owns the kitten image arm")
     t |> equal(tts.files[length(tts.files) - 1], "{TESTS_DIR}/test_model_image.das", "the image file rides last")
     for (i in range(1, length(tts.files) - 1)) {
@@ -178,7 +178,7 @@ def test_area_plan(t : T?) {
     t |> equal(length(suite.files), 1, "a suite run plans the suite table")
     t |> equal(suite.image_arms, "arm12", "a suite run passes --arm through")
     let area <- plan_files(cfg, ["tts"])
-    t |> equal(length(area.files), 9, "an area run plans the area, whatever --suite says")
+    t |> equal(length(area.files), 12, "an area run plans the area, whatever --suite says")
 }
 
 //! the argument contracts: an area run refuses --arm/--full/--suite and an unknown area; a per-PR
@@ -228,7 +228,8 @@ def test_runner_dry_run(t : T?) {
         return
     }
     var out : string
-    t |> equal(run_runner("--area audio,vision --das /usr/bin/true", out), 0, "a dry area run exits clean:\n{out}")
+    let area_rc = run_runner("--area audio,vision --das /usr/bin/true", out)
+    t |> equal(area_rc, 0, "a dry area run exits clean:\n{out}")
     t |> success(find(out, "AREAS audio,vision") >= 0, "the AREAS line names the areas")
     t |> success(find(out, "START test_model_image.das: ") >= 0, "the image file runs")
     let image_start = find(out, "START test_model_image.das: ")
@@ -247,10 +248,12 @@ def test_runner_dry_run(t : T?) {
     t |> equal(run_runner("--suite stocked --exclude test", refused), 2, "an exclusion that drops every file is refused")
     t |> success(find(refused, "dropped every file") >= 0, "and says so:\n{refused}")
     var changed : string
-    t |> equal(run_runner("--changed --base HEAD --das /usr/bin/true", changed), 0, "a --changed run against HEAD exits clean:\n{changed}")
+    let changed_rc = run_runner("--changed --base HEAD --das /usr/bin/true", changed)
+    t |> equal(changed_rc, 0, "a --changed run against HEAD exits clean:\n{changed}")
     t |> success(find(changed, "CHANGED") >= 0 || find(changed, "nothing") >= 0, "it either maps a change or says nothing reached an area:\n{changed}")
     var no_base : string
-    t |> equal(run_runner("--changed --base no-such-ref-here --das /usr/bin/true", no_base), 2, "a base git cannot resolve is refused, never read as nothing changed:\n{no_base}")
+    let no_base_rc = run_runner("--changed --base no-such-ref-here --das /usr/bin/true", no_base)
+    t |> equal(no_base_rc, 2, "a base git cannot resolve is refused, never read as nothing changed:\n{no_base}")
 }
 
 [test]

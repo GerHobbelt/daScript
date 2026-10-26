@@ -132,6 +132,28 @@ Companion to `ARCHITECTURE.md` in this folder; section numbers are unique across
   sits in any `daslib/` folder (`lint029_source_exempt`, `daslib/lint_config.das`):
   library code lives on the builder/state idiom (`var self`, `var writer`), so the
   purity contract binds application code only.
+- **LINT030 keeps one frame per call on a stack and reads mentions off the ordinary walk.**
+  `preVisitExprCall` pushes the frame, `preVisitExprCallArgument` advances its slot, and
+  `preVisitExprVar` records every variable read into the slot being walked - only at the
+  frame's own closure depth, since a lambda argument's body runs later. On `visitExprCall` the
+  frame pops, each argument that is a call is asked which mentioned variables it writes through
+  a mutable by-reference parameter (a bare variable in a `var` slot of `&`, array, table or
+  struct type) that the callee writes during the call - `Lint030WriteScan` reads the callee's
+  body once for the write marks the compiler left on that parameter, discounting an address
+  taken inside a `return`, since a callee that hands out a pointer touches nothing before the
+  caller uses it, discounting a pointer the parameter holds read out or reached through, since
+  the compiler marks a mutable pointer's source and a pointee's write alike while neither moves
+  the parameter (an assignment to the pointer field itself still counts), and deciding the mark
+  on a call argument by that callee's own body for that slot, since the compiler marks every
+  writable argument of a call whose callee modifies any argument; a callee with no body, a
+  builtin or an extern, is read as writing - and the
+  frame's mentions flow into the parent frame's current slot, so a read buried in a deeper
+  call still counts for the outer argument list. A mention that is the outer call's own
+  by-reference argument - the variable, or a chain of plain fields rooted at it, since a field
+  behind a pointer is a value a write can repoint - is not a read: the callee sees the final
+  state whatever the order. The rule fires once per writing argument, on the outer call. It
+  ships default-off in the SDK beside LINT029 (`seed_default_disabled`); `.lint_config` turns
+  it on here.
 - **Closure bodies are per-rule, not global.** LINT010 counts a closure body as a branch
   (it may run later or never - writes inside must not kill outside stores, reads inside
   must not keep an outside init live); LINT021 counts the same body as an escape - a
@@ -234,3 +256,15 @@ Companion to `ARCHITECTURE.md` in this folder; section numbers are unique across
 - **C++ mirror pairs**: the STYLE024/025 unsafe map <-> infer's `unsafe_*` rules;
   `style036_inert_contract` <-> infer's contract clearing. Nothing fails when one side
   moves alone.
+
+### 4.1 STYLE029/030 over a require group {#style-lint-require-group}
+
+- **The source line at a declaration's (file, line, column) key, read for the `[...]`
+  spelling after the keyword and its guard, is what tells a group apart from a require written
+  by hand.** A group's members share the group line's key, but a group with one member has one
+  declaration, exactly like a plain require, so the key alone cannot say; both rules judge
+  members and then keep, suppress and report per key.
+- **A declaration's verdict is settled only after every member sharing its key has been
+  judged**, so `st030_report_requires` records verdicts in one walk and reports them in a
+  later one. Reporting inside the deciding walk would fire on a member judged ahead of the
+  used member that keeps the line.

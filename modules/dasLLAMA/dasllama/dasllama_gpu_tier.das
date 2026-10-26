@@ -48,9 +48,10 @@ typedef MoeGpuAttnFn = function<(var yp : float?; var kp : float?; var vp : floa
                                  fq : int; fk : int; fv : int; fo : int;
                                  xqp : int8 const?; xsp : float const?;
                                  rmsqp : float const?; rmskp : float const?;
+                                 bqp : float const?; bkp : float const?; bvp : float const?;
                                  cosp : float const?; sinp : float const?;
                                  npos : int64; dim : int64; qd : int64; kv_dim : int64;
-                                 hs : int64; rot : int64; n_heads : int64; kv_mul : int64;
+                                 hs : int64; rot : int64; n_heads : int64;
                                  scale : float; eps : float; gated : bool; qknorm : bool) : void>
 
 [unused_argument(goutp, offs1, offs3, offs2, nregions, xqp, xsp, wp, invp, n, nfe, nrows, npos, f1, f3, f2, is_gelu)]
@@ -87,13 +88,14 @@ def private moe_gpu_unset_dn(var yp : float?; woq, woz, woo : int64;
     panic("dasLLAMA: GPU deltanet dispatch hit without an installed GPU tier")
 }
 
-[unused_argument(yp, kp, vp, woq, wok, wov, woo, fq, fk, fv, fo, xqp, xsp, rmsqp, rmskp, cosp, sinp, npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul, scale, eps, gated, qknorm)]
+[unused_argument(yp, kp, vp, woq, wok, wov, woo, fq, fk, fv, fo, xqp, xsp, rmsqp, rmskp, bqp, bkp, bvp, cosp, sinp, npos, dim, qd, kv_dim, hs, rot, n_heads, scale, eps, gated, qknorm)]
 def private moe_gpu_unset_attn(var yp : float?; var kp : float?; var vp : float?;
                                woq, wok, wov, woo : int64; fq, fk, fv, fo : int;
                                xqp : int8 const?; xsp : float const?;
                                rmsqp : float const?; rmskp : float const?;
+                               bqp : float const?; bkp : float const?; bvp : float const?;
                                cosp : float const?; sinp : float const?;
-                               npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul : int64;
+                               npos, dim, qd, kv_dim, hs, rot, n_heads : int64;
                                scale : float; eps : float; gated : bool; qknorm : bool) {
     panic("dasLLAMA: GPU attention dispatch hit without an installed GPU tier")
 }
@@ -135,6 +137,7 @@ typedef RdecNormsFn = function<(norms : array<float>) : void>
 typedef RdecSetLayerFn = function<(l : int64; mir_idx : int64; bq : int64; bk : int64; bv : int64; bo : int64; b1 : int64; b3 : int64; b2 : int64; fq : int; fk : int; fv : int; fo : int; f1 : int; f3 : int; f2 : int) : void>
 typedef RdecSetDnLayerFn = function<(l : int64; bqkv : int64; bz : int64; bout : int64; bbeta : int64; balpha : int64; b1 : int64; b3 : int64; b2 : int64; ba_off : int64; fqkv : int; fz : int; fout : int; f1 : int; f3 : int; f2 : int; convw : float const?; wnormp : float const?; ap : float const?; dtp : float const?) : void>
 typedef RdecUploadDnBaFn = function<(rows : array<float>) : void>
+typedef RdecUploadBiasFn = function<(rows : array<float>) : void>
 typedef RdecDnOwnFn = function<(l : int64; stp : float?; histp : float?) : void>
 typedef RdecDnPrefillOwnFn = function<(l : int64; stp : float?; histp : float?) : void>
 typedef RdecSetClsFn = function<(cls_block : int64; cls_fmt : int) : void>
@@ -199,6 +202,75 @@ var g_rdec_dn_own = @@rdec_unset_dn_own
 var g_rdec_dn_prefill_own = @@rdec_unset_dn_prefill_own
 var g_rdec_dn_installed = false
 
+[unused_argument(rows)]
+def private rdec_unset_upload_bias(rows : array<float>) {
+    panic("dasLLAMA: resident q/k/v bias upload hit without an installed bias seat")
+}
+var g_rdec_upload_bias = @@rdec_unset_upload_bias
+var g_rdec_bias_installed = false
+
+//! Install the resident driver's q/k/v projection-bias seat (qwen2) - separately, so a tier without
+//! it declines a biased model by name instead of serving it unbiased.
+def public install_moe_gpu_resident_bias(upload_bias : RdecUploadBiasFn) {
+    g_rdec_upload_bias = upload_bias
+    g_rdec_bias_installed = true
+}
+
+def public rdec_bias_installed() : bool => g_rdec_bias_installed
+def public rdec_upload_bias(rows : array<float>) { invoke(g_rdec_upload_bias, rows) }
+
+// ===== the resident driver's MoE seats =====
+//! Does the resident MoE block admit an expert triple of these formats - the tile family it
+//! rides is the device's (the f16-fed cm2 tiles today).
+typedef RdecMoeOkFn = function<(f1 : int; f3 : int; f2 : int) : bool>
+//! The MoE geometry and the router plane (every MoE layer's [ne x dim] rows, then its gate row when the shared expert is gated) after the prepare; false = the class rails declined.
+typedef RdecPrepareMoeFn = function<(ne : int64; k : int64; nfe : int64; nsh : int64; n_moe : int64; sh_gated : bool; norm_topk : bool; is_gelu : bool; wscale : float; router : array<float>) : bool>
+//! Register an MoE attention layer: the attention quad, the dense triple (the shared expert's, or -1 blocks for none) and the expert triple.
+typedef RdecSetMoeLayerFn = function<(l : int64; mir_idx : int64; router_slot : int64; bq : int64; bk : int64; bv : int64; bo : int64; b1 : int64; b3 : int64; b2 : int64; be1 : int64; be3 : int64; be2 : int64; fq : int; fk : int; fv : int; fo : int; f1 : int; f3 : int; f2 : int; fe1 : int; fe3 : int; fe2 : int) : void>
+//! Register the routed block on a layer already registered by its own seat (a recurrent MoE layer after its deltanet registration): the expert triple and the layer's router-plane slot.
+typedef RdecSetMoeExpertsFn = function<(l : int64; router_slot : int64; be1 : int64; be3 : int64; be2 : int64; fe1 : int; fe3 : int; fe2 : int) : void>
+
+[unused_argument(f1, f3, f2)]
+def private rdec_unset_moe_ok(f1, f3, f2 : int) : bool => false
+[unused_argument(ne, k, nfe, nsh, n_moe, sh_gated, norm_topk, is_gelu, wscale, router)]
+def private rdec_unset_prepare_moe(ne, k, nfe, nsh, n_moe : int64; sh_gated, norm_topk, is_gelu : bool; wscale : float; router : array<float>) : bool => false
+[unused_argument(l, mir_idx, router_slot, bq, bk, bv, bo, b1, b3, b2, be1, be3, be2, fq, fk, fv, fo, f1, f3, f2, fe1, fe3, fe2)]
+def private rdec_unset_set_moe_layer(l, mir_idx, router_slot, bq, bk, bv, bo, b1, b3, b2, be1, be3, be2 : int64; fq, fk, fv, fo, f1, f3, f2, fe1, fe3, fe2 : int) {}
+[unused_argument(l, router_slot, be1, be3, be2, fe1, fe3, fe2)]
+def private rdec_unset_set_moe_experts(l, router_slot, be1, be3, be2 : int64; fe1, fe3, fe2 : int) {}
+
+var g_rdec_moe_ok = @@rdec_unset_moe_ok
+var g_rdec_prepare_moe = @@rdec_unset_prepare_moe
+var g_rdec_set_moe_layer = @@rdec_unset_set_moe_layer
+var g_rdec_set_moe_experts = @@rdec_unset_set_moe_experts
+var g_rdec_moe_installed = false
+
+//! Install the resident driver's MoE seats - separately, so a tier without them declines a MoE by name.
+def public install_moe_gpu_resident_moe(moe_ok : RdecMoeOkFn; prepare_moe : RdecPrepareMoeFn; set_moe_layer : RdecSetMoeLayerFn; set_moe_experts : RdecSetMoeExpertsFn) {
+    g_rdec_moe_ok = moe_ok
+    g_rdec_prepare_moe = prepare_moe
+    g_rdec_set_moe_layer = set_moe_layer
+    g_rdec_set_moe_experts = set_moe_experts
+    g_rdec_moe_installed = true
+}
+
+def public rdec_moe_installed() : bool => g_rdec_moe_installed
+def public rdec_moe_ok(f1, f3, f2 : int) : bool => invoke(g_rdec_moe_ok, f1, f3, f2)
+def public rdec_prepare_moe(ne, k, nfe, nsh, n_moe : int64; sh_gated, norm_topk, is_gelu : bool; wscale : float; router : array<float>) : bool => invoke(g_rdec_prepare_moe, ne, k, nfe, nsh, n_moe, sh_gated, norm_topk, is_gelu, wscale, router)
+def public rdec_set_moe_layer(l, mir_idx, router_slot, bq, bk, bv, bo, b1, b3, b2, be1, be3, be2 : int64; fq, fk, fv, fo, f1, f3, f2, fe1, fe3, fe2 : int) { invoke(g_rdec_set_moe_layer, l, mir_idx, router_slot, bq, bk, bv, bo, b1, b3, b2, be1, be3, be2, fq, fk, fv, fo, f1, f3, f2, fe1, fe3, fe2) }
+def public rdec_set_moe_experts(l, router_slot, be1, be3, be2 : int64; fe1, fe3, fe2 : int) { invoke(g_rdec_set_moe_experts, l, router_slot, be1, be3, be2, fe1, fe3, fe2) }
+
+var private g_gpu_resident_route = true
+
+//! The in-process twin of DASLLAMA_GPU_RESIDENT: a test pins the whole-model driver off before a
+//! load to hold the per-op rails' claims on a model the driver would take.
+def public set_gpu_resident_route(on : bool) {
+    g_gpu_resident_route = on
+}
+
+//! The whole-model driver is wanted on this load: the knob and the in-process lever both on.
+def public gpu_want_resident : bool => g_env_gpu.gpu_resident && g_gpu_resident_route
+
 //! Install the resident driver's hybrid (deltanet) seats - separately, so a tier without them
 //! declines recurrent layers by name instead of serving a model it cannot step.
 def public install_moe_gpu_resident_dn(set_dn_layer : RdecSetDnLayerFn; upload_dn_ba : RdecUploadDnBaFn; dn_own : RdecDnOwnFn; dn_prefill_own : RdecDnPrefillOwnFn) {
@@ -244,6 +316,10 @@ typedef RdecUploadEmbF32Fn = function<(fblob : array<float>; off : int64; vocab 
 
 //! The raw f32 embd table rides the residency plan's headroom only up to this size; past it the CPU embed serves.
 let public RDEC_EMB_F32_CAP = 512l * 1024l * 1024l
+
+//! Rows of read slack past a cm2 region's last row: the m column loads a partial column unclamped, so
+//! every plane a tile reads (the residency plan's scratch, the prefill's gathered rows, a probe's) carries them.
+let public TILE_READ_SLACK = 128l
 
 //! The device bytes the f32 embed-gather arm would upload for a (vocab x dim) table - 0 past its cap.
 [arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
@@ -623,6 +699,7 @@ def public vk_rdec_rerecord_on : bool => g_vk_rdec_rerecord
 
 var g_moe_gpu_shexp_layers : table<int64>   // layers whose shexp gate/up/down triple is resident
 var g_moe_gpu_shexp_route = true
+var private g_moe_gpu_shexp_said : table<string>   // the prefill's shared-expert decline reasons said for this model
 
 //! Loader contract: mark one layer's shared-expert triple resident on the tier. Reset per load.
 def public set_moe_gpu_shexp_layer(l : int64) {
@@ -631,10 +708,21 @@ def public set_moe_gpu_shexp_layer(l : int64) {
 
 def public reset_moe_gpu_shexp_layers {
     g_moe_gpu_shexp_layers |> clear()
+    g_moe_gpu_shexp_said |> clear()
 }
 
 def public moe_gpu_shexp_on_gpu(l : int64) : bool {
     return g_moe_gpu_installed && g_moe_gpu_shexp_route && key_exists(g_moe_gpu_shexp_layers, l)
+}
+
+//! The prefill's shared expert stays on the CPU for `why`: said once per reason per model while the tier is armed.
+[cold_path]
+def public moe_gpu_shexp_declined(why : string) {
+    if (!g_moe_gpu_installed || key_exists(g_moe_gpu_shexp_said, why)) {
+        return
+    }
+    g_moe_gpu_shexp_said |> insert(why)
+    to_log(LOG_INFO, "dasLLAMA: the prefill's shared expert takes the CPU rail - {why} (said once per reason)\n")
 }
 
 //! Runtime routing gate over the shared-expert marks (the --shexp-ab in-process lever).
@@ -883,6 +971,11 @@ var g_moe_gpu_vram_report = @@moe_gpu_no_vram
 var g_moe_gpu_device_report = @@moe_gpu_no_device
 var g_moe_gpu_budget_report = @@moe_gpu_no_budget
 var g_moe_gpu_plane_bytes_fn = @@moe_gpu_no_plane_bytes
+def private moe_gpu_no_os_memory() : tuple<budget : int64; usage : int64; adapter_dedicated : int64; adapter_shared : int64> => (budget = 0l, usage = 0l, adapter_dedicated = 0l, adapter_shared = 0l)
+[unused_argument(bytes)]
+def private rdec_no_note_weight_bytes(bytes : int64) {}
+var g_moe_gpu_os_memory = @@moe_gpu_no_os_memory
+var g_rdec_note_weight_bytes = @@rdec_no_note_weight_bytes
 
 def set_gpu_tier_want_(want : GpuTierWant) {
     g_gpu_want = want
@@ -1038,6 +1131,23 @@ def public set_moe_gpu_budget_hooks(budget : function<() : int64>; plane : funct
 
 //! Device-local bytes the armed tier may spend on resident weights (0 = no tier).
 def moe_gpu_weight_budget_() : int64 => invoke(g_moe_gpu_budget_report)
+
+//! The OS's video memory numbers, in bytes (all 0 = no OS answer): this process's dedicated ceiling,
+//! what it holds, what every process holds on the adapter, the system memory the adapter maps - the
+//! resident plan's auto arm sizes against the room left where a backend installs the query.
+def moe_gpu_os_memory() : tuple<budget : int64; usage : int64; adapter_dedicated : int64; adapter_shared : int64> => invoke(g_moe_gpu_os_memory)
+
+def public install_moe_gpu_os_memory(f : function<tuple<budget : int64; usage : int64; adapter_dedicated : int64; adapter_shared : int64>>) {
+    g_moe_gpu_os_memory = f
+}
+
+//! Tell the resident driver how many weight bytes its plan put on the device (its warm-up
+//! self-check reads the decode wall against them).
+def rdec_note_weight_bytes(bytes : int64) { invoke(g_rdec_note_weight_bytes, bytes) }
+
+def public install_rdec_note_weight_bytes(f : function<(bytes : int64) : void>) {
+    g_rdec_note_weight_bytes = f
+}
 
 def private moe_gpu_no_binding_cap : int64 => 0l
 var private g_moe_gpu_binding_cap = @@moe_gpu_no_binding_cap
@@ -1231,8 +1341,17 @@ struct MoeSpanDec {
     f1 : array<int>
     f3 : array<int>
     f2 : array<int>
+    nsh : int64                  //! the shared expert's width (0 = the model has none)
+    sh_gated : bool              //! the shared expert's row scales by sigmoid(gate . xb)
+    wsh1 : array<int64>          //! the shared expert's q8 gate plane offset per layer
+    wsh3 : array<int64>          //! ... its up plane
+    wsh2 : array<int64>          //! ... its down plane
+    shgate : float const?        //! [nl x dim] f32 gate rows, layer-major (null when ungated or absent)
     rmsq : array<float const?>   // the qk-norm rows (null when off)
     rmsk : array<float const?>
+    bq : array<float const?>     // the q/k/v projection bias rows (null when the model has none)
+    bk : array<float const?>
+    bv : array<float const?>
     router : float const?        // [nl x ne x dim] f32 rows, layer-major
     att_norm : float const?      // [nl x dim]
     ffn_norm : float const?      // [nl x dim]
@@ -1387,7 +1506,7 @@ def public matmul_moe_gpu_ffn_combined_xf_join(var gout : array<float>) {
 // ===== the decode attention block: one submit per layer over the resident q/k/v/o quad =====
 // The tier keeps a per-layer f16 K/V mirror the prefill chain fills; a served token returns the
 // wo row plus its RAW k and v rows (f32, before norm and rope) so the host re-derives its cache row.
-typedef MoeGpuAttnDecFn = function<(var xb2p : float?; var kp : float?; var vp : float?; woq : int64; wok : int64; wov : int64; woo : int64; fq : int; fk : int; fv : int; fo : int; xqp : int8 const?; xsp : float const?; cosp : float const?; rmsqp : float const?; rmskp : float const?; pos : int64; dim : int64; qd : int64; kvd : int64; hs : int64; n_heads : int64; kv_mul : int64; scale : float; eps : float; neox : bool; qk_norm : bool) : void>
+typedef MoeGpuAttnDecFn = function<(var xb2p : float?; var kp : float?; var vp : float?; woq : int64; wok : int64; wov : int64; woo : int64; fq : int; fk : int; fv : int; fo : int; xqp : int8 const?; xsp : float const?; cosp : float const?; rmsqp : float const?; rmskp : float const?; bqp : float const?; bkp : float const?; bvp : float const?; pos : int64; dim : int64; qd : int64; kvd : int64; hs : int64; n_heads : int64; kv_mul : int64; scale : float; eps : float; neox : bool; qk_norm : bool) : void>
 typedef MoeGpuAttnDecOkFn = function<(woq : int64; pos : int64; gen : int64) : int>
 typedef MoeGpuAttnDecClaimFn = function<(fresh : bool) : int64>
 typedef MoeGpuAttnDecHydrateFn = function<(woq : int64; kp : uint8 const?; vp : uint8 const?; npos : int64; kvd : int64; f16 : bool) : void>
@@ -1397,9 +1516,10 @@ let DAT_STALE_GEN = 1    // the session's generation is not the mirrors' - claim
 let DAT_HYDRATE = 2      // this generation, but the layer's rows are not [0, pos) - refill from the host cache
 let DAT_NEVER = 3        // no block, or pos past the mirror cap
 
-[unused_argument(xb2p, kp, vp, woq, wok, wov, woo, fq, fk, fv, fo, xqp, xsp, cosp, rmsqp, rmskp, pos, dim, qd, kvd, hs, n_heads, kv_mul, scale, eps, neox, qk_norm)]
+[unused_argument(xb2p, kp, vp, woq, wok, wov, woo, fq, fk, fv, fo, xqp, xsp, cosp, rmsqp, rmskp, bqp, bkp, bvp, pos, dim, qd, kvd, hs, n_heads, kv_mul, scale, eps, neox, qk_norm)]
 def private moe_gpu_unset_attn_dec(var xb2p : float?; var kp : float?; var vp : float?; woq, wok, wov, woo : int64; fq, fk, fv, fo : int;
                                    xqp : int8 const?; xsp : float const?; cosp : float const?; rmsqp : float const?; rmskp : float const?;
+                                   bqp : float const?; bkp : float const?; bvp : float const?;
                                    pos, dim, qd, kvd, hs, n_heads, kv_mul : int64; scale, eps : float; neox, qk_norm : bool) {
     panic("dasLLAMA: GPU decode attention hit without an installed block")
 }
@@ -1448,17 +1568,18 @@ def public moe_gpu_attn_dec_ok(woq, pos, gen : int64) : int {
     return invoke(g_moe_gpu_attn_dec_ok, woq, pos, gen)
 }
 
-//! One layer's decode attention on the GPU (q/k/v projections, qk-norm+rope into the layer's
-//! mirror, attention over it, wo). `xb2` gets the wo row; `k`/`v` the RAW projection rows -
-//! the host cache's K takes its own norm + rope from them.
+//! One layer's decode attention on the GPU (q/k/v projections, bias, qk-norm+rope into the layer's
+//! mirror, attention over it, wo). `xb2` gets the wo row; `k`/`v` the RAW projection rows (before the
+//! bias) - the host cache row takes its own bias + norm + rope. Bias rows are this layer's, or null.
 def public matmul_moe_gpu_attn_dec(var xb2 : array<float>; var k : array<float>; var v : array<float>;
                                    woq, wok, wov, woo : int64; fq, fk, fv, fo : int;
                                    xq : array<int8>; xs : array<float>; cossin : array<float>;
                                    rmsq : float const?; rmsk : float const?;
+                                   bqp : float const?; bkp : float const?; bvp : float const?;
                                    pos, dim, qd, kvd, hs, n_heads, kv_mul : int64; scale, eps : float; neox, qk_norm : bool) {
     unsafe {
         invoke(g_moe_gpu_attn_dec, addr(xb2[0]), addr(k[0]), addr(v[0]), woq, wok, wov, woo, fq, fk, fv, fo,
-            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), addr<float const?>(cossin[0]), rmsq, rmsk,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), addr<float const?>(cossin[0]), rmsq, rmsk, bqp, bkp, bvp,
             pos, dim, qd, kvd, hs, n_heads, kv_mul, scale, eps, neox, qk_norm)
     }
 }
@@ -1488,22 +1609,23 @@ def public matmul_moe_gpu_dn(var y : array<float>; woq, woz, woo : int64;
     }
 }
 
-//! One full-attention layer's whole softmax attention block on the GPU tier — see MoeGpuAttnFn
-//! for the contract. y gets npos x dim wo rows; k/v get npos x kv_dim roped-k / raw-v rows.
-//! cos/sin are npos x rot/2 NEOX rope rows; rms weight rows may be null when qknorm is off.
+//! One full-attention layer's whole softmax attention block on the GPU tier (MoeGpuAttnFn). y gets
+//! npos x dim wo rows; k/v get npos x kv_dim roped-k / biased-v rows; cos/sin are npos x rot/2 NEOX
+//! rows; rms rows null when qknorm is off, bias rows null without the projection bias (32-arg cap: no kv_mul).
 def public matmul_moe_gpu_attn(var y : array<float>; var k : array<float>; var v : array<float>;
                                woq, wok, wov, woo : int64; fq, fk, fv, fo : int;
                                xq : array<int8>; xs : array<float>;
                                rmsqp : float const?; rmskp : float const?;
+                               bqp : float const?; bkp : float const?; bvp : float const?;
                                cosp : float const?; sinp : float const?;
-                               npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul : int64;
+                               npos, dim, qd, kv_dim, hs, rot, n_heads : int64;
                                scale : float; eps : float; gated : bool; qknorm : bool) {
     unsafe {
         invoke(g_moe_gpu_attn, addr(y[0]), addr(k[0]), addr(v[0]),
             woq, wok, wov, woo, fq, fk, fv, fo,
             addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
-            rmsqp, rmskp, cosp, sinp,
-            npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul, scale, eps, gated, qknorm)
+            rmsqp, rmskp, bqp, bkp, bvp, cosp, sinp,
+            npos, dim, qd, kv_dim, hs, rot, n_heads, scale, eps, gated, qknorm)
     }
 }
 
@@ -1633,6 +1755,27 @@ def private restore_gpu_tier_fn_defaults { // nolint:STYLE037,STYLE038 — flat 
     }
     if (g_moe_gpu_budget_report == null) {
         g_moe_gpu_budget_report = @@moe_gpu_no_budget
+    }
+    if (g_moe_gpu_os_memory == null) {
+        g_moe_gpu_os_memory = @@moe_gpu_no_os_memory
+    }
+    if (g_rdec_note_weight_bytes == null) {
+        g_rdec_note_weight_bytes = @@rdec_no_note_weight_bytes
+    }
+    if (g_rdec_upload_bias == null) {
+        g_rdec_upload_bias = @@rdec_unset_upload_bias
+    }
+    if (g_rdec_moe_ok == null) {
+        g_rdec_moe_ok = @@rdec_unset_moe_ok
+    }
+    if (g_rdec_prepare_moe == null) {
+        g_rdec_prepare_moe = @@rdec_unset_prepare_moe
+    }
+    if (g_rdec_set_moe_layer == null) {
+        g_rdec_set_moe_layer = @@rdec_unset_set_moe_layer
+    }
+    if (g_rdec_set_moe_experts == null) {
+        g_rdec_set_moe_experts = @@rdec_unset_set_moe_experts
     }
     if (g_moe_gpu_binding_cap == null) {
         g_moe_gpu_binding_cap = @@moe_gpu_no_binding_cap

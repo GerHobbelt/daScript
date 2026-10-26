@@ -32,6 +32,8 @@ require daslib/tty
 require daslib/jobque_boost
 require daslib/jobque_profile
 require daslib/apply_in_context
+require daslib/cross_context
+require daslib/module_group
 require daslib/contracts
 require daslib/defer
 require daslib/with_boost
@@ -146,7 +148,7 @@ require strudel/strudel_sf2_voice
 require strudel/strudel_pattern
 require spirv/spirv_reflect
 require dasllama/dasllama
-require ?llvm llvm/daslib/llvm_tune   // nolint:STYLE030,LINT019 — the framework's is_building_documentation check keeps [tune] inert; a build without dasLLVM has no framework to keep inert
+require [tune_framework]   // nolint:STYLE030,LINT019 — the framework's is_building_documentation check keeps [tune] inert; a build without dasLLVM has no framework to keep inert
 
 def document_module_math(_root : string) {
     var mod = get_module("math")
@@ -230,7 +232,7 @@ def document_module_fio(_root : string) {
         group_by_regex("Filesystem queries", mod, %regex~(temp_directory|temp_directory_result|create_temp_file|create_temp_file_result|create_temp_directory|create_temp_directory_result|disk_space)$%%),
         group_by_regex("Terminal queries", mod, %regex~(is_terminal|terminal_width)$%%),
         group_by_regex("OS specific routines", mod, %regex~(sleep|exit|system|popen|popen_binary|popen_timeout|spawn_argv|popen_argv|popen_argv_pipe|popen_timed_out|run_and_capture|spawn_process|process_drain|process_poll|process_wait|process_terminate|process_kill|process_pid|process_alive|close_process|process_running|with_process|get_env_variable|set_env_variable|sanitize_command_line|has_env_variable)$%%),
-        group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path|describe_pending_dynamic_modules|no_manifest)$%%)
+        group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path|register_module_group|describe_pending_dynamic_modules|no_manifest)$%%)
     )
     documents("File input output library", mod, "fio.rst", groups)
 }
@@ -397,12 +399,13 @@ def document_module_dasllama(_root : string) {
 // The TTS facade and its type floor share one page; the family, assembly and front-end
 // modules a TtsModel field names are engine detail, so their types print plain.
 def document_module_dasllama_tts(_root : string) {
-    for (engine in ["dasllama_styletts2", "dasllama_kitten", "dasllama_kokoro", "dasllama_g2p", "dasllama_postag"]) {
+    for (engine in ["dasllama_styletts2", "dasllama_kitten", "dasllama_kokoro", "dasllama_pocket", "dasllama_g2p", "dasllama_postag"]) {
         mark_module_pageless(engine)
     }
     var mod = [find_module("dasllama_tts"), find_module("dasllama_tts_types")]
     var groups <- array<DocGroup>(
-        group_by_regex("Loading and capabilities", mod, %regex~(load_tts_model|g2p_pack_path|caps|tts_voice_lang|finalize)$%%),
+        group_by_regex("Loading and capabilities", mod, %regex~(load_tts_model|g2p_pack_path|caps|tts_voice_lang|tts_needs_packs|tts_has_phonemes|finalize)$%%),
+        group_by_regex("Voices", mod, %regex~(tts_register_voice)$%%),
         group_by_regex("Text front end", mod, %regex~(tts_normalize|tts_phonemize|tts_chunks)$%%),
         group_by_regex("Synthesis", mod, %regex~(synthesize|synthesize_stream)$%%),
         group_by_regex("The served lane", mod, %regex~(set_tts_q8|reset_tts_q8|tts_serves_q8)$%%),
@@ -445,7 +448,7 @@ def document_module_rtti(_root : string) {
         group_by_regex("Initialization and finalization", mod, %regex~(using|LineInfo|CodeOfPolicies|RttiValue_nothing)$%%),
         group_by_regex("Type access", mod, %regex~(get_dim|builtin_is_same_type|is_compatible_cast|get_das_type_name|is_same_type|each_dim|arg_types|arg_names|get_type_size|get_type_align)$%%),
         group_by_regex("Rtti context access", mod, %regex~(get_total_functions|get_total_variables|get_function_info|get_variable_info|get_variable_value|get_function_by_mnh|get_line_info|this_context|context_for_each_function|context_for_each_variable|for_each_init_function|class_info|type_info)$%%),
-        group_by_regex("Program access", mod, %regex~(program_for_each_module|program_for_each_registered_module|get_this_module|get_module|has_module)$%%),
+        group_by_regex("Program access", mod, %regex~(program_for_each_module|program_for_each_registered_module|get_this_module|get_module|has_module|module_group_for_each_member)$%%),
         group_by_regex("Module access", mod, %regex~(module_for_each_structure|module_for_each_enumeration|module_for_each_function|module_for_each_generic|module_for_each_global|module_for_each_annotation|module_for_each_dependency)$%%),
         group_by_regex("Annotation access", mod, %regex~(get_annotation_argument_value|add_annotation_argument|get_annotation|get_annotation_argument|resolve_annotation|each_annotation|each_annotation_argument)$%%),
         group_by_regex("Compilation and simulation", mod, %regex~(compile|compile_file|for_each_expected_error|for_each_require_declaration|simulate|create_ast_serializer|create_ast_deserializer|delete_ast_serializer|serialize_program|deserialize_program|ast_serializer_get_data)$%%),
@@ -454,6 +457,7 @@ def document_module_rtti(_root : string) {
         group_by_regex("Data walking and printing", mod, %regex~(sprint_data|sprint_json_at|sscan_json_at|describe|get_mangled_name)$%%),
         group_by_regex("Function and mangled name hash", mod, %regex~(get_function_by_mangled_name_hash|get_function_mangled_name_hash|get_function_address)$%%),
         group_by_regex("Context and mutex locking", mod, %regex~(lock_this_context|lock_context|lock_mutex)$%%),
+        group_by_regex("Name lookup builder", mod, %regex~name_lookup_.*%%),
         group_by_regex("Runtime data access", mod, %regex~(get_table_key_index)$%%),
         group_by_regex("Tuple and variant access", mod, %regex~(get_tuple_field_offset|get_variant_field_offset)$%%),
         group_by_regex("Lint suppression", mod, %regex~(rtti_get_source_line|rtti_is_nolint_suppressed|is_lint_suppressed|was_nolint_consumed|extract_lint_code)$%%),
@@ -466,14 +470,14 @@ def document_module_rtti(_root : string) {
 def document_module_ast(_root : string) {
     var mod = [get_module("ast_core"), find_module("ast")]
     var groups <- array<DocGroup>(
-        group_by_regex("Compilation and file access", mod, %regex~(compile|compile_file|parse_file|make_file_access)$%%),
+        group_by_regex("Compilation and file access", mod, %regex~(compile|compile_file|parse_file|make_file_access|require_module_now)$%%),
         group_by_regex("Call generation", mod, %regex~(make_call)$%%),
         group_by_regex("Visitor pattern", mod, %regex~visit.*%%),
         group_by_regex("Expression generation", mod, %regex~(force_generated|get_expression_annotation|make_type_info_structure|stamp_missing_at)%%),
         group_by_regex("Adapter generation", mod, %regex~make_.*%%),
         group_by_regex("Adapter application", mod, %regex~(add_.*_(annotation|macro)|add_new_comment_reader|add_comment_reader|add_module_option)%%),
         group_by_regex("Adding objects to objects", mod, %regex~add_.*%%),
-        group_by_regex("Program and module access", mod, %regex~(this_program|this_module|compiling_program|compiling_module)$%%),
+        group_by_regex("Program and module access", mod, %regex~(this_program|this_module|compiling_program|compiling_module|has_macro_context|find_macro_context|is_used|function_index|variable_index|is_jit_selected|set_jit_selected|clear_jit_selection)$%%),
         group_by_regex("Textual descriptions of the objects", mod, %regex~(describe.*|das_to_string)%%),
         group_by_regex("Searching", mod, %regex~find.*%%),
         group_by_regex("Iterating", mod, %regex~(for_each.*|.*_foreach)%%),
@@ -696,6 +700,23 @@ def document_module_apply_in_context(_root : string) {
     var groups <- array<DocGroup>(
     )
     document("Cross-context evaluation helpers", mod, "apply_in_context.rst", groups)
+}
+
+def document_module_cross_context(_root : string) {
+    var mod = find_module("cross_context")
+    var groups <- array<DocGroup>(
+        group_by_regex("Late require", mod, %regex~(require_module_now|macro_context_of)$%%),
+        group_by_regex("Calls into a macro context", mod, %regex~(call_in_context)$%%)
+    )
+    document("A module required after the walk, and calls into its macro context", mod, "cross_context.rst", groups)
+}
+
+def document_module_module_group(_root : string) {
+    var mod = find_module("module_group")
+    var groups <- array<DocGroup>(
+        group_by_regex("Group members", mod, %regex~(module_group_module_name)$%%)
+    )
+    document("Calls into every member of a module group", mod, "module_group.rst", groups)
 }
 
 def document_module_ansi_colors(_root : string) {
@@ -1949,6 +1970,8 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_ansi_colors(root)
     document_module_tty(root)
     document_module_apply_in_context(root)
+    document_module_cross_context(root)
+    document_module_module_group(root)
     document_module_apply(root)
     document_module_archive(root)
     document_module_array_boost(root)

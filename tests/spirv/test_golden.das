@@ -121,6 +121,7 @@ def test_golden_disassembly(t : T?) { // nolint:STYLE038 - flat list of golden f
         check(t, "echain", echain_words())
         check(t, "eret", eret_words())
         check(t, "rfor", rfor_words())
+        check(t, "ufor", ufor_words())
         // resource / composite fixtures: ids legitimately renumber (call/composite result allocated
         // before operands in the hand-walker, after them in the post-order visitor) -> id-isomorphic.
         check_iso(t, "tri_vert", tri_vert_words())
@@ -175,6 +176,9 @@ def test_golden_disassembly(t : T?) { // nolint:STYLE038 - flat list of golden f
         check(t, "userfn", userfn_words())
         check(t, "userfn_ref", userfn_ref_words())
         check(t, "userfn_global", userfn_global_words())
+        check(t, "spdirect", spdirect_words())
+        check(t, "spelem", spelem_words())
+        check(t, "spelemi", spelemi_words())
         // PR-D mesh + task stage scaffolding fixtures (visitor baseline): cap + ext + execution model
         // + execution modes + SetMeshOutputsEXT (mesh) / EmitMeshTasksEXT (task). byte-identical
         // check() pins the opcode AND id-allocation order of the prologue intrinsics.

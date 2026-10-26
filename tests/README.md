@@ -16,6 +16,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | test_lifecycle.das | Lifecycle functions - get_dt, get_uptime, get_fps, is_paused/set_paused, exit_requested, is_reload, is_live_mode | |
 | test_commands.das | Live command dispatch - [live_command] registration, JSON dispatch, args passing, null return, error handling | |
 | test_live_vars.das | `@live` variable viewer - annotation, archive round-trip, type coverage (int, float, string, bool) | |
+| test_host_ready.das | daslang-live spawned beside the running daslang on `_fixture_host_ready.das` serves `/status` and ends on `/shutdown` - the LiveHost module loads before the host reads its exports | |
 
 ## algorithm/
 
@@ -848,6 +849,14 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 |---|---|---|
 | test_pipes.das | lpipe macro - pipe into function calls, chain operators | |
 
+## lsp/
+
+| File | Description | Expects errors |
+|---|---|---|
+| _fixture_clean.das | *(helper)* the clean disk file the protocol test opens with broken buffer text | |
+| test_lsp_project_root.das | the validate subtool under -project_root sees a project's own descriptors | |
+| test_lsp_protocol.das | the LSP server over a stdio pipe - handshake, overlay diagnostics, navigation, shutdown | |
+
 ## match/
 
 | File | Description | Expects errors |
@@ -1115,6 +1124,14 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 | File | Description | Expects errors |
 |---|---|---|
 | test_uri.das | URI parsing, normalize, rebase, query params, edge cases | |
+
+## watchdog/
+
+| File | Description | Expects errors |
+|---|---|---|
+| _fixture_watchdog_child.das | *(helper)* the supervised child - a run counter and a mode pick the story it acts out | |
+| test_stdio_front.das | the --stdio front through both hosts - the server's own initialize result, local ping, lazy child, respawn after the server's shutdown | |
+| test_watchdog.das | the supervisor - restart backoff, exit-code policy, stages, crash bundles, the stop ladder, the tray | |
 
 ## verify/
 

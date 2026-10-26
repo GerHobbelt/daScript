@@ -1,16 +1,17 @@
-# Shared emitter rules - dasSpirv and dasMetal
+# Shader Emitters Code Review Checklist
 
-**Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist. A change
-under either module, or to any kernel body or fixture either emitter compiles, applies this
-list with that folder's own.** Architecture docs: `dasMetal/ARCHITECTURE.md` and
-`dasSpirv/ARCHITECTURE.md`.
+**Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
+docs: `dasMetal/ARCHITECTURE.md`, `dasSpirv/ARCHITECTURE.md`, `dasSpirv/ARCHITECTURE_COOPMAT.md`.
+
+**Routed here by another checklist: a diff under `dasMetal/` or `dasSpirv/`, or to any kernel
+body or fixture either emitter compiles, applies this list together with its own folder's.**
 
 **Never put anything that cannot run on the CPU into a kernel body or into a function a kernel
-calls - keep both in ordinary das.** The CPU run of the same body is what the tests compare
-against.
+calls - keep both in ordinary das.** The tests compare the kernel against a CPU run.
 
-**A diff that adds or changes an emitter builtin ships a CPU body that returns what the emitted
-form returns, argument for argument.**
+**A diff that adds or changes an emitter builtin - a declaration in
+`daslib/shader_lingua_franca.das` or an emitter's builtin table - ships a CPU body that returns
+what the emitted form returns, argument for argument.**
 
 **Never let a construct the emitter cannot lower produce a kernel or a crash - the emitter
 reports a compile error that names the construct.**
@@ -19,17 +20,17 @@ reports a compile error that names the construct.**
 constant.** A shape constant is any value that fixes the kernel's tiling: a tile row count, a
 tile column count, a cooperating-simdgroup count, a staged chunk depth.
 
-**Never pass a matmul reduction width known only at run time into a kernel that accumulates
-through the emitter's matrix or tensor ops any way but through the emitter's runtime-extent
-descriptor - `dynamic_extent` on Metal, and on SPIR-V a `tensorLayout2D` or `tensorLayout2DPad`
-whose dimension `tensorLayoutSetDimension` sets.** The reduction width is the K dimension - the
-length of the loop the kernel accumulates over; it does not fix tiling, so it is not a shape
-constant. A hand-written reduction loop takes K as a plain uniform.
+**A kernel that loads its operands with the emitter's tensor-load ops (`coopmatLoadTensor*`,
+`coopmatLoadTensorDecode`) receives a run-time-only matmul reduction width through the
+emitter's runtime-extent descriptor and no other way - `dynamic_extent` on Metal, a
+`tensorLayout2D` or `tensorLayout2DPad` whose dimension `tensorLayoutSetDimension` sets on
+SPIR-V.** The reduction width is the K dimension - the length of the loop the kernel
+accumulates over; it does not fix tiling, so it is not a shape constant.
 
-**A diff that makes a kernel need a shape value known only at run time ships a specialization
-path, or records in the emitter's architecture doc - `dasMetal/ARCHITECTURE.md` for a Metal
-kernel, `dasSpirv/ARCHITECTURE.md` for a SPIR-V kernel - that the kernel cannot have one.** A
-specialization path is one compiled variant per constant shape.
+**A diff that makes a kernel need a shape constant known only at run time ships a
+specialization path, or records in an `ARCHITECTURE*.md` at the root of the module the kernel
+ships in that the kernel cannot have one.** A specialization path is one compiled variant per
+constant shape.
 
 **Never check a claim about emitted shape against the das source - check it in the emitted
 words or text.** Emitted shape is the structure of the emitted kernel - its signature, its
@@ -37,8 +38,10 @@ parameter attributes, its statement forms - and its stamped shape values (tile, 
 threadgroup sizes).
 
 **A diff that adds a kernel-model capability to one emitter adds it to the other, or records
-the asymmetry in the shared ledger (`dasMetal/ARCHITECTURE.md`).** A kernel-model
-capability is anything that changes how a kernel is written or how its body is lowered.
+the asymmetry in the shared ledger (`dasMetal/ARCHITECTURE.md`).** A kernel-model capability
+is present on an emitter when a kernel source that uses it compiles there; a diff that leaves
+every kernel source compiling exactly as it did before changed lowering alone, and answers to
+that emitter folder's own checklist.
 
 **A diff that puts a `daslib/shader_lingua_franca` declaration into a kernel body or fixture an
 emitter compiles, where that emitter does not handle it, ships, in the same change, either
@@ -46,8 +49,8 @@ that emitter's lowering of the declaration or a test showing the emitter rejects
 declaration by name.** A declaration in that module is available to both emitters.
 
 **A `?:`, `&&`, or `||` in a `[spirv_kernel]` or `[compute_shader]` body, or in any `def` that
-body calls, never indexes a global - a module global, a `@workgroup` array, or a
-`self.<member>` resource - in an operand the condition can skip; read the value into a local
-above the operator instead, and when the condition was the only thing keeping the index in
-range, clamp the index.** The emitter lowers such an operand as a branch
-(`dasSpirv/ARCHITECTURE.md`, "Operand laziness follows the language").
+body calls, whose skippable operand subscripts a global-rooted array - a module global, a
+`@workgroup` array, or a `self.<member>` resource - is left in its short-circuit form: never
+rewritten around the emitter with an if/else, a clamp or an unconditional read.** The emitter
+lowers such an operand as a branch (`dasSpirv/ARCHITECTURE.md`, "Operand laziness follows the
+language").

@@ -85,7 +85,7 @@ def collectInitFunctionAotNames(program : ProgramPtr; var context : Context) : a
     let thisModule = program.getThisModule
     program.get_ptr() |> for_each_module_no_order($(pm) {
         pm |> for_each_module_function($(pfun) {
-            if (pfun.index < 0 || !pfun.flags.used || !(initMnhSet |> key_exists(pfun.getMangledNameHash))) {
+            if (function_index(program, pfun) < 0 || !is_used(program, pfun) || !(initMnhSet |> key_exists(pfun.getMangledNameHash))) {
                 return
             }
             if (pm != thisModule) {
@@ -116,8 +116,8 @@ def private usedGlobals(var program : ProgramPtr) : array<Variable?> {
     if (program.totalVariables > 0) {
         program.get_ptr() |> for_each_module_no_order($(pm) {
             pm |> for_each_global($(pvar) {
-                if (!pvar.flags.used) return
-                if (pvar.index < 0) {
+                if (!is_used(program, pvar)) return
+                if (variable_index(program, pvar) < 0) {
                     macro_error(program, pvar.at, "standalone AOT: global {pvar.name} is used but was never allocated an index")
                     return
                 }
@@ -136,8 +136,8 @@ def private standaloneCollects(program : ProgramPtr) : bool {
 //! A `VarInfo` per global, made before the helper dumps its tables so every type they name is in
 //! the dump: the collector walks each global through its info, the way the interpreter's
 //! simulate step wires it.
-def private makeGlobalVarInfos(var helper : AotDebugInfoHelper?; globals : array<Variable?>) : array<tuple<index : int; info : VarInfo?>> {
-    return <- [for (pvar in globals); (index = pvar.index, info = helper.helper |> make_variable_debug_info(pvar))]
+def private makeGlobalVarInfos(program : ProgramPtr; var helper : AotDebugInfoHelper?; globals : array<Variable?>) : array<tuple<index : int; info : VarInfo?>> {
+    return <- [for (pvar in globals); (index = variable_index(program, pvar), info = helper.helper |> make_variable_debug_info(pvar))]
 }
 
 def private writeGlobalVarInfos(var helper : AotDebugInfoHelper?; infos : array<tuple<index : int; info : VarInfo?>>; var tw : StringBuilderWriter) {
@@ -150,6 +150,72 @@ def private writeGlobalVarInfos(var helper : AotDebugInfoHelper?; infos : array<
     }
 }
 
+//! the sealed lookup, written as the constant arrays the generated constructor adopts: a NameLookup::StaticTable
+//! named `<prefix>_table` and the four arrays it points at
+def private writeLookupTables(var tw : StringBuilderWriter; prefix : string; lookup : NameLookup?) {
+    write(tw, "    static const NameLookup::Entry {prefix}_entries[] = \{\n")
+    for (i in urange(name_lookup_mnh_slots(lookup))) {
+        write(tw, "        \{0x{name_lookup_entry_mnh(lookup, i):x}ull, {name_lookup_entry_value(lookup, i):d}u, {name_lookup_entry_index(lookup, i):d}u, {name_lookup_entry_next(lookup, i)}, 0\},\n")
+    }
+    write(tw, "    \};\n")
+    write(tw, "    static const NameLookup::NameSlot {prefix}_names[] = \{\n")
+    for (i in urange(name_lookup_name_slots(lookup))) {
+        write(tw, "        \{0x{name_lookup_name_hash(lookup, i):x}ull, {name_lookup_name_head(lookup, i)}, 0\},\n")
+    }
+    write(tw, "    \};\n")
+    write(tw, "    static const uint32_t {prefix}_mnh_disp[] = \{")
+    for (i in urange(name_lookup_mnh_buckets(lookup))) {
+        write(tw, " {name_lookup_mnh_disp(lookup, i):d}u,")
+    }
+    write(tw, " \};\n")
+    write(tw, "    static const uint32_t {prefix}_name_disp[] = \{")
+    for (i in urange(name_lookup_name_buckets(lookup))) {
+        write(tw, " {name_lookup_name_disp(lookup, i):d}u,")
+    }
+    write(tw, " \};\n")
+    write(tw, "    static const NameLookup::StaticTable {prefix}_table = \{ {name_lookup_mnh_buckets(lookup):d}u, {name_lookup_mnh_slots(lookup):d}u, {name_lookup_name_buckets(lookup):d}u, {name_lookup_name_slots(lookup):d}u, {name_lookup_count(lookup):d}u, 0u, {prefix}_mnh_disp, {prefix}_name_disp, {prefix}_entries, {prefix}_names \};\n")
+}
+
+//! the standalone context's function lookup: its table is dense, one slot per emitted function in emission
+//! order, so the index is the position in `usedFunctions`, never the compiler's function index
+def private writeFunctionLookup(var tw : StringBuilderWriter; usedFunctions : array<Function?>) {
+    var lookup = unsafe(name_lookup_create())
+    var index = 0u
+    for (pfun in usedFunctions) {
+        name_lookup_insert(lookup, pfun.getMangledNameHash, string(pfun.name), index, index)
+        index++
+    }
+    name_lookup_seal(lookup)
+    writeLookupTables(tw, "fn_lookup", lookup)
+    unsafe {
+        name_lookup_destroy(lookup)
+    }
+}
+
+//! the standalone context's global lookup: the value is the offset InitGlobalVariable assigns at construction -
+//! the 16-byte-rounded running size of the shared or the plain globals, in declaration order - and the
+//! generated constructor verifies every global against it, so the two computations cannot drift apart silently
+def private writeVariableLookup(program : ProgramPtr; var tw : StringBuilderWriter; globals : array<Variable?>) {
+    var lookup = unsafe(name_lookup_create())
+    var globalsSize = 0u
+    var sharedSize = 0u
+    for (pvar in globals) {
+        let size = (uint(pvar._type.sizeOf) + 15u) & ~15u
+        let offset = pvar.flags.global_shared ? sharedSize : globalsSize
+        if (pvar.flags.global_shared) {
+            sharedSize += size
+        } else {
+            globalsSize += size
+        }
+        name_lookup_insert(lookup, hash(pvar |> get_mangled_name()), string(pvar.name), uint(variable_index(program, pvar)), offset)
+    }
+    name_lookup_seal(lookup)
+    writeLookupTables(tw, "var_lookup", lookup)
+    unsafe {
+        name_lookup_destroy(lookup)
+    }
+}
+
 def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var tw : StringBuilderWriter, program : ProgramPtr; lookupVariableTable : array<Variable?>; var context : Context) {   // nolint:STYLE038 - flat emitter - one write per ctor section
 
     let min_init_stack = 16384
@@ -157,7 +223,8 @@ def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var 
     let requested_stack = stack_arg ?as tInt ?? int(program.policies.stack)
     let stack_base = requested_stack > 0 && stack_arg is tInt ? requested_stack : max(requested_stack, min_init_stack)
     let stack_size = stack_base + int(program.globalInitStackSize)
-    let usedFunctionCount = length(collectProgramUsedFunctions(program, true, false))
+    let usedFunctions <- collectProgramUsedFunctions(program, true, false)
+    let usedFunctionCount = length(usedFunctions)
     write(tw, "{cfg.class_name}::{cfg.class_name}() : Context({stack_size}/*stack*/) \{\n");
     write(tw, "    auto & context = *this;\n");
     write(tw, "    CodeOfPolicies policies;");
@@ -176,9 +243,10 @@ def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var 
 
     write(tw, "     // start totalVariables\n");
     for (pvar in lookupVariableTable) {
-        write(tw, "    InitGlobalVar(context, &context.globalVariables[{pvar.index}/*pvar->index*/], GlobalVarInfo(\"")
+        let vindex = variable_index(program, pvar)
+        write(tw, "    InitGlobalVar(context, &context.globalVariables[{vindex}/*pvar->index*/], GlobalVarInfo(\"")
         write(tw, "{pvar.name}\", \"{pvar |> get_mangled_name()}\", {pvar._type.sizeOf}, {pvar.flags.global_shared}));\n");
-        write(tw, "    context.globalVariables[{pvar.index}].debugInfo = &__gvar_info_{pvar.index};\n");
+        write(tw, "    context.globalVariables[{vindex}].debugInfo = &__gvar_info_{vindex};\n");
     }
     write(tw, "     // end totalVariables\n\n");
     write(tw, "    context.allocateGlobalsAndShared();\n");
@@ -192,8 +260,9 @@ def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var 
     write(tw, "/*(policies.threadlock_context || policies.debugger)*/ ) \{\n");
     write(tw, "        context.contextMutex = new recursive_mutex;\n");
     write(tw, "    }\n");
-    write(tw, "    context.tabMnLookup = make_shared<das_hash_map<uint64_t,SimFunction *>>();\n");
-    write(tw, "    context.tabMnLookup->clear();\n");
+    writeFunctionLookup(tw, usedFunctions)
+    write(tw, "    context.functionLookup = make_shared<NameLookup>();\n");
+    write(tw, "    context.functionLookup->adopt(fn_lookup_table);\n");
 
     if (!empty(initFunctions)) {
         write(tw, "     // start totalFunctions\n");
@@ -206,17 +275,18 @@ def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var 
         write(tw, "    for (const auto& [index, func_info, debug_info]: usedFunctions) \{\n");
         write(tw, "        InitAotFunction(context, &context.functions[index], func_info);\n");
         write(tw, "        context.functions[index].debugInfo = debug_info;\n");
-        write(tw, "        (*context.tabMnLookup)[func_info.mnh] = context.functions + index;\n");
+        write(tw, "        DAS_VERIFYF(context.functionLookup->valueByMnh(func_info.mnh)==uint32_t(index), \"standalone function '%s' sits at index %d, its emitted lookup says %u\", func_info.name.c_str(), int(index), context.functionLookup->valueByMnh(func_info.mnh));\n");
         write(tw, "        id_to_funcs.emplace_back(func_info.aotHash, &context.functions[index]);\n");
         write(tw, "        anyPInvoke |= func_info.pinvoke;\n");
         write(tw, "    \}\n");
     }
 
-    write(tw, "    context.tabGMnLookup = make_shared<das_hash_map<uint64_t,uint32_t>>();\n");
-    write(tw, "    context.tabGMnLookup->clear();\n");
+    writeVariableLookup(program, tw, lookupVariableTable)
+    write(tw, "    context.variableLookup = make_shared<NameLookup>();\n");
+    write(tw, "    context.variableLookup->adopt(var_lookup_table);\n");
     write(tw, "    for ( int i=0, is=context.totalVariables; i!=is; ++i ) \{\n");
-    write(tw, "        auto mnh = context.globalVariables[i].mangledNameHash;\n");
-    write(tw, "        (*context.tabGMnLookup)[mnh] = context.globalVariables[i].offset;\n");
+    write(tw, "        auto & gvar = context.globalVariables[i];\n");
+    write(tw, "        DAS_VERIFYF(context.variableLookup->valueByMnh(gvar.mangledNameHash)==gvar.offset, \"standalone global '%s' sits at offset %u, its emitted lookup says %u\", gvar.name, gvar.offset, context.variableLookup->valueByMnh(gvar.mangledNameHash));\n");
     write(tw, "    \}\n");
     write(tw, "    context.tabAdLookup = make_shared<das_hash_map<uint64_t,uint64_t>>();\n");
     program.get_ptr() |> for_each_module_no_order($(pm) {
@@ -271,7 +341,7 @@ class StandaloneContextGen : CppAot {
         var globals : array<Variable?>;
         prog.get_ptr() |> for_each_module($(pm) {
             pm |> for_each_global($(pvar) {
-                if (pvar.index < 0 || !pvar.flags.used
+                if (variable_index(prog, pvar) < 0 || !is_used(prog, pvar)
                         || pvar._module == prog.getThisModule) return ;
                 globals.push(pvar);
             });
@@ -424,7 +494,7 @@ def genStandaloneSrc(var program : ProgramPtr;
             }
 
             initFunctions = addFunctionInfo(collectProgramUsedFunctions(program, true, false), gen.helper);
-            let globalInfos <- makeGlobalVarInfos(gen.helper, globals)
+            let globalInfos <- makeGlobalVarInfos(program, gen.helper, globals)
             type_defs += gen.declarations;
             gen.declarations = "";
             write(tw, gen.str());
@@ -454,7 +524,7 @@ def private isMarkedNoAot(pfun : Function?) : bool {
 def private checkAllUsedFunctionsCanAot(program : ProgramPtr) {
     program.get_ptr() |> for_each_module_no_order($(pm) {
         pm |> for_each_module_function($(pfun) {
-            if (pfun.index < 0 || !pfun.flags.used || pfun.flags.builtIn) {
+            if (function_index(program, pfun) < 0 || !is_used(program, pfun) || pfun.flags.builtIn) {
                 return
             }
             if (pfun.flags.noAot) {
@@ -514,7 +584,7 @@ def private prepareProgramForEmission(var program : ProgramPtr; context : Contex
         program.get_ptr() |> for_each_module_no_order($(pm) {
             if (pm == thisModule) return
             pm |> for_each_global($(pvar) {
-                if (pvar.index < 0 || !pvar.flags.used || pvar.init == null) return
+                if (variable_index(program, pvar) < 0 || !is_used(program, pvar) || pvar.init == null) return
                 visit_expression(pvar.init, adapter_coll)
             })
         })

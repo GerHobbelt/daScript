@@ -1,8 +1,8 @@
 # dasLLAMA Code Review Checklist - placement
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-docs: `ARCHITECTURE_ENGINE.md`, `ARCHITECTURE_GPU.md`, `ARCHITECTURE_MEDIA.md`,
-`ARCHITECTURE_TTS.md` (sec.1 in each - the per-file charters).
+doc: `ARCHITECTURE.md`, the index of the `ARCHITECTURE_*.md` set beside this file - sec.1 in each
+companion is the per-file charters. Planned work: `followup_general.md`.
 
 **Routed from `REVIEW.md`: a diff that checklist routes here applies this list together with
 it.**
@@ -11,11 +11,15 @@ it.**
 charters own the per-file list; a rule naming what KIND of code lands in which file is the
 checklist's own.
 
-**A tensor format conversion lands in `dasllama/dasllama_convert.das`.**
+**A function whose KIND the file's sec.1 charter line seats in another file lands in that
+file, or the charter line changes in the same diff.**
 
-**A disk-order -> compute-order transform lands per scope: a transform a kernel's layout needs
-in `dasllama/dasllama_repack.das`, a transform run while the model loads in
-`dasllama/dasllama_layout.das`.**
+**A HOST-side tensor format conversion lands in `dasllama/dasllama_convert.das`; a kernel-side
+decode helper rides its backend's kernel home.**
+
+**A disk-order -> compute-order transform lands by its consumer: a transform into the layout
+a CPU row core reads in `dasllama/dasllama_repack.das`, a transform into the layout a GPU plane
+or gather reads in `dasllama/dasllama_layout.das`.**
 
 **A CPU KV-cache store, read, score dot, or V-accumulate OVER CACHE BYTES - a codec primitive
 that knows the K/V element format - lands in `dasllama/dasllama_kv_codec.das`, its format
@@ -27,27 +31,31 @@ backend file (`dasllama/dasllama_spm.das` / `dasllama/dasllama_bpe.das`).**
 
 **A kernel body - the arithmetic loop itself, the one a `[tune]` family or a dispatch class (a
 class a `[metal_dispatch]` or `[vk_dispatch]` declares) picks one variant of - lands in its
-owner's backend file.** A GPU kernel body lands in the file where its pipeline state object
-(PSO) is compiled and released. A CPU-tier kernel body lands in that tier's
-`dasllama/dasllama_math_<tier>.das`. A kernel body never lands in `dasllama/dasllama_math.das`
-or in a file whose job is declaring kernels and routing dispatch. A class stamped from a
-template declared elsewhere is not a kernel body: it compiles and releases its own PSO where it
-is stamped.
+owner's backend file.** A GPU kernel body lands in its backend's kernel home -
+`dasllama/dasllama_metal_kernels.das`, `dasllama/dasllama_vulkan_classes.das` - never in a
+driver, seat or math file. A CPU-tier kernel body lands in that tier's
+`dasllama/dasllama_math_<tier>.das`, never in `dasllama/dasllama_math.das`. A class stamped from
+a template declared elsewhere is not a kernel body: it compiles its own PSO where it is stamped.
 
 **A quirk of one family - one model architecture's file, or one backend driver's - lands in that
 file, never sideways into a sibling.**
 
-**A piece two files need lands in their nearest shared file (its own file when none exists) -
-never a second copy.** A predicate, a constant, or a helper spelled twice drifts on the first
-edit to one copy. A piece two folders outside each other both need lands in the folder that
-owns the concern; one landing under `dasllama/` that code outside `modules/dasLLAMA/` drives
-lands as a public entry module - one `dasllama/dasllama_lint.das` licenses a consumer to
-require directly.
+**A piece two files both execute lands in their nearest shared file (its own file when none
+exists) - never a second copy: two spellings that can drift apart on the first edit to one.** An
+enum-and-int twin of one predicate inside one file is the tier's idiom, and a test's CPU oracle
+that restates the arithmetic is a witness - neither is a copy.
+
+**A caller never re-checks a guard its callee checks - drop the caller's copy and let the
+callee's check stand.**
+
+**A piece two folders outside each other both need lands in the folder that owns the concern;
+one landing under `dasllama/` that code outside `modules/dasLLAMA/` drives lands as a public
+entry module** - one `dasllama/dasllama_lint.das` licenses a consumer to require directly.
 
 **A family gaining an arm for a media kind adds that kind's span markers to that family's chat
 template, never to a second renderer.** Span markers are the template text that opens and
 closes the media rows. A family whose template or vocab lacks them has no arm for that media
-kind - `create_chat_` panics at create, not at render.
+kind.
 
 **No signature in `dasllama/dasllama_tower.das` takes a type that
 `dasllama/dasllama_audio.das`, `dasllama/dasllama_vision.das`, or a family file declares.**
@@ -82,9 +90,9 @@ it does, `dasllama/dasllama_common.das` panics on the unset hook with a message 
 module to require. A program root (test, harness, benchmark, tool) requires the registration
 module it needs directly.
 
-**A `dasllama/` module whose `[init]` registers a hook the engine dispatches through is
-required from `dasllama/dasllama_transformer.das` in the same change that adds it** - a
-registration no umbrella reaches never fires for a consumer of the `dasllama.das` facade.
+**A `dasllama/` module whose `[init]` registers a hook the engine dispatches through gets its
+side-effect require in the same change that adds it** - a registration no engine file reaches
+never fires for a consumer of the `dasllama.das` facade; where it lands is the rule above's.
 
 **An architecture file (`dasllama/dasllama_arch_*.das`) that changes a forward loop, or tests a
 family name on a shared path, is a defect - it carries declarative registration only.**

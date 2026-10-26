@@ -21,7 +21,7 @@ require daslib/json public                // JV(...) for logger field payloads
 require daslib/json_boost                 // ?[] / ?? navigation — the sidecar provenance reader
 require dasllama/dasllama_common public   // QuantMode
 require dasllama/dasllama_math            // active_kernel_backend — the exec_fmt layout receipt
-require ?llvm llvm/daslib/llvm_tune       // nolint:STYLE030,LINT019 — tune_status, the stamp provenance; empty without the framework
+require [tune_framework]                  // nolint:STYLE030,LINT019 — tune_status, the stamp provenance; empty without the framework
 require model_specs public                // the model-set table + its llm/official views
 require box_ident                         // derive_box_name — the hardware-keyed box tag
 
@@ -1934,7 +1934,7 @@ let private BENCH_ENV_VARS = fixed_array(
     "DASLLAMA_GPU_DENSE", "DASLLAMA_GPU_DENSE_ATTN",
     "DASLLAMA_GPU_DENSE_SHEXP", "DASLLAMA_GPU_DN", "DASLLAMA_GPU_DND", "DASLLAMA_GPU_HEAT",
     "DASLLAMA_GPU_MIN_CTX", "DASLLAMA_GPU_MOE_LAYERS", "DASLLAMA_GPU_MOE_STREAM",
-    "DASLLAMA_GPU_NAME", "DASLLAMA_GPU_PROF", "DASLLAMA_GPU_QKV", "DASLLAMA_GPU_SHEXP",
+    "DASLLAMA_GPU_NAME", "DASLLAMA_GPU_PROF", "DASLLAMA_GPU_QKV", "DASLLAMA_GPU_RESIDENT", "DASLLAMA_GPU_SHEXP",
     "DASLLAMA_GPU_VRAM_MB", "DASLLAMA_IMAGE", "DASLLAMA_METAL_ATTN", "DASLLAMA_METAL_ATTN_D",
     "DASLLAMA_METAL_ATTN_SINGLE", "DASLLAMA_METAL_BATCH_CONCURRENT", "DASLLAMA_METAL_BATCH_FUSE",
     "DASLLAMA_METAL_BATCH_GEMM_MIN", "DASLLAMA_METAL_BATCH_MM", "DASLLAMA_METAL_BATCH_MV",

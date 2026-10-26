@@ -26,6 +26,7 @@
     position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
     justify-content: center; gap: 14px; background: #12101a; cursor: default;
   }
+  #gate[hidden] { display: none; }
   #gate h1 { font-weight: 500; font-size: 26px; margin: 0; color: #f4e9d2; letter-spacing: 0.02em; }
   #gate p { margin: 0; color: #8d8577; }
   #bar { width: 320px; height: 6px; border-radius: 3px; background: #2a2636; overflow: hidden; }
@@ -38,6 +39,7 @@
   #note { max-width: 520px; text-align: center; line-height: 1.6; }
   #note b { color: #f4e9d2; font-weight: 500; }
   #note a { color: #f2b955; }
+  #note code { color: #d6cfbf; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -46,11 +48,15 @@
      wasm64 (memory64) with real Web Workers, so it needs an engine with memory64 (Chrome or
      Edge 133+, Firefox 134+; Safari has none yet, and every iPhone and iPad browser is Safari's
      engine) on a cross-origin-isolated page; a browser
-     without either gets the note below and never fetches a byte. Otherwise it fetches the
-     story model, the TTS model and its phoneme packs into MEMFS before the program starts,
-     then waits for a click - browsers only let audio start from a gesture. Models come from
-     ./models/ beside the page, or ?models=<base url>. ?force=unsupported shows the note on a
-     supporting browser, for checking the page. -->
+     without either gets the note below and never fetches a byte. Then it reads
+     models/manifest.json - the list the deploy minted, stamped with the IMAGE_VERSION it minted
+     at - and refuses a set minted for another version before fetching a megabyte of it: the
+     program would decline the images anyway, this way the reason is on the page. Otherwise it
+     fetches the story model, the TTS model and its phoneme packs into MEMFS before the program
+     starts, then waits for a click - browsers only let audio start from a gesture. Models come
+     from ./models/ beside the page, or ?models=<base url>. ?force=unsupported shows the note on a
+     supporting browser, for checking the page. A program that aborts after the click puts its
+     last engine lines back on the page instead of a black canvas. -->
 <nav class="dio-nav" id="nav"><div class="forge-container"><div class="dio-nav__inner">
 <div class="dio-nav__left">
 <button class="dio-nav__burger" onclick="document.getElementById('nav').classList.toggle('is-open')">≡</button>
@@ -63,7 +69,7 @@
 <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
 <div id="gate">
   <h1>storyteller</h1>
-  <p id="status">fetching the models...</p>
+  <p id="status">reading the model list...</p>
   <div id="bar"><i id="fill"></i></div>
   <button id="start">start</button>
   <p id="note" hidden></p>
@@ -75,6 +81,10 @@
 <script>
   var SCROLL_KEYS = { ArrowUp:1, ArrowDown:1, ArrowLeft:1, ArrowRight:1, ' ':1, Spacebar:1, PageUp:1, PageDown:1, Home:1, End:1 };
   window.addEventListener('keydown', function (e) { if (SCROLL_KEYS[e.key]) e.preventDefault(); }, { passive: false });
+
+  // the IMAGE_VERSION this page's program was built with - the deploy stamps it (pages.yml, from
+  // modules/dasLLAMA/dasllama/dasllama_image.das); 0 means "not stamped" (a local rig), no check
+  var PAGE_IMAGE_VERSION = /* @image-version */ 0;
 
   // wasm64 (memory64): validate a minimal module whose memory section carries the memory64
   // flag (0x04) - true only where the engine parses it, unlike a Memory descriptor probe an
@@ -91,13 +101,24 @@
 
   function setStatus(text) { document.getElementById('status').textContent = text; }
   function showNote(status, html) {
-    var note = document.getElementById('note');
+    var gate = document.getElementById('gate'), note = document.getElementById('note');
+    gate.hidden = false;
     note.innerHTML = html + '<br><a href="/examples.html">back to the examples</a>';
     note.hidden = false;
     setStatus(status);
     document.getElementById('bar').hidden = true;
     document.getElementById('start').style.display = 'none';
   }
+  function escapeHtml(text) {
+    var span = document.createElement('span');
+    span.textContent = text;
+    return span.innerHTML;
+  }
+
+  // a page the browser brings back from its back-forward cache returns with the program's
+  // workers and the audio output frozen mid-frame and out of step with each other, and the
+  // first thing heard is whatever sat in the output ring: such a page starts over instead
+  window.addEventListener('pageshow', function (e) { if (e.persisted) location.reload(); });
 
   if (!SUPPORTED) {
     if (FORCE === 'unsupported' || !HAS_WASM64) {
@@ -116,19 +137,14 @@
     // throws "compiled without support for <browser>" at the top of its script): the error
     // becomes the note while the gate is still up, never a download line that stays forever
     window.addEventListener('error', function (e) {
-      if (!document.getElementById('gate') || !e.message) return;
-      var text = document.createElement('span');
-      text.textContent = e.message;
-      showNote('this browser cannot run the build', '<b>This browser cannot run the storyteller.</b><br>' + text.innerHTML);
+      if (!e.message) return;
+      showNote('this browser cannot run the build', '<b>This browser cannot run the storyteller.</b><br>' + escapeHtml(e.message));
     });
     runStoryteller();
   }
 
   function runStoryteller() {
 
-  // the two prepared images (baked for this build's identity by dasllama-convert --config) and the
-  // two English front-end packs - no gguf crosses the wire
-  var MODEL_FILES = ['stories15M.dlim', 'kitten-nano.dlim', 'tts_g2p_en_us.bin', 'tts_postag.bin'];
   var modelsBase = new URLSearchParams(location.search).get('models') || 'models/';
   if (!modelsBase.endsWith('/')) modelsBase += '/';
 
@@ -136,16 +152,26 @@
     document.getElementById('fill').style.width = total ? (100 * done / total) + '%' : '0';
   }
 
-  // fetch every model with one shared progress bar; sizes come from Content-Length when the
-  // server sends it, so a missing header only makes the bar coarse, never wrong
-  async function fetchModels(onFile) {
-    var sizes = await Promise.all(MODEL_FILES.map(async function (name) {
-      var r = await fetch(modelsBase + name, { method: 'HEAD' });
-      return r.ok ? Number(r.headers.get('Content-Length') || 0) : 0;
-    }));
-    var total = sizes.reduce(function (a, b) { return a + b; }, 0), done = 0;
-    for (var i = 0; i < MODEL_FILES.length; i++) {
-      var name = MODEL_FILES[i];
+  // the deploy's manifest: the two prepared images (baked for the build's identity by
+  // dasllama-convert --config) and the two English front-end packs - no gguf crosses the wire -
+  // with their sizes, and the IMAGE_VERSION the images were minted at
+  async function fetchManifest() {
+    var r = await fetch(modelsBase + 'manifest.json', { cache: 'no-cache' });
+    if (!r.ok) throw new Error('manifest.json: HTTP ' + r.status);
+    var m = await r.json();
+    if (!m || !Array.isArray(m.files) || !m.files.length) throw new Error('manifest.json lists no files');
+    if (PAGE_IMAGE_VERSION && m.image_version !== PAGE_IMAGE_VERSION) {
+      throw new Error('the model set was minted at IMAGE_VERSION ' + m.image_version +
+        ', this build needs ' + PAGE_IMAGE_VERSION + ' - the deploy did not re-mint it');
+    }
+    return m;
+  }
+
+  // fetch every file with one shared progress bar, sizes from the manifest
+  async function fetchModels(manifest, onFile) {
+    var total = manifest.files.reduce(function (a, f) { return a + (f.bytes || 0); }, 0), done = 0;
+    for (var i = 0; i < manifest.files.length; i++) {
+      var name = manifest.files[i].name;
       var r = await fetch(modelsBase + name);
       if (!r.ok) throw new Error(name + ': HTTP ' + r.status);
       var chunks = [], reader = r.body.getReader();
@@ -163,6 +189,21 @@
     }
   }
 
+  // the engine's last lines: an abort after the click shows them, so a declined image or a
+  // missing pack reads as text on the page instead of a black canvas
+  var lastLines = [];
+  function remember(text) {
+    text = String(text);
+    if (/dasLLAMA|storyteller|panic|error/i.test(text)) {
+      lastLines.push(text);
+      if (lastLines.length > 6) lastLines.shift();
+    }
+  }
+  function showFailure(what) {
+    var lines = lastLines.map(function (l) { return '<code>' + escapeHtml(l) + '</code>'; }).join('<br>');
+    showNote('the program stopped', '<b>the storyteller stopped: ' + escapeHtml(what) + '</b>' + (lines ? '<br>' + lines : ''));
+  }
+
   window.Module = {
     canvas: (function () {
       var c = document.getElementById('canvas');
@@ -177,25 +218,34 @@
       return c;
     })(),
     arguments: ['--models', '/models', '--story-model', 'stories15M.dlim', '--tts-model', 'kitten-nano.dlim', '--autoplay'],
+    print: function (text) { console.log(text); remember(text); },
+    printErr: function (text) { console.error(text); remember(text); },
+    onAbort: function (what) { showFailure(what || 'abort'); },
+    onExit: function (code) { if (code) showFailure('exit code ' + code); },
     preRun: [function () {
       // the C environment is built from Module.ENV at startup: knobs set later never reach getenv
       Module.ENV.DASLLAMA_IMAGE = '0';          // never mint a sidecar into MEMFS: the images arrive prepared
       Module.ENV.DASLLAMA_ALLOW_UNTUNED = '1';  // the portable kernels, no tune sidecar
       Module.FS.mkdir('/models');
       Module.addRunDependency('storyteller-models');
-      fetchModels(function (name, bytes) { Module.FS.writeFile('/models/' + name, bytes); })
+      fetchManifest()
+        .then(function (manifest) {
+          return fetchModels(manifest, function (name, bytes) { Module.FS.writeFile('/models/' + name, bytes); });
+        })
         .then(function () {
           setStatus('the models are here');
           setProgress(1, 1);
           var start = document.getElementById('start');
           start.style.display = 'block';
           start.addEventListener('click', function () {
-            document.getElementById('gate').remove();
+            document.getElementById('gate').hidden = true;
             document.getElementById('canvas').focus();
             Module.removeRunDependency('storyteller-models');
           });
         })
-        .catch(function (err) { setStatus('could not fetch the models: ' + err.message); });
+        .catch(function (err) {
+          showNote('could not load the model set', '<b>' + escapeHtml(err.message) + '</b>');
+        });
     }],
   };
   // the program: a live copy of the tag emcc put in the template (a cloned template script stays inert)

@@ -1,24 +1,29 @@
-# dasLLAMA Code Review Checklist - the reference build in checked-in text
+# dasLLAMA Reference-Build Naming Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-doc: `ARCHITECTURE_MEASUREMENT.md`.
+doc: `ARCHITECTURE_MEASUREMENT.md`. Planned work: `followup_general.md`, `followup_vulkan.md`,
+`followup_metal.md`.
 
 **Routed from `REVIEW.md`: a diff that checklist routes here applies this list together with
 it.** The reference build is the third-party engine this module measures itself against - the
-checkout `benchmarks/setup_lcpp_ref.das` pins.
+checkout `benchmarks/setup_lcpp_ref.das` pins. Reference-build work is locating a site in that
+build, patching it, running it, regenerating from it, or measuring against it - planned or
+performed; a library the build ships is part of it, and running that library to mint our own
+artifact is reference-build work. The text this list binds is checked-in text under
+`modules/dasLLAMA/`; a document anywhere else in the tree that carries a reference-build name is
+bound by these same rules, routed here by the checklist covering its own folder.
 
-**Checked-in text under `modules/dasLLAMA/` - docs, comments, and string data, any language -
-that is not locating, patching, or reproducing work against the reference build describes an
-upstream mechanism in our own terms: no "lifted/ported verbatim from", and no name belonging
-to the reference build - symbol, header, constant, binary, project or organization - write
-"the reference exe" or "upstream" instead.** A symbol the file carrying that text calls or
-holds as a value is its own name, not attribution.
+**A sentence whose job is not reference-build work describes an upstream mechanism in our own
+terms: no "lifted/ported verbatim from", and no name belonging to the reference build - symbol,
+header, constant, binary, project or organization - write "the reference exe" or "upstream"
+instead.** A symbol this module's code calls or holds as a value is its own name, not
+attribution.
 
-**Prose whose job is to locate, patch, or reproduce work against the reference build names
-that build's binaries and symbols outright, and keeps that naming inside the sentences doing
-that job.** The job decides, not the artifact kind - a regeneration path, an env-knob row, a
-command line in a methodology or how-to document, a ledger row whose subject is a reading of
-the reference build (the compared row, the command that reproduces it), and a source patch
-applied TO the reference build all qualify. A paragraph that mixes a reading of the reference
-build with a proposal of our own keeps them in separate sentences; a row that cites upstream
-while proposing our own work is a proposal, not a reading, so it names no upstream symbol.
+**A figure that describes a part of the reference build rather than a whole run of it names
+the kernel or symbol it was read from.**
+
+**A sentence stating what WE will build or change next carries no reading of the reference
+build and no name belonging to it - symbol, header, constant, binary, project or
+organization; the reading it sits beside gets its own sentence.** A sentence stating a
+reference-build run we will make is reference-build work, not such a proposal, and carries
+that run's names, knobs and commands.

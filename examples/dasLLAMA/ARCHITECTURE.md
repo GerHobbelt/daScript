@@ -1,0 +1,123 @@
+# examples/dasLLAMA - architecture
+
+The contract every architecture doc follows is `ARCHITECTURE_COMMON.md` (repo root); the folder's
+checklist is `REVIEW.md` beside this file. The engine these programs drive is documented under
+`modules/dasLLAMA/`.
+
+## 1. Charters
+
+- `storyteller/` - a browser example: stories15M writes a children's story a few tokens per
+  frame, KittenTTS reads each finished sentence. `main.das` is the whole program, `web_shell.html`
+  the page around its canvas, `.das_package` the release, `models.json` its model set.
+- `storywish/` - a browser example: the typed words become a request in the TinyStoriesInstruct
+  corpus's layout, tinystories-instruct-27M writes the story, Pocket TTS reads it in one baked
+  voice from a file without the codec encoder (text in, no packs, no cloning). Same four files;
+  `wish.das` holds the request side pure (typed line -> words -> prompt, the field-line stop) so a
+  test reaches it without a window.
+- `parrot/` - a browser example: you press record and talk, Silero VAD ends the take when you go
+  quiet, Pocket TTS clones the voice from the take (a file with its codec encoder and its
+  roster, which speaks until a take replaces it), and the text in the box is read aloud in it on
+  the say button; recording again
+  replaces the voice. Same four files. Nothing leaves the program: the take is cloned in memory
+  and never written.
+- `wasm/dlim_config/` - a wasm-only program: prints the running build's DlimConfiguration JSON.
+  `wasm/mint_models.py` - the deploy's staging step for a browser example's model set.
+  `wasm/run_node.js` - runs the wasm64 engine host under node.
+- `chat.das`, `run.das`, `speak.das`, `speak_server.das`, `transcribe.das`, `dictate.das`,
+  `audio_chat.das` - desktop-only programs over the facade; nothing here ships them to a page.
+
+## 2. Definitions
+
+- **A browser example** is a subfolder of this folder with a `web_shell.html`: `daspkg release
+  wasm` builds it to wasm64 for dasllama.io from the same `main.das` the desktop run uses. The
+  checklist's rules about the browser build bind browser examples and nothing else.
+- **A witness line** is a line a browser example logs under its own name (`storyteller: ...`,
+  `storywish: ...`, `parrot: ...`); a smoke test under `modules/dasLLAMA/tests/` matches such
+  lines as substrings, so their words and order are an interface.
+
+## 3. Mechanisms
+
+### 3.1 One source, two builds
+
+A browser example's `main.das` runs its frame loop through `eval_main_loop`, a blocking loop on
+the desktop and `requestAnimationFrame` in the browser. The `.das_package` disables the GPU tiers
+for the wasm build, so the host needs no Metal or Vulkan, and names the shell that fetches the
+models and starts the program on a click (audio needs the gesture). The desktop run and the page
+therefore exercise the same code, which is why a browser-only failure is a language-runtime fact
+worth a rule rather than an app bug. A page the browser restores from its back-forward cache
+(Back to another page, then Forward) comes back with the program's workers and the audio output
+frozen mid-frame and out of step, and the first sound is whatever the output ring held; the
+shell reloads such a page (`pageshow` with `persisted`), so it starts from the gate again.
+
+### 3.2 The speech thread and its stream {#speech-thread-stream}
+
+Speech runs on its own thread so the frame loop never blocks on synthesis. The frame thread
+pushes its requests into a stream as archived records (a sentence for the story examples; for
+parrot a text to say or a take to clone, the PCM riding in the record) and pops finished clips
+from a second stream; a `SeqBox` carries the number of the story (parrot: the say) being told, so
+a queued sentence of one the user replaced is skipped instead of synthesized. The thread's own
+setup - the TTS model path and the voice - rides the same request stream ahead of the first
+request. Parrot's thread answers a say with its chunk count before the first clip, so the frame
+thread can tell the last clip from a pause. A string captured by the thread's lambda would be a
+pointer into the frame thread's heap, which that thread reuses on its own schedule; a browser
+worker starts slowly enough to read story text where the path was. An archived message is copied
+out of the stream into the reader's heap, so the stream is the one channel that is safe for a
+string.
+
+### 3.3 Input is polled {#polled-keys}
+
+A browser example reads the keyboard with `glfwGetKey` each frame, edge-detected per key code,
+never through a GLFW callback. In the browser build a callback lambda fires from a JavaScript
+event outside any frame of the program, where the example's state is not live, and the program
+traps. A printable GLFW key code is its upper-case ASCII, so the key range doubles as the
+character range for a typed line, and repeats come from a hold timer. The mouse is read the same
+way: parrot's buttons are text, and a click is `glfwGetMouseButton` edge-detected against the
+label's own box (the glyph quads rise above the pen position) in design pixels. In the browser
+the surface is the document viewport, and the page's stage sits below the nav, so the picture is
+letterboxed; Emscripten maps a click through the canvas element's box with one ratio per axis,
+which is exact only when that box is the picture - so a shell sizes the canvas element to the
+letterboxed box (`max-width`/`max-height` on the replaced element) instead of stretching it over
+the stage with `object-fit`.
+
+### 3.4 The model set is minted for the build that ships it
+
+Each browser example's `models.json` names its source files by Hugging Face repository, file
+and sha256, in three lists: `images` (a GGUF the build bakes into a `.dlim`), `packs` (a
+front-end pack) and `files` (a GGUF that is its own served form - a Pocket TTS file); a fourth
+list, `tree`, names a file the repository itself carries by its repo-relative path and sha256
+(the voice-activity weights). `wasm/mint_models.py`
+fetches the published ones (cached by sha256), bakes each image against the wasm64 build's own
+DlimConfiguration, copies the packs, files and tree files as they are, writes
+`models/manifest.json` (the file list, their sizes, the IMAGE_VERSION the images carry - a set
+with no image carries the version the deploy expects) and
+stamps that version into the page's `/* @image-version */ 0` slot. The shell reads the manifest,
+refuses a set minted for another version before fetching it, and shows a program abort's last
+engine lines on the page. The configuration the mint bakes against comes from the wasm build
+itself: `wasm/dlim_config/` is cross-compiled and run under node in the deploy, because an image
+is keyed by the build's identity and a set minted for a previous build is declined by the next.
+
+### 3.5 The wasm64 build's configuration probe {#dlim-config-probe}
+
+`wasm/dlim_config/main.das` prints `dlim_config_json(dlim_config_current())` and nothing else.
+Its `.das_package` disables the GPU tiers exactly as the browser examples' do, so the
+configuration it prints is the one their programs run with.
+
+### 3.6 Parrot's take {#the-take}
+
+The microphone is opened at the speech model's own rate (the speech thread reports it, with
+whether the file clones, before the first take), mono, and drained on the frame thread every
+frame into the take; the take is resampled to 16 kHz by linear interpolation with one running
+position across drains, so the stream the Silero iterator hears has no seam where the drains
+met, and the iterator is the only reader of that rate. The take ends on the stop button, two
+seconds after the iterator's last speech end, at the model's 60 s clip cap, or when the device
+has delivered nothing for six seconds (a refused microphone opens but never delivers); the ring's
+tail is drained before the device stops, since stopping frees the ring. The clip is the speech
+plus a quarter second at each end, never longer than the cap, and goes to the speech thread as a
+clone request, so the clone runs off the frame thread like a synthesis. A take with no speech in
+it is dropped, and the status says whether the device gave nothing, silence, or too little. A
+take starts by cancelling a say in flight - a clip still playing would be recorded - and the
+pure side of all this (`take.das`) is what the model-free cells test.
+
+## 4. Exception ledger
+
+None.

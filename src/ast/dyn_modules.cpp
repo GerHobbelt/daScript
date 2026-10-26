@@ -90,7 +90,7 @@ static Result run_descriptor(smart_ptr<FileAccess> fa, const string & mod_filena
 }
 
 static constexpr const char *MANIFEST_SUFFIX = ".das_module.manifest";   // ARCHITECTURE.md sec.2
-static constexpr const char *MANIFEST_HEADER = "das_module_manifest\t2";
+static constexpr const char *MANIFEST_HEADER = "das_module_manifest\t4";
 
 static bool g_ignore_manifests = false;
 
@@ -114,6 +114,7 @@ struct ManifestRead {
     string why;
 };
 
+#if !DAS_NO_FILEIO   // the reader's helpers: a build with no file io reads no manifest
 static das::vector<string> split_tabs(const string & line) {
     das::vector<string> fields;
     size_t start = 0;
@@ -127,6 +128,7 @@ static das::vector<string> split_tabs(const string & line) {
         start = tab + 1;
     }
 }
+#endif
 
 static string hex64(uint64_t v) {
     char buf[32];
@@ -167,11 +169,13 @@ static bool dep_stamp(const smart_ptr<FileAccess> & fa, const string & path, uin
     return true;
 }
 
+#if !DAS_NO_FILEIO
 static bool parse_on_error(const string & s, int & value) {   // RegisterOnError: Quiet, ErrorMsg, Fail
     if ( s.size() != 1 || s[0] < '0' || s[0] > '2' ) return false;
     value = s[0] - '0';
     return true;
 }
+#endif
 
 // the inputs a descriptor's rows can depend on beyond its own bytes: its folder, the das root
 // (`get_das_root()`), and the cross-compile target (`get_cross_platform_name()`, read from argv)
@@ -268,6 +272,12 @@ static ManifestRead read_manifest(const string & file, uint32_t descSize, uint64
             if ( !parse_on_error(fields[3], row.on_error) ) return damaged("dm on_error field");
             row.a = fields[1]; row.b = fields[2]; row.c = fields[4];
             res.rows.push_back(das::move(row));
+        } else if ( kind == "grp" ) {
+            if ( fields.size() != 4 ) return damaged("grp field count");
+            DynModuleManifestRow row;
+            row.group = true;
+            row.a = fields[1]; row.b = fields[2]; row.c = fields[3];
+            res.rows.push_back(das::move(row));
         } else if ( kind == "no_manifest" ) {
             if ( fields.size() != 1 ) return damaged("no_manifest field count");
             optOut = true;
@@ -316,6 +326,8 @@ static bool write_manifest(const string & file, uint32_t descSize, uint64_t desc
             }
             if ( row.dynamic ) {
                 text += "dm\t" + row.a + "\t" + row.b + "\t" + to_string(row.on_error) + "\t" + row.c + "\n";
+            } else if ( row.group ) {
+                text += "grp\t" + row.a + "\t" + row.b + "\t" + row.c + "\n";
             } else {
                 text += "np\t" + row.a + "\t" + row.b + "\t" + row.c + "\n";
             }
@@ -375,7 +387,9 @@ static Result init_dyn_modules(smart_ptr<FileAccess> fa, string path, TextWriter
         int64_t dllUsec = 0;
         size_t deferred = 0;
         for ( auto & row : mr.rows ) {
-            if ( !row.dynamic ) {
+            if ( row.group ) {
+                replay_module_group(row.a.c_str(), row.b.c_str(), row.c.c_str());
+            } else if ( !row.dynamic ) {
                 replay_native_path(row.a.c_str(), row.b.c_str(), row.c.c_str());
             } else if ( !row.c.empty() ) {
                 defer_dynamic_module(row.a.c_str(), row.b.c_str(), row.on_error, row.c.c_str());
@@ -586,14 +600,23 @@ static bool load_deferred_module_for_require(const string & name) {
     auto & threadRoot = gc_root::gc_get_thread_root();
     gc_root parked, loadRoot;
     move_all_nodes(threadRoot, parked);
+    auto boundProgram = daScriptEnvironment::getBound()->g_Program;    // a module's builtin das part parses under its own program; the caller may be mid-parse
     bool loaded = false;
+    bool grown = false;     // the module set changed - the fixed point and the collect are owed whether or not `name` came in
     {
         gc_active_scope scope(&loadRoot);
+        bool wasDeferred = is_dynamic_module_deferred(name.c_str());
         loaded = load_deferred_dynamic_module(name.c_str());
-        if ( loaded ) {
+        grown = loaded;
+        if ( !loaded && wasDeferred ) {
+            // its dlopen failed - a sibling it links may be deferred too; bring every row in (retries the pending ones)
+            load_all_deferred_dynamic_modules();
+            grown = true;
+            loaded = Module::require(name) != nullptr;
+        }
+        if ( grown ) {
             string notInitialized;
             if ( !Module::InitializeDependencies(notInitialized) ) {
-                notInitialized.clear();
                 load_all_deferred_dynamic_modules();
                 if ( !Module::InitializeDependencies(notInitialized) ) {
                     DAS_FATAL_ERROR("Unable to initialize some modules:%s\n", notInitialized.c_str());
@@ -602,7 +625,7 @@ static bool load_deferred_module_for_require(const string & name) {
         }
     }
     move_all_nodes(threadRoot, loadRoot);
-    if ( loaded ) {
+    if ( grown ) {
         // every module: a constructor registers into existing ones too (a vector type's functions)
         Module::foreach([&](Module * m) {
             m->gc_collect(&loadRoot);
@@ -611,6 +634,7 @@ static bool load_deferred_module_for_require(const string & name) {
     }
     loadRoot.gc_sweep();
     move_all_nodes(parked, threadRoot);
+    daScriptEnvironment::getBound()->g_Program = boundProgram;
     return loaded;
 }
 
@@ -620,6 +644,7 @@ bool require_dynamic_modules(FileAccessPtr file_access,
                              const das::vector<das::string> &load_modules,
                              const das::vector<das::string> &disabled_modules,
                              das::TextWriter &tout) {
+    clear_deferred_dynamic_modules();
     setDeferredModuleLoader(&load_deferred_module_for_require);
     // Explicitly-disabled modules (case-insensitive on every platform) are never
     // loaded/registered — keeps a native-only module out of a wasm cross-compile.

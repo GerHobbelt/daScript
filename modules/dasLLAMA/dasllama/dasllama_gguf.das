@@ -63,6 +63,64 @@ let GGML_TYPE_IQ4_XS = 23
 let GGML_TYPE_BF16 = 30
 let GGML_TYPE_MXFP4 = 39
 
+//! Bytes `n` elements of a ggml type take on disk (block bytes x blocks); 0 for a type the loader
+//! does not know, so a census sums what it can and names the rest.
+def ggml_type_bytes(gt : int; n : int64) : int64 {
+    if (gt == GGML_TYPE_F32) return n * 4l
+    if (gt == GGML_TYPE_F16 || gt == GGML_TYPE_BF16) return n * 2l
+    if (gt == GGML_TYPE_Q4_0 || gt == GGML_TYPE_IQ4_NL) return n / 32l * 18l
+    if (gt == GGML_TYPE_Q5_0) return n / 32l * 22l
+    if (gt == GGML_TYPE_Q5_1) return n / 32l * 24l
+    if (gt == GGML_TYPE_Q8_0) return n / 32l * 34l
+    if (gt == GGML_TYPE_MXFP4) return n / 32l * 17l
+    if (gt == GGML_TYPE_Q2_K) return n / 256l * 84l
+    if (gt == GGML_TYPE_Q3_K || gt == GGML_TYPE_IQ3_S) return n / 256l * 110l
+    if (gt == GGML_TYPE_Q4_K) return n / 256l * 144l
+    if (gt == GGML_TYPE_Q5_K) return n / 256l * 176l
+    if (gt == GGML_TYPE_Q6_K) return n / 256l * 210l
+    if (gt == GGML_TYPE_IQ2_XXS) return n / 256l * 66l
+    if (gt == GGML_TYPE_IQ2_XS) return n / 256l * 74l
+    if (gt == GGML_TYPE_IQ2_S) return n / 256l * 82l
+    if (gt == GGML_TYPE_IQ3_XXS) return n / 256l * 98l
+    if (gt == GGML_TYPE_IQ4_XS) return n / 256l * 136l
+    return 0l
+}
+
+//! The ggml type a kq format's plane converts from; -1 for a format no ggml type spells.
+def kq_ggml_type(f : KqFmt) : int {
+    if (f == KqFmt.q8) return GGML_TYPE_Q8_0
+    if (f == KqFmt.q40) return GGML_TYPE_Q4_0
+    if (f == KqFmt.iq4nl) return GGML_TYPE_IQ4_NL
+    if (f == KqFmt.q51) return GGML_TYPE_Q5_1
+    if (f == KqFmt.k2) return GGML_TYPE_Q2_K
+    if (f == KqFmt.k3) return GGML_TYPE_Q3_K
+    if (f == KqFmt.iq3s) return GGML_TYPE_IQ3_S
+    if (f == KqFmt.k4) return GGML_TYPE_Q4_K
+    if (f == KqFmt.k5) return GGML_TYPE_Q5_K
+    if (f == KqFmt.k6) return GGML_TYPE_Q6_K
+    if (f == KqFmt.iq4xs) return GGML_TYPE_IQ4_XS
+    if (f == KqFmt.iq3xxs) return GGML_TYPE_IQ3_XXS
+    if (f == KqFmt.iq2s) return GGML_TYPE_IQ2_S
+    if (f == KqFmt.iq2xs) return GGML_TYPE_IQ2_XS
+    if (f == KqFmt.iq2xxs) return GGML_TYPE_IQ2_XXS
+    return -1
+}
+
+//! Bytes `n` weights of a kq format take on disk (the ggml block sizes) - what a device plane
+//! is measured against; q8 counts its Q8_0 blocks.
+def kq_disk_bytes(f : KqFmt; n : int64) : int64 => ggml_type_bytes(kq_ggml_type(f), n)
+
+let private GGML_TYPE_NAMES <- {
+    GGML_TYPE_F32 => "F32", GGML_TYPE_F16 => "F16", GGML_TYPE_BF16 => "BF16",
+    GGML_TYPE_Q4_0 => "Q4_0", GGML_TYPE_Q5_0 => "Q5_0", GGML_TYPE_Q5_1 => "Q5_1", GGML_TYPE_Q8_0 => "Q8_0", GGML_TYPE_MXFP4 => "MXFP4",
+    GGML_TYPE_Q2_K => "Q2_K", GGML_TYPE_Q3_K => "Q3_K", GGML_TYPE_Q4_K => "Q4_K", GGML_TYPE_Q5_K => "Q5_K", GGML_TYPE_Q6_K => "Q6_K",
+    GGML_TYPE_IQ2_XXS => "IQ2_XXS", GGML_TYPE_IQ2_XS => "IQ2_XS", GGML_TYPE_IQ2_S => "IQ2_S",
+    GGML_TYPE_IQ3_XXS => "IQ3_XXS", GGML_TYPE_IQ3_S => "IQ3_S", GGML_TYPE_IQ4_NL => "IQ4_NL", GGML_TYPE_IQ4_XS => "IQ4_XS"
+}
+
+//! The ggml type's upstream spelling for logs ("Q4_K", "IQ3_S"); "type N" for one the loader does not know.
+def ggml_type_name(gt : int) : string => GGML_TYPE_NAMES?[gt] ?? "type {gt}"
+
 // MXFP4 e2m1 magnitudes DOUBLED (nibble -> ±{0,.5,1,1.5,2,3,4,6}×2, OCP MX spec); the E8M0
 // block scale below is halved to compensate.
 let private MXFP4_KVALUES = fixed_array(0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
@@ -155,6 +213,8 @@ def private skip_array(b : array<uint8> | #; off : int64; arr_type : int; count 
     }
     return off + count * gguf_scalar_size(arr_type)
 }
+
+let GGUF_FIXED_HEADER_BYTES = 24l   // magic, version, tensor count, kv count: what parse_gguf_meta reads before any table
 
 def gguf_magic_ok(bytes : array<uint8> | #) : bool {
     return long_length(bytes) >= 4l && int(bytes[0]) == 'G' && int(bytes[1]) == 'G' && int(bytes[2]) == 'U' && int(bytes[3]) == 'F'
@@ -302,7 +362,8 @@ def gguf_shard_paths(path : string; missing_ok : bool = false) : array<string> {
     return <- res
 }
 
-//! `general.architecture` of the GGUF at `path` ("" when unreadable) - a header-only read.
+//! `general.architecture` of the GGUF at `path` ("" when unreadable - a file that is not a GGUF,
+//! or one cut short of its own metadata, the way a download that stopped is) - a header-only read.
 def gguf_file_arch(path : string) : string {
     var arch = ""
     fopen(path, "rb") $(f) {
@@ -310,10 +371,14 @@ def gguf_file_arch(path : string) : string {
             return
         }
         fmap(f) $(var bytes : array<uint8>#) {
-            return if (!gguf_magic_ok(bytes))
-            var inscope m <- parse_gguf_meta(bytes)
-            if (gguf_has(m, "general.architecture")) {
-                arch = gguf_str(m, bytes, "general.architecture")
+            return if (long_length(bytes) < GGUF_FIXED_HEADER_BYTES || !gguf_magic_ok(bytes))
+            try {
+                var inscope m <- parse_gguf_meta(bytes)
+                if (gguf_has(m, "general.architecture")) {
+                    arch = gguf_str(m, bytes, "general.architecture")
+                }
+            } recover {
+                arch = ""
             }
         }
     }
@@ -1481,6 +1546,9 @@ def gguf_transcode_q8_0(m : GGUFMeta; srcbytes : array<uint8> | #; name : string
     // when splitting a fused tensor (Phi3 attn_qkv / gate_up), so there's no lossy fp32 requantize
     if (src_off + expect_n > m.tensors[ti].n_elem) {
         panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {m.tensors[ti].n_elem} elems")
+    }
+    if (src_off % 32l != 0l || expect_n % 32l != 0l) {
+        panic("gguf: tensor '{name}' Q8_0 slice [{src_off}, +{expect_n}) is not block-aligned")
     }
     let nb = expect_n / 32l
     if (nb <= 0l) {

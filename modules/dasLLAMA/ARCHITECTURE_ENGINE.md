@@ -80,7 +80,7 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
   replay/result text builders, reply parsers; Harmony namespace/channels, gemma-4 DSL, mistral
   control tokens, llama JSON). Every byte of tool wire text is produced here - pure string+JSON
   functions, model-free testable; the chat layer assembles the output into ChatParts and the
-  server parses through the parsers. Wire-format provenance: `history/dasLLAMA/tool_formats_plan.md`.
+  server parses through the parsers.
 - **`dasllama_chat.das`** - conversation turns and chat-template application. Per-arch template
   *content* is registered by the arch file (sec.1.6), not written here.
 - **`dasllama_par.das`** - `maybe_parallel_for` and nothing else. Threading policy (job counts,
@@ -131,14 +131,19 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
 - **`dasllama_tokenizer.das`** - the tokenizer facade: backend selection off the GGUF metadata and
   the one encode/decode/piece surface models and the chat layer call. Re-exports both backends, so
   a consumer requires this file and never picks a backend by hand.
-- **`dasllama_spm.das`** - the SentencePiece backend (Llama-2 family, Phi-3, Gemma): score-greedy
-  merges over vocab pieces, `<0xXX>` byte fallback.
+- **`dasllama_spm.das`** - the SentencePiece backend: score-greedy merges over vocab pieces (Llama-2, Phi-3, Gemma),
+  the unigram Viterbi arm over the same pieces (`unigram_encode`, GGUF `"t5"`, sec.1.7d's tokenizer), `<0xXX>` byte fallback.
 - **`dasllama_bpe.das`** - the byte-level BPE backend (Llama-3 / tiktoken family): vocab load, the
   GPT-2 byte alphabet, ranked merges, encode/decode. Split from SPM because the two algorithms
   share no state; a third merge algorithm gets a fourth file. Two sanctioned family-name tests
   live here rather than in `dasllama_pretok`: the `pre`-name selector inside `bpe_encode`, and the
   gemma-4 newline-run split in `bpe_encode_spm_space`; `load_bpe_tokenizer_gguf`'s per-family
-  metadata defaults are the third and last.
+  metadata defaults are the third and last. A GGUF without `tokenizer.ggml.add_bos_token` takes
+  upstream's per-pre default (`bpe_pre_adds_bos`): the pres on its list - the llama3 family,
+  tekken, chameleon, a few smaller ones - prepend BOS, every other pre - qwen2, qwen35, gpt-2,
+  gpt-4o among them - prepends none. The
+  default matters: a Qwen hybrid fed a leading `<|endoftext|>` degenerates for the whole
+  generation, and the unsloth Qwen3.8 conversions omit the key.
 - **`dasllama_pretok.das`** - the pre-tokenizer: one hand-compiled split function per family
   (llama3/qwen2/qwen35, gpt-2, gpt-4o, tekken), selected by the BPE `pre` name. Regex-port growth
   lands here, never in the merge engine - the two change for different reasons (new model family
@@ -152,7 +157,14 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
 detection, the eager and streamed conversion ladders, and the load entry points. It owns nothing the
 forward path touches at run time - a loaded `Model` is the whole handoff - and it requires
 `dasllama_common` back for `Model`/`Session`, so the transformer umbrella requires it `public` and
-breaks the cycle. That re-export is what keeps every consumer on the facade.
+breaks the cycle. That re-export is what keeps every consumer on the facade. Every big-weight
+conversion is accounted as it runs (`conv_account`, on both the eager and the streamed ladder),
+and a load that converts ends with the report: the file's bytes, then each (disk type ->
+conversion kind) as bytes on disk against bytes served with the delta, biggest overhead first,
+and the count of tags the row-length rule demoted to the q8 rail (each demotion logged by
+name as it is decided). The delta column is where a served form costs more than the file - a
+decoded scale row, an f32 copy of a quantized token table - and it is read as a number, not
+inferred from image sizes.
 
 - **`dasllama_image.das`** - the prepared-model `.dlim` rail, and it is ONE rail
   (`ARCHITECTURE_IMAGE.md` sec.2.1). Nothing
@@ -188,8 +200,8 @@ trunk-only and trunk+head images never collide and one image file serves both tr
   registration. A hand-written tile that the generator could emit belongs in the generator.
 - **`dasllama_tune.das`** - the per-box loop-hint tuner (`[tuned]` / `[dasllama_grid]`). Tuning
   POLICY lives here; tuned VALUES live in the box's sidecar, never in source. The framework is
-  OPTIONAL: the `llvm_tune` require is `?llvm`-guarded and every use of it sits behind
-  `static_if (typeinfo module_exists(llvm_tune))`, so a build without dasLLVM opens no
+  OPTIONAL: `llvm_tune` comes through the `tune_framework` group, empty in a build that did not
+  configure dasLLVM, and every use of it sits behind `static_if (typeinfo module_exists(llvm_tune))`, so a build without dasLLVM opens no
   sidecar, reads no policy env and reports nothing - `[tuned]` stamps the declared `fallback=`
   (or `DEFAULT_PERM`) and the AST rewrite is unchanged. `box_profile_verdict_at` answers the
   reason NAME rather than llvm_tune's enum for the same reason: a signature cannot be gated.

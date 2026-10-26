@@ -305,6 +305,8 @@ namespace das {
     bool builtin_fs_is_absolute ( const char * ) GENERATE_IO_STUB_RET
     void * register_dynamic_module ( const char *, const char *, int, Context *, LineInfoArg * ) GENERATE_IO_STUB_RET
     void register_native_path ( const char *, const char *, const char *, Context *, LineInfoArg * ) GENERATE_IO_STUB
+    void register_module_group ( const char *, const char *, const char *, Context *, LineInfoArg * ) GENERATE_IO_STUB
+    DAS_API void replay_module_group ( const char *, const char *, const char * ) GENERATE_IO_STUB
     DAS_API void retry_pending_dynamic_modules () GENERATE_IO_STUB
     DAS_API string describe_pending_dynamic_modules () GENERATE_IO_STUB_RET
     DAS_API int report_pending_dynamic_modules () GENERATE_IO_STUB_RET
@@ -315,8 +317,8 @@ namespace das {
     DAS_API void defer_dynamic_module ( const char *, const char *, int, const char * ) GENERATE_IO_STUB
     DAS_API bool load_deferred_dynamic_module ( const char * ) GENERATE_IO_STUB_RET
     DAS_API size_t load_all_deferred_dynamic_modules () GENERATE_IO_STUB_RET
-    DAS_API bool has_deferred_dynamic_modules () GENERATE_IO_STUB_RET
     DAS_API bool is_dynamic_module_deferred ( const char * ) GENERATE_IO_STUB_RET
+    DAS_API void clear_deferred_dynamic_modules () GENERATE_IO_STUB
 
 #undef GENERATE_IO_STUB
 #undef GENERATE_IO_STUB_RET
@@ -327,6 +329,7 @@ namespace das {
 
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #if _WIN32
 #include <fcntl.h>
@@ -1803,7 +1806,8 @@ namespace das {
         sa.bInheritHandle = TRUE;
         sa.lpSecurityDescriptor = NULL;
         HANDLE hRead = NULL, hWrite = NULL;
-        if ( !CreatePipe(&hRead, &hWrite, &sa, 0) ) {
+        const DWORD spawnPipeBytes = 64 * 1024;   // src/builtin/ARCHITECTURE.md sec.5
+        if ( !CreatePipe(&hRead, &hWrite, &sa, spawnPipeBytes) ) {
             context->throw_error_at(at, "spawn_process: CreatePipe failed");
             return nullptr;
         }
@@ -2427,12 +2431,16 @@ namespace das {
         int on_error = 0;
     };
     static vector<DeferredDynamicModule> g_deferred_dynamic_modules;    // src/ast/ARCHITECTURE.md sec.2
+    static std::recursive_mutex g_deferred_dynamic_modules_mutex;       // a run-time has_module reads while another thread's compile loads
 
     DAS_API void defer_dynamic_module ( const char * path, const char * cpp_class, int on_error, const char * das_name ) {
+        lock_guard<std::recursive_mutex> guard(g_deferred_dynamic_modules_mutex);
         g_deferred_dynamic_modules.push_back({path ? path : "", cpp_class ? cpp_class : "", das_name ? das_name : "", on_error});
     }
 
     DAS_API bool load_deferred_dynamic_module ( const char * das_name ) {
+        if ( !das_name ) return false;
+        lock_guard<std::recursive_mutex> guard(g_deferred_dynamic_modules_mutex);
         auto it = find_if(g_deferred_dynamic_modules.begin(), g_deferred_dynamic_modules.end(),
             [&](const DeferredDynamicModule & dm) { return dm.das_name == das_name; });
         if ( it == g_deferred_dynamic_modules.end() ) return false;
@@ -2445,6 +2453,7 @@ namespace das {
     }
 
     DAS_API size_t load_all_deferred_dynamic_modules () {
+        lock_guard<std::recursive_mutex> guard(g_deferred_dynamic_modules_mutex);
         vector<DeferredDynamicModule> all;
         all.swap(g_deferred_dynamic_modules);
         if ( trace_module_load() && !all.empty() ) {
@@ -2457,13 +2466,16 @@ namespace das {
         return all.size();
     }
 
-    DAS_API bool has_deferred_dynamic_modules () {
-        return !g_deferred_dynamic_modules.empty();
+    DAS_API bool is_dynamic_module_deferred ( const char * das_name ) {
+        if ( !das_name ) return false;
+        lock_guard<std::recursive_mutex> guard(g_deferred_dynamic_modules_mutex);
+        return find_if(g_deferred_dynamic_modules.begin(), g_deferred_dynamic_modules.end(),
+            [&](const DeferredDynamicModule & dm) { return dm.das_name == das_name; }) != g_deferred_dynamic_modules.end();
     }
 
-    DAS_API bool is_dynamic_module_deferred ( const char * das_name ) {
-        return das_name && find_if(g_deferred_dynamic_modules.begin(), g_deferred_dynamic_modules.end(),
-            [&](const DeferredDynamicModule & dm) { return dm.das_name == das_name; }) != g_deferred_dynamic_modules.end();
+    DAS_API void clear_deferred_dynamic_modules () {
+        lock_guard<std::recursive_mutex> guard(g_deferred_dynamic_modules_mutex);
+        g_deferred_dynamic_modules.clear();
     }
 
     // Re-attempt modules whose dlopen was deferred (Quiet failure during the
@@ -2549,6 +2561,26 @@ namespace das {
 
     DAS_API void replay_native_path ( const char * mod_name, const char * src, const char * dst ) {
         register_native_path(mod_name, src, dst, nullptr, nullptr);
+    }
+
+    void register_module_group ( const char * group, const char * member, const char * guard, Context * context, LineInfoArg * at ) {
+        if ( !group || !group[0] || !member || !member[0] ) {
+            if ( context ) context->throw_error_at(at, "register_module_group needs a group name and a member require path");
+            return;
+        }
+        registerModuleGroupMember(group, member, guard ? guard : "");
+        if ( g_manifest_recording ) {
+            DynModuleManifestRow row;
+            row.group = true;
+            row.a = group;
+            row.b = member;
+            row.c = guard ? guard : "";
+            g_manifest_rows.push_back(das::move(row));
+        }
+    }
+
+    DAS_API void replay_module_group ( const char * group, const char * member, const char * guard ) {
+        register_module_group(group, member, guard, nullptr, nullptr);
     }
 
     void for_each_registered_native_path ( const TBlock<void,const char *,const char *,const char *> & block, Context * context, LineInfoArg * at ) {
@@ -3191,6 +3223,10 @@ namespace das {
             addExtern<DAS_BIND_FUN(register_native_path)>(*this, lib, "register_native_path",
                 SideEffects::worstDefault, "register_native_path")
                     ->args({"mod_name", "src", "dst", "context","at"});
+            addExtern<DAS_BIND_FUN(register_module_group)>(*this, lib, "register_module_group",
+                SideEffects::worstDefault, "register_module_group")
+                    ->args({"group", "member", "guard", "context","at"})
+                    ->arg_init(2, new ExprConstString(""));
             addExtern<DAS_BIND_FUN(builtin_describe_pending_dynamic_modules)>(*this, lib, "describe_pending_dynamic_modules",
                 SideEffects::accessExternal, "builtin_describe_pending_dynamic_modules")
                     ->args({"context","at"})->setTempStringResult();

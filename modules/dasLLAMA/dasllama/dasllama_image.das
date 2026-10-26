@@ -38,7 +38,7 @@ require dasllama/dasllama_load
 // WhisperModel.enc) contribute their planes under dotted names ("enc.fblob"); string-array
 // fields ride the meta blob via serialize_strings — raw string pointers can't be planes.
 
-let IMAGE_VERSION = 33   // an untied Q8 load keeps its Q8_0 token table as quants (emb_q8): the fp32 copy left fblob, a linear q8 copy joined qblob
+let IMAGE_VERSION = 36   // the shared expert's K-quant planes ride beside its q8 transcode on a tier-armed load (wsh*_fmt, wshk*_offs)
 
 //! The metal (blob-only) flavor's identity tag: q8 planes ride the 34B block_q8_0 blob and the
 //! kq scale planes their GPU forms (convert_model_to_metal_blob) — flavors are per-config and
@@ -1553,7 +1553,7 @@ def load_model_image(path : string; var t : Model; tag : string = ""; quant : st
 //! The image-cached model load — ``load_model``'s engine half, public for callers bypassing the facade. ``.dlim`` maps directly (wrong identity panics); q8-mode gguf maps/saves a prepared image (``DASLLAMA_IMAGE=0`` disables); an fp32-mode gguf joins the rail only with ``image_fp32`` (planar flavor — the parity-pinned decoders, e.g. canary's).
 //! Under an active Metal mode the image is the BLOB-ONLY metal flavor (CPU inference against it panics) when servable, the planar CPU flavor otherwise; ``planar_only`` pins the planar CPU flavor regardless of armed GPU tiers (the ASR surface — its decode path reads CPU planes).
 //! Call inside ``with_job_que()``.
-[arch(at = "../ARCHITECTURE_IMAGE.md#image-interp-load"), arch(at = "../ARCHITECTURE_IMAGE.md#image-identity-backend-order")]
+[arch(at = "../ARCHITECTURE_IMAGE.md#image-interp-load"), arch(at = "../ARCHITECTURE_IMAGE.md#image-identity-backend-order"), arch(at = "../ARCHITECTURE_IMAGE.md#dlim-meta-head")]
 def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32;
                       planar_only : bool = false; image_fp32 : bool = false) : Model {
     // under Metal the GPU serves through the override registries, so "no backend registered" would be a false alarm
@@ -1587,6 +1587,10 @@ def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32;
                 : load_model_image(path, t) || load_model_image(path, t, METAL_IMAGE_TAG))
         }
         if (!loaded) {
+            let pk = image_peek(path)
+            if (pk.valid && pk.version != IMAGE_VERSION) {
+                panic("dasLLAMA: '{path}' was minted at IMAGE_VERSION {pk.version}, this build reads {IMAGE_VERSION} - re-mint it from the source gguf (dasllama-convert --config for the target build)")
+            }
             let vk_ident = vk_tag != "" ? " / {image_identity(vk_tag)}" : ""
             panic("dasLLAMA: '{path}' is not a prepared image for this box/knobs (identity {image_identity()} / {image_identity(METAL_IMAGE_TAG)}{vk_ident}) - regenerate it from the source gguf")
         }
@@ -1650,6 +1654,7 @@ def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32;
             var jobs : array<FillJob>
             var streamed = Model()
             var served = false
+            var saved = false
             let ts_s = ref_time_ticks()
             let save = image_save_enabled()
             let ran = load_gguf_streaming(path, mode, mt, jobs, want_metal) $(gm : GGUFMeta; gbytes : array<uint8>) {
@@ -1657,13 +1662,18 @@ def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32;
                 if (want_metal && !mt.metal_blob) {
                     return false
                 }
-                served = (save ? save_model_image_streaming(mt, gm, gbytes, jobs, s_img, s_tag, s_quant)
-                    : image_from_model_streaming(mt, streamed, gm, gbytes, jobs, "", s_tag, s_quant))
+                if (save) {
+                    saved = save_model_image_streaming(mt, gm, gbytes, jobs, s_img, s_tag, s_quant)
+                    if (!saved) {
+                        to_log(LOG_WARNING, "dasLLAMA: the image save for '{path}' declined - serving the streamed build from memory\n")
+                    }
+                }
+                served = saved || image_from_model_streaming(mt, streamed, gm, gbytes, jobs, "", s_tag, s_quant)
                 return served
             }
             delete jobs
             delete mt   // the streamed planes never became model planes; the rest goes now
-            if (served && save) {
+            if (saved) {
                 to_log(LOG_INFO, "dasLLAMA: prepared image streamed in {get_time_usec(ts_s) / 1000} ms - {s_img}\n")
                 if (!load_image(s_img, streamed, s_tag, s_quant)) {
                     panic("dasLLAMA: '{s_img}' was just streamed out and will not map back - see the decline above")

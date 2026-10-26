@@ -12,6 +12,7 @@ require dasllama/dasllama_common   // MoeGate, select_decode_override
 require dasllama/dasllama_blocks   // registers the vulkan_moe_span decode override at init
 require dasllama/dasllama_moe   // moe_select_core: the host select the span's device top-k mirrors
 require ?vulkan dasllama/dasllama_math_vulkan  // the decode attention block + FFN tail under test; the test installs the hooks explicitly (no env gate)
+require ?vulkan dasllama/dasllama_vulkan_decode   // vk_span_reset: the span records once per model, so the second span cell forgets the first's record
 require daslib/f16_cvt
 require math
 require _vk_kq_fixtures
@@ -160,9 +161,15 @@ struct private Quad {
     wv : array<float>
     wo : array<float>
     norm : array<float> // the layer's attention rms weight row
+    bq : array<float>   // the q/k/v projection bias rows (empty = the model has none)
+    bk : array<float>
+    bv : array<float>
     kmir : array<float> // the reference mirror (f16-rounded rows at absolute positions)
     vmir : array<float>
 }
+
+//! a bias row's pointer for the block hook: null when the quad carries no bias
+def private bias_ptr(b : array<float>) : float const? => !empty(b) ? unsafe(addr<float const?>(b[0])) : null
 
 // the expert stack pair (dequantized for the reference), the FFN norm row, the routing
 struct private Ffn {
@@ -189,10 +196,15 @@ def private plane_up(fmt : int; rows, n, seed, woff : int64; var w : array<float
     return moe_gpu_upload_stack(wqb, wsb, woff, n, rows, fmt)
 }
 
-// one attention quad's four planes, uploaded and dequantized; false = no device
-def private quad_up(var q : Quad; fmt : int; base : int64; seed : int64; phase : float; neox : bool) : bool {
+//! one attention quad's four planes, uploaded and dequantized; false = no device, hasb = the quad carries bias rows
+def private quad_up(var q : Quad; fmt : int; base : int64; seed : int64; phase : float; neox, hasb : bool) : bool {
     q.fmt = fmt
     q.neox = neox
+    if (hasb) {
+        q.bq <- [for (i in range64(QD)); 0.05 * sin(float(i) * 0.37 + phase)]
+        q.bk <- [for (i in range64(KVD)); 0.05 * cos(float(i) * 0.29 + phase)]
+        q.bv <- [for (i in range64(KVD)); 0.04 * sin(float(i) * 0.53 - phase)]
+    }
     q.woq = base
     q.wok = base + STRIDE
     q.wov = base + 2l * STRIDE
@@ -211,7 +223,7 @@ def private quad_up(var q : Quad; fmt : int; base : int64; seed : int64; phase :
 
 // the expert stacks: gate/up k4 over N, down k6 over NFE; expert e's plane starts at e * NFE * N;
 // slot j routes expert j
-def private ffn_up(t : T?; var f : Ffn) : bool {
+def private ffn_up(t : T?; var f : Ffn; base_slot : int64 = 30l) : bool {
     var wq1 : array<uint8>
     var ws1 : array<uint8>
     var wq3 : array<uint8>
@@ -221,9 +233,9 @@ def private ffn_up(t : T?; var f : Ffn) : bool {
     fill_kq_stack(1, NE * NFE, N, 41l, true, wq1, ws1)
     fill_kq_stack(1, NE * NFE, N, 43l, true, wq3, ws3)
     fill_kq_stack(3, NE * N, NFE, 47l, false, wq2, ws2)
-    let woff1 = 30l * STRIDE
-    let woff3 = 31l * STRIDE
-    let woff2 = 32l * STRIDE
+    let woff1 = base_slot * STRIDE
+    let woff3 = (base_slot + 1l) * STRIDE
+    let woff2 = (base_slot + 2l) * STRIDE
     if (!moe_gpu_upload_stack(wq1, ws1, woff1, N, NE * NFE, 1)) {
         return false
     }
@@ -241,6 +253,34 @@ def private ffn_up(t : T?; var f : Ffn) : bool {
     return true
 }
 
+//! a shared expert's q8 triple (dequantized for the reference), its plane offsets and the two
+//! layers' gate rows; width NFE like the routed experts
+struct private Shexp {
+    w1 : array<float>
+    w3 : array<float>
+    w2 : array<float>
+    off1 : int64
+    off3 : int64
+    off2 : int64
+    gate : array<float>   //! 2 x N, layer-major
+}
+
+def private shexp_up(t : T?; var sh : Shexp; base : int64) : bool {
+    sh.off1 = base
+    sh.off3 = base + STRIDE
+    sh.off2 = base + 2l * STRIDE
+    if (!plane_up(0, NFE, N, 71l, sh.off1, sh.w1)) {
+        return false
+    }
+    t |> success(plane_up(0, NFE, N, 73l, sh.off3, sh.w3), "dec span shexp: the shared up plane uploaded")
+    t |> success(plane_up(0, N, NFE, 79l, sh.off2, sh.w2), "dec span shexp: the shared down plane uploaded")
+    sh.gate |> resize(2l * N)
+    for (i in range64(2l * N)) {
+        sh.gate[i] = 0.03 * sin(float(i) * 0.47 + 0.9) + 0.02 * cos(float(i / N) * 1.7)
+    }
+    return true
+}
+
 // the block's reference for one position: the feed, q/k/v, rope, the mirror row, attention, wo
 def private block_ref(var q : Quad; x : array<float>; pos : int64; cossin : array<float>; var xb2 : array<float>; var kraw : array<float>) {
     var xd : array<float>
@@ -254,6 +294,15 @@ def private block_ref(var q : Quad; x : array<float>; pos : int64; cossin : arra
     gemv_ref(q.wk, KVD, N, xd, kr)
     gemv_ref(q.wv, KVD, N, xd, vr)
     kraw := kr
+    if (!empty(q.bq)) {
+        for (i in range64(QD)) {
+            qr[i] += q.bq[i]
+        }
+        for (i in range64(KVD)) {
+            kr[i] += q.bk[i]
+            vr[i] += q.bv[i]
+        }
+    }
     rope_ref(qr, NH, cossin, q.neox)
     rope_ref(kr, 1l, cossin, q.neox)
     for (i in range64(KVD)) {
@@ -317,8 +366,10 @@ def private token_cell(t : T?; var qa : Quad; var qb : Quad; f : Ffn; pos : int6
     var xq : array<int8>
     var xs : array<float>
     feed_ref(x, qa.norm, qa.fmt, xd, xq, xs)
-    matmul_moe_gpu_attn_dec(xb2, kout, vout, qa.woq, qa.wok, qa.wov, qa.woo, qa.fmt, qa.fmt, qa.fmt, qa.fmt, xq, xs, cossin, null, null,
-        pos, N, QD, KVD, HS, NH, KVM, ATTN_SCALE, EPS, qa.neox, false)
+    unsafe {
+        matmul_moe_gpu_attn_dec(xb2, kout, vout, qa.woq, qa.wok, qa.wov, qa.woo, qa.fmt, qa.fmt, qa.fmt, qa.fmt, xq, xs, cossin, null, null,
+            bias_ptr(qa.bq), bias_ptr(qa.bk), bias_ptr(qa.bv), pos, N, QD, KVD, HS, NH, KVM, ATTN_SCALE, EPS, qa.neox, false)
+    }
     var xb2_ref : array<float>
     var kraw_ref : array<float>
     block_ref(qa, x, pos, cossin, xb2_ref, kraw_ref)
@@ -344,8 +395,10 @@ def private token_cell(t : T?; var qa : Quad; var qb : Quad; f : Ffn; pos : int6
     let pair <- [0l, 1l]   // the tail arm routes slot j to expert j
     ffn_ref_sel(f, fd, pair, f.rw, x1_ref)
     // layer B on the block: its feed came from the tail; the host acts are ignored
-    matmul_moe_gpu_attn_dec(xb2, kout, vout, qb.woq, qb.wok, qb.wov, qb.woo, qb.fmt, qb.fmt, qb.fmt, qb.fmt, xq, xs, cossin, null, null,
-        pos, N, QD, KVD, HS, NH, KVM, ATTN_SCALE, EPS, qb.neox, false)
+    unsafe {
+        matmul_moe_gpu_attn_dec(xb2, kout, vout, qb.woq, qb.wok, qb.wov, qb.woo, qb.fmt, qb.fmt, qb.fmt, qb.fmt, xq, xs, cossin, null, null,
+            bias_ptr(qb.bq), bias_ptr(qb.bk), bias_ptr(qb.bv), pos, N, QD, KVD, HS, NH, KVM, ATTN_SCALE, EPS, qb.neox, false)
+    }
     t |> success(!moe_gpu_ffn_tail_pending(), "{tag} pos {pos}: layer B's attention collected the tail")
     check_row(t, "{tag} pos {pos} residual row after FFN A (the tail's combine)", x, x1_ref)
     var xb2b_ref : array<float>
@@ -361,13 +414,13 @@ def private token_cell(t : T?; var qa : Quad; var qb : Quad; f : Ffn; pos : int6
 }
 
 // one quad pair in one plane format through two positions; false = no device
-def private pair_cell(t : T?; f : Ffn; fmt : int; base : int64; tag : string; neox : bool) : bool {
+def private pair_cell(t : T?; f : Ffn; fmt : int; base : int64; tag : string; neox, hasb : bool) : bool {
     var qa : Quad
     var qb : Quad
-    if (!quad_up(qa, fmt, base, 21l + int64(fmt), 0.3, neox)) {
+    if (!quad_up(qa, fmt, base, 21l + int64(fmt), 0.3, neox, hasb)) {
         return false
     }
-    t |> success(quad_up(qb, fmt, base + 10l * STRIDE, 33l + int64(fmt), 0.7, neox), "{tag}: layer B's quad uploaded")
+    t |> success(quad_up(qb, fmt, base + 10l * STRIDE, 33l + int64(fmt), 0.7, neox, hasb), "{tag}: layer B's quad uploaded")
     let gen = moe_gpu_attn_dec_claim(true)
     // a layer the block has never seen hydrates first (zero rows at position 0 creates it), then serves
     t |> success(moe_gpu_attn_dec_ok(qa.woq, 0l, gen) == DAT_HYDRATE, "{tag}: an unseen layer asks for a hydrate at position 0")
@@ -515,7 +568,87 @@ def private span_args(qa, qb : Quad; f : Ffn) : MoeSpanDec {
         f1 <- [1, 1], f3 <- [1, 1], f2 <- [3, 3])
     a.rmsq |> resize(2)   // no qk-norm: null rows
     a.rmsk |> resize(2)
+    a.bq |> resize(2)   // no projection bias: null rows
+    a.bk |> resize(2)
+    a.bv |> resize(2)
     return <- a
+}
+
+//! the span's arguments with a shared expert beside the routed pair (both layers share its triple), gated or not
+def private span_args_sh(qa, qb : Quad; f : Ffn; sh : Shexp; gated : bool) : MoeSpanDec {
+    var a <- span_args(qa, qb, f)
+    a.nsh = NFE
+    a.sh_gated = gated
+    a.wsh1 <- [sh.off1, sh.off1]
+    a.wsh3 <- [sh.off3, sh.off3]
+    a.wsh2 <- [sh.off2, sh.off2]
+    return <- a
+}
+
+//! one span layer's reference with a shared expert: span_layer_ref's steps, the shared gate on the
+//! same f32 normed row, then the shared FFN on the Q8_0 feed (its hidden row requantized Q8_0 as
+//! the q8 down GEMV reads it) scaled by sigmoid(gate) - or by one, ungated - onto the residual
+def private span_layer_ref_sh(var q : Quad; f : Ffn; sh : Shexp; router : array<float>; li : int64; var x : array<float>; pos : int64; cossin : array<float>; var kraw : array<float>; gated : bool) {
+    var xb2 : array<float>
+    block_ref(q, x, pos, cossin, xb2, kraw)
+    for (i in range64(N)) {
+        x[i] += xb2[i]
+    }
+    var xb : array<float>
+    xb |> resize(N)
+    rmsnorm(xb, x, f.norm, N, EPS)
+    var lg : array<float>
+    lg |> resize(NE)
+    for (e in range64(NE)) {
+        var acc = 0.0
+        for (i in range64(N)) {
+            acc += router[(li * NE + e) * N + i] * xb[i]
+        }
+        lg[e] = acc
+    }
+    var gl = 0.0
+    for (i in range64(N)) {
+        gl += sh.gate[li * N + i] * xb[i]
+    }
+    let g = gated ? 1.0 / (1.0 + exp(-gl)) : 1.0
+    var idx : array<int64>
+    var w : array<float>
+    idx |> resize(K)
+    w |> resize(K)
+    unsafe {
+        moe_select_core(MoeGate.softmax, NE, K, true, 1.0, addr(lg[0]), addr(idx[0]), addr(w[0]), 0l)
+    }
+    var fd : array<float>
+    var gxq1 : array<int8>
+    var gxs1 : array<float>
+    feed_ref(x, f.norm, 1, fd, gxq1, gxs1)
+    var fd0 : array<float>
+    var xq0 : array<int8>
+    var xs0 : array<float>
+    feed_ref(x, f.norm, 0, fd0, xq0, xs0)
+    ffn_ref_sel(f, fd, idx, w, x)
+    var gg : array<float>
+    var u : array<float>
+    gemv_ref(sh.w1, NFE, N, fd0, gg)
+    gemv_ref(sh.w3, NFE, N, fd0, u)
+    var hrow : array<float>
+    hrow |> resize(NFE)
+    for (i in range64(NFE)) {
+        hrow[i] = silu(gg[i]) * u[i]
+    }
+    var hq : array<int8>
+    var hsc : array<float>
+    hq |> resize(NFE)
+    hsc |> resize(NFE / 32l)
+    quantize_q8_0_into(hrow, NFE, hq, hsc, 0l, 0l)
+    for (i in range64(NFE)) {
+        hrow[i] = float(hq[i]) * hsc[i / 32l]
+    }
+    var d : array<float>
+    gemv_ref(sh.w2, N, NFE, hrow, d)
+    for (i in range64(N)) {
+        x[i] += g * d[i]
+    }
 }
 
 [test]
@@ -554,8 +687,8 @@ def test_vulkan_dec_span(t : T?) {
         }
         var qa : Quad
         var qb : Quad
-        t |> success(quad_up(qa, 1, 60l * STRIDE, 51l, 0.4, true), "dec span: layer A's quad uploaded")
-        t |> success(quad_up(qb, 1, 70l * STRIDE, 63l, 0.8, true), "dec span: layer B's quad uploaded")
+        t |> success(quad_up(qa, 1, 60l * STRIDE, 51l, 0.4, true, false), "dec span: layer A's quad uploaded")
+        t |> success(quad_up(qb, 1, 70l * STRIDE, 63l, 0.8, true, false), "dec span: layer B's quad uploaded")
         let gen = moe_gpu_attn_dec_claim(true)
         matmul_moe_gpu_attn_dec_hydrate(qa.woq, null, null, 0l, KVD, true)
         matmul_moe_gpu_attn_dec_hydrate(qb.woq, null, null, 0l, KVD, true)
@@ -623,6 +756,95 @@ def test_vulkan_dec_span(t : T?) {
     }
 }
 
+//! the span with a gated shared expert: the routed slots plus sigmoid(gate) times the shared down
+//! row in one combine, the shared feed off the same normed row, one submit per position
+[test]
+def test_vulkan_dec_span_shexp(t : T?) {   // nolint:STYLE038 — one span cell: the fixture, the hooks, two positions and the two controls, in the plain span cell's shape
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        vk_span_reset()   //! the span records once per model: this cell is the second model in the process
+        install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+        set_moe_gpu_attn_dec_hooks(@@vk_moe_attn_dec, @@vk_moe_attn_dec_ok, @@vk_moe_attn_dec_claim, @@vk_moe_attn_dec_hydrate)
+        set_moe_gpu_span_dec_hook(@@vk_moe_span_dec)
+        //! bases past every other cell's (the tail pairs sit at 10-23, 40-53 and 80-93 x STRIDE, the
+        //! routed stacks at 30-32, the plain span's quads at 60-73): first-hit stack lookup
+        var f : Ffn
+        if (!ffn_up(t, f, 100l)) {
+            t |> skip("dec span shexp: no Vulkan device (or probe/budget refused the upload)")
+            return
+        }
+        var sh : Shexp
+        t |> success(shexp_up(t, sh, 103l * STRIDE), "dec span shexp: the shared gate plane uploaded")
+        var qa : Quad
+        var qb : Quad
+        t |> success(quad_up(qa, 1, 110l * STRIDE, 51l, 0.4, true, false), "dec span shexp: layer A's quad uploaded")
+        t |> success(quad_up(qb, 1, 120l * STRIDE, 63l, 0.8, true, false), "dec span shexp: layer B's quad uploaded")
+        var router : array<float>
+        var att_norms : array<float>
+        var ffn_norms : array<float>
+        span_planes(qa, qb, f, router, att_norms, ffn_norms)
+        var no_freqs : array<float>
+        var cossin : array<float>
+        cossin |> resize(HS)
+        for (gated in fixed_array(true, false)) {
+            vk_span_reset()   //! the record keys on the shared expert's gate: the ungated arm is a new span
+            let tag = gated ? "gated" : "ungated"
+            let gen = moe_gpu_attn_dec_claim(true)
+            matmul_moe_gpu_attn_dec_hydrate(qa.woq, null, null, 0l, KVD, true)
+            matmul_moe_gpu_attn_dec_hydrate(qb.woq, null, null, 0l, KVD, true)
+            t |> success(moe_gpu_attn_dec_ok(qa.woq, 0l, gen) == DAT_SERVE && moe_gpu_attn_dec_ok(qb.woq, 0l, gen) == DAT_SERVE,
+                "dec span shexp ({tag}): both layers serve position 0")
+            var a <- span_args_sh(qa, qb, f, sh, gated)
+            var kout : array<float>
+            var vout : array<float>
+            kout |> resize(2l * KVD)
+            vout |> resize(2l * KVD)
+            for (pos in range64(2)) {
+                build_rope_row_packed(cossin, 0l, pos, HS, 10000.0, 1.0, 1.0, no_freqs)
+                var x : array<float>
+                fill_row(x, N, 0.5 + 0.7 * float(pos))
+                var x_ref := x
+                var xd : array<float>
+                var xq : array<int8>
+                var xs : array<float>
+                feed_ref(x, qa.norm, 1, xd, xq, xs)
+                unsafe {
+                    a.pos = pos
+                    a.router = addr<float const?>(router[0])
+                    a.shgate = addr<float const?>(sh.gate[0])
+                    a.att_norm = addr<float const?>(att_norms[0])
+                    a.ffn_norm = addr<float const?>(ffn_norms[0])
+                    a.xq = addr<int8 const?>(xq[0])
+                    a.xs = addr<float const?>(xs[0])
+                    a.cossin = addr<float const?>(cossin[0])
+                    a.x = addr(x[0])
+                    a.kout = addr(kout[0])
+                    a.vout = addr(vout[0])
+                }
+                matmul_moe_gpu_span_dec(a)
+                var kraw_a : array<float>
+                var kraw_b : array<float>
+                span_layer_ref_sh(qa, f, sh, router, 0l, x_ref, pos, cossin, kraw_a, gated)
+                span_layer_ref_sh(qb, f, sh, router, 1l, x_ref, pos, cossin, kraw_b, gated)
+                check_row(t, "span shexp ({tag}) pos {pos} residual row after both layers", x, x_ref)
+                if (pos == 0l) {
+                    var poison := x
+                    poison[0] += 1.0 + 2.0 * max_abs(x_ref)
+                    t |> success(count_bad(poison, x_ref, ABS_BAR, REL_BAR * max_abs(x_ref)) == 1, "span shexp ({tag}): the bars catch a poisoned element")
+                    var x_no : array<float>
+                    fill_row(x_no, N, 0.5)
+                    var ka : array<float>
+                    var kb : array<float>
+                    span_layer_ref(qa, f, router, 0l, x_no, 0l, cossin, ka)
+                    span_layer_ref(qb, f, router, 1l, x_no, 0l, cossin, kb)
+                    t |> success(count_bad(x, x_no, ABS_BAR, REL_BAR * max_abs(x_no)) > 0, "span shexp ({tag}): the reference without the shared expert misses the device row")
+                }
+            }
+        }
+    } else {
+        t |> skip("dasVulkan not installed; the decode span is untestable here")
+    }
+}
+
 [test]
 def test_vulkan_dec_tail(t : T?) {
     static_if (typeinfo builtin_module_exists(vulkan)) {
@@ -634,8 +856,9 @@ def test_vulkan_dec_tail(t : T?) {
             t |> skip("dec tail: no Vulkan device (or probe/budget refused the upload)")
             return
         }
-        t |> success(pair_cell(t, f, 1, 10l * STRIDE, "k4 quads (Q8_K feed, neox rope)", true), "dec tail: the k4 pair uploaded")
-        t |> success(pair_cell(t, f, 0, 40l * STRIDE, "q8 quads (Q8_0 feed, classic rope)", false), "dec tail: the q8 pair uploaded")
+        t |> success(pair_cell(t, f, 1, 10l * STRIDE, "k4 quads (Q8_K feed, neox rope)", true, false), "dec tail: the k4 pair uploaded")
+        t |> success(pair_cell(t, f, 0, 40l * STRIDE, "q8 quads (Q8_0 feed, classic rope)", false, false), "dec tail: the q8 pair uploaded")
+        t |> success(pair_cell(t, f, 0, 80l * STRIDE, "q8 quads with the q/k/v projection bias (qwen2moe, neox rope)", true, true), "dec tail: the biased q8 pair uploaded")
     } else {
         t |> skip("dasVulkan not installed; the decode block and tail are untestable here")
     }

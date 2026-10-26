@@ -1,10 +1,15 @@
 # dasLLAMA image rail Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-doc: `ARCHITECTURE_IMAGE.md`.
+doc: `ARCHITECTURE_IMAGE.md`. Planned work: `followup_general.md`.
 
 **Routed from `REVIEW.md`: a diff that checklist routes here applies this list together with
 `REVIEW.md`.**
+
+**A diff that moves or re-means the `.dlim` header's first two words - the magic number and the
+version - or changes their byte layout, updates `examples/dasLLAMA/wasm/mint_models.py` in the
+same change.** That script reads both words at their offsets to gate a browser deploy, and no
+compile catches it when they move; a bump of the version's value needs nothing there.
 
 **A transform on the go-live path - repacking, quantizing, folding, permuting - is a defect;
 it belongs to the mint.** Going live is `parse_image` pointing a live carrier's planes into the
@@ -16,13 +21,19 @@ image rail does not carry is a ledgered lane in `ARCHITECTURE_IMAGE.md`, never a
 
 **A weight carrier becomes live only through `build_image` and `parse_image` in
 `dasllama/dasllama_image.das`: reading weights into a live carrier, or releasing an image
-backing, anywhere else is a defect - and a second mint path, per family, per format, or per
-backend, is a defect even where its output is identical.**
+backing, anywhere else is a defect.**
 
-**A decoder mint never holds the whole model.** A decoder mint is the mint of an LLM decoder
-model, not of a tower or embedder carrier. It sizes the image before writing the first byte and
-writes each plane as it is produced. A mint that is slower in exchange for a lower peak is
-correct.
+**A second mint path - per family, per format, or per backend - is a defect even where its
+output is identical.**
+
+**A decoder mint never materializes the whole image in memory: it sizes the image before
+writing the first byte and writes each plane as it is produced.** A decoder mint is the mint of
+an LLM decoder model, not of a tower or embedder carrier. A mint that is slower in exchange for
+a lower peak is correct.
+
+**A decoder mint never holds two copies of the carrier: the planar model it streamed from is
+released before the written image is mapped, and a declined save serves the streamed build
+from memory instead of reloading.**
 
 **A staged carrier mint (`cache_via_image_staged`) meeting a source file at or past 1 GiB
 either refuses it or streams it the way a decoder mint does.** A refusal names that file. The

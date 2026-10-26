@@ -593,6 +593,12 @@ namespace das {
         static __forceinline TT * cast ( const QQ & expr ) {
             return const_cast<TT *>(reinterpret_cast<const TT *>(&expr));
         }
+        static __forceinline TT * cast ( const Func & expr ) {
+            return (TT *) expr.PTR;
+        }
+        static __forceinline TT * cast ( const Lambda & expr ) {
+            return (TT *) expr.capture;
+        }
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable:4312)   // reinterpret_cast used between related classes
@@ -4511,12 +4517,7 @@ namespace das {
     __forceinline vec4f cvt_uint3 ( float3 f ) { return v_cast_vec4f(v_cvt_vec4i(f)); }
     __forceinline vec4f cvt_uint4 ( float4 f ) { return v_cast_vec4f(v_cvt_vec4i(f)); }
 
-    __forceinline vec4f cvt_pass ( int2 i )  { return i; }
-    __forceinline vec4f cvt_pass ( int3 i )  { return i; }
-    __forceinline vec4f cvt_pass ( int4 i )  { return i; }
-    __forceinline vec4f cvt_pass ( uint2 i ) { return i; }
-    __forceinline vec4f cvt_pass ( uint3 i ) { return i; }
-    __forceinline vec4f cvt_pass ( uint4 i ) { return i; }
+    __forceinline vec4f cvt_pass ( vec4f i ) { return i; }
 
     __forceinline int32_t class_rtti_size ( void * ptr ) {
        auto pti = (TypeInfo **)ptr;

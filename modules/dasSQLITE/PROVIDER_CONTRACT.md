@@ -8,10 +8,6 @@ reference implementation; [dasDuckDB](https://github.com/borisbat/dasDuckDB) and
 document is the contract; the registry core in `daslib/sql_provider.das` is its
 executable form.
 
-The rework arc's design records - `API_REWORK.md`, `API_MISSING.md`, `API_CHECKED.md`,
-`API_MIGRATION.md`, `TUTORIALS.md`, and the `tutorial-mockup/` design artifacts - are
-archived under `history/dasSQLITE/` (2026-07-24).
-
 ## Architecture in one paragraph
 
 `_sql(...)` and its siblings analyze a LINQ-shaped chain at **compile time** and emit
@@ -65,13 +61,17 @@ Registries live per macro context (consumer-requires-contributor; see
 skills/das_macros.md "Macro modules each compile into their own context"), so
 registration is pulled, not pushed: each consulting macro module (`daslib/sql_boost`,
 `daslib/sql_linq`) has a `[_macro]` twin calling `sql_register_present_providers`
-(in `daslib/sql_boost`), which optionally-requires each provider's **registration
-shim** (`require ?sqlite sqlite/sqlite_provider`) and calls its registration
-function under `static_if (typeinfo builtin_module_exists(<mod>))`. A new provider
-therefore ships a lean shim module (stmt factories + dialect hooks + caps; it must
-NOT require the provider's boost - that would cycle through `daslib/sql_boost`) and
-adds one `require ?<mod>` line plus one `static_if` branch to
-`sql_register_present_providers`. Entry fields:
+(in `daslib/sql_boost`), which requires the `sql_provider` **group** and calls
+`register_provider` on every member (`call_module_group`, `daslib/module_group`). A
+new provider therefore ships a lean **registration shim** module (stmt factories +
+dialect hooks + caps; it must NOT require the provider's boost - that would cycle
+through `daslib/sql_boost`) that defines `register_provider`, and joins the group:
+`register_module_group("sql_provider", "<mod>/<mod>_provider", "<mod>")` in its
+`.das_module` descriptor - the third argument guards the row on the C++ module, since the
+descriptor and the das files sit in every checkout and the module only in a build configured
+with it - plus `registerModuleGroupMember` with the first two strings in the C++ module's
+`initMain` (the binder generates the constructor) for a host that runs no descriptors.
+Nothing in `daslib/` is edited. Entry fields:
 
 | Field | SQLite value | Consulted by |
 |---|---|---|

@@ -1,12 +1,16 @@
 # dasLLAMA Architecture - the Vulkan per-op tier's decode era
 
 Companion to `ARCHITECTURE_GPU_VULKAN.md`; section numbers are `ARCHITECTURE.md`'s. This
-document carries sections 2.2r-2.2v: the decode attention block over per-layer K/V mirrors,
-the streamed expert layer's GPU/CPU split, the whole-token decode span, the deltanet decode
-step's per-session resident state, and the whole-model driver's hybrid token command. The
-prefill window chain, the cm2 tiles and the MoE expert chain these build on are
-`ARCHITECTURE_GPU_VULKAN.md` sections 2.2j-2.2m and 2.2p-2.2q; the residency plan and the marks
-swap under them are `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` sections 2.2n-2.2o.
+document carries sections 2.2r-2.2v: the decode attention block over per-layer K/V mirrors, the
+streamed expert layer's GPU/CPU split, the whole-token decode span, the deltanet decode step's
+per-session resident state, and the whole-model driver's hybrid token command. The prefill
+window chain and byte stores these build on are `ARCHITECTURE_GPU_VULKAN.md` sections 2.2j,
+2.2p, 2.2ab, 2.2ac and 2.2ad; the routed block an MoE layer takes in either era - the prefill
+window's and the token command's - is `ARCHITECTURE_GPU_VULKAN_MOE.md` sections 2.2af and
+2.2ag; the cm2 tiles, the MoE expert chain on them, the KHR arm's kq tile and the decode GEMV
+family's lane split are `ARCHITECTURE_GPU_VULKAN_GEMM.md` sections 2.2k-2.2m, 2.2q, 2.2ae and
+2.2ah; the residency plan and
+the marks swap under them are `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` sections 2.2n-2.2o.
 
 ### 2.2r The per-op tier's decode attention block {#decode-attention-block}
 
@@ -25,18 +29,22 @@ The PREFILL chain's readback is the other way round; its k rows come home roped.
 **The block serves one shape, and `attn_dec_shape_ok` is the whole gate.** The layer's q, k, v
 and o planes are resident, the k source is the layer itself (no shared KV), the session's cache
 is flat (not paged) and neither codec is tq4, the rope covers the whole head, and the model
-carries no qkv or output bias, no v-norm, no attention sinks, no logit softcap, no q gate and no
+carries no output bias, no v-norm, no attention sinks, no logit softcap, no q gate and no
 sliding window - the chain's kernels implement none of them. q, k and v also share one quant
-class, because k and v read the q stack's activation image.
+class, because k and v read the q stack's activation image. A q/k/v projection bias (qwen2moe)
+is served: the layer's `[q | k | v]` row uploads once when its sets are made and binds where the
+rope kernels expect it, so the mirror rows carry the bias; the raw rows that come home are the
+GEMV output before it, and the host store adds the bias before its own norm and rope.
 
 **The mirror is per layer, keyed by the q plane offset, and capped** (`DAT_MIRROR_ROWS` rows;
 VRAM is layers x rows x kvd x 4 bytes). The loader reports that need
 (`set_moe_gpu_dat_need`) and the tier carves it from the weight budget BEFORE placement, the
 way the stream slots are carved: the mirrors are allocated after placement, and un-carved they
 came out of the desktop reserve and paged the resident expert stacks (the FFN chain's submit
-went from 147 us to 741 us). The prefill chain fills it from its own f16 K/V
-shadows at the end of each layer's window (`ARCHITECTURE_GPU_VULKAN.md` sec.2.2q's fa arm converts the attended prefix;
-the fill is a device copy of it), and the block appends one row per served token.
+went from 147 us to 741 us). The prefill chain fills it from its own f16 K/V shadows at the end
+of each layer's window (`ARCHITECTURE_GPU_VULKAN_GEMM.md` sec.2.2q's fa arm converts the
+attended prefix; the fill is a device copy of it), and the block appends one row per served
+token.
 
 **Ownership is a generation plus a per-layer count.** Every prefill claims ONCE, at the end of
 `forward_prefill_body` - the token entry and the embedding entries alike - and the tier mints a
@@ -80,8 +88,9 @@ three constants (`SPLIT_BUS_BPS`, `SPLIT_GPU_ROW_S`, `SPLIT_CPU_ROW_S` in `dasll
 sit at 13.5 GB/s, 1.2 us and 10 us - the reference box's measurements (zen2 16 lanes, 5060 Ti on
 PCIe gen4 x8; `benchmarks/lcpp_bench.das -t 16` pp512 under `DASLLAMA_GPU_PROF=1`: the bus moves a
 streamed expert's bytes at ~11 GB/s, the cm2 chain costs ~1.6 us per bucket row, the CPU kq
-groupn chain ~10 us per bucket row), tuned to where the split balanced best. A head that would cover every expert falls back to
-the plain rail - streaming the whole layer beats splitting it against an idle CPU.
+groupn chain ~10 us per bucket row), tuned to where the split balanced best. A head that would
+cover every expert falls back to the plain rail - streaming the whole layer beats splitting it
+against an idle CPU.
 
 **The GPU head streams only its experts' regions** (`copy_stream_group_partial` copies the
 claimed experts' plane ranges into the stream slot at their expert offsets), records the cm2
@@ -97,13 +106,14 @@ and the whole-group rail's overlap - compute on one while the transfer queue fil
 
 **Every resident expert layer's decode runs as ONE recorded chain and ONE submit per token**
 (`DASLLAMA_GPU_DEC_SPAN`, on; the `vulkan_moe_span` decode override, selected when the MoE
-placement leaves expert layers or the classifier on the device, deselected at the model drop). The per-layer form costs a submit per attention and one per FFN, and each submit
-carries ~75 us of queue and fence latency the GPU spends idle (`DASLLAMA_GPU_PROF=1`'s
-`vk_dec prof` ledger over 96 tokens) - on a 48-layer model with 35
-resident layers that is the largest single term of the token. The span keeps the host out of the
-resident suffix [l0, n_layers): the host feeds layer l0's attention row in its plane's acts
-form, the device runs per layer the attention chain (sec.2.2r above), the residual add fused with the
-FFN rms (`cls_ar`, `add_on`), the gate/up feed requants, the router GEMV over an f32 plane
+placement leaves expert layers or the classifier on the device, deselected at the model drop).
+The per-layer form costs a submit per attention and one per FFN, and each submit carries ~75 us
+of queue and fence latency the GPU spends idle (`DASLLAMA_GPU_PROF=1`'s `vk_dec prof` ledger
+over 96 tokens) - on a 48-layer model with 35 resident layers that is the largest single term
+of the token. The span keeps the host out of the resident suffix [l0, n_layers): the host feeds
+layer l0's attention row in its plane's acts form, the device runs per layer the attention
+chain (sec.2.2r above), the residual add fused with the FFN rms (`cls_ar`, `add_on`), the
+gate/up feed requants, the router GEMV over an f32 plane
 (`router_gemv_cls`: one workgroup per expert row, f32 in and f32 out - the host router's own
 arithmetic rather than a quant chain, so the device's picks track the CPU's up to summation
 order) and
@@ -126,8 +136,19 @@ row serves every slot) and j for the down stack (the act+requant output has one 
 slot - the row stride is the down feed's blocks per row). The select mirrors the host's
 `moe_select_core` softmax arm: max, exp floored at -80, sum, k picks of the largest with the
 lowest index on ties and the winner knocked out, the picks renormalized (the sum clamped at
-f16-min) and scaled. Only that arm rides - sigmoid gates, router biases, shared experts,
-post-norms and biased experts decline to the per-layer path (`span_model_ok`).
+f16-min) and scaled. Only that arm rides - sigmoid gates, router biases, gemma4's dense
+shared expert with its sandwich norms, post-norms and biased experts decline to the per-layer
+path (`span_model_ok`).
+
+**A qwen2moe-class shared expert rides inside the span beside the routed slots.** Its q8 triple
+is resident under the shexp mark (the span's serve gate asks per layer), its feed is the same
+normed row requantized into its own stacks' images, its metas are one fixed region the host
+writes once (the top-k never touches them), its gate logit is one more `RouterGemv` row over the
+layer's gate vector landing past the router's logits, and one combine (`DecCombineSh`) adds
+the routed slots and `sigmoid(gate)` times the shared down row onto the residual; an ungated
+shared expert (glm4moe) adds at weight one. Before this the span declined every shared-expert
+model to the per-layer path, and there the resident layer's shared expert ran on the CPU
+(`sh_gpu` in `dasllama_moe.das` serves the shexp rail only beside CPU experts).
 
 **The span declines whole, per token, never per layer.** `span_first_layer` walks the layers
 downward through the block's serve gate (so a hydrate a layer needs runs first) and stops at
@@ -136,8 +157,9 @@ resident layer under the suffix - a resident layer there would arm its FFN tail 
 suffix's first feed (the layer under is a streamed one, or there is none). A model whose gate
 is not the softmax-with-renorm the top-k kernel mirrors, whose expert count or routed slots
 exceed the kernel's one-workgroup reach, whose router planes exceed one SSBO range, or whose
-arch binds a non-standard attention or FFN block declines whole (`span_model_ok`). The gemv sets carry no hazard bits on their feed and meta bindings, so the
-span's recorder declares those edges by hand (`vhz_dep` on the span's own region bits) after
+arch binds a non-standard attention or FFN block declines whole (`span_model_ok`). The gemv
+sets carry no hazard bits on their feed and meta bindings, so the span's recorder declares
+those edges by hand (`vhz_dep` on the span's own region bits) after
 each requant and after the top-k. The loader carves the router planes with the mirrors
 (`set_moe_gpu_dat_need`).
 
@@ -186,9 +208,10 @@ natively where this driver will be attempted or no GPU rail wants them (Metal of
 grouped, since a grouped file has no exact transcode, and either the whole-model driver armed on
 an expert-free model or a tier whose per-op dense and deltanet rails are unwanted; every other
 case transcodes them to q8, because Metal and the per-op rails bind deltanet q8 only), each GEMV
-dispatches per format and a superblock plane takes the Q8_K x feed - while the out plane is q8,
-since the step's o row feeds it as Q8_0
-(a K-quant out plane declines the layer); the beta and alpha rows are q8 arena planes when
+dispatches per format and a superblock plane takes the Q8_K x feed. The out plane rides its
+file format too: for a q8 plane the step writes the o row as Q8_0 blocks, for a superblock plane
+it writes the f32 row and the Q8_K requant - the attention head's wo twin - makes the out GEMV's
+feed, billed to the out role so the stamp count stands; the beta and alpha rows are q8 arena planes when
 the file carries them quantized, or - the F32-on-disk case - one f16 device copy of every
 recurrent layer's `[beta ; alpha]` rows that the router-form GEMV's f16 twin reads with an output
 base into the smalls. A hybrid takes the split activation rail (no fused add+rms+requant): the f32
@@ -211,6 +234,21 @@ mirror is sized `n_attn x seq_cap x kv_dim` and each attention layer carries its
 once on a recurrent layer. The attention geometry (head size, q and kv widths) is the first
 attention layer's - on qwen35 layer 0 is recurrent.
 
+**A q/k/v projection bias (qwen2) folds into the rope stage.** The biased models' bias rows
+upload once as one row per layer in the projection buffer's own `[q | k | v]` layout
+(`vk_rdec_upload_bias`, a recurrent layer's row zero), bound at the last binding of the three
+rope kernels - the decode rope+store, the prefill's batched twin and the fused qk-norm+rope -
+which add the bias to each element as they read it, before the rotation (or the norm) and
+before the v copy, so no dispatch is added: the CPU chain adds the bias between the projection
+and the norm, and so does this. A model without a bias binds the norms buffer in that slot as
+a placeholder the kernel never reads (`hasb` 0). The seat installs separately
+(`install_moe_gpu_resident_bias`), so a tier without it names the bias in its decline instead
+of serving the model unbiased. The per-op tier carries the same rows through its hooks: the
+decode block binds the layer's row to the same rope kernels (sec.2.2r), and the prefill chain's
+`AtPrep` stage adds the q and k rows before its norm and rope and runs a third pass over the raw
+v window - `AtPrep` with no rope and no norm is a copy plus bias, in place - so the attention and
+the v rows that come home both carry it (`ARCHITECTURE_GPU_VULKAN_GEMM.md`, the per-op chain).
+
 **Gated attention and partial rotary ride the fused qk-norm+rope kernel and the decode
 attention kernel, not a detour.** On a gated model the q GEMV writes `2 x qd` rows in the
 loader's per-head `[q | gate]` layout; the fused kernel reads and writes q head-strided
@@ -223,7 +261,7 @@ arm, so a gated or partial-rope model takes the fused kernel whatever the fuse g
 two arms need qk-norm, and a model with either but without it declines by name.
 
 **The prefill window chain carries the same three arms** (`ARCHITECTURE_GPU_VULKAN.md`
-sec.2.2j): a recurrent layer's window block runs the qkv and z batch GEMMs, the beta and alpha
+sec.2.2ad): a recurrent layer's window block runs the qkv and z batch GEMMs, the beta and alpha
 rows into the layer's own smalls, the conv, the sequential scan over the layer's own device
 state slot (the raw o rows in the tier's workspace), the o requant and the out GEMM into the block
 output, so the window command needs no host round trip per layer. The state slots are the

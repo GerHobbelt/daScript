@@ -11,12 +11,14 @@
 
 using namespace das;
 
-// files whose text change can alter emitted machine code without changing the user
-// program's AOT hashes. llvm_tune.das stays out by design (selection only);
-// x64_avx/aarch64_neon/f16_cvt are plain das reference bodies, visible to the AOT hash;
-// llvm_aot/llvm_exe emit explicit artifacts, not silently cached DLLs.
+// files whose text change can alter what a silently cached DLL carries - emitted machine code,
+// or the debug metadata beside it - without changing the user program's AOT hashes.
+// llvm_tune.das stays out by design (selection only); x64_avx/aarch64_neon/f16_cvt are plain
+// das reference bodies, visible to the AOT hash; llvm_aot/llvm_exe emit explicit artifacts,
+// not silently cached DLLs.
 static const char * EMITTER_FILES[] = {
     "llvm_jit.das",
+    "llvm_jit_di.das",
     "llvm_jit_common.das",
     "llvm_boost.das",
     "llvm_macro.das",
@@ -30,6 +32,8 @@ static const char * EMITTER_FILES[] = {
     "llvm_cpu_class.das",
     "llvm_tune_fat_word.das",
     "llvm_code_shell.das",
+    "llvm_jit_plan.das",
+    "llvm_jit_link.das",
 };
 
 // normalized to LF so Windows and Linux checkouts agree
@@ -75,7 +79,7 @@ TEST_CASE("jit emitter sources match the pinned hash") {
     uint64_t pinned = strtoull(runSrc.c_str() + hexAt, nullptr, 16);
     char pinLiteral[32];
     snprintf(pinLiteral, sizeof(pinLiteral), "0x%llxul", (unsigned long long) emitterHash);
-    INFO("emitter sources changed: set LLVM_JIT_EMITTER_HASH = " << pinLiteral
-        << " in llvm_jit_run.das, and bump LLVM_JIT_CODEGEN_VERSION beside it if emitted code changed");
+    INFO("emitter sources changed: first bump LLVM_JIT_CODEGEN_VERSION in llvm_jit_plan.das if emitted code changed"
+        << " (that file is in the hashed set), then set LLVM_JIT_EMITTER_HASH = " << pinLiteral << " in llvm_jit_run.das");
     CHECK_EQ(emitterHash, pinned);
 }

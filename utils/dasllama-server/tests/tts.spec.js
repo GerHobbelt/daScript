@@ -175,6 +175,41 @@ test('a refused phonemes call leaves the panel hidden and does not disturb the a
     await expect(page.locator('#s-phon')).toBeHidden();
 });
 
+// the capture with one tts fact overridden: both arms of a page rule are driven explicitly, so
+// the spec never pins the arm the current capture happens to be in
+function withTts(field, value) {
+    const s = JSON.parse(JSON.stringify(fx('stats_tts')));
+    s.tts[field] = value;
+    return s;
+}
+
+test('a model with no speed control loses the speed knob, and the request still carries 1.0', async ({ page }) => {
+    await openControl(page, { stats: withTts('speed', true) });
+    await expect(page.locator('#s-speed-knob')).toBeVisible();
+    const { posts } = await openControl(page, Object.assign({ stats: withTts('speed', false) }, wavAnswer()));
+    await expect(page.locator('#s-speed-knob')).toBeHidden();
+    await page.locator('#s-text').fill('no speed knob here');
+    await page.locator('#s-run').click();
+    await expect(page.locator('#s-note')).toContainText('of audio in');
+    expect(lastJson(posts.filter(p => p.path === SPEECH)).speed).toBe(1);
+});
+
+test('the offer card says so when the wired model clones a voice', async ({ page }) => {
+    await openControl(page, { stats: withTts('cloning', false), config: fx('config_tts') });
+    await expect(page.locator('#tts-offer')).not.toContainText('clones a voice');
+    await openControl(page, { stats: withTts('cloning', true), config: fx('config_tts') });
+    await expect(page.locator('#tts-offer')).toContainText('clones a voice');
+});
+
+test('the config editor carries the voices directory as a path override', async ({ page }) => {
+    const c = fx('config_tts');
+    expect(c.surface.config).toHaveProperty('tts_voices_dir');
+    await openControl(page, { stats: fx('stats_tts'), config: c });
+    await expect(page.locator('#f-tts_voices_dir')).toHaveValue(c.surface.config.tts_voices_dir);
+    // the override box follows the key's source: ticked when the capture's TOML set it, clear at the default
+    await expect(page.locator('#en-tts_voices_dir')).toBeChecked({ checked: c.surface.sources.tts_voices_dir === 'toml' });
+});
+
 test('the picked voice survives a reload', async ({ page }) => {
     const s = fx('stats_tts');
     const second = s.tts.voices[1];
@@ -286,6 +321,37 @@ test('a downloaded model beside the packs offers enable-speech, which wires and 
     // a saved wire is one restart from live, so the note offers it
     await page.locator('#cat-note button', { hasText: 'restart now' }).click();
     expect(posts.some(p => p.path === '/restart')).toBe(true);
+});
+
+// the packs taken away again - the state a box is in with one file on disk
+function withPacksAbsent(doc) {
+    const d = JSON.parse(JSON.stringify(doc));
+    for (const i of d.tts) {
+        if (i.pack) { i.present = false; i.path = ''; }
+    }
+    return d;
+}
+
+test('a model that reads no packs enables speech with the packs absent; one that reads them waits for them', async ({ page }) => {
+    const idle = fx('catalog_idle');
+    const readsPacks = speechModels(idle).find(m => m.present);
+    expect(readsPacks.needs_packs).toBe(true);   // the capture stocks one phoneme family
+    // the phoneme family alone, packs gone: the ladder re-offers the packs, no enable
+    const waiting = withPacksAbsent(idle);
+    await openControl(page, { catalog: waiting });
+    await expect(page.locator('#tts-offer button', { hasText: 'enable speech' })).toHaveCount(0);
+    await expect(page.locator('#tts-offer button', { hasText: 'download the front-end packs' })).toHaveCount(1);
+    // a second model on disk whose row says it reads no packs - the page reads only that key,
+    // so any absent row of the capture serves, its needs_packs overridden: it is the one enable
+    // wires, the packs still absent
+    const alone = speechModels(idle).find(m => !m.present);
+    const doc = withModelPresent(waiting, alone.file);
+    doc.tts.find(i => i.file === alone.file).needs_packs = false;
+    const { posts } = await openControl(page, { catalog: doc });
+    await expect(page.locator('#tts-pick')).toHaveCount(0);   // the phoneme family is not a choice without its packs
+    await page.locator('#tts-offer button', { hasText: 'enable speech' }).click();
+    await expect(page.locator('#cat-note')).toContainText('speech wired (' + modelName(alone.file) + ')');
+    expect(lastJson(posts.filter(p => p.path === '/config')).tts).toBe(doc.models_dir + '\\' + alone.file);
 });
 
 test('several downloaded models become a picker that defaults to the smallest', async ({ page }) => {

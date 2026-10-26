@@ -183,7 +183,10 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_gemma4uv.das",
                     "modules/dasLLAMA/tests/test_gemma4v.das",
                     "modules/dasLLAMA/tests/test_gpu_model_swap.das",
+                    "modules/dasLLAMA/tests/test_gpu_moe_shexp.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_hybrid.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_moe.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_qwen2.das",
                     "modules/dasLLAMA/tests/test_gpu_slot_swap.das",
                     "modules/dasLLAMA/tests/test_kquant.das",
                     "modules/dasLLAMA/tests/test_kv_codec.das",
@@ -193,6 +196,7 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_mtp_gemma_drafter.das",
                     "modules/dasLLAMA/tests/test_parity.das",
                     "modules/dasLLAMA/tests/test_parity_pregate.das",
+                    "modules/dasLLAMA/tests/test_parrot.das",
                     "modules/dasLLAMA/tests/test_ple_modes.das",
                     "modules/dasLLAMA/tests/test_prefill.das",
                     "modules/dasLLAMA/tests/test_qwen3v.das",
@@ -200,11 +204,13 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_sampling.das",
                     "modules/dasLLAMA/tests/test_scheduler.das",
                     "modules/dasLLAMA/tests/test_storyteller_restart.das",
+                    "modules/dasLLAMA/tests/test_storywish.das",
                     "modules/dasLLAMA/tests/test_tokenizer.das",
                     "modules/dasLLAMA/tests/test_tts_postag.das",
                     "modules/dasLLAMA/tests/test_tts_g2p.das",
                     "modules/dasLLAMA/tests/test_tts_kitten.das",
                     "modules/dasLLAMA/tests/test_tts_kokoro.das",
+                    "modules/dasLLAMA/tests/test_tts_pocket.das",
                     "modules/dasLLAMA/tests/test_tts_facade.das",
                     "modules/dasLLAMA/tests/test_vision_chat.das",
                     "modules/dasLLAMA/tests/test_vision_embedder.das",
@@ -236,14 +242,15 @@ let TESTS_DIR = "modules/dasLLAMA/tests"
 def area_tests(area : string) : array<string> {
     if (area == "audio") {
         return <- [ "test_asr_verbs.das", "test_audio.das", "test_audio_embedder.das", "test_dasllama_lint_contracts.das",
-                    "test_tower_asr_kernels.das", "test_tower_helpers.das", "test_vad.das", "test_whisper.das" ]
+                    "test_parrot.das", "test_tower_asr_kernels.das", "test_tower_helpers.das", "test_vad.das", "test_whisper.das" ]
     } elif (area == "vision") {
         return <- [ "test_attn_span.das", "test_gemma3v.das", "test_gemma4uv.das", "test_gemma4v.das", "test_qwen25v.das",
                     "test_qwen3v.das", "test_tower_helpers.das", "test_vision.das", "test_vision_chat.das",
                     "test_vision_embedder.das" ]
     } elif (area == "tts") {
-        return <- [ "test_storyteller_restart.das", "test_tts_blocks.das", "test_tts_facade.das", "test_tts_g2p.das",
-                    "test_tts_kitten.das", "test_tts_kokoro.das", "test_tts_postag.das", "test_tts_textnorm.das" ]
+        return <- [ "test_parrot.das", "test_storyteller_restart.das", "test_storywish.das", "test_tts_blocks.das", "test_tts_facade.das",
+                    "test_tts_g2p.das", "test_tts_kitten.das", "test_tts_kokoro.das", "test_tts_pocket.das",
+                    "test_tts_postag.das", "test_tts_textnorm.das" ]
     } elif (area == "infra") {
         return <- [ "failed_dasllama_lint_require.das", "failed_dasllama_lint_sidedoor.das", "test_bench_records_schema.das",
                     "test_box_ident.das", "test_box_profile.das", "test_dasllama_lint_contracts.das",
@@ -255,7 +262,7 @@ def area_tests(area : string) : array<string> {
         return <- [ "test_accel_backend.das", "test_affinity_predicates.das", "test_arch_registry.das", "test_batch_decode.das",
                     "test_batch_grid.das", "test_chat.das", "test_deltanet.das", "test_dispatch_shaping.das", "test_facade.das",
                     "test_flash.das", "test_forward.das", "test_fused_decode.das", "test_gguf_quant.das", "test_gguf_shards.das",
-                    "test_gpu_model_swap.das", "test_gpu_resident_hybrid.das", "test_gpu_serving_declines.das", "test_gpu_slot_swap.das", "test_gpu_tier.das", "test_groupn.das",
+                    "test_gpu_model_swap.das", "test_gpu_moe_shexp.das", "test_gpu_resident_hybrid.das", "test_gpu_resident_moe.das", "test_gpu_resident_qwen2.das", "test_gpu_serving_declines.das", "test_gpu_slot_swap.das", "test_gpu_tier.das", "test_groupn.das",
                     "test_jobque_tripwire.das", "test_kernel_backend.das", "test_kgroup_repack.das", "test_kqformat.das", "test_kquant.das",
                     "test_kv_codec.das", "test_kv_paged.das", "test_kv_prefix.das", "test_math_activations.das",
                     "test_math_elementwise.das", "test_matmul.das", "test_matmul_batch.das",
@@ -266,7 +273,7 @@ def area_tests(area : string) : array<string> {
                     "test_q8q8_family.das", "test_quant.das",
                     "test_repack.das", "test_repack_lane_context.das", "test_rmsnorm.das", "test_rope.das", "test_rope_apply.das",
                     "test_sampling.das",
-                    "test_scheduler.das", "test_silu.das", "test_softmax.das", "test_storyteller_restart.das", "test_think_split.das", "test_tokenizer.das",
+                    "test_scheduler.das", "test_silu.das", "test_softmax.das", "test_storyteller_restart.das", "test_storywish.das", "test_think_split.das", "test_tokenizer.das",
                     "test_tool_formats.das", "test_unicode.das", "test_vulkan_dec_tail.das", "test_vulkan_kernels.das",
                     "test_vulkan_moe_cm2.das", "test_vulkan_tier.das" ]
     }
@@ -299,7 +306,7 @@ let MODULE_AREAS <- {
     "dasllama_gemma3v" => "vision", "dasllama_gemma4uv" => "vision", "dasllama_gemma4v" => "vision",
     "dasllama_qwen25v" => "vision", "dasllama_qwen3v" => "vision", "dasllama_vision" => "vision",
     "dasllama_vision_embedder" => "vision", "dasllama_vision_io" => "vision",
-    "dasllama_g2p" => "tts", "dasllama_kitten" => "tts", "dasllama_kokoro" => "tts", "dasllama_postag" => "tts",
+    "dasllama_g2p" => "tts", "dasllama_kitten" => "tts", "dasllama_kokoro" => "tts", "dasllama_pocket" => "tts", "dasllama_postag" => "tts",
     "dasllama_styletts2" => "tts", "dasllama_textnorm" => "tts", "dasllama_tts" => "tts",
     "dasllama_tts_blocks" => "tts", "dasllama_tts_types" => "tts",
     "dasllama_exchange" => "infra", "dasllama_exchange_schema" => "infra", "dasllama_lint" => "infra",
@@ -314,7 +321,8 @@ let MODULE_AREAS <- {
     "dasllama_kv_codec" => "llm", "dasllama_metal_decode" => "llm", "dasllama_metal_mtp_gemma" => "llm",
     "dasllama_metal_prefill" => "llm", "dasllama_moe" => "llm", "dasllama_mtp_gemma" => "llm",
     "dasllama_parity" => "llm", "dasllama_ple" => "llm", "dasllama_prefix" => "llm", "dasllama_pretok" => "llm",
-    "dasllama_rope" => "llm", "dasllama_sampling" => "llm", "dasllama_scheduler" => "llm", "dasllama_spm" => "llm",
+    "dasllama_rope" => "llm", "dasllama_sampling" => "llm", "dasllama_scheduler" => "llm",
+    "dasllama_spm" => "llm,tts",   // the unigram arm is the Pocket tokenizer (test_tts_pocket)
     "dasllama_bench" => "llm,infra",   // the rows serve lcpp_bench (llm) and the server's /bench (infra's tooling)
     "dasllama_tokenizer" => "llm", "dasllama_transformer" => "llm", "dasllama_unicode" => "llm",
     "dasllama_vulkan_decode" => "llm", "dasllama_vulkan_prefill" => "llm", "dasllama_vulkan_seams" => "llm"

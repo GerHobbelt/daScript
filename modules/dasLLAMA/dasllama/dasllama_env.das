@@ -95,12 +95,15 @@ struct public GpuTierEnv {
     gpu_moe_stream : Option<int64>
 
     @clarg_default_doc = "probed"
-    @clarg_doc = "Override the detected VRAM budget in MiB that sizes the resident expert stacks."
+    @clarg_doc = "Override the detected VRAM budget in MiB that sizes the resident expert stacks; a pinned cap takes no headroom and reads no OS room."
     gpu_vram_mb : Option<int64>
 
     @clarg_default_doc = "built-in floor"
     @clarg_doc = "Lower the context floor for arming the resident decode driver, for a short-context session on a small card."
     gpu_min_ctx : int64 = 0l
+
+    @clarg_doc = "The whole-model resident driver for a model that fits the card, MoE included; 0 keeps the per-op rails (the A/B lever)."
+    gpu_resident : bool = true
 
     @clarg_default_doc = "follows DASLLAMA_GPU"
     @clarg_doc = "DeltaNet rail on the GPU."
@@ -346,8 +349,8 @@ struct public VulkanEnv {
     @clarg_doc = "Serve from P3-trimmed vulkan images (big CPU weight families dropped; folded into the flavor identity)."
     trim : bool = false
 
-    @clarg_doc = "Tag allocations high-priority (VK_EXT_memory_priority) so the driver demotes desktop memory, not ours."
-    vk_memprio : bool = true
+    @clarg_doc = "Tag every device allocation priority 1.0 (VK_EXT_memory_priority). Off by default: on the NVIDIA WDDM driver the tag makes the tagged weights the pageable set, and a resident model then decodes at PCIe speed once anything is demoted."
+    vk_memprio : bool = false
 
     @clarg_doc = "Vulkan flash attention: the decode fa kernel pick AND the cm2 prefill fa tile; 0 falls back to the chunked/scalar paths."
     vk_fa : bool = true
@@ -373,10 +376,10 @@ struct public VulkanEnv {
     @clarg_doc = "Arm the resident driver with f32 KV mirrors instead of the f16 default (A/B instrument; only sessions of the armed codec are served)."
     vk_kv32 : int64 = 0l
 
-    @clarg_doc = "cm2 prefill tile pick: 0 = occupancy heuristic, 128 = force the m tile, 256 = force the l tile (A/B instrument)."
+    @clarg_doc = "cm2 prefill tile pick: 0 = occupancy heuristic, 128 = force the m tile, 256 = force the l tile (A/B instrument). Inert on the KHR arm (DASLLAMA_COOPMAT=mm, or a device without NV_coopmat2), whose kq tile has one geometry."
     cm2_tile : int64 = 0l
 
-    @clarg_doc = "cm2 split-k: 0 = occupancy heuristic, 1 = off, N = force N k-chunks (A/B instrument; shrinks if N strands an empty tail)."
+    @clarg_doc = "cm2 split-k: 0 = occupancy heuristic, 1 = off, N = force N k-chunks (A/B instrument; shrinks if N strands an empty tail). Inert on the KHR arm, whose kq tile carries no split-k scratch."
     cm2_splitk : int64 = 0l
 
     @clarg_path
@@ -695,11 +698,11 @@ struct public TestEnv {
     whisper_dir : string = ""
 
     @clarg_env = "DISPLAY"
-    @clarg_doc = "Ambient platform variable; read only by the storyteller restart test to tell whether a Linux box has a window server for the example's window."
+    @clarg_doc = "Ambient platform variable; read only by the browser examples' smoke tests (storyteller, storywish, parrot) to tell whether a Linux box has a window server for the example's window."
     display : string = ""
 
     @clarg_env = "WAYLAND_DISPLAY"
-    @clarg_doc = "Ambient platform variable (the Wayland twin of DISPLAY); read only by the storyteller restart test."
+    @clarg_doc = "Ambient platform variable (the Wayland twin of DISPLAY); read only by the browser examples' smoke tests."
     wayland_display : string = ""
 
     @clarg_path

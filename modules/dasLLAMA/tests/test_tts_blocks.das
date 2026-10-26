@@ -6,8 +6,14 @@ options _dasllama_internal = true
 require dastest/testing_boost public
 require dasllama/dasllama_tts_blocks
 require dasllama/dasllama_math   // setup_dasllama_jobque_
+require dasllama/dasllama_math_default   // dot_k4q8, the K-quant leaf per row
+require dasllama/dasllama_convert   // transcode_q4k_superblock, quantize_q8_k_into_ptr
+require dasllama/dasllama_gemm_schema   // kq_qsb / kq_ssb by format id
+require daslib/f16_cvt
 require daslib/jobque_boost
 require daslib/defer
+require daslib/rtti   // this_context().last_exception: a refusal read as text
+require strings
 require math
 
 // The TTS block home's two layouts against each other: every rows-form kernel (token-major
@@ -21,6 +27,7 @@ let REL = 1.0e-4
 let FLOOR = 1.0e-6
 let T_ROWS = 2048l
 let STYLE = 32l
+let KQ_REL = 2.0e-4   //! the K-quant lane against its own leaf: the repacked tile sums the superblocks' scale products in its own order (the disk-order arm is bit-exact)
 
 struct BlockCase {
     name : string
@@ -527,6 +534,133 @@ def private linear_case_q8(nin, nout : int64) : BlockCase {
     return res
 }
 
+// ===== the K-quant lane against the leaf per row =====
+
+def private put_f16(var b : array<uint8>; off : int64; v : float) {
+    let bits = f32_to_f16(v)
+    b[off] = uint8(bits & 0xFFu)
+    b[off + 1l] = uint8(bits >> 8u)
+}
+
+//! one Q4_K superblock in the GGUF's disk layout: two f16 scales, 12 bytes of 6-bit sub-scales, 128 bytes of nibbles
+def private q4k_disk_superblock() : array<uint8> {
+    var b : array<uint8>
+    b |> resize(144l)
+    put_f16(b, 0l, 0.375)
+    put_f16(b, 2l, 0.125)
+    for (i in range64(12l)) {
+        b[4l + i] = uint8((i * 37l + 13l) % 256l)
+    }
+    for (i in range64(128l)) {
+        b[16l + i] = uint8((i * 29l + 7l) % 256l)
+    }
+    return <- b
+}
+
+//! [rows][n] of Q4_K planes as the GGUF transcoder writes them: the one superblock everywhere, its nibbles salted per row
+def private build_q4k_planes(var kq : array<uint8>; var ks : array<uint8>; rows, n : int64; seed : uint) {
+    let nsb = n / 256l
+    let qsb = kq_qsb(4)
+    let ssb = kq_ssb(4)
+    var inscope blk <- q4k_disk_superblock()
+    kq |> resize(rows * nsb * qsb)
+    ks |> resize(rows * nsb * ssb)
+    for (r in range64(rows)) {
+        for (s in range64(nsb)) {
+            transcode_q4k_superblock(blk, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+        }
+        var st = seed + uint(r) * 0x85EBCA6Bu
+        for (i in range64(nsb * qsb)) {
+            st = st * 1664525u + 1013904223u
+            kq[r * nsb * qsb + i] = uint8(uint(kq[r * nsb * qsb + i]) ^ (st >> 16u))
+        }
+    }
+}
+
+//! the leaf the lane applies per row: the row requantized to the Q8_K form, dot_k4q8 over the disk-order planes, then the bias
+def private kq_leaf_rows(kq, ks : array<uint8>; x : array<float>; t, nin, nout : int64; b : array<float>; var want : array<float>) {
+    let nsb = nin / 256l
+    let qsb = kq_qsb(4)
+    let ssb = kq_ssb(4)
+    var xq : array<int8>
+    var xs : array<float>
+    var xbs : array<int>
+    xq |> resize(nin)
+    xs |> resize(nsb)
+    xbs |> resize(nin / 16l)
+    want |> resize(t * nout)
+    unsafe {
+        for (p in range64(t)) {
+            quantize_q8_k_into_ptr(addr<float const?>(x[p * nin]), nin, addr(xq[0]), addr(xs[0]), addr(xbs[0]), 0l, 0l, 0l)
+            for (o in range64(nout)) {
+                let d = dot_k4q8(addr<uint8 const?>(kq[o * nsb * qsb]), addr<uint8 const?>(ks[o * nsb * ssb]),
+                    addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), addr<int const?>(xbs[0]), nin)
+                want[p * nout + o] = d + b[o]
+            }
+        }
+    }
+}
+
+// linear_rows (the batched kq GEMM where the backend carries the tile, the GEMV per row otherwise)
+// and linear_rows_decode (the GEMV) on the K-quant lane against the leaf per row; `repack` false
+// holds the planes in disk order - the portable arm every tier without kq kernels runs; `poison`
+// adds a fixed value to one expected element, which the bar must see
+def private linear_case_kq(nin, nout : int64; decode, repack : bool; poison : bool = false) : BlockCase {
+    var r = TtsRng()
+    rng_seed(r, 0xebcul + uint64(nin))
+    let t = decode ? 1l : T_ROWS
+    var l = TtsLinear(nin = nin, nout = nout)
+    rand_fill(r, l.b, nout, 0.5)
+    var kq : array<uint8>
+    var ks : array<uint8>
+    build_q4k_planes(kq, ks, nout, nin, 0x51ED270Bu)
+    var inscope x : array<float>
+    rand_fill(r, x, t * nin, 2.0)
+    var inscope want : array<float>
+    kq_leaf_rows(kq, ks, x, t, nin, nout, l.b, want)
+    if (poison) {
+        want[length(want) / 2] += 4.0   // a fixed value: the outputs run to a few thousand, so a quarter would hide inside the relative bar
+    }
+    linear_take_kq(l, 4, kq, ks, repack)   // the planes move into the layer
+    var inscope got : array<float>
+    if (decode) {
+        linear_rows_decode(l, x, got)
+    } else {
+        linear_rows(l, x, t, got)
+    }
+    var inscope env : array<float>
+    env |> resize(t * nout)
+    for (i in range64(t * nout)) {
+        env[i] = abs(want[i]) + 1.0
+    }
+    let name = "linear kq {nin}x{nout} {decode ? "decode" : "rows"}{repack ? "" : " disk-order"}{poison ? " poisoned" : ""}"
+    var res = score_at(name, got, want, env, 0.0, KQ_REL)
+    if (l.kq_fmt != 4 || !empty(l.w) || (repack && kernel_backend_has_kq() != l.kq_repacked)) {
+        res.bad += 1000000   // the kq lane never engaged, or the repack did not follow the backend
+    }
+    return res
+}
+
+// a width the 256-superblock does not divide is refused by name: a case with one bad element
+// when the panic text is not the layer's, none when it is
+def private kq_width_refusal() : BlockCase {
+    var res = BlockCase(name = "linear kq width refusal")
+    var why = "no panic"
+    try {
+        var l = TtsLinear(nin = 100l, nout = 8l)
+        var kq : array<uint8>
+        var ks : array<uint8>
+        linear_take_kq(l, 4, kq, ks, false)
+    } recover {
+        why = this_context().last_exception |> rtrim
+    }
+    if (why |> find("needs nin on 256") < 0) {
+        res.bad = 1
+        res.name = "linear kq width refusal - got '{why}'"
+    }
+    return res
+}
+
 // 66 input channels padded to 96 quantize per 32, so the padded conv reaches the q8 lane: the
 // padded rows form against the unpadded channel-major reference at the q8 bar.
 def private pad_case_q8() : BlockCase {
@@ -926,6 +1060,15 @@ def test_rows_convs(t : T?) {
             report(t, conv_case_q8("conv q8 k11 d5", 256l, 256l, 11l, 25l, 5l))
             report(t, linear_case_q8(768l, 768l))
         }
+        t |> run("the K-quant lane against the leaf per row - both arms, and a width off the float4 bias") @(t : T?) {
+            report(t, linear_case_kq(512l, 96l, false, true))
+            report(t, linear_case_kq(768l, 64l, true, true))
+            report(t, linear_case_kq(512l, 96l, false, false))
+            report(t, linear_case_kq(768l, 64l, true, false))
+            report(t, linear_case_kq(256l, 6l, true, true))   // nout off 4: the bias tail past the last float4
+            report_poison(t, linear_case_kq(512l, 96l, false, true, true))
+            report(t, kq_width_refusal())
+        }
         t |> run("snake, adain, pad, polar") @(t : T?) {
             report(t, snake_case())
             report(t, adain_case(64l))
@@ -993,6 +1136,312 @@ def test_rows_split_invariance(t : T?) {
         split_arms(t, SplitAxis.lane_cap)
         split_arms(t, SplitAxis.worker_limit)
     }
+}
+
+// ===== the causal cached attention, ELU and layer scale (the continuous-audio family's kernels) =====
+
+let CATT_HIDDEN = 256l
+let CATT_HEADS = 4l
+
+// a cache filled with `n` random positions, plus the q rows of the last `t` of them
+def private catt_fixture(var r : TtsRng; n, t : int64; var kc : TtsKvCache; var q : array<float>) {
+    kv_cache_init(kc, CATT_HEADS, CATT_HIDDEN / CATT_HEADS, n + 8l)
+    var inscope k : array<float>
+    var inscope v : array<float>
+    rand_fill(r, k, n * CATT_HIDDEN, 1.0)
+    rand_fill(r, v, n * CATT_HIDDEN, 1.0)
+    kv_cache_append(kc, k, v, n, CATT_HIDDEN)
+    rand_fill(r, q, t * CATT_HIDDEN, 1.0)
+}
+
+// the rows form against the double-precision reference over the same cache: an absolute bar,
+// since the softmax bounds every output by the values' magnitude
+def private catt_case(name : string; n, t, context : int64; seed : uint64) : BlockCase {
+    var r = TtsRng()
+    rng_seed(r, seed)
+    var inscope kc = TtsKvCache()
+    var inscope q : array<float>
+    catt_fixture(r, n, t, kc, q)
+    var inscope want : array<float>
+    var inscope got : array<float>
+    attention_causal_ref(q, t, CATT_HIDDEN, context, kc, want)
+    attention_causal_rows(q, t, CATT_HIDDEN, context, kc, got)
+    var inscope env : array<float>
+    env |> resize(length(want))
+    for (e in env) {
+        e = 1.0
+    }
+    return score_at(name, got, want, env, 0.0, CATT_BAR)
+}
+
+let CATT_BAR = 1.0e-5
+
+// the control of the causal-attention bar: the reference moved by twice the bar on one element
+def private catt_poison_case(name : string; seed : uint64) : BlockCase {
+    var r = TtsRng()
+    rng_seed(r, seed)
+    var inscope kc = TtsKvCache()
+    var inscope q : array<float>
+    catt_fixture(r, 40l, 40l, kc, q)
+    var inscope want : array<float>
+    var inscope got : array<float>
+    attention_causal_ref(q, 40l, CATT_HIDDEN, 0l, kc, want)
+    attention_causal_rows(q, 40l, CATT_HIDDEN, 0l, kc, got)
+    want[7] += 2.0 * CATT_BAR
+    var inscope env : array<float>
+    env |> resize(length(want))
+    for (e in env) {
+        e = 1.0
+    }
+    return score_at(name, got, want, env, 0.0, CATT_BAR)
+}
+
+// the same fixture under a pinned split leg: the rows form must not move with the lanes
+def private catt_split_case(name : string; n, t : int64; axis : SplitAxis) : SplitCase {
+    var r = TtsRng()
+    rng_seed(r, 0xca77ul + uint64(n))
+    var inscope kc = TtsKvCache()
+    var inscope q : array<float>
+    catt_fixture(r, n, t, kc, q)
+    var inscope one : array<float>
+    var inscope many : array<float>
+    at_split(axis, true) {
+        attention_causal_rows(q, t, CATT_HIDDEN, 0l, kc, one)
+    }
+    at_split(axis, false) {
+        attention_causal_rows(q, t, CATT_HIDDEN, 0l, kc, many)
+    }
+    return split_diff(name, one, many)
+}
+
+[test]
+def test_causal_attention(t : T?) {
+    with_job_que() {
+        setup_dasllama_jobque_()
+        for (c in [catt_case("prompt 40 of 40, full", 40l, 40l, 0l, 11ul), catt_case("decode step at 41", 41l, 1l, 0l, 12ul),
+                   catt_case("prompt 300 of 300, window 250", 300l, 300l, 250l, 13ul), catt_case("decode at 301, window 250", 301l, 1l, 250l, 14ul),
+                   catt_case("17 new rows over 90, window 64", 90l, 17l, 64l, 15ul),
+                   catt_case("prompt 700 of 700, window 250: three query blocks", 700l, 700l, 250l, 17ul),
+                   catt_case("prompt 600 of 600, full: the window is the whole prefix", 600l, 600l, 0l, 18ul),
+                   catt_case("300 new rows over 900, window 100", 900l, 300l, 100l, 19ul)]) {
+            t |> success(c.bad == 0, "{c.name}: {c.bad} over the bar, max |diff| {c.max_abs}")
+        }
+        // a grown cache answers as the cache it grew from
+        {
+            var rg = TtsRng()
+            rng_seed(rg, 20ul)
+            var inscope kc = TtsKvCache()
+            var inscope q : array<float>
+            catt_fixture(rg, 30l, 5l, kc, q)
+            var inscope before : array<float>
+            attention_causal_rows(q, 5l, CATT_HIDDEN, 0l, kc, before)
+            kv_cache_grow(kc, 200l)
+            t |> equal(int(kc.cap), 200, "the cache grew to the asked capacity")
+            t |> equal(int(kc.n), 30, "the fill survived the growth")
+            var inscope after : array<float>
+            attention_causal_rows(q, 5l, CATT_HIDDEN, 0l, kc, after)
+            let g = split_diff("grown cache", before, after)
+            t |> equal(g.diffs, 0, "elements that differ after the growth")
+            kv_cache_grow(kc, 100l)
+            t |> equal(int(kc.cap), 200, "a smaller capacity leaves the cache as it is")
+            var inscope k : array<float>
+            rand_fill(rg, k, 150l * CATT_HIDDEN, 1.0)
+            kv_cache_append(kc, k, k, 150l, CATT_HIDDEN)
+            t |> equal(int(kc.n), 180, "the grown cache takes rows the old capacity refused")
+        }
+        let poison = catt_poison_case("prompt 40, one expected element poisoned", 11ul)
+        t |> success(poison.bad > 0, "{poison.name}: the bar must red a poisoned expectation ({poison.bad} over)")
+        // a window that admits one key is the value row itself
+        var r = TtsRng()
+        rng_seed(r, 16ul)
+        var inscope kc = TtsKvCache()
+        var inscope q : array<float>
+        catt_fixture(r, 12l, 1l, kc, q)
+        var inscope got : array<float>
+        attention_causal_rows(q, 1l, CATT_HIDDEN, 1l, kc, got)
+        var worst = 0.0
+        for (h in range64(CATT_HEADS)) {
+            for (e in range64(CATT_HIDDEN / CATT_HEADS)) {
+                worst = max(worst, abs(got[h * (CATT_HIDDEN / CATT_HEADS) + e] - kc.v[(h * kc.cap + 11l) * (CATT_HIDDEN / CATT_HEADS) + e]))
+            }
+        }
+        t |> success(worst < 1.0e-6, "a one-key window returns that key's value row (max |diff| {worst})")
+        for (axis in [SplitAxis.lane_cap, SplitAxis.worker_limit]) {
+            t |> success(shaped_lanes(axis, true) < shaped_lanes(axis, false), "the {axis_name(axis)} axis moves the split")
+            let s = catt_split_case("prompt 200 on the {axis_name(axis)} axis", 200l, 200l, axis)
+            t |> equal(s.diffs, 0, "{s.name}: elements that differ between the legs")
+        }
+        // the cache refuses to overflow, and a query count past the fill is refused
+        var tripped = false
+        try {
+            var inscope k : array<float>
+            rand_fill(r, k, 20l * CATT_HIDDEN, 1.0)
+            kv_cache_append(kc, k, k, 20l, CATT_HIDDEN)
+        } recover {
+            tripped = true
+        }
+        t |> success(tripped, "kv_cache_append panics past the cache's capacity")
+    }
+}
+
+[test]
+def test_elu_and_layer_scale(t : T?) {
+    with_job_que() {
+        setup_dasllama_jobque_()
+        var r = TtsRng()
+        rng_seed(r, 21ul)
+        var inscope x : array<float>
+        rand_fill(r, x, 4096l, 6.0)
+        var inscope want : array<float>
+        want |> resize(length(x))
+        for (src, dst in x, want) {
+            dst = src > 0.0 ? src : exp(src) - 1.0
+        }
+        elu_rows(x, 4096l)
+        var worst = 0.0
+        for (g, w in x, want) {
+            worst = max(worst, abs(g - w))
+        }
+        t |> success(worst <= 1.0e-6, "elu_rows against the scalar form (max |diff| {worst})")
+        var inscope y : array<float>
+        rand_fill(r, y, 16l * 64l, 1.0)
+        var inscope s : array<float>
+        rand_fill(r, s, 64l, 0.5)
+        var inscope want2 : array<float>
+        want2 |> resize(length(y))
+        for (i in range64(16l * 64l)) {
+            want2[i] = y[i] * s[i % 64l]
+        }
+        layer_scale_rows(y, 16l, 64l, s)
+        var exact = 0
+        for (g, w in y, want2) {
+            if (g != w) {
+                exact++
+            }
+        }
+        t |> equal(exact, 0, "layer_scale_rows elements that differ from the per-channel product")
+        var inscope padded : array<float>
+        pad_edge_left_rows(y, 16l, 64l, 3l, padded)
+        t |> equal(length(padded), 19 * 64, "pad_edge_left_rows grows by the pad rows")
+        var edge_ok = true
+        for (rr in range64(3l)) {
+            for (j in range64(64l)) {
+                edge_ok = edge_ok && padded[rr * 64l + j] == y[j]
+            }
+        }
+        for (i in range64(16l * 64l)) {
+            edge_ok = edge_ok && padded[3l * 64l + i] == y[i]
+        }
+        t |> success(edge_ok, "pad_edge_left_rows repeats the first row and keeps the rest")
+        // an unseeded generator must refuse, not spin: its polar loop never leaves the unit disc
+        var fresh = TtsRng()
+        var tripped = false
+        try {
+            let v = rng_normal(fresh)
+        } recover {
+            tripped = true
+        }
+        t |> success(tripped, "rng_normal panics on a generator nobody seeded")
+        rng_seed(fresh, 5ul)
+        let v2 = rng_normal(fresh)
+        t |> success(abs(v2) < 10.0, "a seeded generator draws")
+    }
+}
+
+// the two elementwise kernels that dispatch, bit-equal on both axes that move the split
+[test]
+def test_elementwise_split_invariance(t : T?) {
+    with_job_que() {
+        setup_dasllama_jobque_()
+        var r = TtsRng()
+        rng_seed(r, 23ul)
+        for (axis in [SplitAxis.lane_cap, SplitAxis.worker_limit]) {
+            t |> success(shaped_lanes(axis, true) < shaped_lanes(axis, false), "the {axis_name(axis)} axis moves the split")
+            var inscope e1 : array<float>
+            var inscope e2 : array<float>
+            rand_fill(r, e1, 8192l, 6.0)
+            e2 := e1
+            at_split(axis, true) {
+                elu_rows(e1, 8192l)
+            }
+            at_split(axis, false) {
+                elu_rows(e2, 8192l)
+            }
+            let se = split_diff("elu_rows @ {axis_name(axis)}", e1, e2)
+            t |> equal(se.diffs, 0, "{se.name}: elements that differ between the legs")
+            var inscope l1 : array<float>
+            var inscope l2 : array<float>
+            rand_fill(r, l1, 64l * 128l, 1.0)
+            l2 := l1
+            var inscope ls : array<float>
+            rand_fill(r, ls, 128l, 0.5)
+            at_split(axis, true) {
+                layer_scale_rows(l1, 64l, 128l, ls)
+            }
+            at_split(axis, false) {
+                layer_scale_rows(l2, 64l, 128l, ls)
+            }
+            let sl = split_diff("layer_scale_rows @ {axis_name(axis)}", l1, l2)
+            t |> equal(sl.diffs, 0, "{sl.name}: elements that differ between the legs")
+        }
+    }
+}
+
+// rope over rows against the leaf applied per row, and the variance-scaled norm against its
+// double-precision form
+[test]
+def test_rope_rows_and_var_scale_norm(t : T?) {
+    var r = TtsRng()
+    rng_seed(r, 24ul)
+    var inscope rx : array<float>
+    rand_fill(r, rx, 6l * 64l, 1.0)
+    var inscope want_rope := rx
+    unsafe {
+        for (row in range64(6l)) {
+            rope_scaled(addr(want_rope[row * 64l]), 100l + row, 16l, 64l, 10000.0, 1.0, false, null)
+        }
+    }
+    rope_rows(rx, 6l, 64l, 16l, 100l, 10000.0)
+    var rope_diffs = 0
+    for (g, w in rx, want_rope) {
+        if (g != w) {
+            rope_diffs++
+        }
+    }
+    t |> equal(rope_diffs, 0, "rope_rows elements that differ from the leaf applied per row")
+    t |> success(rx[0] != want_rope[64] || rx[1] != want_rope[65], "the rows are rotated at their own positions, not one")
+    var inscope vx : array<float>
+    rand_fill(r, vx, 256l, 0.01)
+    var inscope valpha : array<float>
+    rand_fill(r, valpha, 256l, 1.0)
+    var mean = 0.0lf
+    for (v in vx) {
+        mean += double(v)
+    }
+    mean /= 256.0lf
+    var variance = 0.0lf
+    for (v in vx) {
+        variance += (double(v) - mean) * (double(v) - mean)
+    }
+    variance /= 255.0lf
+    var inscope want_norm : array<float>
+    want_norm |> resize(256)
+    for (j in range(256)) {
+        want_norm[j] = float(double(vx[j]) * double(valpha[j]) / sqrt(variance + 1e-5lf))
+    }
+    var_scale_norm(vx, valpha, 256l, 1.0e-5)
+    var norm_worst = 0.0
+    for (g, w in vx, want_norm) {
+        norm_worst = max(norm_worst, abs(g - w))
+    }
+    t |> success(norm_worst <= 1.0e-6, "var_scale_norm against the double form (max |diff| {norm_worst})")
+    // the control: a poisoned double form lands outside the bar
+    want_norm[3] += 1.0e-5
+    var poisoned_worst = 0.0
+    for (g, w in vx, want_norm) {
+        poisoned_worst = max(poisoned_worst, abs(g - w))
+    }
+    t |> success(poisoned_worst > 1.0e-6, "the norm bar discriminates a poisoned expectation")
 }
 
 def private rows_conv_panics(c : TtsConv1d; x : array<float>; t_in : int64) : bool {

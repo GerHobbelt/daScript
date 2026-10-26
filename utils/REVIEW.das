@@ -13,12 +13,18 @@ require dastest/review_gate
 // utils/ children that are not tool directories: the shared library hub
 var private LIBRARY_DIRS <- { "common" }
 
+// tools whose development runs interpreted under a supervisor - the watchdog front for mcp,
+// lsp_supervisor.py for lsp: never built or shipped as an exe, since that form would ship
+// without anyone having run it. An entry leaves when the supervisor's --program names the exe.
+var private SUPERVISED_TOOLS <- { "mcp", "lsp" }
+
 // Files licensed to name utils/internal outside internal/:
 var private INTERNAL_REF_EXEMPT <- {
     "utils/REVIEW.md",              // states the rule
     "utils/REVIEW.das",             // carries the needle
     "utils/CMakeLists.txt",         // builds and CI-tests internal tools, never ships
-    "utils/mcp/mcp_supervisor.py"   // detects the internal das-herd entry to refuse it; same exclusion as ci/smoke_test_bundle.sh
+    "utils/mcp/setup.das",          // wires the internal das-herd shim behind an exists-check; same exclusion as ci/smoke_test_bundle.sh
+    "utils/mcp/test_setup.das"      // plants that shim in a scratch root to drive the exists-check; not installed
 }
 
 // Extensions that can carry a reference by require, include, or command line.
@@ -54,7 +60,7 @@ def private mentions_path(text : string; p : string) : bool {
 def private list_dirs(parent : string) : array<string> {
     var out : array<string>
     dir(parent) $(name) {
-        return if (name == "." || name == "..")
+        return if (name |> starts_with("."))      // `.`, `..`, and a JIT's `.jitted_scripts` cache
         let st = stat(path_join(parent, name))
         if (st.is_valid && st.is_dir) {
             out |> push(name)
@@ -164,6 +170,21 @@ def private check_no_internal_refs {
     }
 }
 
+def private check_supervised_tools {
+    let ucm = fread("utils/CMakeLists.txt")
+    var inscope exes <- cmake_list_entries(ucm, "DAS_UTILS_SHIPPED_EXES")
+    var inscope built <- cmake_list_entries(ucm, "DAS_UTILS")
+    for (s in keys(SUPERVISED_TOOLS)) {
+        var hit = find_index(exes, s) >= 0
+        for (b in built) {
+            hit ||= base_name(b) == s
+        }
+        if (hit) {
+            gate_finding("utils/CMakeLists.txt", "{s} is in DAS_UTILS or DAS_UTILS_SHIPPED_EXES — its development runs interpreted under a supervisor, so an exe form ships without anyone having run it; point the supervisor's --program at the exe first")
+        }
+    }
+}
+
 var private BIN_EXE <- %regex~`([A-Za-z0-9_./-]+)\.exe`%%
 
 def private check_shipped_exes(externals : array<string>) {
@@ -244,5 +265,6 @@ def main() : int {
     check_registration_triple(tools, internals)
     check_no_internal_refs()
     check_shipped_exes(externals)
+    check_supervised_tools()
     return gate_verdict("utils")
 }
