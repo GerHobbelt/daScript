@@ -19,6 +19,7 @@ require llvm/daslib/llvm_jit_intrin
 require llvm/daslib/llvm_jit_lower
 require llvm/daslib/llvm_jit_common
 require llvm/daslib/llvm_jit_code
+require llvm/daslib/llvm_cpu_class
 require llvm/daslib/llvm_user_modules  // nolint:STYLE030,LINT019 - side-effect require: [llvm_code] generator modules must be in THIS module's closure so their [init] registration runs in the context that reads the registry; STYLE030 is policy-gated, so the keep only fires under a require-analysis run
 require llvm/daslib/llvm_dll_utils
 require daslib/ast_boost
@@ -300,6 +301,7 @@ class public LlvmJitVisitor : AstVisitor {
     // LIFO matches visitor recursion, so nested `[[..],[..]]` just push/pop (no per-expr bookkeeping).
     heapMkaData : array<LLVMOpaqueValue?>
     v2v : table<Variable?; LLVMOpaqueValue?>
+    g2v : table<Variable?; LLVMOpaqueValue?>    //! a solid-context global's entry-block pointer, cleared per LLVM function
     v2t : table<LLVMOpaqueValue?; LLVMOpaqueType?>
     call2cmres : table<Expression?; LLVMOpaqueValue?>
     ffunc, wfunc : LLVMOpaqueValue?
@@ -777,7 +779,21 @@ class public LlvmJitVisitor : AstVisitor {
         wfunc = LLVMGetNamedFunction(g_mod, fnmna.publ())
         var gc = LlvmCodeCtx(jit = JitCtx(ctx = g_ctx, builder = g_builder, types = types),
                              fn = fun, impl = ffunc, impl_type = g_fn_types[fnmna.impl()], ann = ann)
-        let generated = invoke_llvm_code_generator(gen_name, gc)
+        var generated = false
+        let klass = llvm_code_class_name(ann)
+        if (empty(klass)) {
+            generated = invoke_llvm_code_generator(gen_name, gc)
+        } else {
+            // a fat-mode clone lowers for its class and its generator sees the class's gates;
+            // noinline keeps it a function - AArch64's inliner admits a callee with more features
+            // when its body carries no target intrinsic, and the inlined copy would lower for the baseline
+            LLVMAddTargetDependentFunctionAttr(ffunc, "target-cpu", jit_cpu_class_row(klass).cpu)
+            LLVMAddTargetDependentFunctionAttr(ffunc, "target-features", jit_class_plus_features(klass))
+            LLVMAddAttributeToFunction(ffunc, attributes.noinline)
+            with_class_target_gates(klass) $ {
+                generated = invoke_llvm_code_generator(gen_name, gc)
+            }
+        }
         if (generated) {
             build_wrapper_function(fnmna, fun.arguments, clone_type(fun.result), isCMRES(fun), null, fun.at)
         }
@@ -946,6 +962,7 @@ class public LlvmJitVisitor : AstVisitor {
         assert(g_builder != null, "missing builder")
         thisFunc = fun
         uid.reset(fun)
+        g2v |> clear()
         ldu_hint = LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS
         let fnmna = uid.get_dll_fn_name(fun)
         ffunc = LLVMGetNamedFunction(g_mod, fnmna.impl())
@@ -1053,10 +1070,13 @@ class public LlvmJitVisitor : AstVisitor {
     }
 
     def override preVisitExprBlockExpression(blk : ExprBlock?; expr : ExpressionPtr) : void {
+        if (current_block_terminates()) {
+            //! a statement after a terminator - a nested block's return / break / continue, or the
+            //! constant-condition if the compiler unfolds even unoptimized - lands in its own dead block
+            LLVMPositionBuilderAtEnd(g_builder, append_basic_block("dead_at_line_{int(expr.at.line)}_"))
+        }
         if (LLVM_DEBUG_TRACES && LLVM_DEBUG_LINE_TRACES) {
-            if (!current_block_terminates()) {
-                build_debug_trace(expr.at, FN_JIT_DEBUG_LINE)
-            }
+            build_debug_trace(expr.at, FN_JIT_DEBUG_LINE)
         }
     }
 
@@ -4871,12 +4891,12 @@ class public LlvmJitVisitor : AstVisitor {
     def override visitExprGoto(expr : ExprGoto?) : ExpressionPtr {
         if (expr.subexpr != null) {
             var labI = getE(expr.subexpr)
+            var badLab = append_basic_block("invalid_label")
+            var sw = LLVMBuildSwitch(g_builder, labI, badLab, uint(length(sortedLabels)))
             for (kv in sortedLabels) {
-                var nextLab = append_basic_block("not_label_{kv.index}")
-                let isL = LLVMBuildICmp(g_builder, LLVMIntPredicate.LLVMIntEQ, labI, types.ConstI32(uint64(kv.index)), "")
-                LLVMBuildCondBr(g_builder, isL, kv.blk, nextLab)
-                LLVMPositionBuilderAtEnd(g_builder, nextLab)
+                LLVMAddCase(sw, types.ConstI32(uint64(kv.index)), kv.blk)
             }
+            LLVMPositionBuilderAtEnd(g_builder, badLab)
             build_exception("invalid label index", expr.at)
         } else {
             var lab = labels[expr.labelName]
@@ -6033,26 +6053,29 @@ class public LlvmJitVisitor : AstVisitor {
             }
         } else {
             var tryV = tryGetV(expr.variable)
-            if (tryV == null) {
+            let isSolidContext = expr.variable._module.moduleFlags.isSolidContext
+            if (tryV == null && isSolidContext) {
+                g2v |> get(expr.variable) $(cached) {
+                    tryV = cached
+                }
+            }
+            if (tryV == null && !isSolidContext) {
+                let mnh = hash(get_mangled_name(expr.variable))
+                let vptr = get_global_offset_by_mnh(mnh, expr.variable.flags.global_shared, "global_var_{expr.variable.name}_mnh_ptr")
+                tryV = LLVMBuildPointerCast(g_builder, vptr, get_type_pointer(expr.variable._type), "global_var_{expr.variable.name}")
+            } elif (tryV == null) {
                 at_function_entry() {
-                    let isSolidContext = expr.variable._module.moduleFlags.isSolidContext
-                    var vptr : LLVMOpaqueValue?
-                    if (!isSolidContext) {
-                        let mnh = hash(get_mangled_name(expr.variable))
-                        vptr = get_global_offset_by_mnh(mnh, expr.variable.flags.global_shared, "global_var_{expr.variable.name}_mnh_ptr")
-                        vptr = LLVMBuildPointerCast(g_builder, vptr, get_type_pointer(expr.variable._type), "global_var_{expr.variable.name}")
-                    } else {
-                        // Globals base = context->globals, via the host-baked
-                        // offsetof(Context, globals); index by stackTop. host==target
-                        // (native or wasm64), so the baked Context offset is correct.
-                        var ctx_ptr = LLVMBuildPointerCast(g_builder, get_context_param(), LLVMPointerType(types.t_int8, 0u), "")
-                        let coffset = expr.variable.flags.global_shared ? CONTEXT_OFFSET_OF_SHARED : CONTEXT_OFFSET_OF_GLOBALS
-                        var gp = LLVMBuildGEP2(g_builder, types.t_int8, ctx_ptr, types.ConstI32(uint64(coffset)), "")
-                        let global_ptr = LLVMBuildLoad2(g_builder, LLVMPointerType(types.t_int8, 0u), gp, "")
-                        vptr = LLVMBuildGEP2(g_builder, types.t_int8, global_ptr, types.ConstI32(uint64(expr.variable.stackTop)), "")
-                    }
+                    // Globals base = context->globals, via the host-baked
+                    // offsetof(Context, globals); index by stackTop. host==target
+                    // (native or wasm64), so the baked Context offset is correct.
+                    var ctx_ptr = LLVMBuildPointerCast(g_builder, get_context_param(), LLVMPointerType(types.t_int8, 0u), "")
+                    let coffset = expr.variable.flags.global_shared ? CONTEXT_OFFSET_OF_SHARED : CONTEXT_OFFSET_OF_GLOBALS
+                    var gp = LLVMBuildGEP2(g_builder, types.t_int8, ctx_ptr, types.ConstI32(uint64(coffset)), "")
+                    let global_ptr = LLVMBuildLoad2(g_builder, LLVMPointerType(types.t_int8, 0u), gp, "")
+                    let vptr = LLVMBuildGEP2(g_builder, types.t_int8, global_ptr, types.ConstI32(uint64(expr.variable.stackTop)), "")
                     tryV = LLVMBuildPointerCast(g_builder, vptr, get_type_pointer(expr.variable._type), "global_var_{expr.variable.name}")
                 }
+                g2v[expr.variable] = tryV
             }
             if (expr.varFlags.r2v) {
                 setE(expr, LLVMBuildLoadData2Aligned(g_builder, type_to_llvm_type(expr._type), tryV, expr._type.alignOf, "global_var_r2v_{expr.variable.name}"))

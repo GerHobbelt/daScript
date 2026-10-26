@@ -3,7 +3,9 @@
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
 docs: `ARCHITECTURE.md`, `ARCHITECTURE_LINT.md`, `ARCHITECTURE_EMIT.md`, `ARCHITECTURE_LINQ.md`.
 Planned work: `plans/daslib_comment_sweep.md` (repo root).
-A diff touching the linq family - `linq*.das`, `sql_*.das` - applies `REVIEW_LINQ.md` too.
+A diff touching the linq family - `linq*.das`, `sql_*.das` - applies `REVIEW_LINQ.md` too. A
+diff touching `daspkg.das` - the functions a `.das_package` manifest body calls - applies
+`utils/daspkg/REVIEW.md` (repo root) too; the folder walk never opens it for a `daslib/` diff.
 
 **A diff that changes the body of `perf_warning` (`perf_lint.das`), `style_warning`
 (`style_lint.das`), or `lint_error` (`lint.das`) runs the suppression check before the body
@@ -33,19 +35,25 @@ initializer reports the variable.
 state scoped to that construct.** State an early return leaves set poisons the next
 construct's visit.
 
-**Never keep per-loop visitor state in a bare scalar - keep it in a stack.** A scalar
-survives into the sibling loop's exit path and unbalances its counter.
+**Visitor state that must be restored to a value saved when its construct was entered lives in
+a stack, never in a bare scalar.** A saved value kept in a scalar survives into the sibling
+construct's exit path and unbalances it.
 
 **A diff that adds or changes a daslib fact - code or a `//!` contract - whose truth is
 decided by a C++-side definition, with no test, lint, or compile error failing when the two
-sides no longer match, records the pair in the architecture doc, in its module's section,
-naming both sides.**
+sides no longer match, records the pair in the architecture doc, in the section of the file
+the daslib side lives in, naming both sides.**
 
 **When a diff changes one side of a recorded daslib/C++ pair so the two no longer match, it
-changes the other side and updates the pair's architecture-doc entry in the same diff.**
+changes the other side in the same diff.**
 
-**A diff that adds an architecture-doc entry adds it only where no name, shape, or test can
-carry the fact.**
+**A diff that renames, deletes, or changes the behavior of a daslib name that an
+`ARCHITECTURE*.md` in this folder spells updates that entry in the same change.** The doc is
+read as the current tree, and a name that no longer resolves or a scope that no longer holds is
+trusted until someone reads the code.
+
+**A diff that adds an architecture-doc entry adds it only where no name, shape, test, lint, or
+compile error fails when the entry's fact goes false.**
 
 **A diff that changes daslib's nolint scanning - suppression parsing, staleness detection, or
 the header window - keeps `tests/lint/test_nolint_suppression.das` and
@@ -117,8 +125,8 @@ set without the cap is a silently missed finding; raising a cap without the over
 suggestion that does not compile.
 
 **A diff that adds or changes an emit entry point - a function that runs the emit visitor
-(`CppAot` or any subclass of it) and then returns or writes the generated C++ - keeps the
-error check ahead of that return or write.** The error check is the program's
+(`CppAot` or any subclass of it) and then writes the generated C++ to a file - keeps the
+error check ahead of that file write.** The error check is the program's
 `macroException`/`failToCompile` state, read directly or through `log_aot_emit_errors`; a
 codegen exception mid-visit leaves partial C++.
 
@@ -132,15 +140,16 @@ writes out as complete.
 
 **A diff that changes how a struct's C++ name is built changes every site that spells
 that name the same way.** The name is the module namespace (`aotModuleName`, or
-`aotModuleNameFromString` on the `VarInfo` path) plus the `_S` suffix; the sites that
-spell it are `aotStructName` and the `VarInfo` emitter's inline
-`aotSuffixNameEx(info.name, "_S", ...)`. One site changed alone writes `offsetof`s that
-name a struct declared under a different name.
+`aotModuleNameFromString` in `describeCppStructInfoFields`) plus the `_S` suffix; the sites
+that spell it are `aotStructName` and `describeCppStructInfoFields`'s inline
+`aotSuffixNameEx(info.name, "_S", ...)` (both `aot_cpp.das`). One site changed alone writes
+`offsetof`s that name a struct declared under a different name.
 
-**A diff that adds or changes a function that runs `CppAot` or any subclass of it
-keeps `buildStructEnumCollisions` running before that visitor runs - directly or in a
-helper it calls.** The table decides when a name gets its collision suffix, and a run
-that skips the seeding spells structs differently from the run that seeded it.
+**A diff that adds or changes a function that emits a struct or enum C++ name - anything
+reaching `aotStructName` / `aotEnumName`, a `CppAot` subclass and `ArgsConverter` alike -
+keeps `buildStructEnumCollisions` running before it, directly or in a helper it calls.**
+The table decides when a name gets its collision suffix, and a run that skips the seeding
+spells structs differently from the run that seeded it.
 
 **Never pass a synthesized access expression's location to `match_error` - pass a pattern
 node's location.** `match_error` stores the `LineInfo` pointer BORROWED, and access nodes
@@ -262,3 +271,17 @@ a value.
 marker annotation to the instance it finishes, and returns unchanged when it sees that marker.**
 A chain of template ancestors delivers one copy of the annotation per level, so a macro without
 the marker runs a second time over a structure it already rewrote.
+
+**A diff that adds or renames a public intrinsic in `aarch64_neon.das`, `x64_avx.das` or
+`f16_cvt.das` changes its row in the lookup table of `modules/dasLLVM/daslib/llvm_jit_intrin.das`
+(repo root) that is gated on the CPU feature the instruction needs, in the same change.** The JIT
+recognizes these calls by function name alone, so a missing row runs the portable fallback on
+every target with every test green, and a row in a table gated on a weaker feature emits an
+instruction the generic machine cannot select - the `tests/jit_tests` twins compare hardware
+against a reference body and catch a wrong emitter, never a missing or misplaced one.
+
+**A function in `aarch64_neon.das`, `x64_avx.das` or `f16_cvt.das` that is the wider- or
+newer-tier variant of the same math another function in that file computes calls that function -
+never a hand-written scalar loop.** A box whose CPU lacks the tier then runs the recognized
+narrower path instead of scalar code. A tier function with no same-math sibling (`smmla`'s 2x8
+by 8x2 shape) keeps its own fallback body.

@@ -19,6 +19,30 @@ this document states what the folder is and why its tests take the shape they do
   serves the record, a changed file re-parses from that module on and says so.
 - `test_generic_instance_origin.das` - a generic instance restored from the cache keeps its
   origin generic, so a fresh program compiled in the same process after the restore resolves it.
+- `test_descriptor_manifest.das` - the manifest the module scan keeps beside each `.das_module`
+  descriptor, replaying its registrations instead of compiling the descriptor, on a project root
+  the test writes, three modules in it: one whose descriptor registers
+  a require path, one whose descriptor registers an absent C++ artifact (the `dm` row, replayed
+  and retried), one whose descriptor does not compile (no manifest, the run goes on). Over the
+  first: the first start compiles the descriptor and writes the manifest beside it, the second
+  replays it, an edited descriptor recompiles once, every rejection the reader knows - a table
+  over each mutated line - recompiles and rewrites, an edited module the descriptor requires
+  recompiles it once, a `--jit-target` run keys apart from a native one, a `no_manifest()` descriptor compiles on every start, a recorded argument with a
+  tab leaves the manifest unwritten, and a directory sitting where the `.tmp` or the manifest
+  goes fails the create or the rename so the start just compiles; each verdict is read from
+  the `DAS_TRACE_MODULE_LOAD=1` line the child prints.
+- `test_deferred_modules.das` - a replayed `dm` row is not loaded by the scan. The project root
+  holds a copy of the tree's `dasUnitTest` (descriptor and artifact), which shadows the tree's,
+  so the copy's manifest is the test's to make cold or warm: a cold start compiles the
+  descriptor, loads the module to record its name, and a `require ?UnitTest x` is taken; a
+  warm start defers the row and loads nothing for a program that requires nothing; the first
+  `require UnitTest` loads it and the program calls into it; a guard alone loads the module
+  and is taken, as it is with a `require UnitTest` above it, below it, or in the entry while
+  the guard sits in a module walked earlier;
+  `-ignore-manifest` compiles every descriptor, loads every C++ module on start and writes no
+  manifest; and, where the tree holds dasImgui and dasGlfw, `require imgui_app` brings every
+  deferred module in because its `initDependencies` asks for two more. A static build, whose
+  tree holds no `.shared_module`, has nothing to observe and the test says so and returns.
 - `_fixtures/` - the driver and module scripts the spawned children compile (`mc_dep_*`,
   `mc_generic_origin_*`); a case needing a macro-bearing module graph puts it here instead of
   writing the script inline.
@@ -31,6 +55,11 @@ in-process sees none of them. Each case therefore spawns the daslang binary dast
 under (`argv[0]`): the default-path case on scripts it writes to a temp directory, asserting on
 the child's stdout and on the files under `.jitted_scripts/module_cache/` in the cwd; the
 explicit-cache cases on a driver under `_fixtures/` with `-module-cache` pointed into a temp
-directory, asserting on the child's stdout. Each removes what it wrote. A child's stdout is
-echoed on failure, because the exit code alone would turn a one-line answer into an exit-code
-hunt.
+directory, asserting on the child's stdout; the manifest case on a project root under a temp
+directory, asserting on the scan trace. Each removes what it wrote under its own directory,
+with one ledgered write outside it: the default-path case's child writes the default cache,
+which is `.jitted_scripts/module_cache/` under the cwd it shares with dastest by definition,
+and the test removes what that child wrote before it returns. The `.das_module.manifest`
+sidecars every child's module scan warms beside the tree's descriptors are the scan's,
+gitignored, and stay. A child's stdout is echoed on failure,
+because the exit code alone would turn a one-line answer into an exit-code hunt.

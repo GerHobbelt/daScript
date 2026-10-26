@@ -18,9 +18,10 @@ require daslib/jobque_profile  // JOBQUE_PROFILING_ENABLED — the compile-time 
 require dasllama/dasllama_kv_codec public  // the KV-cache codec families — kv_store_row/kv_load_row/kv_dot/kv_axpy dispatch into them
 require dasllama/dasllama_convert   // cvt_f32_to_f16/cvt_f16_to_f32 — the f16 rows (wscale plane + the f16 KV codec)
 require dasllama/dasllama_math_default  // registers the portable Q8·Q8 backend at [init] (the fallback everywhere)
-require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 backend at [init]; no-op off-ARM
-require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
-require ?llvm/daslib/llvm_tune llvm/daslib/llvm_tune public  // re-export ONLY llvm_tune (not math_gen's whole public surface — its jobque_boost would flood requirers with ambiguities): the auto-policy pass and tune_status reach every app that requires this module
+require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 backend at [init] under arm64 + JIT alone; compiles everywhere (daslib/aarch64_neon carries scalar fallbacks)
+require dasllama/dasllama_math_gen  // [init]-only: registers "arm64-gen" / "x64-gen" (the generated GEMM family) under the JIT alone; compiles everywhere - its reference bodies are the portable tier's kq kernels
+require daslib/tune public  // the tune annotations + the auto-policy pass, inert without dasLLVM; PUBLIC for the same reach as the line below
+require ?llvm llvm/daslib/llvm_tune public  // re-export ONLY llvm_tune (not math_gen's whole public surface — its jobque_boost would flood requirers with ambiguities): tune_status reaches every app that requires this module
 require ?das_metal dasllama/dasllama_metal_gemm  // [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
 require ?das_accelerate dasllama/dasllama_math_accelerate  // [init]-only: arms the "+AMX" float-batch override when DASLLAMA_ACCEL=1. Same Apple-only guard shape as the metal driver
 require dasllama/dasllama_gguf
@@ -1454,6 +1455,24 @@ def public box_profile_runtime_applied() : bool {
     return g_box_profile_runtime_applied
 }
 
+// the race that mints a missing runtime section in place (a fat exe's first start); it writes
+// the app sidecar and answers true, and the checked apply then reads the file it wrote
+var private g_runtime_race_hook : function<() : bool>
+var private g_runtime_race_armed = false
+
+//! Install the first-start race (`dasllama_fat_start` registers the fat exe's); returns the
+//! previous hook so a caller can restore it.
+def public set_runtime_race_hook(hook : function<() : bool>) : function<() : bool> {
+    let old = g_runtime_race_hook
+    g_runtime_race_hook = hook
+    g_runtime_race_armed = hook != null   // restoring a null previous hook disarms; an armed null would be invoked
+    return old
+}
+
+def private runtime_race_writes() : bool {
+    return g_runtime_race_armed && invoke(g_runtime_race_hook)
+}
+
 //! Why the checked apply declined the box sidecar - the `TuneSidecarReason` name, "" when it
 //! did not decline (or was never asked).
 def public box_profile_runtime_declined() : string {
@@ -1475,20 +1494,27 @@ def apply_box_profile_runtime(path : string = "") {
 def apply_box_profile_runtime_checked(path : string) {
     g_box_profile_runtime_applied = false   // both flags describe THIS apply, never an earlier one
     g_box_profile_runtime_declined = ""
-    let reason = box_profile_verdict_at(path)
-    if (reason == TuneSidecarReason.absent) {
-        g_box_profile_runtime_declined = "{reason}"
+    var reason = box_profile_verdict_at(path)
+    // no section of this box's own to apply: the first-start race, when one is installed, mints it now
+    if ((reason == "absent" || reason == "foreign_box") && runtime_race_writes()) {
+        reason = box_profile_verdict_at(path)
+    }
+    if (reason == "absent") {
+        g_box_profile_runtime_declined = reason
         return
     }
-    if (reason == TuneSidecarReason.foreign_box || reason == TuneSidecarReason.unreadable) {
-        g_box_profile_runtime_declined = "{reason}"
+    if (reason == "foreign_box" || reason == "unreadable") {
+        g_box_profile_runtime_declined = reason
         to_log(LOG_INFO, "dasLLAMA: tune sidecar {path} not applied ({reason}) - its runtime knobs are the minting box's state\n")
         return
     }
-    if (reason == TuneSidecarReason.stale_binary) {
+    if (reason == "stale_binary") {
         to_log(LOG_INFO, "dasLLAMA: tune sidecar predates the binary - kernel winners fall back; the runtime knobs are box state and apply\n")
     }
     apply_box_profile_runtime_at(path)
+    if (g_box_profile_runtime_declined == "no_runtime_section" && runtime_race_writes()) {
+        apply_box_profile_runtime_at(path)
+    }
 }
 
 [arch(at="../ARCHITECTURE_RUNTIME.md#hybrid-pool-policy")]
@@ -1739,7 +1765,6 @@ def moe_layer_kq(t : Model; l : int64) : bool {
     return fmt_at(t.we1_fmt, l) != KqFmt.q8 || fmt_at(t.we2_fmt, l) != KqFmt.q8 || fmt_at(t.we3_fmt, l) != KqFmt.q8
 }
 
-// Are layer l's deltanet projection planes all q8? (Metal and the GPU tiers bind/upload dn q8 only.)
 def dn_layer_q8(t : Model; l : int64) : bool {
     return fmt_at(t.dnqkv_fmt, l) == KqFmt.q8 && fmt_at(t.dngate_fmt, l) == KqFmt.q8 && fmt_at(t.dnout_fmt, l) == KqFmt.q8
 }
@@ -1988,9 +2013,9 @@ struct Session {
     kv_dtype_k : KVDtype      // key codec, snapshotted from the module knob in make_run_state
     kv_dtype_v : KVDtype      // value codec (independent of K by design)
     // resident-driver mirror ownership: gen stamps which session's rows the device KV mirror
-    // holds (0 = never resident-prefilled); hydrated = host KV has been read back since
+    // holds (0 = never resident-prefilled); rdec_host_current = the host KV holds everything the mirror does
     rdec_gen : int64
-    rdec_hydrated : bool
+    rdec_host_current : bool
     dat_gen : int64             // the per-op decode attention block's mirror generation this session claimed (0 = none)
     tail_next1 : int64          // 1 + the layer whose resident FFN may take the decode tail this token (0 = none)
     tail_taken : bool           // the tail took this layer's FFN: the residual add is the device's
@@ -5275,10 +5300,9 @@ def chat_content() : ChatPart {
     return ChatPart(kind = ChatPartKind.content, s = "")
 }
 
-//! Install the ChatML turn set (``<|im_start|>``/``<|im_end|>``) the whole qwen family shares,
-//! empty-think suppress included — every ``<|im_start|>`` GGUF maps here, thinking fine-tunes
-//! too; template resolution removes unsupported reasoning forms, and the suppress additionally
-//! requires the think specials in the vocab.
+//! Install the ChatML turns every ``<|im_start|>`` GGUF maps to, including empty-think suppression.
+//! Template resolution removes unsupported reasoning forms; suppression also requires the think
+//! specials in the vocab.
 def chatml_chat(var ct : ChatTemplate) {
     ct.system.parts <- [chat_special("<|im_start|>"), chat_text("system\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
     ct.user.parts <- [chat_special("<|im_start|>"), chat_text("user\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]

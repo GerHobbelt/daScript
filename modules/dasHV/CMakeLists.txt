@@ -80,6 +80,13 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
 			get_filename_component(_MINGW_BIN ${CMAKE_C_COMPILER} DIRECTORY)
 			get_filename_component(OPENSSL_ROOT_DIR ${_MINGW_BIN} DIRECTORY)
 		ENDIF()
+		IF(APPLE)
+			# Homebrew's OpenSSL dylibs carry absolute install names under /opt/homebrew, so a
+			# module that links them loads only on a box with that Homebrew tree. The static
+			# archives beside them fold OpenSSL into dasModuleHV.shared_module, and a daspkg
+			# bundle or an SDK install runs on a Mac with no Homebrew at all.
+			SET(OPENSSL_USE_STATIC_LIBS TRUE)
+		ENDIF()
 		find_package(OpenSSL REQUIRED)
 		# libhv ≥ master renames hv_static's OUTPUT_NAME to "hv" on POSIX
 		# (-> libhv.a) but keeps the original name on mingw (-> libhv_static.a).
@@ -207,7 +214,7 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
 	ADD_MODULE_CPP(HV)
 	ADD_MODULE_LIB(libDasModuleHV dasModuleHV ${DAS_HV_MODULE_SRC} ${DAS_HV_MODULE_PLATFORM_SRC})
 	MACRO(SETUP_HV lib)
-		TARGET_INCLUDE_DIRECTORIES(${lib} PRIVATE "${DAS_HV_DIR}/hv/$<CONFIG>/include")
+		TARGET_INCLUDE_DIRECTORIES(${lib} SYSTEM PRIVATE "${DAS_HV_DIR}/hv/$<CONFIG>/include")
 		TARGET_LINK_LIBRARIES(${lib} PRIVATE ${HV_LIBRARIES} ${OPENSSL_LIBRARIES_FILES})
 		ADD_DEPENDENCIES(${lib} LIBHV)
 		SETUP_CPP11(${lib})

@@ -2,6 +2,7 @@
 
 The design document `REVIEW.md` cites. Numbered sections are the stable reference targets;
 usage and installation live in `README.md`, the debugger rail and its roadmap in `DEBUGGING.md`.
+Companion: `ARCHITECTURE_TARGET_FEATURES.md` (CPU feature truth, the tier gates, the CPU classes).
 
 ## 1. The jit backend pipeline
 
@@ -104,7 +105,9 @@ re-emits from the reverted module on, same as the edit did.
 
 The backend's override knobs - the escapes that change what a run compiles, tunes, or emits
 beyond its defaults - are: `DAS_TUNE_POLICY` (replaces the declared/injected tune policy),
-`DAS_TUNE_MODE` (grid/tuner compile modes), `DAS_TUNE_MANIFEST` (pins the sidecar),
+`DAS_TUNE_MODE` (grid/tuner compile modes, and `fat` - one clone per shipped CPU class in a
+standalone exe; `ARCHITECTURE_TARGET_FEATURES.md` sec.11), `DAS_TUNE_FAT_CLASS` (pins the class a
+fat exe runs at startup), `DAS_TUNE_MANIFEST` (pins the sidecar),
 `DAS_TUNE_NOISE_CV` (recalibrates the tuner noise gate), `DAS_TUNE_NOISE_OVERRIDE` (mints
 through a failing gate), `--tune` (forced re-mint), `--tune-only` / `DAS_TUNE_ONLY` (re-mints
 only the named families; the policy guard arms it itself for a profile's residue),
@@ -112,7 +115,9 @@ only the named families; the policy guard arms it itself for a profile's residue
 partition to re-emit, bypassing the obj cache), `DAS_JIT_PROBE_LTO` (split partitions emit
 bitcode and the link runs lld LTO - a dev probe artifact), `DAS_JIT_X64_FORCE_FEATURES` /
 `DAS_JIT_ARM64_FORCE_FEATURES` (force CPU features past detection - emission, the cache keys,
-and `cpu_supports`-based tune eligibility all follow), and the runtime escape API
+and `cpu_supports`-based tune eligibility all follow), `DAS_JIT_BASELINE` (build for a CPU class
+instead of the box - the machine, the gates, the tune ladder and the cache keys all follow;
+`ARCHITECTURE_TARGET_FEATURES.md` sec.10), and the runtime escape API
 `tune_suppress_mint(knob)` (a library `[init]` suppresses the auto/restart mint; the caller
 passes the knob name it acts for). The announce contract: an override announces at the point
 it CHANGES THE OUTCOME - at least one line naming the knob (its env spelling, or the
@@ -128,68 +133,42 @@ Environment knobs load ONCE, at context init, into the `[EnvConfig]` structs `g_
 In-process overrides therefore go through the tune setters (`tune_set_verbosity`,
 `tune_set_noise_cv`, ...), which also arm spawned children by exporting the matching variable.
 
-## 4. Host CPU feature truth on aarch64 {#aarch64-feature-truth}
+## 4. Host CPU feature truth on aarch64
 
-An aarch64 host target reads its CPU features from two sources, because neither answers alone.
-`LLVMGetHostCPUFeatures` returns an EMPTY string on macOS - there the CPU name is meant to imply
-the features - and a part this LLVM cannot name maps to the generic CPU, where SDOT and SMMLA
-have no instruction to select and codegen aborts. `cpu_supports` reads the operating system
-instead (sysctl / `AT_HWCAP` / `IsProcessorFeaturePresent`), so it answers for silicon LLVM has
-never heard of. Both the tier gates (`init_jit_target_flags`) and the target machine's feature
-string (`create_default_target_machine`) therefore take the union of the two: an LLVM host-string
-hit OR a `cpu_supports` hit (fullfp16 additionally reads darwin-arm64 as always-on - every
-Apple Silicon part has it). A cross-compile triple takes neither - only the force env.
-
-The two ways a feature reaches the target machine's string license different things. A
-detection-derived append - `+dotprod` always, `+i8mm` when `cpu_supports` confirms it - is
-EXECUTION-safe: the silicon running this process really has the instruction. A
-`DAS_JIT_ARM64_FORCE_FEATURES` append is EMISSION-only: it may name silicon this box does not
-have, so the artifact is for another machine and executing it here traps.
+Moved to `ARCHITECTURE_TARGET_FEATURES.md` sec.4, with sec.6 (the x64 tier gates) and sec.10
+(CPU classes and `DAS_JIT_BASELINE`).
 
 ## 5. The tune sidecar is a module-cache dependency {#tune-sidecar-cache-pin}
 
 `[tuned]` and `[tune_policy]` stamp a function's hints at macro time out of the tune sidecar,
 and the module cache stores the stamped AST. A re-mint therefore has to invalidate the cached
 record, or a later run serves stamps minted against the old sidecar until some source file
-changes. `read_manifest` (`daslib/llvm_tune.das`) registers the sidecar path with
-`add_module_cache_dependency` on every read; the record carries the path with the file's byte
-size and content hash, and the reader re-validates both before it trusts the payload. Content,
-not mtime: an app that rewrites its sidecar byte-identically on exit must not churn the cache.
+changes. The stamping paths (`tune_apply`, `tune_kernel_pick`) register the sidecar path with
+`add_module_cache_dependency` through `pin_module_cache_dependency` before they read it; the
+record carries the path with the file's byte size and content hash, and the reader re-validates
+both before it trusts the payload. Content, not mtime: an app that rewrites its sidecar
+byte-identically on exit must not churn the cache.
 
 The registration runs before the staleness gate, and for a path that does not exist yet,
 because the mints that matter most produce no successful read - the first mint has no sidecar,
 and a re-mint replaces one the gate rejected. An absent file registers as size -1 and hash 0,
-which the next run's re-validation sees change. Registering is a no-op outside compilation, so
-the manifest's runtime readers reach the same call unconditionally.
+which the next run's re-validation sees change. The pin sits beside the read, not inside
+`read_manifest`: the runtime shares that reader (the box-profile pin at load, `tune_status`),
+and a standalone exe binds every extern its functions name at startup, so a reader carrying the
+`ast_core` extern would drag the compiler module into every exe - and a wasm cross-link, which
+sees only the compiler-free runtime archive, has nothing to bind it to.
 
 The shipped defaults profiles are the same kind of input: with no sidecar entry a kernel
-stamps its class entry out of `<defaults>/<class>.tune-defaults.json`, so `locate_profile_doc`
+stamps its class entry out of `<defaults>/<class>.tune-defaults.json`, so `pin_profile_chain`
 registers every candidate on the class ladder it tries, existing or not - a profile that
 appears, or is re-exported after a re-mint, must invalidate the stamps minted without it. The
 staleness gate itself compares the sidecar's mtime with the running binary's, which no content
 hash sees; the host closes that hole by keying its default module cache on the binary's
 mtime and size, so a rebuild is a fresh cache rather than a hit on pre-rebuild stamps.
 
-## 6. The x64 kernel-matrix tier gates {#x64-tier-gates}
+## 6. The x64 kernel-matrix tier gates
 
-An x64 host target publishes eight boolean gates (`g_target_x64_*`), one per instruction tier the
-kernel matrix and the tune grids select on: `avx2`, `f16c`, `vnni256` (256-bit VPDPBUSD by either
-VEX AVX-VNNI or EVEX AVX512-VNNI+VL), `avx512bw` (zmm byte ops - BW, not merely F), `avx512vnni`
-(zmm VPDPBUSD; implies bw, the sign trick around it is BW), `avx512vbmi` (VPERMI2B / VPERMB /
-VPMULTISHIFTQB - the grid formats' symbol lattice), `vnniint8` (VEX VPDPBSSD, native s8 x s8),
-and `amx` (both amx-tile and amx-int8; the per-process XTILEDATA grant is a separate runtime step
-the family's own witness performs). `init_jit_target_flags` decides each from cpuid truth OR'd with
-the `DAS_JIT_X64_FORCE_FEATURES` emission-only override; a cross triple or a generic target
-(`host_features = false`) drops to forced-only truth - cpuid is not consulted, the force env is
-the only tier source there.
-
-The cpuid truth is `das_cpu_supports` (`src/builtin/module_builtin_runtime.cpp`), a hand-kept table
-keyed by the LLVM target-feature spelling - so the force env and `llc -mattr` take the same names.
-A tier feature usually lands as three parts: its cpuid line there, its name in
-`TUNE_KNOWN_FEATURES` (`daslib/llvm_tune.das`, the profile fingerprint the `requires=` gates are
-checked against), and - when the emitters branch on it - a `g_target_x64_*` gate. The cpuid line
-is the load-bearing one: a name missing from the table answers false on every box, so the perm
-that requires it declines everywhere and no error names the cause.
+Moved to `ARCHITECTURE_TARGET_FEATURES.md` sec.6.
 
 ## 7. A constant-folded GEP is not an instruction {#gep-constant-fold}
 
@@ -269,3 +248,48 @@ vecmath carries no vector sinh/cosh/tanh, so `SimPolicy` binds `vsinh`/`vcosh`/`
 exp polynomial's error rather than agreeing with them - the opposite trade from every other
 emitter on the rail, taken because the consumer (GELU over float4 rows) otherwise pays four
 libm calls per vector. `tests/llvm_vector_math.das` asserts the size of that divergence.
+
+## 9. The idot family's target lowerings {#idot-lowerings}
+
+The exact integer dots on the 8-bit lattice have three lowerings, picked by target: one
+`@llvm.aarch64.neon.sdot` where the target has DotProd (`g_target_arm64_dotprod` - the host rail's
+`+dotprod` append, or the force env on the generic rail), the SIMD128 form on a wasm target
+(`idot_wasm_simd128`), generic widen-multiply IR everywhere else. The native arms exist because
+neither backend produces them from the generic form: AArch64 expands it to zip/uzp/smull instead
+of folding to SDOT, and the wasm backend runs it a fifth as fast. The wasm form is the ISA's two
+halves of an int8 dot, `i16x8.extmul_{low,high}_i8x16_s` (what LLVM makes of `mul(sext, sext)`) and
+`i32x4.extadd_pairwise_i16x8_s`; the pairwise sums land as byte pairs, and one even/odd shuffle-add
+folds them into the quad lanes the generic form defines - exact for every int8 lane. The
+relaxed-SIMD dot (`i32x4.relaxed_dot_i8x16_i7x16_add_s`) is NOT used: its second operand is 7-bit,
+so the sign trick that would feed it (`dot(w, x) == dot(sign(x)*w, |x|)`) wraps at -128 in either
+operand and answers the wrong sign there, and `+relaxed-simd` is a whole-module switch that also
+turns float-vector `min`/`max` and `mad` into engine-defined instructions (NaN and signed-zero
+answers, fusion) - the feature string stays `+simd128,+nontrapping-fptoint`, the runtime archive's.
+
+## 10. A standalone exe's require-resolver rows
+
+`inject_main` (`daslib/llvm_exe.das`) decides the exe's link - the runtime-only library, or the
+whole compiler library when the program registers every builtin module, ships a dynamic module,
+or reaches a compiler-lib module - and emits the `register_native_path` rows the host's module
+scan loaded only under the whole-lib link, once, after that decision. The rows feed the
+compile-time require resolver (`FsFileAccess::getModuleInfo`), which lives in the compiler
+library: a runtime-only exe has no compiler and can never reach them, and every row it would
+carry is a startup `jit_register_native_path_resolve` call - one exe-file lookup and one stat per
+row, for every row the host scan loaded - and a build-machine path baked into the binary. A whole-lib
+exe (`dastest.exe`, which compiles test files at run time) still carries every row, re-rooted at
+run time the way dynamic modules are.
+
+## 11. A global's address is a memory(none) lookup at its use site
+
+JIT code reaches a das global through `jit_get_global_mnh(mnh, ctx)` (`jit_get_shared_mnh` for a
+shared one): the mangled-name hash is static, and the offset it names is added to the context's
+globals base, which is what a cross-context call needs - the same JIT function runs on any context
+of the program, each with its own base, so the address cannot be baked. The emitter
+(`visitExprVar`, `daslib/llvm_jit.das`) emits the call where the variable is used and declares it
+`memory(none)` (`daslib/llvm_jit_common.das`): the result depends on nothing but its arguments for
+the lifetime of the context, so LLVM CSEs one use against a dominating one, hoists a loop's lookup
+into the preheader, and - the call not being `speculatable` - never moves it ahead of a branch, so
+a global written on one branch is looked up on that branch only. Every access to a global in a
+function therefore shares one base pointer, which is what lets LLVM see `xs[j]` and `xs[j + 1]` as
+adjacent. Under `options solid_context` the address is instead `context->globals + stackTop`,
+computed once per function in the entry block.

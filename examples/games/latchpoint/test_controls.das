@@ -1,6 +1,17 @@
 options gen2
 require dastest/testing_boost public
 require lp_controls
+require lp_world
+require daslib/fio
+
+[test]
+def test_pointer_and_retina(t : T?) {
+    t |> success(camera_dragging(true, false))
+    t |> success(camera_dragging(false, true))
+    t |> success(!camera_dragging(false, false))
+    t |> equal(ui_scissor_rect(10, 20, 100, 40, int2(1280, 800), int2(2560, 1600)), int4(20, 1480, 200, 80))
+    t |> equal(ui_scissor_rect(10, 20, 100, 40, int2(1280, 800), int2(1280, 800)), int4(10, 740, 100, 40))
+}
 
 [test]
 def test_navigation(suite : T?) {
@@ -32,4 +43,18 @@ def test_navigation(suite : T?) {
         state[GLFW_KEY_LEFT] = true
         t |> equal(movement_axes(state), float2(0.0, 1.0))
     }
+}
+
+[test]
+def test_lifecycle_guards(t : T?) {
+    let temp = create_temp_file_result("latchpoint_pose", ".json")
+    t |> success(temp is value, "temporary pose file created")
+    return if (!(temp is value))
+    let path = temp as value
+    t |> success(fwrite(path, "saved pose"))
+    t |> success(!save_avatar_on_shutdown(true, path), "closing the untouched initial menu does not save")
+    t |> equal(fread(path), "saved pose", "the existing Continue pose remains byte-identical")
+    t |> success(save_avatar_on_shutdown(false, path), "an active game persists its current pose")
+    t |> success(fread(path) != "saved pose", "active gameplay replaces the pose")
+    remove(path)
 }

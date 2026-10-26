@@ -29,4 +29,21 @@ DAS_CC_API bool require_dynamic_modules(smart_ptr<FileAccess> file_access,
                                      const vector<string> &load_modules,
                                      const vector<string> &disabled_modules,
                                      TextWriter &tout);
+
+// src/ast/ARCHITECTURE.md sec.2
+struct DynModuleManifestRow {
+    bool    dynamic = false;    // false: native path (a=mod_name, b=src, c=dst); true: dynamic module (a=path, b=cpp class, c=das name)
+    string  a, b, c;
+    int     on_error = 0;       // dynamic only: the RegisterOnError the descriptor used
+};
+DAS_API void begin_dynamic_module_recording();
+DAS_API void end_dynamic_module_recording(vector<DynModuleManifestRow> & rows, bool & optOut);
+DAS_API void replay_native_path(const char * mod_name, const char * src, const char * dst);
+DAS_API void replay_dynamic_module(const char * path, const char * cpp_class, int on_error);
+DAS_API void defer_dynamic_module(const char * path, const char * cpp_class, int on_error, const char * das_name);
+DAS_API bool load_deferred_dynamic_module(const char * das_name);
+DAS_API size_t load_all_deferred_dynamic_modules();                 // the count it attempted
+DAS_API bool has_deferred_dynamic_modules();
+DAS_API bool is_dynamic_module_deferred(const char * das_name);
+DAS_CC_API void ignore_dynamic_module_manifests(bool ignore);
 }

@@ -3,11 +3,13 @@
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture doc:
 `README.md`. Planned work: `plans/dasllama_io_site.md`.
 
-In this checklist "a page" means every served `.html` page under this directory, the generated
-news region inside index.html included.
+In this checklist "a page" means a served `.html` file under this directory, the generated news
+region inside index.html, `feed.xml`, and `sitemap.xml`. Publish time is the deploy that
+follows the merge of the change under review; copy about a linked download is judged against
+the artifact reachable at that link at that moment.
 
-**A shell command, flag, or output line shown on a page is a defect unless the command runs
-verbatim and produces the result the page shows.**
+**A program name, flag, command line, or output line shown on a page must match what the
+download that page links accepts or emits, verbatim, for every platform that page offers.**
 
 **A code sample shown on a page that does not compile and run with the current toolchain is
 a defect.**
@@ -18,8 +20,9 @@ that run: the live endpoint the page renders it from, the checked-in measurement
 comment or prose clause names, the box and date and what was measured, or the word
 placeholder.
 
-**A comparative superiority claim made in words rather than as side-by-side figures, on any
-page, is a defect** - the arithmetic a reader does over two figures is not the page's claim.
+**A claim on any page that one engine, build, or way of running beats another on anything a run
+measures - speed, error rate, footprint, size - made in words rather than as side-by-side
+figures, is a defect** - the arithmetic a reader does over two figures is not the page's claim.
 
 **Copy or rendering that lets a row with no reference engine's figure imply parity is a
 defect - an empty ratio cell means the comparison was never run.**
@@ -37,17 +40,27 @@ top-level `.html` page here, or in a script or stylesheet under `files/`, that n
 `site/files/dasllama-table.css` (repo root) defines and no `id="..."` in those files declares -
 is a defect.**
 
-**A claim in any text this folder publishes or documents - a page, a `_news/*.md` or
-`_stories/*.md` entry, or `README.md` - that is not true at publish time is a defect.** A dated
-`_news` or `_stories` entry is read as a claim about its own date; standing page copy - a
-masthead, section prose, a meta tag - is read as a claim about now, and a diff that falsifies
-standing copy fixes it in the same change. Check a claim about what a shipped tool does against
-that tool's current code, and a claim about what a page here renders against the page's markup
-and `files/dasllama-io.js`.
+**A claim in any text under this folder a reader or an operator reads as fact - a page, a
+`_news/*.md` or `_stories/*.md` entry, `README.md`, a tool's docstring - that is not true at
+publish time is a defect.** A dated `_news` or `_stories` entry is read as a claim about its own
+date; standing page copy - a masthead, section prose, a meta tag - is read as a claim about
+now. `README.md`'s copy rules say how a claim is checked.
+
+**A diff that falsifies standing page copy - a masthead, section prose, a meta tag - fixes it
+in the same change.**
+
+**A PR whose copy describes what a linked download contains refreshes that download's release
+before the PR merges, or holds the copy until it does.** The rolling release republishes on its
+own trigger, never on a page's merge.
 
 **A `_news/*.md` or `_stories/*.md` entry for something not yet shipped is a defect.** Shipped
-means a reader can have it now: the code the entry describes is merged to this repository's
-`master`, and any artifact the entry points a reader at is downloadable from where it points.
+means a reader can have it at publish time: the code the entry describes is merged to this
+repository's `master`, and any artifact the entry points a reader at is downloadable from where
+it points.
+
+**A PR that adds or changes copy describing what a downloadable artifact contains names, in
+the PR body, the URL it fetched for each artifact the copy points at and what the fetch
+returned.**
 
 **A figure in a `_stories/*.md` entry that names no date and build sha for the run it came
 from - in the entry's own text or its `<!-- figures: ... -->` comment - is a defect** - a
@@ -58,11 +71,12 @@ context-correct escape is a defect: `esc()` (which escapes `< > & " '`) for text
 quoted-attribute values, `Number(...)` for anything numeric, and `safeApiHref()` (an
 `^/api/...` allow-list) for anything landing in `href`/`src` or fed to `fetch`.**
 
-**Weakening `test_metadata.py`'s per-page assertions - the test that fails a page without a
-`<title>`, a meta description, the OpenGraph tags, or the Atom `<link>` - is a defect.**
+**Weakening `test_metadata.py`'s per-page assertions - the test that fails an `.html` page
+without a `<title>`, a meta description, the OpenGraph tags, or the Atom `<link>` - is a
+defect.**
 
-**Weakening `REVIEW.das`'s page census - the gate that reports a served page, or the `stories/`
+**Weakening `REVIEW.das`'s page census - the gate that reports a served file, or the `stories/`
 directory, missing from the dasllama.io deploy step (`.github/workflows/pages.yml`, repo root),
-from `build_news.py`'s sitemap list or `sitemap.xml`, or from `test_metadata.py`'s page list -
-is a defect.** Local preview serves the tree directly, so no miss shows there: the page deploys
-unlisted, uncrawled, or unchecked.
+or an `.html` page missing from `build_news.py`'s sitemap list or `sitemap.xml` or from
+`test_metadata.py`'s page list - is a defect.** Local preview serves the tree directly, so no
+miss shows there: the page deploys unlisted, uncrawled, or unchecked.

@@ -6,6 +6,7 @@ options auto_inline_functions = false
 
 require daslib/fio
 require clipboard/clipboard
+require stddlg
 require daslib/rtti
 require daslib/ast
 require math
@@ -145,7 +146,7 @@ require strudel/strudel_sf2_voice
 require strudel/strudel_pattern
 require spirv/spirv_reflect
 require dasllama/dasllama
-require llvm/daslib/llvm_tune   // documentation context keeps [tune] fully inert
+require ?llvm llvm/daslib/llvm_tune   // nolint:STYLE030,LINT019 — the framework's is_building_documentation check keeps [tune] inert; a build without dasLLVM has no framework to keep inert
 
 def document_module_math(_root : string) {
     var mod = get_module("math")
@@ -199,7 +200,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Binary serializer", mod, %regex~(binary_load|binary_save)$%%),
         group_by_regex("Path and command line", mod, %regex~(get_command_line_arguments|with_argv)$%%),
         group_by_regex("Time and date", mod, %regex~(get_time_usec|ref_time_ticks|get_clock|get_time_nsec|mktime|iso8601_now|format_time|clock)$%%),
-        group_by_regex("Platform queries", mod, %regex~(get_context_share_counter|das_is_dll_build|das_is_exceptions_enabled|is_standalone_exe|get_platform_name|get_running_platform_name|get_cross_platform_name|get_architecture_name|cpu_supports)$%%),
+        group_by_regex("Platform queries", mod, %regex~(get_context_share_counter|das_is_dll_build|das_is_exceptions_enabled|is_standalone_exe|get_platform_name|get_running_platform_name|get_cross_platform_name|get_architecture_name|get_target_triple|get_target_architecture_name|cpu_supports)$%%),
         group_by_regex("String formatting", mod, %regex~(fmt)$%%),
         hide_group(group_by_regex("Temp string reclaim", mod, %regex~(_temp_string_result)$%%)),
         group_by_regex("Argument consumption", mod, %regex~(consume_argument)$%%),
@@ -228,8 +229,8 @@ def document_module_fio(_root : string) {
         group_by_regex("Glob and pattern matching", mod, %regex~(match_glob|glob|glob_filtered|is_glob_pattern|expand_glob|parse_file_list)$%%),
         group_by_regex("Filesystem queries", mod, %regex~(temp_directory|temp_directory_result|create_temp_file|create_temp_file_result|create_temp_directory|create_temp_directory_result|disk_space)$%%),
         group_by_regex("Terminal queries", mod, %regex~(is_terminal|terminal_width)$%%),
-        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|system|popen|popen_binary|popen_timeout|spawn_argv|popen_argv|popen_argv_pipe|popen_timed_out|run_and_capture|get_env_variable|set_env_variable|sanitize_command_line|has_env_variable)$%%),
-        group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path|describe_pending_dynamic_modules)$%%)
+        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|system|popen|popen_binary|popen_timeout|spawn_argv|popen_argv|popen_argv_pipe|popen_timed_out|run_and_capture|spawn_process|process_drain|process_poll|process_wait|process_terminate|process_kill|process_pid|process_alive|close_process|process_running|with_process|get_env_variable|set_env_variable|sanitize_command_line|has_env_variable)$%%),
+        group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path|describe_pending_dynamic_modules|no_manifest)$%%)
     )
     documents("File input output library", mod, "fio.rst", groups)
 }
@@ -401,7 +402,7 @@ def document_module_dasllama_tts(_root : string) {
     }
     var mod = [find_module("dasllama_tts"), find_module("dasllama_tts_types")]
     var groups <- array<DocGroup>(
-        group_by_regex("Loading and capabilities", mod, %regex~(load_tts_model|caps|tts_voice_lang|finalize)$%%),
+        group_by_regex("Loading and capabilities", mod, %regex~(load_tts_model|g2p_pack_path|caps|tts_voice_lang|finalize)$%%),
         group_by_regex("Text front end", mod, %regex~(tts_normalize|tts_phonemize|tts_chunks)$%%),
         group_by_regex("Synthesis", mod, %regex~(synthesize|synthesize_stream)$%%),
         group_by_regex("The served lane", mod, %regex~(set_tts_q8|reset_tts_q8|tts_serves_q8)$%%),
@@ -414,7 +415,7 @@ def document_module_debugapi(_root : string) {
     var mod = get_module("debugapi")
     var groups <- array<DocGroup>(
         group_by_regex("Agent lifecycle", mod, %regex~(fork_debug_agent_context|install_debug_agent|install_debug_agent_thread_local|install_new_debug_agent|install_new_thread_local_debug_agent|has_debug_agent_context|get_debug_agent_context|delete_debug_agent_context|is_in_debug_agent_creation|lock_debug_agent)$%%),
-        group_by_regex("Cross-context invocation", mod, %regex~(invoke_in_context|invoke_debug_agent_method|invoke_debug_agent_function)$%%),
+        group_by_regex("Cross-context invocation", mod, %regex~(invoke_in_context|try_invoke_in_context|invoke_debug_agent_method|invoke_debug_agent_function)$%%),
         group_by_regex("Agent construction", mod, %regex~(make_debug_agent|make_data_walker|make_stack_walker)$%%),
         group_by_regex("Agent tick and state collection", mod, %regex~(tick_debug_agent|collect_debug_agent_state|on_breakpoints_reset|report_context_state|debug_agent_command|debugger_stop_requested|debugger_thread_context_ready)$%%),
         group_by_regex("Instrumentation", mod, %regex~(instrument_node|instrument_function|instrument_all_functions|instrument_all_functions_thread_local|instrument_context_allocations|clear_instruments|set_single_step)$%%),
@@ -1527,6 +1528,15 @@ def document_module_validate_code(_root : string) {
     document("Code validation annotations", mod, "validate_code.rst", groups)
 }
 
+def document_module_stddlg(_root : string) {
+    var mod = get_module("stddlg")
+    var groups <- array<DocGroup>(
+        group_by_regex("Standard dialogs", mod, %regex~(dlg_init|get_dlg_ok_from_user|get_dlg_ok_cancel_from_user|get_dlg_save_file|get_dlg_open_file)$%%),
+        group_by_regex("Tray icon", mod, %regex~tray_.*$%%)
+    )
+    document("Standard dialogs and tray icon", mod, "stddlg.rst", groups)
+}
+
 def document_module_stbimage(_root : string) {
     var mod = get_module("stbimage")
     var groups <- array<DocGroup>(
@@ -1892,6 +1902,7 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_math(root)
     document_module_fio(root)
     document_module_clipboard(root)
+    document_module_stddlg(root)
     document_module_network(root)
     document_module_dashv(root)
     document_module_openai(root)

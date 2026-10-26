@@ -129,6 +129,7 @@ def test_areas_for_path(t : T?) {
     t |> equal(join(areas_for_path("modules/dasLLAMA/dasllama/dasllama_tower.das"), ","), "audio,vision", "the shared tower reaches both towers")
     t |> equal(join(areas_for_path("modules/dasLLAMA/dasllama/dasllama_math.das"), ","), every, "a core module reaches every area")
     t |> equal(join(areas_for_path("modules/dasLLAMA/dasllama/dasllama_brand_new.das"), ","), every, "a module without a row reaches every area - the safe default")
+    t |> equal(join(areas_for_path("modules/dasLLAMA/dasllama/dasllama_bench.das"), ","), "llm,infra", "the bench rows reach the engine area and the tooling that drives them")
     t |> equal(join(areas_for_path("modules/dasLLAMA/tests/test_gemma3v.das"), ","), "vision", "a test file reaches its own area")
     t |> equal(join(areas_for_path("modules/dasLLAMA/tests/test_tower_helpers.das"), ","), "audio,vision", "a two-area test reaches both")
     t |> equal(length(areas_for_path("modules/dasLLAMA/tests/test_metal_decode_parity.das")), 0, "a model-suite file reaches no area - it takes --arm")
@@ -155,12 +156,15 @@ def test_areas_for_path(t : T?) {
 [test]
 def test_area_plan(t : T?) {
     let tts <- area_plan(["tts"])
-    t |> equal(length(tts.files), 7, "tts plans its seven files")
-    t |> equal(tts.image_arms, "", "tts owns no image arms, so no image file")
-    t |> success(find_index(tts.files, "{TESTS_DIR}/test_model_image.das") < 0, "no image file without arms")
-    for (i in range(1, length(tts.files))) {
+    t |> equal(length(tts.files), 9, "tts plans its eight files and the image file its kitten arm rides")
+    t |> equal(tts.image_arms, "kitten", "tts owns the kitten image arm")
+    t |> equal(tts.files[length(tts.files) - 1], "{TESTS_DIR}/test_model_image.das", "the image file rides last")
+    for (i in range(1, length(tts.files) - 1)) {
         t |> success(tts.files[i - 1] < tts.files[i], "the plan is sorted: {tts.files[i - 1]} < {tts.files[i]}")
     }
+    let infra <- area_plan(["infra"])
+    t |> equal(infra.image_arms, "", "infra owns no image arms, so no image file")
+    t |> success(find_index(infra.files, "{TESTS_DIR}/test_model_image.das") < 0, "no image file without arms")
     let both <- area_plan(["audio", "vision"])
     let n_image = length([for (f in both.files); f; where f == "{TESTS_DIR}/test_model_image.das"])
     t |> equal(n_image, 1, "two arm-owning areas append the image file once")
@@ -174,7 +178,7 @@ def test_area_plan(t : T?) {
     t |> equal(length(suite.files), 1, "a suite run plans the suite table")
     t |> equal(suite.image_arms, "arm12", "a suite run passes --arm through")
     let area <- plan_files(cfg, ["tts"])
-    t |> equal(length(area.files), 7, "an area run plans the area, whatever --suite says")
+    t |> equal(length(area.files), 9, "an area run plans the area, whatever --suite says")
 }
 
 //! the argument contracts: an area run refuses --arm/--full/--suite and an unknown area; a per-PR

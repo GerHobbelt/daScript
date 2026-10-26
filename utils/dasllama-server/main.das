@@ -20,13 +20,15 @@ options stack = 524288   // every dasLLAMA program root takes this budget (optio
 // explicit exchange_accept key in the config consults it); a tune exits so the watchdog can restart
 // with the winners (missing = "restart"); `--tune` forces a local re-tune. Set DAS_TUNE_POLICY=error
 // while developing to skip per-start tuning (it prints the tuner command instead). The winners live
-// at <das_root>/dasllama.tune.json, shared by every dasLLAMA app on this box.
+// at <das_root>/dasllama.tune.json, shared by every dasLLAMA app on this box. A fat build (the
+// download) carries no tuner: its kernels are the class clones, and `--tune` is ignored.
 
 require openai_server           // the server + route handlers (this directory)
 require model_catalog           // catalog_models_dir — the models-dir resolution
 require dasllama/dasllama       // load_model / QuantMode / load_asr_model
-require llvm/daslib/llvm_tune   // [tune_policy] + tune_status (the injected guard resolves here)
-require dasllama/dasllama_exchange   // the sidecar exchange: boot resolver + submit check
+require daslib/tune             // [tune_policy] + log_tune_status (the injected guard resolves here)
+require ?llvm llvm/daslib/llvm_tune   // nolint:STYLE030,LINT019 — OPTIONAL: tune_suppress_mint, reached under module_exists(llvm_tune)
+require ?llvm dasllama/dasllama_exchange   // nolint:STYLE030,LINT019 — OPTIONAL: the sidecar exchange (boot resolver + submit check), which rides the tune framework
 require jobque                  // set_jobque_threads_cap / set_jobque_affinity
 require daslib/clargs
 require daslib/toml
@@ -145,7 +147,7 @@ struct ServerArgs {
     @clarg_doc = "Directory the model catalog downloads into (default ~/.dasllama/models; DASLLAMA_MODELS_DIR overrides)"
     models_dir : string
 
-    @clarg_doc = "Re-tune this box's dasLLAMA kernels, then relaunch (handled before arg parsing)"
+    @clarg_doc = "Re-tune this box's dasLLAMA kernels, then relaunch (handled before arg parsing; a fat build carries no tuner and ignores it)"
     tune : bool
 
     @clarg_short = "?"
@@ -177,7 +179,9 @@ struct ModelEntry {
 // untuned boot consults the exchange only when the config opts in (the exchange is closed; off by default)
 [init]
 def register_exchange_resolver {
-    exchange_register_resolver("dasllama-server.toml")
+    static_if (typeinfo module_exists(dasllama_exchange)) {
+        exchange_register_resolver("dasllama-server.toml")
+    }
 }
 
 // A clearly model-free boot (no --model/-m, no --config/-c, no discoverable toml) heads for
@@ -194,9 +198,11 @@ def suppress_tune_for_setup {
         }
     }
     delete args
-    if (!configured && !stat("dasllama-server.toml").is_valid
-            && !stat(path_join(get_this_module_dir(), "dasllama-server.toml")).is_valid) {
-        tune_suppress_mint("no model configured - setup mode boots on fallback kernels")
+    static_if (typeinfo module_exists(llvm_tune)) {
+        if (!configured && !stat("dasllama-server.toml").is_valid
+                && !stat(path_join(get_this_module_dir(), "dasllama-server.toml")).is_valid) {
+            tune_suppress_mint("no model configured - setup mode boots on fallback kernels")
+        }
     }
 }
 
@@ -675,11 +681,11 @@ def parse_args() {
     g_args_parsed = true
     g_args_ready = false
     g_exit_code = 0
-    // JIT is mandatory: the kernels are per-box JIT-tuned [llvm_code], the tune framework needs
-    // a live JIT, and a baked standalone -exe additionally mis-wires shared-module [init] globals
-    // (the vulkan GPU-tier arm probe bakes null -> crash). There is no correct non-JIT path here.
-    if (!jit_enabled()) {
-        to_log(LOG_ERROR, "dasllama-server requires the JIT — run: daslang -jit main.das -- ... (a baked -exe is unsupported)\n")
+    // compiled code only: the kernels are [llvm_code] - JIT-tuned on this box under -jit, or the
+    // baked per-class clones of a daspkg release exe. The interpreter would run them far too
+    // slowly to serve, so it is refused rather than run.
+    if (!jit_enabled() && !is_standalone_exe()) {
+        to_log(LOG_ERROR, "dasllama-server needs compiled kernels — run: daslang -jit main.das -- ... or the released dasllama-server executable\n")
         g_exit_code = 1
         request_exit()
         return
@@ -851,7 +857,14 @@ def init() {   // nolint:STYLE037,STYLE038 — boot sequence: the knobs are orde
     log_tune_status("dasllama-server")
     // a fresh local tune that has not been shared: submit now (always) or surface the offer
     // (ask — the watchdog balloon + the control page's exchange card); quiet otherwise
-    exchange_boot_submit_check(exchange_policy_from_config(g_cfg.config))
+    static_if (typeinfo module_exists(llvm_tune)) {
+        // a fat release has no tune of its own to offer - its kernels are the shipped class clones
+        if (!tune_fat_built()) {
+            static_if (typeinfo module_exists(dasllama_exchange)) {
+                exchange_boot_submit_check(exchange_policy_from_config(g_cfg.config))
+            }
+        }
+    }
     // GPU backend lands BEFORE the load: the metal mode pins the row-major backend the GPU
     // kernels read, and the vulkan tier want must be armed before the load walk uploads stacks
     let gpu = effective_gpu(g_cfg)
@@ -1067,8 +1080,9 @@ def init() {   // nolint:STYLE037,STYLE038 — boot sequence: the knobs are orde
         to_log(LOG_INFO, "dasllama-server: models dir {catalog_dir} (DASLLAMA_MODELS_DIR overrides the models_dir config key)\n")
     }
     set_setup_mode(g_setup_mode)
-    // the bench button runs OUR bench as a child daslang process (lcpp_bench.das) — a
-    // standalone-exe deployment has no script runner, so the button stays disabled there
+    // the A/B bench and the bake spawn a child daslang process (lcpp_bench.das, the converter) — a
+    // standalone-exe deployment has no script runner, so /bake refuses there and /bench measures
+    // in process instead
     var daslang_bin = ""
     if (!is_standalone_exe()) {
         for (a in get_command_line_arguments()) {   // argv[0] = the running daslang binary (locked temp — no delete)
@@ -1104,8 +1118,9 @@ def shutdown() {
     logger_flush()
 }
 
-// missing = "restart": an untuned first start writes the tune sidecar and returns 3 before
-// parse_args/init can create the JobQue, load the model, or bind the port. The watchdog relaunches.
+// missing = "restart": under -jit an untuned first start writes the tune sidecar and returns 3
+// before parse_args/init can create the JobQue, load the model, or bind the port; the watchdog
+// relaunches. A standalone exe carries no policy rail - a fat release serves its baked clones.
 [export, tune_policy(missing = "restart")]
 def main : int {
     parse_args()

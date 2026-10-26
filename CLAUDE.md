@@ -96,7 +96,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/internal/documentation_rst.md` | Editing RST in `doc/source/`, `//!` doc-comments in `daslib/*.das`, tutorial RST pages |
 | `skills/internal/tutorials.md` | Anything that looks like a tutorial - they live under `/tutorials/<area>/`, NEVER `modules/<X>/tutorial/` |
 | `skills/internal/tutorial_prose.md` | WRITING or revising general-reader doc/tutorial prose (`documentation_rst.md` is mechanics, this is the words) |
-| `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums; shipping without the compiler (`libDaScriptNano`) |
+| `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums; shipping without the compiler (`libDaScriptNano`, or a standalone context on the full runtime) |
 | `skills/internal/cpp_codebase_notes.md` | Working on daslang's own C++ - where inference/builtins/errors/parser live, AST function flags |
 | `skills/internal/clang_bind_build.md` | Enabling `dasClangBind` / bumping the libclang SDK / running any `bind_*.das` self-binder |
 | `skills/daslib_modules.md` | Working with `daslib/` modules or extending the stdlib |
@@ -238,6 +238,9 @@ diagnostic in any tier.
   fresh clone per registration, not the same variable passed twice.
 - **`new WithCtor(field = v)` skips the user constructor** - it is plain field-init, so
   inherited fields stay zero. Write `new WithCtor(args)` when the constructor must run.
+- **`exit(N)` does not set the process exit code under the daslang CLI.** It unwinds as an
+  abnormal termination and the process reports 1, whatever `N` was - a supervisor or shell sees a
+  crash. A code the parent must read comes from `def main() : int { return N }`.
 
 ### Code style - prefer idiomatic forms
 

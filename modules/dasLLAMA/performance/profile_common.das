@@ -21,7 +21,7 @@ require daslib/json public                // JV(...) for logger field payloads
 require daslib/json_boost                 // ?[] / ?? navigation — the sidecar provenance reader
 require dasllama/dasllama_common public   // QuantMode
 require dasllama/dasllama_math            // active_kernel_backend — the exec_fmt layout receipt
-require llvm/daslib/llvm_tune             // tune_status — stamp provenance for the platform block
+require ?llvm llvm/daslib/llvm_tune       // nolint:STYLE030,LINT019 — tune_status, the stamp provenance; empty without the framework
 require model_specs public                // the model-set table + its llm/official views
 require box_ident                         // derive_box_name — the hardware-keyed box tag
 
@@ -474,7 +474,8 @@ def private platform_os() : string {
     return strip("{run_capture(". /etc/os-release && echo $PRETTY_NAME", true)} {run_capture("uname -r", true)}")
 }
 
-def private tune_row_str(r : TuneStatus) : string {
+//! generic on purpose: the row type lives in the framework, and this file compiles without it
+def private tune_row_str(r) : string {
     let sfx = empty(r.suffix) ? "reference" : r.suffix
     return "{r.fname}={sfx} ({r.source})"
 }
@@ -482,24 +483,33 @@ def private tune_row_str(r : TuneStatus) : string {
 //! One-line gen-kernel stamp provenance — "" (omitted from JSON) when the driver declares no
 //! `[tune_policy]` (tune_status is empty then).
 def tune_summary() : string {
-    var st <- tune_status()
-    var parts <- [for (r in st); tune_row_str(r)]
-    let s = join(parts, "; ")
-    delete parts
-    delete st
-    return s
+    static_if (typeinfo module_exists(llvm_tune)) {
+        var st <- tune_status()
+        var parts <- [for (r in st); tune_row_str(r)]
+        let s = join(parts, "; ")
+        delete parts
+        delete st
+        return s
+    } else {
+        return ""
+    }
 }
 
 //! The bench cells' provenance gate: REFUSE to measure on fallback kernel winners. A
 //! stale/absent sidecar silently downgrades every ``[tune]`` kernel with only [I]-level
-//! warnings — the m4 pilot shipped a full board that way. Three worlds, because
-//! ``tune_status()`` populates in exactly one of them:
+//! warnings — the m4 pilot shipped a full board that way. Four worlds, because
+//! ``tune_status()`` populates in two of them:
+//! * **fat exe** (``daspkg release --fat``): the kernels are the class profiles' clones and the
+//!   status rows name each clone's class and source - the gate passes when every clone this
+//!   box runs came from a profile; a fat run is never a box mint, so it is no board row.
 //! * **standalone exe** (the board rig): winners are BAKED at build time, so the status table
 //!   is empty by design — provenance is the sidecar the release shipped beside the binary.
 //! * **``DAS_TUNE_MANIFEST`` pinned**: stamps apply, status stays empty (framework gap,
 //!   ledgered) — gate on the FILE: present, newer than the binary, carrying kernels.
 //! * **plain script**: the policy rail ran, so every row must stamp a manifest winner.
-//! ``DASLLAMA_ALLOW_UNTUNED=1`` is the dev-run escape in all three (it also suppresses the
+//! A build without the framework (no dasLLVM, the portable tier) has no winners at all - every
+//! kernel is its reference body - and the gate refuses by name.
+//! ``DASLLAMA_ALLOW_UNTUNED=1`` is the dev-run escape in every world (it also suppresses the
 //! auto-mint at ``[init]`` — see ``dasllama_math_gen_register`` — so the gate is reached at all).
 var private g_tune_gate_bypassed = false
 
@@ -510,9 +520,35 @@ def tune_gate_bypassed() : bool {
 }
 
 def tune_gate() : bool {
+    static_if (typeinfo module_exists(llvm_tune)) {
+        return tune_gate_verdict(tune_gate_why(0))
+    } else {
+        return tune_gate_verdict("this build carries no tune framework (dasLLVM absent) - every kernel runs its reference body")
+    }
+}
+
+def private tune_gate_verdict(why : string) : bool {
+    if (empty(why)) {
+        return true
+    }
+    if (g_env_bench.allow_untuned) {
+        g_tune_gate_bypassed = true
+        to_log(LOG_WARNING, "tune gate: {why} - measuring anyway (DASLLAMA_ALLOW_UNTUNED=1, numbers are NOT publishable)\n")
+        return true
+    }
+    to_log(LOG_ERROR, "tune gate: {why}. Mint with: DAS_TUNE_MODE=tune bin/daslang -jit modules/dasLLAMA/harness/dasllama_tuner.das -dasroot <repo>; DASLLAMA_ALLOW_UNTUNED=1 overrides for dev runs\n")
+    return false
+}
+
+//! The four-world refusal text, "" when the cell may measure. Generic on purpose (the unused
+//! parameter is what keeps it one): it names framework functions, so its body must instantiate
+//! only from `tune_gate`'s framework arm - a plain function would compile in every build.
+def private tune_gate_why(_) : string {
     var why = ""
     let mpath = g_env_core.tune_manifest
-    if (is_standalone_exe()) {
+    if (is_standalone_exe() && tune_fat_built()) {
+        why = fat_gate_why(0)
+    } elif (is_standalone_exe()) {
         // the release ships <exe>.tune.json from the same mint that baked the winners in
         let sc = tune_manifest_path()
         if (!stat(sc).is_valid) {
@@ -553,16 +589,43 @@ def tune_gate() : bool {
             why = "{bad}/{total} kernels stamp non-manifest winners (first: {sample}) - the sidecar is stale or absent; a class-profile stamp covers the kernels but is not this box's mint"
         }
     }
-    if (empty(why)) {
-        return true
+    return why
+}
+
+// the fat exe's world: of each kernel's clones, the one this box runs is the most capable class
+// of the mask, and it must have come from a profile. Generic for the same reason as tune_gate_why.
+def private fat_gate_why(_) : string {
+    var st <- tune_status()
+    var bestBit : table<string; int>
+    var bestSrc : table<string; string>
+    for (r in st) {
+        continue if (empty(r.klass))
+        let bit = tune_fat_class_bit(r.klass)
+        continue if ((tune_fat_mask() & bit) == 0)
+        let cur = (bestBit |> key_exists(r.fname)) ? bestBit[r.fname] : 2147483647
+        if (bit < cur) {
+            bestBit[r.fname] = bit
+            bestSrc[r.fname] = "{r.source}:{r.klass}"
+        }
     }
-    if (g_env_bench.allow_untuned) {
-        g_tune_gate_bypassed = true
-        to_log(LOG_WARNING, "tune gate: {why} - measuring anyway (DASLLAMA_ALLOW_UNTUNED=1, numbers are NOT publishable)\n")
-        return true
+    delete st
+    var bad = 0
+    var sample = ""
+    for (fname, src in keys(bestSrc), values(bestSrc)) {
+        if (!(src |> starts_with("profile:"))) {
+            bad++
+            if (empty(sample)) {
+                sample = "{fname}={src}"
+            }
+        }
     }
-    to_log(LOG_ERROR, "tune gate: {why}. Mint with: DAS_TUNE_MODE=tune bin/daslang -jit modules/dasLLAMA/harness/dasllama_tuner.das -dasroot <repo>; DASLLAMA_ALLOW_UNTUNED=1 overrides for dev runs\n")
-    return false
+    if (empty(bestSrc)) {
+        return "fat exe: tune_status carries no clone rows - the exe cannot name its kernels"
+    }
+    if (bad > 0) {
+        return "fat exe: {bad}/{length(bestSrc)} kernels run a clone that came from no profile (first: {sample}) - ship a profile for that class"
+    }
+    return ""
 }
 
 //! True when a das run cannot name the winners it measured under — an empty ``tune`` or
@@ -903,14 +966,25 @@ def private compute_sha256(path : string) : string {
     //! sha256 of this process's tune sidecar — the sidecar GENERATION a measurement runs under.
     //! Rows minted under different generations are not comparable; "" when the sidecar is absent.
 def tune_manifest_sha() : string {
-    return sidecar_generation_sha(tune_manifest_path())
+    static_if (typeinfo module_exists(llvm_tune)) {
+        return sidecar_generation_sha(tune_manifest_path())
+    } else {
+        return ""
+    }
 }
 
 //! The mint's noise verdict from the sidecar provenance ("ok" | "overridden"; "" when the
-//! sidecar or its provenance is absent) — records copy it so a mint taken through a failing
-//! noise gate is visible on the board, not only inside the sidecar.
+//! sidecar or its provenance is absent, and in a build without the framework) — records copy it
+//! so a mint taken through a failing noise gate is visible on the board, not only inside the sidecar.
 def tune_manifest_noise() : string {
-    let path = tune_manifest_path()
+    static_if (typeinfo module_exists(llvm_tune)) {
+        return sidecar_noise_verdict(tune_manifest_path())
+    } else {
+        return ""
+    }
+}
+
+def private sidecar_noise_verdict(path : string) : string {
     if (!stat(path).is_valid) {
         return ""
     }

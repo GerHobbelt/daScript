@@ -9,8 +9,8 @@ require llvm/bindings/llvm_struct
 require llvm/daslib/llvm_jit_intrin
 require daslib/ast_boost
 
-//! JIT-side half of the `[llvm_code]` rail (the user-side annotation lives in
-//! `llvm/daslib/llvm_code.das`): a name-keyed registry of das generator functions that emit a
+//! JIT-side half of the `[llvm_code]` rail (the user-side annotation registers in
+//! `daslib/tune.das`, forwarding to `llvm_code_apply` in `llvm/daslib/llvm_code.das`): a name-keyed registry of das generator functions that emit a
 //! function's LLVM IR wholesale. Generator modules compile into the JIT's context via the
 //! require list in `llvm/daslib/llvm_user_modules.das` and register themselves from `[init]`.
 
@@ -63,6 +63,14 @@ def public find_llvm_code_annotation(fn : FunctionPtr) : AnnotationDeclaration c
 def public llvm_code_generator_name(ann : AnnotationDeclaration const?) : string {
     for (arg in ann.arguments) {
         if (arg.name == "name" && arg.basicType == Type.tString) return string(arg.sValue)
+    }
+    return ""
+}
+
+//! The CPU class a fat-mode clone is stamped for (`tune_class=`), "" for every other function.
+def public llvm_code_class_name(ann : AnnotationDeclaration const?) : string {
+    for (arg in ann.arguments) {
+        if (arg.name == "tune_class" && arg.basicType == Type.tString) return string(arg.sValue)
     }
     return ""
 }

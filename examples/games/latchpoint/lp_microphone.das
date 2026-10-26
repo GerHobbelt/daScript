@@ -4,7 +4,6 @@ options persistent_heap
 require audio/audio_record
 require lp_audio
 require lp_dialogue
-require strudel/strudel_player
 
 var microphone_active = false
 var microphone_samples : array<float>
@@ -13,6 +12,12 @@ var microphone_since = 0.0
 var microphone_level = 0.0
 let MICROPHONE_RATE = 16000
 let MICROPHONE_LIMIT = MICROPHONE_RATE * 20
+
+def recording_has_signal(samples : array<float>) : bool {
+    var peak = 0.0
+    for (sample in samples) { peak = max(peak, abs(sample)) }
+    return peak >= 0.00001
+}
 
 def cancel_microphone() {
     if (microphone_active) { sound_record_stop() }
@@ -64,6 +69,13 @@ def finish_microphone() {
         set_robot_phase(conversation_resident, RobotPhase.idle)
         return
     }
+    if (!recording_has_signal(microphone_samples)) {
+        microphone_samples |> clear()
+        reply_text = "Microphone delivered silence. Check microphone permission and input device, or press E to type."
+        conversation_stage = "failed"
+        set_robot_phase(conversation_resident, RobotPhase.failed)
+        return
+    }
     let path = path_join(get_das_root(), "logs/latchpoint-input/microphone.wav")
     mkdir_rec(dir_name(path))
     if (!write_wav(path, microphone_samples, uint(MICROPHONE_RATE), 1)) {
@@ -85,5 +97,4 @@ def tick_microphone() {
     if (microphone_active && (length(microphone_samples) >= MICROPHONE_LIMIT || get_uptime() - microphone_since > 20.0)) {
         finish_microphone()
     }
-    if (microphone_active || conversation_stage == "asr") { strudel_set_volume(music_volume * 0.1, 0.1) }
 }

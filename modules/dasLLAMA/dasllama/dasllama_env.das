@@ -694,6 +694,14 @@ struct public TestEnv {
     @clarg_doc = "Directory of whisper models for the audio tests."
     whisper_dir : string = ""
 
+    @clarg_env = "DISPLAY"
+    @clarg_doc = "Ambient platform variable; read only by the storyteller restart test to tell whether a Linux box has a window server for the example's window."
+    display : string = ""
+
+    @clarg_env = "WAYLAND_DISPLAY"
+    @clarg_doc = "Ambient platform variable (the Wayland twin of DISPLAY); read only by the storyteller restart test."
+    wayland_display : string = ""
+
     @clarg_path
     @clarg_doc = "Directory of audio corpus files for the transcription tests."
     corpus_dir : string = ""
@@ -726,7 +734,7 @@ struct public ExchangeEnv {
     @clarg_doc = "Sidecar exchange base URL override (tests, mirrors); unset = the baked-in dasllama.io. Setting it is an expressed choice to use the exchange - the first-contact consent question is skipped (announced at boot)."
     exchange_url : string = ""
 
-    @clarg_doc = "One-shot exchange accept-policy override: verified | any | off; unset = the app config's exchange_accept. The watchdog arms 'any' on a relaunch when the user adopts an unverified sidecar over finishing a tune. Setting it is an expressed choice to use the exchange - the first-contact consent question is skipped (announced at boot)."
+    @clarg_doc = "One-shot exchange accept-policy override: verified | any | off; unset = the app config's exchange_accept. A host may arm 'any' for one relaunch to adopt an unverified sidecar over finishing a tune. Setting it is an expressed choice to use the exchange - the first-contact consent question is skipped (announced at boot)."
     exchange_accept : string = ""
 }
 

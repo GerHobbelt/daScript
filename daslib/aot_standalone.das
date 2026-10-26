@@ -24,7 +24,9 @@ struct StandaloneContextCfg {
     context_name : string;
     class_name : string;
     cpp_output_dir : string;
-    cross_platform : bool
+    cross_platform : bool;
+    //! the context links C++ modules beyond the builtin one, so its constructor registers them
+    registers_modules : bool
 };
 
 def aotFunctionName(str : string) {
@@ -107,26 +109,55 @@ def collectInitFunctionAotNames(program : ProgramPtr; var context : Context) : a
     return <- initNames
 }
 
-def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var tw : StringBuilderWriter, program : ProgramPtr; var context : Context) {   // nolint:STYLE038 - flat emitter - one write per ctor section
-    var lookupVariableTable : array<Variable?>;
+//! The globals the context carries, in the order the constructor initializes them; a used global
+//! without an index is the compiler's error, collected like every other emit error.
+def private usedGlobals(var program : ProgramPtr) : array<Variable?> {
+    var globals : array<Variable?>
     if (program.totalVariables > 0) {
         program.get_ptr() |> for_each_module_no_order($(pm) {
             pm |> for_each_global($(pvar) {
                 if (!pvar.flags.used) return
                 if (pvar.index < 0) {
-                    panic("Internal compiler errors. Simulating variable which is not used{pvar.name}");
+                    macro_error(program, pvar.at, "standalone AOT: global {pvar.name} is used but was never allocated an index")
                     return
                 }
-                lookupVariableTable.push(pvar);
+                globals.push(pvar);
             });
         });
     }
+    return <- globals
+}
+
+//! `options gc`: the program collects its own heaps.
+def private standaloneCollects(program : ProgramPtr) : bool {
+    return program._options |> find_arg("gc") ?as tBool ?? false
+}
+
+//! A `VarInfo` per global, made before the helper dumps its tables so every type they name is in
+//! the dump: the collector walks each global through its info, the way the interpreter's
+//! simulate step wires it.
+def private makeGlobalVarInfos(var helper : AotDebugInfoHelper?; globals : array<Variable?>) : array<tuple<index : int; info : VarInfo?>> {
+    return <- [for (pvar in globals); (index = pvar.index, info = helper.helper |> make_variable_debug_info(pvar))]
+}
+
+def private writeGlobalVarInfos(var helper : AotDebugInfoHelper?; infos : array<tuple<index : int; info : VarInfo?>>; var tw : StringBuilderWriter) {
+    for (entry in infos) {
+        let suffix = "_gvar_{entry.index}"
+        helper->writeDim(unsafe(addr(tw)), entry.info, suffix)
+        helper->writeArgTypes(unsafe(addr(tw)), entry.info, suffix)
+        helper->writeArgNames(unsafe(addr(tw)), entry.info, suffix)
+        write(tw, "VarInfo __gvar_info_{entry.index} = \{ {helper->describeCppVarFuncInfo(entry.info.name, entry.info, suffix)} \};\n")
+    }
+}
+
+def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var tw : StringBuilderWriter, program : ProgramPtr; lookupVariableTable : array<Variable?>; var context : Context) {   // nolint:STYLE038 - flat emitter - one write per ctor section
 
     let min_init_stack = 16384
     let stack_arg = program._options |> find_arg("stack")
     let requested_stack = stack_arg ?as tInt ?? int(program.policies.stack)
     let stack_base = requested_stack > 0 && stack_arg is tInt ? requested_stack : max(requested_stack, min_init_stack)
     let stack_size = stack_base + int(program.globalInitStackSize)
+    let usedFunctionCount = length(collectProgramUsedFunctions(program, true, false))
     write(tw, "{cfg.class_name}::{cfg.class_name}() : Context({stack_size}/*stack*/) \{\n");
     write(tw, "    auto & context = *this;\n");
     write(tw, "    CodeOfPolicies policies;");
@@ -138,18 +169,23 @@ def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var 
     write(tw, "    policies.string_heap_size_hint = {string_heap_hint:d};\n");
     write(tw, "    policies.track_allocations = {program._options |> find_arg("track_allocations") ?as tBool ?? program.policies.track_allocations};\n");
     write(tw, "    context.setup({program.totalVariables}/*totalVariables*/, {program.globalStringHeapSize:d} /*globalStringHeapSize*/, policies, \{\});\n");
+    // the nano context has no collector flag
+    if (standaloneCollects(program)) {
+        write(tw, "    context.gcEnabled = true;\n");
+    }
 
     write(tw, "     // start totalVariables\n");
     for (pvar in lookupVariableTable) {
         write(tw, "    InitGlobalVar(context, &context.globalVariables[{pvar.index}/*pvar->index*/], GlobalVarInfo(\"")
         write(tw, "{pvar.name}\", \"{pvar |> get_mangled_name()}\", {pvar._type.sizeOf}, {pvar.flags.global_shared}));\n");
+        write(tw, "    context.globalVariables[{pvar.index}].debugInfo = &__gvar_info_{pvar.index};\n");
     }
     write(tw, "     // end totalVariables\n\n");
     write(tw, "    context.allocateGlobalsAndShared();\n");
     write(tw, "    if ( context.globals ) memset(context.globals, 0, context.getGlobalSize());\n");
     write(tw, "    context.totalVariables = {program.totalVariables}/*totalVariables*/;\n");
-    write(tw, "    context.functions = (SimFunction *) context.code->allocate( {program.totalFunctions}/*totalFunctions*/*sizeof(SimFunction) );\n");
-    write(tw, "    context.totalFunctions = {program.totalFunctions}/*totalFunctions*/;\n");
+    write(tw, "    context.functions = (SimFunction *) context.code->allocate( {usedFunctionCount}/*totalFunctions*/*sizeof(SimFunction) );\n");
+    write(tw, "    context.totalFunctions = {usedFunctionCount}/*totalFunctions*/;\n");
     write(tw, "    bool anyPInvoke = false;\n");
 
     write(tw, "    if ( anyPInvoke || {program.policies.threadlock_context || program.policies.debugger}");
@@ -199,17 +235,20 @@ def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var 
     write(tw, "\}\n");
 }
 
-def writeStandaloneContext(var program : ProgramPtr, initFunctions : string, var header : StringBuilderWriter, var source : StringBuilderWriter; cfg : StandaloneContextCfg; var context : Context) {
+def writeStandaloneContext(var program : ProgramPtr, initFunctions : string, var header : StringBuilderWriter, var source : StringBuilderWriter; cfg : StandaloneContextCfg; globals : array<Variable?>; var context : Context) {
 
     write(header, "\n\n");
-    write(header, "class {cfg.class_name} : public Context \{\n");
+    //! the module scope is the FIRST base: constructed before Context, destroyed after it, so the
+    //! registry outlives the context's own teardown
+    let bases = cfg.registers_modules ? "public StandaloneModuleScope, public Context" : "public Context"
+    write(header, "class {cfg.class_name} : {bases} \{\n");
     write(header, "public:\n");
     write(header, "    {cfg.class_name}();\n");
     writeStandaloneContextMethods(program, header, "", true, cfg);
     write(header, "\};\n");
 
     writeStandaloneContextMethods(program, source, "{cfg.class_name}::", false, cfg);
-    writeStandaloneCtor(cfg, initFunctions, source, program, context);
+    writeStandaloneCtor(cfg, initFunctions, source, program, globals, context);
 }
 
 class StandaloneContextGen : CppAot {
@@ -251,14 +290,15 @@ class StandaloneContextGen : CppAot {
         declarations = ss |> string_builder_str();
         ss |> string_builder_clear();
         write(*ss, "\n");
-        let fnn = collectProgramUsedFunctions(prog, false, false);
+        // every used function of every module, declared once (a shared generic instance has one name)
+        let fnn = collectProgramUsedFunctions(prog, true, false);
         var inline_fns : array<string>
+        inline_fns |> reserve(length(fnn))
         for (pfun in fnn) {
-            let needInline = that == pfun._module;
-            if (needInline) {
-                inline_fns.push(describeCppFunc(pfun, collector, cross_platform, true, needInline));
-                used_functions.insert(aotFuncName(pfun));
-            }
+            let name = aotFuncName(pfun)
+            if (used_functions |> key_exists(name)) continue
+            inline_fns.push(describeCppFunc(pfun, collector, cross_platform, true, true));
+            used_functions.insert(name);
         }
         let sep = ";\n";
         let maybe_sem = inline_fns |> empty() ? "" : sep;
@@ -268,22 +308,49 @@ class StandaloneContextGen : CppAot {
 };
 
 
+def writeModuleDeclarations(var header, source : StringBuilderWriter; registrations : array<StandaloneModuleEntry>) {
+    //! the header carries the registry include (the class derives from its scope base); the
+    //! source carries the module declarations its registration table takes addresses of
+    if (empty(registrations)) return
+    write(header, "#include \"daScript/simulate/standalone_modules.h\"\n");
+    write(source, "#include \"daScript/simulate/standalone_modules.h\"\n");
+    for (entry in registrations) {
+        write(source, "DECLARE_MODULE({entry.mod.cppClassName});\n");
+    }
+}
+
+def writeModuleRegistration(var source : StringBuilderWriter; registrations : array<StandaloneModuleEntry>) {
+    //! This TU's linked C++ modules join the process-wide list before main; the first context's
+    //! `StandaloneModuleScope` base (standalone_modules.h) registers the union once, and the last
+    //! context's destruction shuts down, so several contexts in one binary share one lifetime.
+    if (empty(registrations)) return
+    write(source, "static const StandaloneModule das_standalone_modules[] = \{\n");
+    for (entry in registrations) {
+        write(source, "    \{ \"{entry.mod.name}\", &::register_{entry.mod.cppClassName}, {entry.rank} \},\n");
+    }
+    write(source, "\};\n");
+    write(source, "static const bool das_standalone_modules_added = standaloneAddModules(das_standalone_modules, {length(registrations)});\n\n");
+}
+
 def writeRegistration(var header : StringBuilderWriter;
                       var source : StringBuilderWriter;
                       initFunctions : string;
                       var program : ProgramPtr;
                       cfg : StandaloneContextCfg;
+                      registrations : array<StandaloneModuleEntry>;
+                      globals : array<Variable?>;
                       var context : Context) {
     write(source, "using namespace {program.thisNamespace};\n");
     write(header, "namespace {cfg.context_name} \{\n");
     write(source, "namespace {cfg.context_name} \{\n");
-    dumpRegisterAot(unsafe(addr(source)), program, context, false, cfg.cross_platform);
-    writeStandaloneContext(program, initFunctions, header, source, cfg, context);
+    dumpRegisterAot(unsafe(addr(source)), program, context, true, cfg.cross_platform);
+    writeModuleRegistration(source, registrations);
+    writeStandaloneContext(program, initFunctions, header, source, cfg, globals, context);
     write(header, "\} // namespace {cfg.context_name}\n");
     write(source, "\} // namespace {cfg.context_name}\n");
 }
 
-def GetFunctionInfo(pfun : Function?, info : string) {
+def GetFunctionInfo(pfun : Function?; index : int; info : string) {
     return build_string() $(tw) {
         let args = ["\"{pfun.name}\"",
                     "\"{pfun |> get_mangled_name()}\"",
@@ -296,7 +363,7 @@ def GetFunctionInfo(pfun : Function?, info : string) {
                     "{pfun._module.moduleFlags.promoted}",
                     "{pfun.result.isRefType && !pfun.result.flags.ref}",
                     "{pfun.moreFlags.pinvoke}"]
-        write(tw, "        \{{pfun.index}, FunctionInfo({args|>join(", ")}), &{info}\},\n");
+        write(tw, "        \{{index}, FunctionInfo({args|>join(", ")}), &{info}\},\n");
     }
 }
 
@@ -308,9 +375,13 @@ def addFunctionInfo(fnn : array<Function?>; var helper : AotDebugInfoHelper?) {
         lookupFunctionTable.push((pfun, info));
     }
 
+    //! the table is dense: a slot per function the context still reaches, in emission order,
+    //! so a standalone context carries no row for what the interpreter would have removed
     return build_string() $(tw) {
+        var index = 0
         for ((fun_info, info) in lookupFunctionTable) {
-            write(tw, GetFunctionInfo(fun_info, funcInfoName(info)));
+            write(tw, GetFunctionInfo(fun_info, index, funcInfoName(info)));
+            index++
         }
     }
 }
@@ -319,7 +390,7 @@ def addFunctionInfo(fnn : array<Function?>; var helper : AotDebugInfoHelper?) {
 def genStandaloneSrc(var program : ProgramPtr;
                      var header : StringBuilderWriter;
                      var source : StringBuilderWriter; cfg : StandaloneContextCfg;
-                     var coll : BlockVariableCollector?) {
+                     var coll : BlockVariableCollector?; globals : array<Variable?>) {
     var initFunctions : string;
     var type_defs = "";
     let ctx_generated = build_string() $(tw) {
@@ -338,12 +409,26 @@ def genStandaloneSrc(var program : ProgramPtr;
             make_visitor(*gen) $(adapter) {
                 gen.adapter := adapter
                 program |> visit_module(adapter, program.getThisModule);
+                // a generic instance several modules instantiated is one C++ function: emit the first copy only
+                var emitted : table<string>
+                for (pfun in collectProgramUsedFunctions(program, false, false)) {
+                    emitted |> insert(aotFuncName(pfun))
+                }
+                var foreign <- foreignUsedFunctions(program, false)
+                for (fn in foreign) {
+                    let name = aotFuncName(fn)
+                    if (emitted |> key_exists(name)) continue
+                    emitted |> insert(name)
+                    visit(fn, adapter)
+                }
             }
 
-            initFunctions = addFunctionInfo(collectProgramUsedFunctions(program, false, false), gen.helper);
+            initFunctions = addFunctionInfo(collectProgramUsedFunctions(program, true, false), gen.helper);
+            let globalInfos <- makeGlobalVarInfos(gen.helper, globals)
             type_defs += gen.declarations;
             gen.declarations = "";
             write(tw, gen.str());
+            writeGlobalVarInfos(gen.helper, globalInfos, tw)
             unsafe {
                 delete gen.collector
                 delete gen
@@ -385,14 +470,22 @@ def private checkAllUsedFunctionsCanAot(program : ProgramPtr) {
 
 def private prepareProgramForEmission(var program : ProgramPtr; context : Context) : BlockVariableCollector? {
     var noAotMarker = new NoAotMarker();
+    var unmarked <- foreignUsedFunctions(program, true)
     make_visitor(*noAotMarker) $(adapter_no_aot) {
         visit(program, adapter_no_aot)
+        for (fn in unmarked) {
+            visit(fn, adapter_no_aot)
+        }
     }
     checkAllUsedFunctionsCanAot(program)
+    var foreign <- foreignUsedFunctions(program, false)
 
     var pmarker = new PrologueMarker();
     make_visitor(*pmarker) $(adapter_p) {
         visit(program, adapter_p)
+        for (fn in foreign) {
+            visit(fn, adapter_p)
+        }
     }
 
     setAotHashes(program, context);
@@ -400,6 +493,9 @@ def private prepareProgramForEmission(var program : ProgramPtr; context : Contex
     var flags = new SetPrinterFlags();
     make_visitor(*flags) $(flags_adapter) {
         visit(program, flags_adapter)
+        for (fn in foreign) {
+            visit(fn, flags_adapter)
+        }
     }
     unsafe {
         delete flags
@@ -410,16 +506,30 @@ def private prepareProgramForEmission(var program : ProgramPtr; context : Contex
     var coll = new BlockVariableCollector();
     make_visitor(*coll) $(adapter_coll) {
         visit(program, adapter_coll)
+        for (fn in foreign) {
+            visit(fn, adapter_coll)
+        }
+        // foreign globals initialize in __init_script too: their temporaries collect under the null key
+        let thisModule = program.getThisModule
+        program.get_ptr() |> for_each_module_no_order($(pm) {
+            if (pm == thisModule) return
+            pm |> for_each_global($(pvar) {
+                if (pvar.index < 0 || !pvar.flags.used || pvar.init == null) return
+                visit_expression(pvar.init, adapter_coll)
+            })
+        })
     }
     return coll
 }
 
-def public runStandaloneVisitor(var program : ProgramPtr, modules : array<string>, var pctx : smart_ptr<Context>; cfg : StandaloneContextCfg) : bool {
+def public runStandaloneVisitor(var program : ProgramPtr, modules : array<string>; registrations : array<StandaloneModuleEntry>; var pctx : smart_ptr<Context>; cfg : StandaloneContextCfg) : bool {
     //! Runs the standalone AOT visitor on the program to generate C++ source and header files.
+    //! `registrations` are the C++ modules the generated constructor registers, in order.
     //! Returns false (writing nothing) when emission collected errors.
     assume context = *pctx;
 
     var coll = prepareProgramForEmission(program, context)
+    let globals <- usedGlobals(program)
 
     let mod = program.getThisModule;
     let mod_name = mod.moduleFlags.promoted ? "" : string(mod.name);
@@ -440,13 +550,14 @@ def public runStandaloneVisitor(var program : ProgramPtr, modules : array<string
 
         write(source, "#include \"daScript/simulate/standalone_ctx_utils.h\"\n");
         write(source, "{join(modules, "")}");
+        writeModuleDeclarations(header, source, registrations);
         write(source, "#include \"{mod.name.empty() ? cfg.context_name : string(mod.name)}.das.h\"\n\n");
         write(source, AOT_HEADERS);
 
         write(source, "namespace das \{\n");
         write(header, "namespace das \{\n");
-            let initFunctions = genStandaloneSrc(program, header, source, cfg, coll);
-            writeRegistration(header, source, initFunctions, program, cfg, context);
+            let initFunctions = genStandaloneSrc(program, header, source, cfg, coll, globals);
+            writeRegistration(header, source, initFunctions, program, cfg, registrations, globals, context);
         write(source, "\} // namespace das\n");
         write(header, "\} // namespace das\n");
 
@@ -492,7 +603,7 @@ def public standalone_aot(input : string; output_dir : string; cross_platform : 
     //! without compiling the program a second time.
     let file_name = input |> split_by_chars("/\\") |> back()
     let ctx_name = (file_name |> split("."))[0]
-    let cfg = StandaloneContextCfg(context_name = ctx_name,
+    var cfg = StandaloneContextCfg(context_name = ctx_name,
                                    class_name = "Standalone",
                                    cpp_output_dir = output_dir,
                                    cross_platform = cross_platform)
@@ -507,7 +618,9 @@ def public standalone_aot(input : string; output_dir : string; cross_platform : 
                 panic("Standalone context called on non aot module {input}")
             } else {
                 before_emit |> invoke(program)
-                ok = runStandaloneVisitor(program, modules_str, pctx, cfg)
+                let registrations <- standaloneModuleRegistration(program)
+                cfg.registers_modules = !empty(registrations)
+                ok = runStandaloneVisitor(program, modules_str, registrations, pctx, cfg)
             }
         }
     }

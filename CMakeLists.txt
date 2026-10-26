@@ -1446,6 +1446,7 @@ if (NOT ${DAS_TESTS_DISABLED})
     # AOT examples are enabled — gate the inclusion accordingly.
     if(NOT ${DAS_AOT_EXAMPLES_DISABLED})
         include(examples/pathTracer/CMakeLists.txt)
+        include(examples/dasLLAMA/CMakeLists.txt)
     endif()
     if(NOT ${DAS_AOT_EXAMPLES_DISABLED} AND NOT (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4))
         include(tests/aot/CMakeLists.txt)
@@ -1771,6 +1772,7 @@ SET(DAS_SIMULATE_INCLUDES
     include/daScript/simulate/simulate_visit_op.h
     include/daScript/simulate/simulate_visit_op_undef.h
     include/daScript/simulate/standalone_ctx_utils.h
+    include/daScript/simulate/standalone_modules.h
 )
 
 install(FILES
@@ -1816,6 +1818,13 @@ install(FILES include/dag_noise/dag_uint_noise.h
 # Install internal builtin headers (needed by integration tutorials like class adapters).
 file(GLOB DAS_BUILTIN_HEADERS ${PROJECT_SOURCE_DIR}/src/builtin/*.h)
 install(FILES ${DAS_BUILTIN_HEADERS}
+    DESTINATION include/daScript/builtin
+)
+# The generated binding tables: the shipped aot_builtin_ast.h includes ast_gen.inc, so without it
+# an SDK consumer's AOT translation unit that touches the ast module fails to compile.
+install(FILES
+    ${PROJECT_SOURCE_DIR}/include/daScript/builtin/ast_gen.inc
+    ${PROJECT_SOURCE_DIR}/include/daScript/builtin/debugapi_gen.inc
     DESTINATION include/daScript/builtin
 )
 
@@ -2134,11 +2143,11 @@ install(FILES ${PROJECT_SOURCE_DIR}/utils/dasllama-convert/main.das
     DESTINATION utils/dasllama-convert
 )
 
-# Install watchdog (supervisor for long-running daslang programs; the worked
-# example in the daspkg skill's release_include_from docs)
+# Install watchdog (supervisor for long-running daslang programs; the static exe installs
+# beside daslang from utils/CMakeLists.txt, these are the library and the interpreter entry)
 install(FILES
-    ${PROJECT_SOURCE_DIR}/utils/watchdog/watchdog.py
-    ${PROJECT_SOURCE_DIR}/utils/watchdog/dummy_server.py
+    ${PROJECT_SOURCE_DIR}/utils/watchdog/watchdog.das
+    ${PROJECT_SOURCE_DIR}/utils/watchdog/main.das
     ${PROJECT_SOURCE_DIR}/utils/watchdog/README.md
     DESTINATION utils/watchdog
 )

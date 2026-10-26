@@ -37,6 +37,20 @@ Companion to `ARCHITECTURE.md` in this folder; section numbers are unique across
   `set_aot_main_module_name` writes the daslib global AND forwards to
   `set_aot_main_module_name_cpp`; a spelling rule changed on one side only produces a TU
   where the definition and its debug-info references disagree.
+- **`fromExtraDependency` describes the host process, not the program being emitted.** The
+  flag is set when the host first loaded a shared module as an extra dependency (a `-jit`
+  host loads `strings`, `fio_core` and `math` that way) and stays on the shared module for
+  every later compile in the process. `getRequiredModulesFor` skips such modules only on the
+  regular AOT path; a standalone context decides by its linked set alone, otherwise a
+  generator running under a `-jit` host (the JIT test lane) prunes the modules the program
+  calls.
+- **`DEFAULT_MODULE_ORDER` mirrors `register_builtin_modules_impl`** in
+  `src/builtin/modules.cpp` - the same builtin C++ modules in the same order, a
+  daslib-to-C++ pair `tests/aot/test_standalone_emit.das` reads back from the C++ source and
+  pins. A standalone context registers these first because
+  module constructors `Module::require` earlier ones by name (`fio_core` takes `strings`,
+  dasHV takes `rtti_core`). A module missing from the daslib list still registers, only in
+  the dependencies-first pass that follows; a module added to the C++ side joins the list.
 
 ## 6. aot_standalone
 
@@ -59,6 +73,18 @@ Companion to `ARCHITECTURE.md` in this folder; section numbers are unique across
   `globalInitStackSize` reaches the emitter through the rtti `Program` binding in
   `src/builtin/module_builtin_rtti.cpp`, so an `invoke` during init still has das stack for
   its prologue.
+- **The ctor wires what the collector walks, the way `Program::simulate` does** - two pairs
+  with `src/ast/ast_simulate.cpp`: `context.gcEnabled = true` is emitted for a program with
+  `options gc` (simulate reads the same option into the same field), and every used global gets
+  a `VarInfo __gvar_info_<index>` through the emitter's debug helper with
+  `globalVariables[<index>].debugInfo` pointing at it (simulate's `makeVariableDebugInfo`);
+  the collector's global walk in `src/simulate/simulate_gc.cpp` dereferences that info
+  unguarded, so a context that collects with a null one crashes. The flag line is gated on
+  the option because the nano context (`nano/include/daScript/simulate/simulate.h`) has no
+  `gcEnabled`; it does carry `GlobalVariable::debugInfo`, so the infos are emitted for every
+  standalone program. `tests/aot/test_standalone_emit.das` pins the emitted text; the
+  watchdog (`utils/watchdog/main.das`, `options gc`, globals) is the build that compiles and
+  runs it, collecting on its first tick.
 - **There is no `!stopFlags` guard between `[init]` calls** - a panic propagates out of the
   ctor instead of soft-stopping the sequence.
 - **Global init order is fixed by `var->index` assignment**: `StandaloneContextGen`'s
@@ -69,16 +95,66 @@ Companion to `ARCHITECTURE.md` in this folder; section numbers are unique across
   index. `[init]` function order is not re-derived at all: the emitter reads the
   simulated context's list through rtti `for_each_init_function`, so the C++ late-init
   sort stays the single source of truth.
-- **Cross-module limits fail loud at emit time**: only main-module, AOT-emitted `[init]`
-  functions can be called from the ctor (required-module and `[no_aot]` ones are collected
-  emit errors with the reason), because the standalone TU only emits the entry module's
-  function bodies.
+- **The TU holds every used function of every module.** A standalone context is one
+  translation unit with no other to link, so `prepareProgramForEmission`'s markers, the
+  block-variable collector, `registerAotCpp`'s `ArgsConverter` thunks and
+  `StandaloneContextGen` each walk the entry module through `visit_module` and then every
+  foreign used function through `visit(fn, adapter)` (`foreignUsedFunctions`, aot_cpp): a
+  builtin is C++ already, a template never emits, a used `[no_aot]` function was refused by
+  name before the walk. A generic instance several modules instantiated has one AOT name,
+  so declarations, bodies, thunks and table rows are emitted once per name. A foreign
+  global's initializer temporaries collect under the collector's null key, the one
+  `__init_script` declares. `UseTypeMarker` walks the foreign functions too, so an extern
+  or handled type reached only from one still links its module.
+- **Cross-module `[init]` is refused at emit time**: only entry-module, AOT-emitted `[init]`
+  functions are called from the ctor; a required module's and `[no_aot]` ones are collected
+  emit errors with the reason.
 - **Every used function must have an AOT body** - a standalone context has no
   interpreter, so a used `noAot` function (the `[no_aot]` annotation, or `NoAotMarker`
   finding a type AOT cannot express) is a collected emit error, never a
   `fnByMangledName` call that would crash at runtime. `prepareProgramForEmission` runs
   `NoAotMarker` first (the regular AOT paths run it too; standalone must match) and
   then `checkAllUsedFunctionsCanAot` walks used, non-builtin functions.
+- **The function table is dense** - `addFunctionInfo` numbers the emitted rows in emission
+  order and the ctor sizes `context.functions` by that count, not by the program's
+  `totalFunctions`. The program count includes every function the interpreter simulated
+  (externs among them), while the context emits only what it still reaches; a table sized
+  by the larger count leaves rows of uninitialized memory that the destructor's shutdown
+  walk (`runShutdownScript`) reads. Nothing reads a function by program index: AOT calls
+  are direct, function pointers resolve through `fnByMangledName`, and `FillFunction`
+  matches rows by AOT hash.
+- **A context links the modules the program reaches, and registers the C++ ones itself.**
+  `aot_cpp.das`'s `collectLinkedModules` marks the module of every used function, of every
+  function a used function or global calls (`UseTypeMarker` reads the callee of each call,
+  operator and `@@` address - externs carry no `used` flag of their own), and of every
+  struct, enum and handled type; a program that reaches no C++ module beyond the builtin one
+  links exactly that set. A nano program reaches none by contract (every builtin module is
+  absent there), so its output stays registry-free.
+  Once it reaches one, the default C++ modules the compiler loaded and every linked C++
+  module's `module_for_each_dependency` closure join the set, because module constructors
+  `Module::require` those by name (dasHV takes `rtti_core` this way). The pruned modules
+  (`compile time only, not linked`) get no `aotRequire` include and no registration.
+  `standaloneModuleRegistration` orders the C++ subset and ranks it: `DEFAULT_MODULE_ORDER`
+  first (the pair it mirrors is recorded in sec. 5), then the rest dependencies-first, ranked
+  by dependency depth. Each generated TU emits its list as a `StandaloneModule` table added to
+  the process-wide list before main, and the context class takes `StandaloneModuleScope`
+  (`include/daScript/simulate/standalone_modules.h`, inline so every TU shares one copy) as
+  its FIRST base, ahead of `Context`: constructed before it, destroyed after it. The first
+  scope constructed registers the union, rank order, and initializes once; the last scope
+  destroyed shuts down - inside main, after the last context's own teardown and while the
+  runtime's statics still stand. A static destructor cannot do this: it runs after main,
+  when statics constructed later than it (libhv's, the runtime's own) are already gone, and
+  on Windows that shutdown corrupts the heap - the exit-time race the `-exe` path avoids by
+  shutting down before main returns. Two contexts with different module sets in one binary
+  therefore share one lifetime. A host that registered the builtin module owns the registry
+  instead: the context registers nothing and stops the program, by name, on a linked module
+  the host did not register - the runtime cannot add to an initialized registry and keep
+  `Initialize`/`Shutdown` balanced, and a second shutdown would walk a registry the first
+  one deleted. The shutdown is `Module::ShutdownStandalone`, never `Module::Shutdown`: the
+  latter resets the fusion engine through a function pointer only the interpreter's
+  `simulate_fusion.cpp` installs, and a standalone binary links no interpreter. Handled
+  types need the registry because `TypeInfo::resolveAnnotation` walks the bound
+  environment's module list; a context with none dereferences a null environment.
 - **Type definitions live in the header, once** - struct/enum definitions (the
   dependency dump plus the entry module's own `declarations` capture) are emitted into
   the `.das.h`, which the `.das.cpp` includes; the source never redefines them. They sit

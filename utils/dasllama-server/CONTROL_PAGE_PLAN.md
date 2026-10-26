@@ -148,7 +148,7 @@ scheduler 12/12, server 17/17 live (post-work stats assertions), page via mock+p
   the program (created if the server started config-less). `GET /config` returns effective
   config + per-key source (default / cli / toml) for the form.
 - **Restart**: `POST /restart` = drain like `/shutdown`, then exit with a **distinct** exit
-  code (3 stays tune-restart; pick 4 = config-restart; `watchdog.py` treats both as relaunch,
+  code (3 stays tune-restart; pick 4 = config-restart; the watchdog treats both as relaunch,
   logs them apart).
 - **Model picker**: server enumerates `*.gguf` / `*.dlim` in the configured model's directory
   (`load_model` already auto-caches gguf->`.dlim` beside the file in q8 mode - show which rail
@@ -249,8 +249,10 @@ scheduler 12/12, server 17/17 live (post-work stats assertions), page via mock+p
 
 ## Deferred - recorded gates
 
-- **V2 (GATED on the 0.6.4 release):** the 30-second try-it - copy-paste serve + demo
-  commands on the page/README. Needs **shippable daslang for `[tune]`** (per-box tuning from a
-  release binary). Add when 0.6.4 is out.
+- **V2 - gate lifted:** the 30-second try-it is the README's *Get it* section - download the
+  fat bundle for the platform, start the watchdog, pick a model on the page. The gate was a
+  shippable `[tune]` story from a release binary; `daspkg release --fat` is that story. What is
+  still open: the same try-it on the control page itself, and the per-box tune from a release
+  binary (today the fat clones serve; a per-box mint needs the SDK).
 - **V3 (if ever):** multi-LLM serving (jobque = one model at a time today; easier over
   `.dlim`); per-model stats restructure rides it.

@@ -95,21 +95,26 @@ beside it: a projector, a draft head, an assistant sidecar, an image fixture - p
 `companions` of the row that pins its carrier, and names it from every other row that consumes
 it.** Uniqueness itself is `../tests/test_model_specs.das`'s to enforce.
 
-**A diff that adds or changes a `serve_*` field on a row of `model_specs()`, or any `serve_*`
-function in `model_specs.das`, lands `utils/dasllama-server/test_model_catalog.das` (repo
-root) green in the same change** - the serving catalog is a view over these rows, so its gates
-red on a row this folder ships.
+**A diff that changes what any `serve_*` function in `model_specs.das` returns - a `serve_*`
+field on a row, the function's body, or a `companions` entry with a `url` on a row a `serve_*`
+view reads - lands `utils/dasllama-server/test_model_catalog.das` (repo root) green in the same
+change** - the serving catalog is a view over these rows, so its gates red on a row this folder
+ships.
 
 **A convert, a bench, or a tune-state write reached from `fetch_models.das --fetch` is a
 defect - `--fetch` downloads only.** Each has its own home: a conversion recipe runs under
 `--convert`, a timing runs in a board cell (`gen_bench_records.das` or a
 `../benchmarks/lcpp_bench.das` cell), and a tune sidecar is written under a `--tune` run.
 
-**A change to a model row's provenance that alters which bytes verify - `bytes`, `sha256`,
-`recipe`, a new row or a new `companions` entry in `model_specs.das` or
-`profile_common.das` - or a change to `fetch_models.das` other than its comments, records
-its settling evidence in the PR description: a `fetch_models.das --` run ending
-`0 pending, 0 failed` on a box that already has the pinned files on disk.**
+**A diff that adds a row or a `companions` entry, or changes a `bytes`, `sha256` or `recipe`
+value, in `model_specs.das` or `profile_common.das` records its settling evidence in the PR
+description: one `fetch_models.das -- -o <name>` run per changed row, on a box holding that
+row's model file, ending `0 pending, 0 failed` with the row reported `ok`, plus one unscoped
+`fetch_models.das --` run in which no row the diff touched is `pending`.** A box stocks only
+some of the rows, so an unscoped run's `pending` count is the box's.
+
+**A diff that changes `fetch_models.das` beyond its comments records its settling evidence in
+the PR description: one unscoped `fetch_models.das --` run ending `0 failed`.**
 
 **A url-only re-pin - a row's `url` changed with its `bytes` and `sha256` unchanged -
 records its settling evidence in the PR description: a fetch through the new url into a

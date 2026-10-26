@@ -83,6 +83,38 @@ the package root is the working directory, so the compiler finds `namespace/modu
 relative to it. No `.das_project` is needed. The descriptor is what makes the same
 require work after `daspkg install` drops the package into a consumer's `modules/`.
 
+## The manifest beside the descriptor
+
+The scan runs every descriptor as a daslang program on every start, and that costs more than
+the rest of a small program's startup. So after a descriptor runs, the scan writes what it
+registered to `.das_module.manifest` next to it, and later starts replay those rows without
+compiling the descriptor. The file is keyed by the descriptor's content, the content of every
+module its compile read (`require ./helper` beside it, the daslib it uses) and the four inputs a
+descriptor can read - its folder, the das root, the binary kind and the `--jit-target`
+cross-compile name: edit the descriptor or a module it requires, move the module or the tree,
+switch binaries or targets and the next start recompiles it and rewrites the manifest. It is generated - gitignore it (this repo does) - and
+a read-only tree just compiles on every start.
+
+A descriptor whose registrations depend on something the file's content cannot see - a probe
+of the machine, a variant picked by hardware - opts out by calling `no_manifest()` inside
+`initialize`; it then runs on every start. Everything a descriptor registers is replayed, so
+the opt-out is only for a descriptor whose answer changes between starts.
+
+A replayed C++ module loads at the first `require` naming it, not in the scan: the require
+walk loads the row and runs the `initDependencies` fixed point; a module needing another
+deferred one pulls the whole deferred set in. A program pays for the C++ modules it requires.
+Two consequences:
+
+- `require ?mod x` and `typeinfo builtin_module_exists(mod)` still ask whether the build has
+  `mod`: a guard loads a waiting module, so a cold start and a warm one answer alike.
+- A tool that enumerates the process's modules (the MCP server, the LSP subtools) runs with
+  `-ignore-manifest`: no manifest read or written, every descriptor compiles, every C++ module
+  loads on start. `has_module(name)` (`daslib/rtti`) answers loaded-or-deferred, so a sweep
+  gate asking what the tree has keeps its answer.
+
+`DAS_TRACE_MODULE_LOAD=1` prints one line per descriptor (replayed or compiled, why, the
+deferred count) and one per deferred module as a require loads it.
+
 ## Adding a `.das` file to an existing module needs the same edit
 
 Require-root registration is manifest-driven: a file not named in the module's

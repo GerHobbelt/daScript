@@ -51,10 +51,10 @@ FILE(GLOB AOT_DASPEG_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tes
 
 FILE(GLOB AOT_DASGLTF_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/dasGLTF/*.das")
 
-# dasLLAMA IS NEVER AOT'D. No dasLLAMA test — old or new — joins test_aot: the engine is
-# -jit only (its AOT story ends at the generic compile of the tree), and its require graph
-# reaches dasVulkan, which is in-tree but carries no AOT registration at all, so a dasLLAMA
-# AOT TU would have no Vulkan half to link against. Do not re-register it here.
+# No dasLLAMA test — old or new — joins test_aot: the suite is -jit (tests/run.das), and its
+# require graph reaches dasVulkan, which is in-tree but carries no AOT registration at all, so
+# a dasLLAMA test TU would have no Vulkan half to link against. Do not re-register it here.
+# The engine's own AOT tier is the opt-in examples/dasLLAMA target (CPU modules only).
 
 FILE(GLOB AOT_DECS_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/decs/*.das")
 # Exclude expect-error tests (they intentionally fail to compile)
@@ -158,6 +158,11 @@ IF(NOT DAS_HV_DISABLED)
     FILE(GLOB AOT_DASHV_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/dasHV/*.das")
     # Exclude module files (compiled via DAS_AOT_LIB)
     list(FILTER AOT_DASHV_FILES EXCLUDE REGEX "/_")
+ENDIF()
+
+SET(AOT_WATCHDOG_FILES)
+IF(NOT DAS_HV_DISABLED AND NOT DAS_STDDLG_DISABLED)
+    FILE(GLOB AOT_WATCHDOG_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/watchdog/*.das")
 ENDIF()
 
 IF(NOT DAS_CLIPBOARD_DISABLED)
@@ -273,9 +278,6 @@ FILE(GLOB AOT_METAL_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "test
 list(FILTER AOT_METAL_FILES EXCLUDE REGEX "/_")
 SET(AOT_METAL_MODULE_FILES
     tests/metal/_metal_common.das
-    # f16_cvt is a generic dasLLVM daslib helper the tensor-ops test requires; it used to ride
-    # the (deleted) dasLLAMA module lib — dasLLAMA itself is NEVER AOT'd (see above)
-    modules/dasLLVM/daslib/f16_cvt.das
 )
 IF(APPLE)
     # das_metal_boost hard-requires the APPLE-gated das_metal C++ module; the GPU-behavioral
@@ -290,6 +292,7 @@ SET(AOT_DASLIB_FILES
     tests/daslib/tty_test.das
     tests/daslib/test_sha_256.das
     tests/daslib/test_faker.das
+    tests/daslib/test_tune_shells.das
 )
 
 FILE(GLOB AOT_MCP_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/mcp/*.das")
@@ -445,7 +448,9 @@ set(DAS_AOT_IRREGULAR
     "dashv|reg|NOT DAS_HV_DISABLED|-|1"
     "dashv|mod|-|-|1"
     "clipboard|reg|AOT_CLIPBOARD_FILES|-|1"
+    "watchdog|reg|AOT_WATCHDOG_FILES|-|1"
     "minfft|reg|NOT DAS_MINFFT_DISABLED|-|1"
+    "stddlg|reg|NOT DAS_STDDLG_DISABLED|-|1"
     "subset_daslib|mod|-|-|0"
 )
 foreach(_row IN LISTS DAS_AOT_IRREGULAR)

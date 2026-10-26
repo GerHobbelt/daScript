@@ -16,6 +16,7 @@ require llvm/daslib/llvm_targets
 
 require llvm/daslib/llvm_dsl
 require llvm/daslib/llvm_env
+require llvm/daslib/llvm_cpu_class
 require daslib/ast_boost
 require daslib/strings
 require daslib/strings_boost
@@ -126,6 +127,8 @@ class public Attributes {
     // memory(argmem: readwrite, inaccessiblemem: readwrite) — for deallocator-style runtime calls
     // 3 | (3 << 2) = 15
     memory_arg_inaccessible_rw : LLVMOpaqueAttributeRef?
+    // memory(none) — a pure function of its arguments; the global-offset lookups
+    memory_none : LLVMOpaqueAttributeRef?
 
     def Attributes(ctx : LLVMContextRef) {
         noreturn = ctx |> LLVMGetEnumAttribute("noreturn")
@@ -148,6 +151,7 @@ class public Attributes {
         let memory_kind = LLVMGetEnumAttributeKindForName("memory")
         memory_inaccessible_rw = LLVMCreateEnumAttribute(ctx, memory_kind, 12ul)
         memory_arg_inaccessible_rw = LLVMCreateEnumAttribute(ctx, memory_kind, 15ul)
+        memory_none = LLVMCreateEnumAttribute(ctx, memory_kind, 0ul)
     }
 
 }
@@ -444,8 +448,11 @@ var public g_target_x64_amx = false
 // targets. Gates emission that calls Linux-only externs (the amx witness's arch_prctl).
 var public g_target_os_linux = false
 
+// ARMv8.2 DotProd (SDOT — the aarch64_neon sdot4 family, the idot ss form); rails: ARCHITECTURE_TARGET_FEATURES.md#aarch64-feature-truth
+var public g_target_arm64_dotprod = false
+
 // ARMv8.6 i8mm (SMMLA — 2×2 s8 matrix-multiply-accumulate; Apple M2/A15+, Graviton3+; M1 has
-// DotProd only). Host truth is LLVMGetHostCPUFeatures "+i8mm" OR cpu_supports (ARCHITECTURE.md#aarch64-feature-truth).
+// DotProd only). Host truth is LLVMGetHostCPUFeatures "+i8mm" OR cpu_supports (ARCHITECTURE_TARGET_FEATURES.md#aarch64-feature-truth).
 var public g_target_arm64_i8mm = false
 
 // ARMv8.2 fullfp16 (native half arithmetic — fadd.4h/8h etc.). Detected as i8mm, except
@@ -453,13 +460,28 @@ var public g_target_arm64_i8mm = false
 // Linux host strings carry +fullfp16, and on macOS the host CPU name implies it in the backend.
 var public g_target_arm64_fullfp16 = false
 
+// A baseline class (DAS_JIT_BASELINE) reads as forced: its feature set is the tier truth on the
+// generic rail, exactly like the force env, and the env's names still append after it.
 def private arm64_forced_feature(name : string) : bool {
+    if (jit_baseline_has(name)) {
+        return true
+    }
     for (part in split(g_env_jit.jit_arm64_force_features, ",")) {
         if (part == name) {
             return true
         }
     }
     return false
+}
+
+def public arm64_forced_plus_features() : string {
+    let plus <- [for (part in split(g_env_jit.jit_arm64_force_features, ",")); "+{part}"; where !empty(part)]
+    return join_plus_features(jit_class_plus_features(jit_baseline_class()), join(plus, ","))
+}
+
+// the baseline class's append first, the env's forced names after it (the last spelling of a name wins in LLVM)
+def private join_plus_features(base, forced : string) : string {
+    return empty(base) ? forced : (empty(forced) ? base : "{base},{forced}")
 }
 
 // "+name" present in LLVM's host-features string (comma-separated "+feat"/"-feat" entries;
@@ -475,6 +497,9 @@ def private host_llvm_feature(name : string) : bool {
 }
 
 def private x64_forced_feature(name : string) : bool {
+    if (jit_baseline_has(name)) {
+        return true
+    }
     for (part in split(g_env_jit.jit_x64_force_features, ",")) {
         if (part == name) {
             return true
@@ -499,7 +524,7 @@ def private x64_tier_feature(name : string; cross : bool) : bool {
 // Empty when the env is unset.
 def public x64_forced_plus_features() : string {
     let plus <- [for (part in split(g_env_jit.jit_x64_force_features, ",")); "+{part}"; where !empty(part)]
-    return join(plus, ",")
+    return join_plus_features(jit_class_plus_features(jit_baseline_class()), join(plus, ","))
 }
 
 // Cross-compile a wasm object for a -pthread (SharedArrayBuffer) runtime: adds
@@ -512,6 +537,7 @@ var public g_target_wasm_threads = false
 // mismatch. Diagnoses the MSVC-host vs wasm/clang-target C++ ABI layout class. Opt-in, off by default.
 var public g_jit_check_handled_abi = false
 
+[arch(at = "../ARCHITECTURE.md#idot-lowerings")]
 def private wasm_target_features() : string {
     return g_target_wasm_threads ? "+simd128,+nontrapping-fptoint,+atomics,+bulk-memory" : "+simd128,+nontrapping-fptoint"
 }
@@ -603,8 +629,10 @@ def public init_jit_clopts() {
 // Pure target truth, no LLVM state touched: safe and required BEFORE init_jit, whose DisableJitVisitor
 // consults these gates. init_jit re-runs it — pass the SAME host_features or pass and emission diverge.
 // host_features=false targets a GENERIC CPU: cpuid gates stay off, since leaked F16C emits libcalls.
-[arch(at = "../ARCHITECTURE.md#aarch64-feature-truth"), arch(at = "../ARCHITECTURE.md#x64-tier-gates")]
-def public init_jit_target_flags(target_triple : string = ""; host_features : bool = true) {
+[arch(at = "../ARCHITECTURE_TARGET_FEATURES.md#aarch64-feature-truth"), arch(at = "../ARCHITECTURE_TARGET_FEATURES.md#x64-tier-gates")]
+def public init_jit_target_flags(target_triple : string = ""; host_features_asked : bool = true) {
+    // a baseline class replaces the running box: its set is the only tier truth, whatever the caller asked
+    let host_features = host_features_asked && empty(jit_baseline_class())
     g_target_host_features = host_features
     g_target_is_wasm = target_triple |> starts_with("wasm")
     // Host path (empty triple): the module targets the host, so the daslang binary's own arch is the
@@ -634,6 +662,8 @@ def public init_jit_target_flags(target_triple : string = ""; host_features : bo
     g_target_os_linux = (empty(target_triple)
         ? get_platform_name() == "linux"
         : find(target_triple, "linux") >= 0)
+    g_target_arm64_dotprod = g_target_is_aarch64 && (arm64_forced_feature("dotprod")
+        || (empty(target_triple) && host_features && (host_llvm_feature("dotprod") || cpu_supports("dotprod"))))
     g_target_arm64_i8mm = g_target_is_aarch64 && (arm64_forced_feature("i8mm")
         || (empty(target_triple) && host_features && (host_llvm_feature("i8mm") || cpu_supports("i8mm"))))
     // aarch64 fullfp16 (see declaration comment): darwin-arm64 == Apple Silicon == always.
@@ -644,6 +674,50 @@ def public init_jit_target_flags(target_triple : string = ""; host_features : bo
     // (routing truth for isExprOp2/Op1_Func — lives in llvm_boost). aarch64 needs no feature
     // gate: f16<->f32 converts are ARMv8.0 baseline, so even generic-exe aarch64 stays native.
     g_lattice_fp16_ops_native = g_target_is_aarch64 || g_target_x64_f16c
+}
+
+// The tier gates as one CPU class's set, for the span of `blk` - a fat-mode clone's generator
+// emits for its class, not the baseline the process targets; the gates are restored after.
+[arch(at = "../ARCHITECTURE_TARGET_FEATURES.md#fat-mode")]
+def public with_class_target_gates(klass : string; blk : block<void>) {
+    let s_avx2 = g_target_x64_avx2
+    let s_f16c = g_target_x64_f16c
+    let s_vnni256 = g_target_x64_vnni256
+    let s_avx512bw = g_target_x64_avx512bw
+    let s_avx512vnni = g_target_x64_avx512vnni
+    let s_avx512vbmi = g_target_x64_avx512vbmi
+    let s_vnniint8 = g_target_x64_vnniint8
+    let s_amx = g_target_x64_amx
+    let s_dotprod = g_target_arm64_dotprod
+    let s_i8mm = g_target_arm64_i8mm
+    let s_fullfp16 = g_target_arm64_fullfp16
+    let s_lattice = g_lattice_fp16_ops_native
+    g_target_x64_avx2 = g_target_is_x64 && jit_class_has(klass, "avx2")
+    g_target_x64_f16c = g_target_is_x64 && jit_class_has(klass, "f16c")
+    g_target_x64_vnni256 = g_target_x64_avx2 && (jit_class_has(klass, "avxvnni")
+        || (jit_class_has(klass, "avx512vnni") && jit_class_has(klass, "avx512vl")))
+    g_target_x64_avx512bw = g_target_x64_avx2 && jit_class_has(klass, "avx512f") && jit_class_has(klass, "avx512bw")
+    g_target_x64_avx512vnni = g_target_x64_avx512bw && jit_class_has(klass, "avx512vnni")
+    g_target_x64_avx512vbmi = g_target_x64_avx512bw && jit_class_has(klass, "avx512vbmi")
+    g_target_x64_vnniint8 = g_target_x64_avx2 && jit_class_has(klass, "avxvnniint8")
+    g_target_x64_amx = g_target_is_x64 && jit_class_has(klass, "amx-tile") && jit_class_has(klass, "amx-int8")
+    g_target_arm64_dotprod = g_target_is_aarch64 && jit_class_has(klass, "dotprod")
+    g_target_arm64_i8mm = g_target_is_aarch64 && jit_class_has(klass, "i8mm")
+    g_target_arm64_fullfp16 = g_target_is_aarch64 && jit_class_has(klass, "fullfp16")
+    g_lattice_fp16_ops_native = g_target_is_aarch64 || g_target_x64_f16c
+    invoke(blk)
+    g_target_x64_avx2 = s_avx2
+    g_target_x64_f16c = s_f16c
+    g_target_x64_vnni256 = s_vnni256
+    g_target_x64_avx512bw = s_avx512bw
+    g_target_x64_avx512vnni = s_avx512vnni
+    g_target_x64_avx512vbmi = s_avx512vbmi
+    g_target_x64_vnniint8 = s_vnniint8
+    g_target_x64_amx = s_amx
+    g_target_arm64_dotprod = s_dotprod
+    g_target_arm64_i8mm = s_i8mm
+    g_target_arm64_fullfp16 = s_fullfp16
+    g_lattice_fp16_ops_native = s_lattice
 }
 
 [macro_function]
@@ -716,6 +790,7 @@ def public init_jit_state(cg_opt_level : uint; target_triple : string; host_feat
     assume nofree = attrs.nofree
     assume memory_inaccessible_rw = attrs.memory_inaccessible_rw
     assume memory_arg_inaccessible_rw = attrs.memory_arg_inaccessible_rw
+    assume memory_none = attrs.memory_none
     build_jit_types()
 
     // cold: opt sinks the failure block off the hot path; pairs with noreturn.
@@ -737,9 +812,9 @@ def public init_jit_state(cg_opt_level : uint; target_triple : string; host_feat
         jit_fn_type($(ctx : void?; nArgs : int; types, at, args : void?) : void? {}),
         get_jit_string_builder_temp(), fixed_array(nounwind, willreturn))
     jit_add_extern(FN_JIT_GET_GLOBAL_MNH, jit_fn_type($(mnh : int64; ctx : void?) : void? {}),
-        get_jit_get_global_mnh(), fixed_array(nounwind, willreturn), (nocapture, [1]))
+        get_jit_get_global_mnh(), fixed_array(nounwind, willreturn, memory_none), (nocapture, [1]))
     jit_add_extern(FN_JIT_GET_SHARED_MNH, jit_fn_type($(mnh : int64; ctx : void?) : void? {}),
-        get_jit_get_shared_mnh(), fixed_array(nounwind, willreturn), (nocapture, [1]))
+        get_jit_get_shared_mnh(), fixed_array(nounwind, willreturn, memory_none), (nocapture, [1]))
     // Wasm-only: resolves a handled-type (C++) field offset against the TARGET runtime's annotation
     // registry, into per-field globals at init. Declared unconditionally; only used when g_target_is_wasm.
     jit_add_extern(FN_JIT_GET_HANDLED_FIELD_OFFSET,
@@ -893,7 +968,7 @@ def public with_target_machine(triple, cpu, features : string; opt_level : uint;
     LLVMDisposeTargetMachine(targetMachine)
 }
 
-[macro_function, arch(at = "../ARCHITECTURE.md#aarch64-feature-truth")]
+[macro_function, arch(at = "../ARCHITECTURE_TARGET_FEATURES.md#aarch64-feature-truth")]
 def public create_default_target_machine(opt_level : uint; use_host_cpu : bool) : LLVMTargetMachineRef {
     LLVMInitializeAllTargetInfos()
     LLVMInitializeAllTargets()
@@ -922,20 +997,22 @@ def public create_default_target_machine(opt_level : uint; use_host_cpu : bool) 
             feats = "{feats},+i8mm"
         }
         // a forced feature's artifact cache-hits on the target box without a linker there
-        let forced_arm <- [for (part in split(g_env_jit.jit_arm64_force_features, ",")); "+{part}"; where !empty(part)]
+        let forced_arm = arm64_forced_plus_features()
         if (!empty(forced_arm)) {
-            feats = "{feats},{join(forced_arm, ",")}"
+            feats = "{feats},{forced_arm}"
         }
         targetMachine = create_target_machine(triple_msg, cpu_msg, feats, opt_level)
-    } elif (use_host_cpu && g_target_is_x64 && !empty(x64_forced_plus_features())) {
-        // DAS_JIT_X64_FORCE_FEATURES emission-only override (see the g_target_x64_* declaration
-        // comment): append AFTER the host features — the last occurrence of a feature wins in
-        // LLVM's SubtargetFeatures, so "+avx512f" here overrides the host list's "-avx512f".
-        let forced = x64_forced_plus_features()
-        let feats = empty(features_msg) ? forced : "{features_msg},{forced}"
-        targetMachine = create_target_machine(triple_msg, cpu_msg, feats, opt_level)
     } else {
-        targetMachine = create_target_machine(triple_msg, cpu_msg, features_msg, opt_level)
+        let forced = g_target_is_x64 ? x64_forced_plus_features() : (g_target_is_aarch64 ? arm64_forced_plus_features() : "")
+        let feats = empty(forced) ? features_msg : (empty(features_msg) ? forced : "{features_msg},{forced}")
+        let env_forced = g_target_is_x64 ? g_env_jit.jit_x64_force_features : (g_target_is_aarch64 ? g_env_jit.jit_arm64_force_features : "")
+        // the baseline class names the machine's cpu; the generic rail otherwise leaves it to LLVM's default
+        let baseline = jit_baseline_class()
+        let cpu = (use_host_cpu || empty(baseline)) ? cpu_msg : jit_cpu_class_row(baseline).cpu
+        if (!empty(env_forced)) {
+            to_log(LOG_INFO, "LLVM JIT: {g_target_is_x64 ? "DAS_JIT_X64_FORCE_FEATURES" : "DAS_JIT_ARM64_FORCE_FEATURES"} appends {env_forced} to the machine {cpu}\n")
+        }
+        targetMachine = create_target_machine(triple_msg, cpu, feats, opt_level)
     }
 
     if (use_host_cpu) {

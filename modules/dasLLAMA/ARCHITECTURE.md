@@ -48,12 +48,18 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
 - `ARCHITECTURE_GPU_PREFILL.md` - sec.2.2c-2.2i, 2.2u-2.2v, 2.2aa: the Metal prefill driver's
   GEMM form ladder, dev-W knee map, attention slab, MoE bucket rail, chunked submission, the
   f16 twin dual-store, the last-layer FFN tail, and the dense-KQ tensor mul_mm scaffold.
-- `ARCHITECTURE_GPU_VULKAN.md` - sec.2.2j-2.2q: the Vulkan resident driver - the prefill window
-  chain, the cm2 decode lanes and tile pick, the class-pipeline build seat, the residency plan,
-  the GPU-slot marks swap, the Q8 requant byte store, and the MoE expert chain on the cm2 tiles.
-- `ARCHITECTURE_GPU_VULKAN_DECODE.md` - sec.2.2r-2.2u: the per-op tier's decode era - the decode
+- `ARCHITECTURE_GPU_VULKAN.md` - sec.2.2j-2.2m, 2.2p-2.2q: the Vulkan resident driver's kernels
+  and encode chains - the prefill window chain, the cm2 decode lanes and tile pick, the
+  class-pipeline build seat, the Q8 requant byte store, and the MoE expert chain on the cm2
+  tiles.
+- `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` - sec.2.2n-2.2o: what a model has to fit on the card
+  before the driver runs - the residency plan, and the GPU-slot marks swap that lets one slot
+  serve many models.
+- `ARCHITECTURE_GPU_VULKAN_DECODE.md` - sec.2.2r-2.2v: the per-op tier's decode era - the decode
   attention block over per-layer K/V mirrors, the streamed expert layer's GPU/CPU split, the
-  whole-token decode span, and the deltanet decode step's per-session resident state.
+  whole-token decode span, the deltanet decode step's per-session resident state, and the
+  whole-model driver's hybrid token command and prefill (recurrent layers, gated attention,
+  partial rotary, the prefill-to-decode state handoff).
 - `ARCHITECTURE_GPU_MTP.md` - sec.2.28-2.39: the Metal speculative round over the batch driver's
   same-slab verify, the box knob that sets the depth a round drafts, and the kernel
   argument-alignment contract enforced at every dispatch.
@@ -62,15 +68,18 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
   MoE region split.
 - `ARCHITECTURE_MEDIA.md` - sec.2.13-2.16: the padded tower GEMM widths, the family GPU hooks,
   the tower weight lane, and the plain-Model ASR decoders.
-- `ARCHITECTURE_MEASUREMENT.md` - sec.2.5, 2.10, 2.20, 2.21, 2.26-2.28, 2.40-2.41: the benchmark
-  rig, the tune gate, the sanctioned instrumentation rails, kernel-race fidelity, the gemv's own
-  tune seat, the CPU kernel bench's fixture conditions, the speculative round's ruler record, the
-  `[tuned]` perm precedence, and the mint wall in the sidecar's provenance.
-- `ARCHITECTURE_CPU_KERNELS.md` - sec.2.22-2.24: the sub-block-packed k3/k6 planes, the grid
-  formats' panel and row-group decodes, and the VBMI symbol lattice.
-- `ARCHITECTURE_TTS.md` - sec.2.28-2.35: the TTS block home's two layouts, tap stacking, the
+- `ARCHITECTURE_MEASUREMENT.md` - sec.2.5, 2.10, 2.20, 2.21, 2.26-2.28, 2.40-2.41, 2.42a: the
+  benchmark rig, the tune gate, the sanctioned instrumentation rails, kernel-race fidelity, the
+  gemv's own tune seat, the CPU kernel bench's fixture conditions, the speculative round's ruler
+  record, the `[tuned]` perm precedence, the mint wall in the sidecar's provenance, and the fat
+  exe's first-start race.
+- `ARCHITECTURE_CPU_KERNELS.md` - sec.2.22-2.24, 2.42: the sub-block-packed k3/k6 planes, the grid
+  formats' panel and row-group decodes, the VBMI symbol lattice, and the tier that selects on the
+  target rather than the host.
+- `ARCHITECTURE_TTS.md` - sec.2.28-2.35, 2.43: the TTS block home's two layouts, tap stacking, the
   padded concat width, the per-synthesis carrier, the served carrier on the image rail, the
-  sine source's operation order, the heteronym context, and the rig's scoring.
+  sine source's operation order, the heteronym context, the rig's scoring, and the two-tier
+  phoneme pack.
 
 ## 3. Inherited invariants
 

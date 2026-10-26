@@ -10,7 +10,85 @@ It reaches **only** public facade verbs (`load_model` / `create_chat_renderer` /
 that is the point: the server is the acceptance test for the API rework. If it builds with no
 reach into engine internals, the facade is complete.
 
-## Run
+## Get it
+
+The server ships as a standalone download from the rolling
+`dasllama-server` release, refreshed with every daslang release:
+<https://github.com/GaijinEntertainment/daScript/releases/tag/dasllama-server>
+
+| Platform | Asset |
+|---|---|
+| macOS, Apple silicon | `dasllama-server-darwin-arm64.zip` |
+| Windows x64 | `dasllama-server-windows-x64.zip` |
+| Linux x86_64 | `dasllama-server-linux-x86_64.tar.gz` |
+| Linux arm64 | `dasllama-server-linux-arm64.tar.gz` |
+
+The Linux bundles need glibc 2.35 or newer (Debian 12, Ubuntu 22.04 and later), the system
+OpenSSL 3 (`libssl3` on Debian and Ubuntu, `openssl-libs` on Fedora) and `curl` for the catalog
+downloads; the macOS and Windows bundles carry their own OpenSSL.
+
+Unpack it and start the supervisor beside the server - `watchdog` (`watchdog.exe`), or on
+macOS the `dasllama-server.app` itself, whose launcher is the watchdog. The server binary
+beside it is `dasllama-server.exe` on Linux and Windows alike (the macOS app carries it as
+`Contents/MacOS/dasllama-server`). The watchdog keeps the server up, puts the dasllama mark in
+the notification area, and a click on it opens the control page, <http://127.0.0.1:8080/>.
+With no model configured the server starts in **setup mode** (below): pick a model from the
+catalog, it downloads into `~/.dasllama/models`, and *serve this model* restarts into it. The
+config it writes, `dasllama-server.toml` beside the exe, and the tune sidecar beside it survive
+an upgrade unpacked over the old directory on Linux and Windows; on macOS a new `.app` replaces
+the old one whole, so copy the two files out of `Contents/MacOS` first and back in after.
+
+The exe is a fat build (`daspkg release --fat`): plain code for the platform's baseline CPU
+class - `x86-avx2` on x86, `arm-neon` on arm64 - with one clone of every `[tune]` kernel per
+class the engine ships a profile for (`x86-vnni512`, `x86-amx`, `arm-i8mm`), picked from cpuid
+at start. On a Mac the Metal crowns are raced once at the first start and kept beside the exe.
+That is the good default, and it is as far as a solid executable goes: **a fat build cannot
+tune**. Its kernels are baked, there is no tuner in it, and `--tune`, the sidecar exchange
+and a re-tune have nothing to act on (the control page's exchange levers refuse). To tune
+every kernel for this box, install daslang with dasLLAMA - the SDK - and run the server
+through the JIT, `bin/daslang -jit utils/dasllama-server/main.das` below, or `daspkg release`
+this package on that box: either mints the box's own sidecar, every kernel raced on your own
+hardware instead of picked from a class profile.
+
+## Measure your box
+
+The control page's *benchmark* button runs the llama-bench rows on the served model right in
+the server - pp512 and tg128, three timed reps each after an untimed warmup - and shows tokens
+per second beside the hardware line; every route that could contend holds for the run's
+duration (the text, audio and speech routes answer 503, the model-switching, bake and download
+routes 409), so nothing shares the cores with it. A run is seconds on a small model - about a
+second for a 135M model and six for a 1B one on an M1 Max. The same rows from a shell, and the
+comparison the page cannot run itself, come from `dasllama-bench` beside the server -
+`dasllama-bench.exe` on Linux and Windows, `dasllama-server.app/Contents/MacOS/dasllama-bench`
+on a Mac:
+
+```sh
+./dasllama-bench.exe -m ~/.dasllama/models/<model>.gguf           # pp512/tg128, five reps
+./dasllama-bench.exe -m <model.gguf> --ref /path/to/llama-bench   # and llama.cpp on the same GGUF
+```
+
+It is `modules/dasLLAMA/benchmarks/lcpp_bench.das` baked with the server's class; `--help`
+lists the rest (`-p`, `-n`, `-r`, `-t`, `-o md`). Its first start on a Mac races the Metal
+crowns like the server's does. The two run the same rows, not the same numbers: the page
+measures the served slot as it is - its device (Metal, or the Vulkan tier where the slot armed
+one), its KV codec - on a session sized to the rows, while `dasllama-bench` runs f16 KV on the
+CPU unless `-ngl` says otherwise, the llama-bench defaults, five reps to the page's three. The
+page's result names what produced it - the device that served the rows, the KV codec, the exec
+tier (`exe-native` in a bundle, `jit` from the SDK), the tune state (`fat` in a bundle; `tuned`
+or `untuned` under the JIT) - and the `llama-bench` line that matches it. One difference to
+know about: the rows run llama-bench's flat session, so on the Vulkan tier they take the
+resident driver where the paged serving path declines it, and the result says `gpu:resident`
+when they did. A pp rep on a large CPU model can outlast the watchdog's two-second health
+probe; the tray reads unhealthy for that rep and recovers on its own.
+
+The bundles are not code-signed. macOS quarantines a downloaded app, and an app started from
+the download folder runs from a read-only copy where nothing it writes beside itself survives -
+so first drag `dasllama-server.app` out of Downloads with the Finder (Applications, or any folder
+of yours), then either allow it under System Settings > Privacy & Security after the first
+refused start, or clear the flag once - `xattr -dr com.apple.quarantine dasllama-server.app`.
+Windows SmartScreen shows an unknown publisher: *More info*, *Run anyway*.
+
+## Run from the source tree
 
 ```sh
 bin/daslang -jit utils/dasllama-server/main.das -- --model <model.gguf> [--port 8080] [--quant q8] \
@@ -19,7 +97,7 @@ bin/daslang -jit utils/dasllama-server/main.das -- --model <model.gguf> [--port 
                                                     [--streams 4] [--chunk 64] [--page-rows 64] [--prefix N]
 ```
 
-Run under `-jit` - interpreted inference is far too slow. Flags:
+Run under `-jit` - the interpreter is refused, it is far too slow for inference. Flags:
 
 | Flag | Short | Default | Meaning |
 |---|---|---|---|
@@ -45,6 +123,7 @@ Run under `-jit` - interpreted inference is far too slow. Flags:
 | `--flat` | - | - | Flat preallocated KV sessions - disables paged serving and the prefix cache |
 | `--mtp` | - | - | MTP/NextN self-speculative decode - needs a model with an in-file NextN head (the `-MTP-` GGUFs). Greedy requests are output-invariant; a sampled request (`temperature` > 0, penalties included) draws each verify row with its own sampler and keeps the plain sampled distribution, at a lower acceptance rate. Up to ~2x decode on the dense qwen35/qwen3.6 models (measured rows: `modules/dasLLAMA/performance/records/<box>.json`, on the site board), ~nothing on the MoEs. `/v1/stats` reports `mtp_drafted`/`mtp_accepted` |
 | `--models-dir` | - | `~/.dasllama/models` | Where the model catalog downloads land (`DASLLAMA_MODELS_DIR` overrides both this and the config key) |
+| `--tune` | - | - | Re-tune this box's dasLLAMA kernels, then relaunch (the JIT run; a fat build carries no tuner and ignores it) |
 | `--help` | `-?` | - | Show help and exit |
 
 A config file replaces long command lines; keys are the long flag names with underscores.
@@ -146,28 +225,28 @@ team/FIFO policy and applies only the worker's selected team-dispatch participat
 
 ## Supervised deployment
 
-dasllama-server is JIT-only (per-box `[tune]`/`[llvm_code]` kernels, plus a shared-module `[init]`
-global a baked exe mis-wires), so it is deployed as `daslang -jit main.das` under the shared
-watchdog in `utils/watchdog/`. A deployed bundle needs no arguments - the watchdog finds `main.das`
-beside `bin/Release/daslang.exe` and supervises that, and `watchdog.json` pins the name so logs land
-in `logs/dasllama-watchdog.log`:
+The server runs under the shared watchdog in `utils/watchdog/`, in the release bundle and in a
+JIT deployment alike. The watchdog needs no arguments: in the bundle it finds the baked exe
+beside it, in a JIT deployment `main.das` beside `bin/Release/daslang.exe`, and `watchdog.json`
+pins the name so logs land in `logs/dasllama-watchdog.log`, turns the tray on and names
+`tray.ico` as its mark. A JIT deployment on Windows:
 
 ```powershell
 Set-Location E:/dasllama-server
 
 # Run once from an elevated PowerShell. Installs an app-specific WER normal-minidump policy;
 # it does not dump the model weights/private heap.
-python ./watchdog.py --install-local-dumps
+.\watchdog.exe --install-local-dumps
 
 # Day-to-day launch, no elevation. dasllama-server.toml is auto-loaded from this directory.
 $env:DAS_JOBQUE_THREADS = "16"
-python ./watchdog.py --require-dumps
+.\watchdog.exe --require-dumps
 ```
 
-From the source tree the watchdog no longer sits beside the script, so pass `--cwd`:
+From the source tree the watchdog does not sit beside the script, so pass `--cwd`:
 
 ```powershell
-python utils/watchdog/watchdog.py --cwd utils/dasllama-server --jit-stack
+bin/Release/watchdog.exe --cwd utils/dasllama-server --jit-stack
 ```
 
 The first JIT start on an untuned box writes the tune sidecar and exits with code 3; the watchdog
@@ -175,23 +254,34 @@ recognizes that bootstrap exit and relaunches. That cold path - DLL cache miss, 
 (`jit_codegen` -> `jit_linked` -> `tuning` -> `model_load` -> `ready`) with the elapsed time of
 each, and reports health only on transition plus a heartbeat.
 
-It writes rotating JSON-line logs, samples process memory once a minute, and polls `/v1/models`
+It writes rotating JSON-line logs and polls `/v1/models`
 (use `--health-url`/`--shutdown-url` for a non-default port). `--jit-stack` records every generated
 daslang call in the logical stack; Windows JIT links also retain a compact `.map` beside the
 `.dll/.o`. After a crash it waits for the WER minidump, copies it with the matching JIT artifacts,
 tune manifest, metadata and log into `logs/crashes/`, shows a Windows notification, and restarts
 with bounded exponential backoff. The ten newest bundles are retained.
 
-Full watchdog reference - config keys, discovery rules, control plugins: `utils/watchdog/README.md`.
+Full watchdog reference - config keys, discovery rules, the log: `utils/watchdog/README.md`.
 
 ## Deploying (daspkg release)
 
-`release_requires_jit()` makes `daspkg release` refuse this package outright: baking a `-exe`
-would drop the per-box JIT kernels and ship a broken binary. Deploy by staging the JIT bundle -
-`main.das`, `bin/Release/daslang.exe` plus the runtime DLLs and shared modules, `watchdog.py`,
-`watchdog.json`, `control.html` - into the target directory, and keep the deployed
-`dasllama-server.toml` and `dasllama-server.tune.json` across upgrades. Stop a running server first;
-Windows locks the DLLs.
+`daspkg release --root utils/dasllama-server --out <dir>` bakes the server into a standalone
+bundle: the exe, the shared modules and runtime libraries it needs, `watchdog` beside it,
+`dasllama-bench` (the `release_program` companion - lcpp_bench baked under the same class,
+sharing the bundle's libraries), `watchdog.json`, `control.html` and `tray.ico`. Plain `release` tunes the kernels on the build
+box and ships that box's sidecar - the bundle for a machine you own. `release --fat x86-avx2`
+(`arm-neon` on arm64) is what the public download is built from: no mint, no sidecar, one
+clone of every kernel per shipped class profile, the runtime section minted at the first start
+on whatever box runs it (the Metal twin kernels race where a Metal device exists; elsewhere it
+records the knob defaults). The `.das_package` names the launcher: on macOS the `.app` opens the
+watchdog, so a double click supervises. The exchange levers on the control page - apply a
+sidecar, share, re-tune - refuse on a fat release, which has no tune of its own.
+
+A JIT deployment instead stages the toolchain - `main.das`, `bin/Release/daslang.exe` plus the
+runtime DLLs and shared modules, `watchdog.exe`, `watchdog.json`, `control.html`, `tray.ico` -
+into the target directory (`deploy-jit.ps1` does it on Windows). Either way, keep the deployed
+`dasllama-server.toml` and `dasllama-server.tune.json` across upgrades, and stop a running
+server first; Windows locks the DLLs.
 
 ## Endpoints
 
@@ -212,8 +302,8 @@ Windows locks the DLLs.
 | `POST` | `/vad` | Silero speech spans over an uploaded clip (the control page's waveform overlay; in-handler, <=120 s, needs the in-repo `silero_vad.bin`) |
 | `GET`  | `/catalog` | The curated model list with local presence, the `asr` tower row, the `tts` list (the three speech GGUFs and the two front-end packs, each `file`/`bytes`/`pack`/`present`/`path`), the `box` memory facts + the download state machine (`idle | downloading | verifying | done | failed`, byte progress) |
 | `POST` | `/catalog/download` | `{"name": <entry>}` - start one catalog download; `{"name", "tower": "vision"}` / `{"tower": "asr"}` pull a tower, `{"tower": "tts", "file": <file>}` one file of the speech set (409 while one runs or the file exists; sha-verified, never waived) |
-| `POST` | `/bench` | Loopback-only: start the quiesced A/B benchmark - our engine then the configured `lcpp_bin` - spawned as a child process (needs a source-tree daslang + `lcpp_bin` in the config; 409 while a bench runs or streams are active) |
-| `GET`  | `/bench` | Bench state (`idle | running | done | failed`), live log lines, the result JSON, and the hardware line |
+| `POST` | `/bench` | Loopback-only: start the benchmark, quiesced. In process by default: pp512 and tg128 on the served model, an untimed warmup then three timed reps each, one pp prefill or one tg token per tick, the text, audio and speech routes (503) and the model-switching, bake and catalog-download routes (409) holding until it finishes - in either mode; with `lcpp_bin` in the config on a source-tree daslang, the A/B child instead - our lcpp_bench then llama-bench on the same GGUF. 400 in setup mode or when the served context is shorter than pp512, 409 while a bench, a bake or a catalog download runs or streams are active, 503 while draining |
+| `GET`  | `/bench` | Bench state (`idle | running | done | failed`), `mode` (`inprocess` | `ab`: what a `POST` runs), live log lines, the result JSON - `ours_pp`, `ours_tg`, `threads`, `elapsed_s`, `ts`; in process also `mode`, `pp_sd`, `tg_sd`, `reps`, `model`, `gguf`, `backend` (`metal`, `gpu:resident`, or the slot's word), `kv` (the codec the rows ran), `exec` (`exe-native` | `jit` | `interpreted`), `tune` (`fat` | `tuned` | `untuned (N of M on fallback)` | `none`) and `ref_cmd` (the llama-bench line for the comparison); the A/B also `theirs_pp`, `theirs_tg`, `pp_ratio`, `tg_ratio` and `record` - and the hardware line |
 | `POST` | `/bake` | `{"model"?: name}` loopback-only: bake the slot's prepared `.dlim` image by spawning `dasllama-convert` (empty body bakes the default slot; 409 while a bake or bench runs or streams are active; the dlim GC of never-loadable images runs on completion) |
 | `GET`  | `/bake` | Bake state (`idle | running | done | failed`), the slot it runs for, log lines, the result JSON |
 | `GET`  | `/v1/images` | Per-slot prepared-image inventory: source GGUF path, the flavor THIS process mapped (planar/vulkan/metal, or raw gguf), the trimmed flag, and each on-disk `.dlim`'s info - plus the slot name a bake is currently running for |
@@ -227,7 +317,7 @@ Windows locks the DLLs.
 | `POST` | `/exchange/apply` | `{"sha": ...}`: download + validate (content sha, schema, `DASLLAMA_RELEASE`) + adopt that sidecar, then drain and exit **4** so the relaunch stamps its winners |
 | `POST` | `/exchange/submit` | Privacy-strip and submit this box's own tune to the exchange (refuses exchange-sourced or foreign-box sidecars) |
 | `POST` | `/exchange/retune` | Arm a local re-tune: removes the sidecar, skips the exchange once, restarts - the next boot races this box (~12 min, quiet machine) |
-| `POST` | `/exchange/consent` | `{"accept": true\|false}`: record the first-contact choice (the GDPR gate below); replies `{ok, accepted, restarting?}`. Accept on an untuned/stale box drains and exits **4** so the relaunch runs the lookup |
+| `POST` | `/exchange/consent` | `{"accept": true\|false}`: record the first-contact choice; replies `{ok, accepted, restarting?}`. Accept on an untuned/stale box drains and exits **4** so the relaunch runs the lookup |
 | `POST` | `/gc` | Schedule a validated collection at the next lifecycle safe point; concurrent requests coalesce |
 | `POST` | `/shutdown` | Stop admitting new LLM/ASR work, drain accepted work, then exit |
 
@@ -235,25 +325,18 @@ Config precedence: `defaults < config TOML < explicit CLI flags` - unless the TO
 `authoritative = true` (what the control page saves), which flips the top: `defaults < CLI <
 authoritative TOML`.
 
-The sidecar exchange rides three config-only keys (no CLI flags - one code path). **The
-exchange is closed: both policies default to off, and only an explicit key turns them on** -
-a box its shipped class profile covers stamps its kernels at compile time and never needed the
-exchange, and the residue races locally. `exchange_accept = verified | any | off` (default
-`off`; `verified` - at an untuned boot a verified match downloads and applies instead of racing;
-unverified NEVER auto-applies), `exchange_submit = ask | always | never` (default `never`;
-`ask` - a fresh local tune surfaces as an offer on the control page and the watchdog balloon;
-`always` shares it automatically), and `exchange_url` (baked default `https://dasllama.io`).
-`DASLLAMA_EXCHANGE_URL` / `DASLLAMA_EXCHANGE_ACCEPT` env override for tests and one-shot
-watchdog relaunches. Lookup failure is never fatal - the boot falls through to the local tuner.
+### The sidecar exchange {#exchange-policy}
 
-**First-contact consent (GDPR):** nothing is sent to the exchange until a choice is
-expressed. Setting any `exchange_*` key (TOML or env) IS that choice; on the zero-config
-path the recorded choice lives in `<app>.tune.consent` beside the sidecar
-(`accepted`/`declined`, one word). With no recorded choice: an interactive terminal asks
-inline (Enter = Accept); a supervised boot emits `@sidecar consent state=needed` - the
-watchdog shows a native Accept/Decline dialog - and this page's exchange card carries the
-same banner (`POST /exchange/consent`). Until one of those answers, the box tunes locally
-and no request leaves. The `gpu` key (`auto | off | metal | metal-required | vulkan`) is the first-class
+Closed by default: the three config-only keys `exchange_accept` (`verified | any | off`, default
+`off`), `exchange_submit` (`ask | always | never`, default `never`) and `exchange_url` are the
+only way in, and every `/exchange*` route resolves them from `g_config_save_path`, the path a
+`POST /config` writes, whether or not that file exists yet. The client rides the tune framework:
+a build without dasLLVM registers none of it and every `/exchange*` route answers 404, and a fat
+release refuses the levers (its kernels are the shipped class clones).
+
+### The gpu key
+
+The `gpu` key (`auto | off | metal | metal-required | vulkan`) is the first-class
 backend selector, and **defaults-first: unset (with no legacy `--metal` flag) behaves as
 `auto`** - the boot probes the box and serves on the best detected backend (the Metal rails
 where the box has them, else the Vulkan tier when a device answers, else the CPU), logging
@@ -346,8 +429,9 @@ mode too. E.g. Qwen3.6's instruct-mode card settings: `"temperature": 0.7, "top_
 
 ### Thinking control and `reasoning_content`
 
-`enable_thinking` is tri-state: ABSENT leaves the family's own default in force (the
-Qwen3/3.5/3.6, GLM, gemma-4, and gpt-oss families all think by default), and a present bool -
+`enable_thinking` is tri-state: ABSENT leaves the model template's own default in force
+(thinking-capable Qwen3/3.5/3.6, GLM, gemma-4, and gpt-oss templates default on; a bare Qwen
+Instruct generation branch such as Qwen3 Instruct-2507 defaults off), and a present bool -
 top-level or the llama.cpp spelling
 `"chat_template_kwargs": {"enable_thinking": ...}` - overrides it. `false` on a
 `<think>`-family appends the template's empty think block so the model answers directly;

@@ -73,6 +73,10 @@ struct DaspkgArgs {
     @clarg_doc = "During `release`, accept a complete existing sidecar instead of re-minting — the ONLY mode that inherits"
     quick : bool
 
+    @clarg_name = "fat"
+    @clarg_doc = "During `release`, build a FAT exe for this CPU class (x86-avx2, x86-vnni512, arm-neon, ...): the plain code targets the class, every [tune] kernel ships one clone per class the library has a profile for, and the exe picks the clone from cpuid at startup. No mint and no shipped sidecar - the kernels come from the profiles, and a kernel with no profile entry for the class refuses the release"
+    fat : string = ""
+
     @clarg_name = "wasm"
     @clarg_doc = "Target wasm64 (memory64): `build --wasm` builds the wasm64 runtime + module archives; `release wasm` ships compiled .wasm artifacts"
     wasm : bool
@@ -1299,9 +1303,15 @@ def cmd_check(root : string; json : bool = false; is_global : bool = false) {
     return 0
 }
 
+//! The one gate a `.das_package` string passes before it reaches a path or a shell command line:
+//! letters, digits, `_`, `-` and `.`, and not `.` or `..` - an allowlist, because the strings
+//! are spliced unquoted into `run_cmd` lines, where a space splits argv and `;` or `$(` run.
 def private is_safe_pkg_name(name : string) : bool {
     if (empty(name) || name == "." || name == "..") return false
-    return !(find(name, "/") >= 0 || find(name, "\\") >= 0)
+    for (c in name) {
+        if (!(is_alpha(c) || is_number(c) || c == '_' || c == '-' || c == '.')) return false
+    }
+    return true
 }
 
 def cmd_cleanup(root : string; force : bool; is_global : bool = false) : int { // nolint:STYLE038 — flat removal checklist (modules/, lock, caches), one arm per artifact
@@ -1412,6 +1422,7 @@ struct private TuneScopeDep {
     tuner : string                  //!< tuner harness path ("" = none declared)
     complete : bool                 //!< every [tune] kernel of this scope has a fresh sidecar entry
     fallbacks : string              //!< fallback stamps selected by this same compile/host
+    fat_unprofiled : string         //!< fat builds: the [tune] kernels whose baseline clone came from no profile
 }
 
 struct private ReleaseDeps {
@@ -1450,6 +1461,140 @@ def private sidecar_provenance_line(manifest : string) : string {
     let line = "noise={doc?["provenance"]?["noise"] ?? "?"} mode={doc?["provenance"]?["mode"] ?? "?"} sha={doc?["provenance"]?["engine_sha"] ?? "?"} written={doc?["provenance"]?["written"] ?? "?"} box={doc?["provenance"]?["box"] ?? "?"}"
     delete_json(doc)
     return line
+}
+
+//! a companion's shared modules and das modules join the main program's, each once: the ship
+//! loops below key on the bundle-relative path and the module name, the dep walk on the package
+//! directory (a root script's module is named "", so the name cannot key it). Tune scopes do not
+//! merge: the mint ran on the main program's before any companion built, and a companion is
+//! refused a scope the main program lacks
+def private merge_release_deps(var deps : ReleaseDeps; extra : ReleaseDeps) {
+    for (e in extra.shared_modules) {
+        var seen = false
+        for (h in deps.shared_modules) {
+            seen = seen || (h.rel == e.rel && h.das_name == e.das_name)
+        }
+        if (!seen) {
+            deps.shared_modules |> push(SharedModuleEntry(rel = e.rel, abs = e.abs, das_name = e.das_name))
+        }
+    }
+    for (dm in extra.das_modules) {
+        var seen = false
+        for (h in deps.das_modules) {
+            seen = seen || h.package_dir == dm.package_dir
+        }
+        if (!seen) {
+            deps.das_modules |> push(DasModuleEntry(name = dm.name, file = dm.file, package_dir = dm.package_dir))
+        }
+    }
+}
+
+//! the env prefix that pins the tune manifest a build reads - the main program's minted sidecar,
+//! so a companion bakes the winners the main exe bakes instead of whatever sits beside its script
+def private release_manifest_env(manifest : string) : string {
+    return empty(manifest) ? "" : (get_platform_name() == "windows" ?
+        "set \"DAS_TUNE_MANIFEST={manifest}\"&& " :
+        "DAS_TUNE_MANIFEST=\"{manifest}\" ")
+}
+
+//! Bake one release_program companion: `<bundle_dir>/<name>.exe` (extensionless inside a macOS
+//! .app, like the main exe) under the same fat class and mode - or, in a plain release, under
+//! the main program's freshly minted manifest - its `.o` dropped, its rpaths scrubbed, the MSVC
+//! `.lib` recorded, and its deps JSON gated: every tune scope it declares is one the main
+//! program declared (that is the scope the mint measured; a scope only the companion carries
+//! was never measured on this box), and under `--fat` the fat gate refuses the release the way
+//! the main exe's does. Returns 0, or 1 with the reason logged and the half-built files removed;
+//! `deps_file` is left for the caller to merge.
+def private release_build_program(daslang, main_path, bundle_dir, name, deps_file, fat, manifest, force_args : string; main_scopes : array<string>; is_mac_app : bool; var shipped : array<string>) : int {
+    let exe_path = path_join(bundle_dir, name)
+    let cmd = "{release_fat_env(fat)}{release_manifest_env(manifest)}\"{daslang}\" -exe -output \"{exe_path}\" --list-shared-modules \"{deps_file}\"{force_args} \"{main_path}\""
+    let mode_note = empty(fat) ? "" : " ({fat} class, fat)"
+    log("  build: companion {name} from {base_name(main_path)}{mode_note}\n")
+    let t0 = ref_time_ticks()
+    var output : string
+    let rc = run_cmd(cmd, output)
+    if (rc != 0) {
+        to_log(LOG_ERROR, "release: daslang -exe failed for companion {name} (rc={rc}):\n{output}\n")
+        release_drop_program_files(exe_path)
+        return 1
+    }
+    log("  build: companion {name} in {release_elapsed(t0)}s\n")
+    var pdeps : ReleaseDeps
+    if (!read_release_deps(deps_file, pdeps)) {
+        to_log(LOG_ERROR, "release: the companion {name}'s deps JSON {deps_file} cannot be read, so its tune scopes and its fat gate were never checked\n")
+        release_drop_program_files(exe_path)
+        return 1
+    }
+    for (ts in pdeps.tune_scopes) {
+        if (find_index(main_scopes, ts.name) < 0) {
+            to_log(LOG_ERROR, "release: companion {name} declares the tune scope `{ts.name}`, which the main program does not - the mint measured the main program's scopes only; release the companion from its own package, or give the main program that scope\n")
+            release_drop_program_files(exe_path)
+            return 1
+        }
+    }
+    if (!empty(fat)) {
+        let refusal = release_fat_gate(pdeps, fat)
+        if (!empty(refusal)) {
+            to_log(LOG_ERROR, "companion {name}: {refusal}\n")
+            release_drop_program_files(exe_path)
+            return 1
+        }
+        for (ts in pdeps.tune_scopes) {
+            log("  tune: companion {name} ships scope `{ts.name}`'s {fat}-and-up profile clones\n")
+        }
+    }
+    let obj_path = "{exe_path}.o"
+    if (fexist(obj_path)) {
+        remove(obj_path)
+    }
+    shipped |> push(is_mac_app ? name : "{name}.exe")
+    if (fexist("{exe_path}.lib")) {
+        shipped |> push("{name}.lib")
+    }
+    if (is_mac_app) {
+        var rerr : string
+        if (!rename("{exe_path}.exe", exe_path, rerr)) {
+            to_log(LOG_ERROR, "release: cannot rename {exe_path}.exe -> {exe_path}: {rerr}\n")
+            release_drop_program_files(exe_path)
+            return 1
+        }
+    }
+    scrub_external_rpaths(is_mac_app ? exe_path : "{exe_path}.exe")
+    return 0
+}
+
+//! a companion that failed after its build leaves nothing behind: the exe, its object file and
+//! the MSVC side artifacts are outside every manifest, so a later release would never sweep them
+def private release_drop_program_files(exe_path : string) {
+    for (suffix in [".exe", ".o", ".lib", ".map", ".pdb"]) {
+        if (fexist("{exe_path}{suffix}")) {
+            remove("{exe_path}{suffix}")
+        }
+    }
+}
+
+// the env prefix a fat release builds its exe under: the baseline class and the fat tune mode
+def private release_fat_env(fat : string) : string {
+    return empty(fat) ? "" : (get_platform_name() == "windows" ?
+        "set \"DAS_JIT_BASELINE={fat}\"&& set \"DAS_TUNE_MODE=fat\"&& " :
+        "DAS_JIT_BASELINE={fat} DAS_TUNE_MODE=fat ")
+}
+
+// a fat release ships profile clones only: the refusal text for one scope whose baseline
+// clones came from no profile (`unprofiled` = the deps JSON's ';'-joined list), "" when empty
+def release_fat_refusal(scope, unprofiled, fat : string) : string {
+    if (empty(unprofiled)) return ""
+    return "release --fat {fat}: scope `{scope}` has no {fat} profile entry for {replace(unprofiled, ";", ", ")} - a fat exe ships profile clones, never fallback stamps; mint a {fat} profile for the library (a full mint on a {fat} box, then tune_profile_export) or release without --fat"
+}
+
+def private release_fat_gate(deps : ReleaseDeps; fat : string) : string {
+    for (ts in deps.tune_scopes) {
+        let refusal = release_fat_refusal(ts.name, ts.fat_unprofiled, fat)
+        if (!empty(refusal)) {
+            return refusal
+        }
+    }
+    return ""
 }
 
 def private release_tuner_cmd(daslang : string; ts : TuneScopeDep; paranoid : bool) : string {
@@ -1509,8 +1654,10 @@ def private sanitize_bundle_id_part(s : string) : string {
 // Minimal macOS .app Info.plist. Built with dasPUGIXML so values are
 // XML-escaped automatically — inputs (bundle_name, exe, bundle_id) are
 // otherwise unrestricted on the XML side. CFPropertyList accepts plist
-// without a DOCTYPE, so we omit it.
-def private build_info_plist(name, exe, bundle_id : string) : string {
+// without a DOCTYPE, so we omit it. `ui_element` marks a menu-bar-only app
+// (LSUIElement): no Dock tile, no application menu - the shape of a
+// supervisor launcher, whose only surface is its tray icon.
+def private build_info_plist(name, exe, bundle_id : string; ui_element : bool) : string {
     var out = ""
     with_doc() $(doc) {
         doc |> tag("plist") $(var pl) {
@@ -1520,6 +1667,10 @@ def private build_info_plist(name, exe, bundle_id : string) : string {
                 d |> tag("string", name)
                 d |> tag("key", "CFBundleExecutable")
                 d |> tag("string", exe)
+                if (ui_element) {
+                    d |> tag("key", "LSUIElement")
+                    d |> tag("true")
+                }
                 d |> tag("key", "CFBundleIdentifier")
                 d |> tag("string", bundle_id)
                 d |> tag("key", "CFBundlePackageType")
@@ -1977,6 +2128,38 @@ def private ship_external_files(bundle_name, dst_dir : string; external_files : 
 }
 
 
+//! A built tool ships by bare name from `<das_root>/bin/` - the installed SDK and single-config
+//! trees - or `bin/Release/` in an MSVC tree, with the platform's `.exe`, to the bundle root.
+def public ship_tools(bundle_name, dst_dir : string; tools : array<string>; var shipped : array<string>; das_root : string) : int {
+    let ext = get_platform_name() == "windows" ? ".exe" : ""
+    shipped |> reserve(length(shipped) + length(tools))
+    for (name in tools) {
+        if (!is_safe_pkg_name(name)) {
+            to_log(LOG_ERROR, "release: `{bundle_name}` declared release_include_tool(\"{name}\") - a tool is a bare name, no path separators\n")
+            return 1
+        }
+        var src = path_join(das_root, "bin/{name}{ext}")
+        if (!fexist(src)) {
+            src = path_join(das_root, "bin/Release/{name}{ext}")
+        }
+        if (!fexist(src)) {
+            to_log(LOG_ERROR, "release: `{bundle_name}` declared release_include_tool(\"{name}\") but neither bin/{name}{ext} nor bin/Release/{name}{ext} exists under {das_root}\n")
+            return 1
+        }
+        let dst = path_join(dst_dir, "{name}{ext}")
+        var err : string
+        if (!copy_file(src, dst, true, err)) {
+            to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
+            return 1
+        }
+        scrub_external_rpaths(dst)
+        ship_symbols_for(src, shipped)
+        shipped |> push("{name}{ext}")
+    }
+    log("  ship tools: {length(tools)} file(s)\n")
+    return 0
+}
+
 def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<string>;
                              var shipped : array<string>; rel_prefix : string) : int {
     let platform = get_platform_name()
@@ -2101,10 +2284,13 @@ def private release_note_ship_manifest(manifest : string; var ship_manifest : st
     }
 }
 
-def cmd_release(root : string; out_dir : string; paranoid = false; quick = false) : int { // nolint:STYLE037,STYLE038 — phased orchestrator sharing bundle state end to end; the real split belongs to the daspkg cleanup pass
+def cmd_release(root : string; out_dir : string; paranoid = false; quick = false; fat = "") : int { // nolint:STYLE037,STYLE038 — phased orchestrator sharing bundle state end to end; the real split belongs to the daspkg cleanup pass
     let release_t0 = ref_time_ticks()
     if (paranoid && quick) {
         to_log(LOG_WARNING, "release: --paranoid no longer changes the tuner's budget; --quick wins\n")
+    }
+    if (!empty(fat) && quick) {
+        to_log(LOG_WARNING, "release: --quick means nothing under --fat - a fat exe mints nothing and inherits nothing; its kernels come from the class profiles\n")
     }
     // Reset the patchelf availability cache so a daspkg process that releases
     // multiple bundles can pick up a patchelf install between calls.
@@ -2150,8 +2336,54 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
     // separators / `..` so a hostile or typo'd name can't escape out_dir
     // when path_join + force_rmdir run below.
     if (!is_safe_pkg_name(bundle_name)) {
-        to_log(LOG_ERROR, "Error: unsafe bundle name `{bundle_name}` (must not contain path separators or be `.` / `..`)\n")
+        to_log(LOG_ERROR, "Error: unsafe bundle name `{bundle_name}` (letters, digits, `_`, `-` and `.` only; not `.` or `..`)\n")
         return 1
+    }
+    // release_launcher() names the tool the macOS .app opens; checked on every platform so a
+    // typo fails the Linux and Windows releases too, not only the one that writes the plist
+    if (!empty(spec.launcher) && find_index(spec.tools, spec.launcher) < 0) {
+        to_log(LOG_ERROR, "release: release_launcher(\"{spec.launcher}\") names no shipped tool - add release_include_tool(\"{spec.launcher}\") beside it\n")
+        return 1
+    }
+    // release_program() companions are checked before anything builds: the name lands in the
+    // bundle as a file name, and a script that is not there would fail minutes into the release
+    var programs : array<tuple<name : string; script : string>>
+    programs |> reserve(length(spec.programs))
+    for (p in spec.programs) {
+        let at = find(p, "@")
+        if (at <= 0) {   // release_program() writes `name@script`; only an edit to daslib/daspkg.das breaks that
+            to_log(LOG_ERROR, "release: malformed companion entry `{p}` - release_program(name, script) records `name@script`\n")
+            return 1
+        }
+        let pname = slice(p, 0, at)
+        let pscript = slice(p, at + 1, length(p))
+        // the name is a file name the platform suffixes itself (`foo.exe.exe` otherwise), and one
+        // clean_previous_release never sweeps when it carries `..`
+        if (empty(pname) || !is_safe_pkg_name(pname) || pname == bundle_name || (pname |> ends_with(".exe")) || find(pname, "..") >= 0) {
+            to_log(LOG_ERROR, "release: release_program(\"{pname}\", ...) - the name is the companion's file name: letters, digits, `_`, `-` and `.` only, no `.exe` suffix, no `..`, and not the bundle's own `{bundle_name}`\n")
+            return 1
+        }
+        // the script path reaches the build command line quoted: every segment is a name, or `..`
+        // (a companion may live in another tree), so a quote or a shell character cannot ride in
+        var path_ok = !empty(pscript)
+        for (seg in split(replace(pscript, "\\", "/"), "/")) {
+            path_ok = path_ok && (seg == ".." || is_safe_pkg_name(seg))
+        }
+        if (!path_ok || !fexist(path_join(root, pscript))) {
+            to_log(LOG_ERROR, "release: release_program(\"{pname}\", \"{pscript}\") names no script under {root} (the path is `/`-separated segments of letters, digits, `_`, `-` and `.`, or `..`)\n")
+            return 1
+        }
+        // a shipped tool of the same name would land on the companion later and silently replace
+        // it; two companions of one name would build over each other
+        var taken = find_index(spec.tools, pname) >= 0
+        for (q in programs) {
+            taken = taken || q.name == pname
+        }
+        if (taken) {
+            to_log(LOG_ERROR, "release: release_program(\"{pname}\", ...) - the name is already a shipped tool's or another companion's\n")
+            return 1
+        }
+        programs |> push((name = pname, script = pscript))
     }
     // macOS: emit a clickable .app bundle. The exe + dylibs + modules go into
     // Contents/MacOS/, so all subsequent ship logic uses bundle_dir unchanged
@@ -2226,7 +2458,14 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
             writer |> write("\"")
         }
     }
-    let cmd = "\"{daslang}\" -exe -output \"{exe_path}\" --list-shared-modules \"{deps_file}\"{force_args} \"{main_path}\""
+    if (!empty(fat) && !is_safe_pkg_name(fat)) {   // the class name is spliced unquoted into the build line
+        to_log(LOG_ERROR, "release --fat: '{fat}' is not a CPU class name (letters, digits, '-', '_' and '.' only)\n")
+        return 1
+    }
+    let cmd = "{release_fat_env(fat)}\"{daslang}\" -exe -output \"{exe_path}\" --list-shared-modules \"{deps_file}\"{force_args} \"{main_path}\""
+    if (!empty(fat)) {
+        log("  build: fat exe for the {fat} class (DAS_JIT_BASELINE={fat}, DAS_TUNE_MODE=fat)\n")
+    }
     let build_t0 = ref_time_ticks()
     let rc = run_cmd(cmd, output)
     if (rc != 0) {
@@ -2243,7 +2482,31 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
     //     COMPLETE one (an incomplete/stale scope mints even under --quick: the frozen exe
     //     itself never tunes, so shipping it unmeasured is not an option).
     var ship_manifest = ""   // the resolved scope manifest step 2.6 ships (see there)
-    {
+    if (!empty(fat)) {
+        // a fat exe mints nothing: its kernels are the class profiles' clones, and a kernel the
+        // baseline class has no profile entry for would ship a fallback stamp forever
+        var deps0 : ReleaseDeps
+        if (read_release_deps(deps_file, deps0)) {
+            let refusal = release_fat_gate(deps0, fat)
+            if (!empty(refusal)) {
+                to_log(LOG_ERROR, "{refusal}\n")
+                if (fexist(deps_file)) {
+                    remove(deps_file)
+                }
+                return 1
+            }
+            for (ts in deps0.tune_scopes) {
+                log("  tune: scope `{ts.name}` ships its {fat}-and-up profile clones (fat: no mint, no sidecar - the exe races its runtime section at first start)\n")
+            }
+        } else {
+            // the deps JSON is the only place the fat gate can read; without it the gate never ran
+            to_log(LOG_ERROR, "release --fat {fat}: the release-deps JSON {deps_file} cannot be read, so the fat gate never ran - the build line above says why\n")
+            if (fexist(deps_file)) {
+                remove(deps_file)
+            }
+            return 1
+        }
+    } else {
         var deps0 : ReleaseDeps
         if (read_release_deps(deps_file, deps0)) {
             var tuned_any = false
@@ -2325,6 +2588,32 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
     // everywhere except a mac .app, where the rename above already dropped it.
     scrub_external_rpaths(is_mac_app ? exe_path : "{exe_path}.exe")
 
+    // 1.8 Companion programs (release_program): each bakes beside the main exe under the same
+    //     class and mode - and, after a mint, under the main program's manifest, so both exes
+    //     bake the winners this box measured - and its deps JSON joins the main one below, so a
+    //     shared module only the companion requires still ships.
+    var program_deps : array<string>
+    program_deps |> reserve(length(programs))
+    var main_deps : ReleaseDeps
+    let main_read = !empty(programs) && read_release_deps(deps_file, main_deps)
+    let main_scopes <- [for (ts in main_deps.tune_scopes); ts.name; where main_read]
+    for (p in programs) {
+        run_cmd_counter ++
+        let pdeps = "{get_das_root()}/_daspkg_release_deps_{run_cmd_counter}.json"
+        let rc_p = release_build_program(daslang, path_join(root, p.script), bundle_dir, p.name, pdeps, fat, ship_manifest, force_args, main_scopes, is_mac_app, shipped)
+        if (rc_p != 0) {
+            for (d in program_deps) {
+                remove(d)
+            }
+            if (fexist(pdeps)) {
+                remove(pdeps)
+            }
+            remove(deps_file)
+            return rc_p
+        }
+        program_deps |> push(pdeps)
+    }
+
     // 2. Parse deps JSON, ship dylibs at the relative path the exe expects.
     //    The writer has already merged force-included modules into shared_modules,
     //    so we just iterate.
@@ -2335,6 +2624,16 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
         return 1
     }
     remove(deps_file)
+    for (d in program_deps) {
+        var pd : ReleaseDeps
+        let ok = read_release_deps(d, pd)
+        remove(d)
+        if (!ok) {
+            to_log(LOG_ERROR, "release: cannot read a companion program's deps file at {d}\n")
+            return 1
+        }
+        merge_release_deps(deps, pd)
+    }
     for (e in deps.shared_modules) {
         if (empty(e.rel)) {
             to_log(LOG_WARNING, "release: skipping module `{e.das_name}` (no /modules/ in `{e.abs}`)\n")
@@ -2403,7 +2702,11 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
     // freshly-minted exe on M4's first standalone run
     let sidecar_default = "{slice(main_path, 0, length(main_path) - 4)}.tune.json"
     let sidecar_src = (!empty(ship_manifest) && fexist(ship_manifest)) ? ship_manifest : sidecar_default
-    if (fexist(sidecar_src)) {
+    if (!empty(fat)) {
+        // no sidecar ships with a fat exe: its kernels are baked per class, and it writes its own
+        // runtime section beside itself at first start on the box it runs on
+        log("  ship: no tune sidecar (fat exe - the runtime section is raced at first start)\n")
+    } elif (fexist(sidecar_src)) {
         let sidecar_rel = "{bundle_name}.tune.json"
         let sidecar_dst = path_join(bundle_dir, sidecar_rel)
         var serr : string
@@ -2422,6 +2725,23 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
         }
         log("  ship: {sidecar_rel} (tune sidecar)\n")
         shipped |> push(sidecar_rel)
+        // each companion resolves `<its stem>.tune.json` beside itself: the same sidecar, under
+        // its name, so its runtime section is the one the main exe reads
+        shipped |> reserve(length(shipped) + length(programs))
+        for (p in programs) {
+            let prel = "{p.name}.tune.json"
+            let pdst = path_join(bundle_dir, prel)
+            var perr : string
+            if (!copy_file(sidecar_dst, pdst, true, perr)) {
+                to_log(LOG_ERROR, "release: copy_file({sidecar_dst} -> {pdst}) failed: {perr}\n")
+                return 1
+            }
+            if (!set_mtime(pdst, ahead, terr)) {
+                to_log(LOG_WARNING, "release: cannot touch {pdst}: {terr} — the companion's sidecar may read as stale\n")
+            }
+            log("  ship: {prel} (tune sidecar, the companion's copy)\n")
+            shipped |> push(prel)
+        }
     }
     if (runtime_copies == 0) {
         to_log(LOG_ERROR, "release: no daslang runtime libs matched `{runtime_glob}` under `{runtime_lib_dir}`; bundle would not load on a relocated machine\n")
@@ -2500,6 +2820,10 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
         let rc4 = ship_external_files(bundle_name, bundle_dir, spec.external_files, shipped)
         if (rc4 != 0) return rc4
     }
+    if (!empty(spec.tools)) {
+        let rc5 = ship_tools(bundle_name, bundle_dir, spec.tools, shipped, get_das_root())
+        if (rc5 != 0) return rc5
+    }
 
     // 5. macOS .app: write Contents/Info.plist. Bundle ID source priority:
     //    explicit release_bundle_id() > derived com.<sanitized-author>.<sanitized-name>
@@ -2513,11 +2837,12 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
             bundle_id = "com.{sanitize_bundle_id_part(author_raw)}.{sanitize_bundle_id_part(bundle_name)}"
         }
         let plist_path = path_join(app_root, "Contents/Info.plist")
-        if (!fwrite(plist_path, build_info_plist(bundle_name, bundle_name, bundle_id))) {
+        let launcher = empty(spec.launcher) ? bundle_name : spec.launcher
+        if (!fwrite(plist_path, build_info_plist(bundle_name, launcher, bundle_id, !empty(spec.launcher)))) {
             to_log(LOG_ERROR, "release: cannot write {plist_path}\n")
             return 1
         }
-        log("  wrote: Contents/Info.plist (CFBundleIdentifier={bundle_id})\n")
+        log("  wrote: Contents/Info.plist (CFBundleIdentifier={bundle_id}, CFBundleExecutable={launcher})\n")
     }
     // every release writes the ownership manifest — the .app too: the wipe path does not
     // consult it, but tooling and the migration semantics read one record everywhere
@@ -2665,10 +2990,16 @@ def private ensure_external_wasm_archives(pkg_dir, wasm_lib_dir : string; var bu
 // Build one app: cross-compile → discover modules → emcc-link → stage assets.
 def private release_one_wasm_app(root, out_dir, app_name, main_script : string; // nolint:STYLE037,STYLE038 — flat per-app wasm release steps + their error arms
                                  wasm_lib_dir, runtime_archive, shell_path : string;
-                                 include_globs, exclude_globs : array<string>) : int {
+                                 include_globs, exclude_globs, disabled_modules, app_emcc_args : array<string>) : int {
     if (!is_safe_pkg_name(app_name)) {
-        to_log(LOG_ERROR, "release wasm: unsafe app name `{app_name}` (no path separators / `.` / `..`)\n")
+        to_log(LOG_ERROR, "release wasm: unsafe app name `{app_name}` (letters, digits, `_`, `-` and `.` only; not `.` or `..`)\n")
         return 1
+    }
+    for (m in disabled_modules) {   // a .das_package string that reaches the cross-compile command line
+        if (!is_safe_pkg_name(m)) {
+            to_log(LOG_ERROR, "release wasm: unsafe module name `{m}` in release_wasm_disable_module (letters, digits, `_`, `-` and `.` only; not `.` or `..`)\n")
+            return 1
+        }
     }
     let main_path = path_join(root, main_script)
     if (!fexist(main_path)) {
@@ -2700,7 +3031,13 @@ def private release_one_wasm_app(root, out_dir, app_name, main_script : string; 
     //    cross-compile scans the script's folder and misses the package's modules/<dep>.
     // --jit-threads: emit +atomics,+bulk-memory so the object's ABI matches the -pthread runtime
     // archive (the wasm build is threaded — see cmd_build_wasm). The link below adds -pthread.
-    let xc_cmd = "\"{daslang}\" -exe -output \"{obj_path}\" --list-shared-modules \"{deps_file}\" -project-root \"{root}\" --disable-module dashv \"{main_path}\" -- --jit-target=wasm64-unknown-emscripten --jit-emit-object --jit-threads --jit-runtime-lib=\"{runtime_archive}\""
+    let disable_args = build_string() $(w) {
+        write(w, "--disable-module dashv")
+        for (m in disabled_modules) {
+            write(w, " --disable-module {m}")
+        }
+    }
+    let xc_cmd = "\"{daslang}\" -exe -output \"{obj_path}\" --list-shared-modules \"{deps_file}\" -project-root \"{root}\" {disable_args} \"{main_path}\" -- --jit-target=wasm64-unknown-emscripten --jit-emit-object --jit-threads --jit-runtime-lib=\"{runtime_archive}\""
     var xc_out : string
     let xc_rc = run_cmd(xc_cmd, xc_out)
     if (xc_rc != 0 || !fexist(obj_path)) {
@@ -2777,6 +3114,9 @@ def private release_one_wasm_app(root, out_dir, app_name, main_script : string; 
         }
     }
 
+    // the app's own release_emcc_arg() lines come last, after every module's: an app-level flag wins
+    emcc_args |> push_from(app_emcc_args)
+
     // 4. emcc link → <app>.{html,js,wasm}. run_cmd handles the Windows
     //    cmd.exe outer-quote wrapping, so quoted paths survive on every host.
     let html_out = path_join(app_out_dir, "{app_name}.html")
@@ -2800,7 +3140,9 @@ def private release_one_wasm_app(root, out_dir, app_name, main_script : string; 
         // context/jobque mutexes). __wrap_emscripten_futex_wait (src/hal/wasm_thread_malloc.cpp)
         // busy-polls on the worklet instead, delegating all other threads to the real impl. No
         // emscripten fork needed — the wrap + shim live in libDaScript_runtime.a (like the malloc lock).
-        w |> write(" -sMEMORY64=1 -sFULL_ES3 -sMAX_WEBGL_VERSION=2 -sGL_ENABLE_GET_PROC_ADDRESS=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -sEXIT_RUNTIME=0 -sFORCE_FILESYSTEM=1 -pthread -sPTHREAD_POOL_SIZE=16 -sAUDIO_WORKLET=1 -sWASM_WORKERS=1 -Wl,--wrap=emscripten_futex_wait")
+        // EXPORTED_RUNTIME_METHODS=FS,ENV: a custom shell stages files into MEMFS and sets the
+        // program's environment knobs in Module.preRun (the C environment is built from Module.ENV at startup).
+        w |> write(" -sMEMORY64=1 -sFULL_ES3 -sMAX_WEBGL_VERSION=2 -sGL_ENABLE_GET_PROC_ADDRESS=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -sEXIT_RUNTIME=0 -sFORCE_FILESYSTEM=1 -sEXPORTED_RUNTIME_METHODS=FS,ENV -pthread -sPTHREAD_POOL_SIZE=16 -sAUDIO_WORKLET=1 -sWASM_WORKERS=1 -Wl,--wrap=emscripten_futex_wait")
         for (a in emcc_args) {
             w |> write(" {a}")
         }
@@ -2892,5 +3234,5 @@ def cmd_release_wasm(root : string; out_dir : string; wasm_lib_dir_override : st
     }
 
     mkdir_rec(out_dir)
-    return release_one_wasm_app(root, out_dir, bundle_name, main_script, wasm_lib_dir, runtime_archive, shell_path, spec.include_globs, spec.exclude_globs)
+    return release_one_wasm_app(root, out_dir, bundle_name, main_script, wasm_lib_dir, runtime_archive, shell_path, spec.include_globs, spec.exclude_globs, spec.wasm_disabled_modules, spec.emcc_args)
 }

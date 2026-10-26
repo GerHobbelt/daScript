@@ -1240,7 +1240,7 @@ namespace das {
                 auto ginfo = yyextra->g_Access->getModuleInfo(*guard, yyextra->g_FileAccessStack.back()->name);
                 guardAvailable = !ginfo.fileName.empty() && yyextra->g_Access->getFileInfo(ginfo.fileName) != nullptr;
             } else {
-                guardAvailable = Module::requireEx(*guard, false) != nullptr;
+                guardAvailable = guardModuleAvailable(*guard);
             }
             delete guard;
             if ( !guardAvailable ) {

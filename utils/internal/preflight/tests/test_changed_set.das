@@ -30,6 +30,16 @@ def test_reach_hit(t : T?) {
     t |> success(!reach_hit(none, imgui), "an empty diff misses every reach set")
 }
 
+[test]
+def test_review_md_tests_reach(t : T?) {
+    t |> success(review_md_tests_reach(["utils/REVIEW.das"]), "a gate under utils/ reaches the suites")
+    t |> success(review_md_tests_reach(["modules/dasLLAMA/REVIEW.das", "plans/x.md"]), "a module's gate reaches them")
+    t |> success(review_md_tests_reach(["utils/internal/review-md/gate.das"]), "the walkers reach them")
+    t |> success(review_md_tests_reach(["dastest/review_gate.das"]), "the gate library reaches them")
+    t |> success(!review_md_tests_reach(["utils/watchdog/REVIEW.md", "utils/watchdog/watchdog.das"]), "a checklist or a tool edit misses them")
+    t |> success(!review_md_tests_reach(["modules/dasLLAMA/dasllama/PREVIEW.das"]), "a name that merely ends in the letters misses them")
+}
+
 // The compile sweep's root filter: program roots under the swept trees, never tests, generated files,
 // fixtures, or a module tree nested inside an example through a junction.
 [test]
@@ -120,4 +130,14 @@ def test_failed_files_block(t : T?) {
     let rows <- [for (i in range(7)); "  tests/t{i}.das — 1 failed"]
     let many = "FAILURES:\n" + join(rows, "\n") + "\n"
     t |> equal(failed_files_block(many), "tests/t0.das, tests/t1.das, tests/t2.das, tests/t3.das, tests/t4.das, and 2 more", "five named, the rest counted")
+}
+
+// CI's changed-set lint reads .das and .md in one command; the local gate must not read less
+[test]
+def test_lint_inputs(t : T?) {
+    t |> success(is_lint_input("daslib/lint.das"), "a .das file is a lint input")
+    t |> success(is_lint_input("modules/dasLLVM/ARCHITECTURE.md"), "a .md file is a lint input - LINT027's line gate reads it")
+    t |> success(!is_lint_input("doc/source/index.rst"), "an .rst is not")
+    t |> success(!is_lint_input("src/ast/ast.cpp"), "a .cpp is not")
+    t |> success(!is_lint_input("utils/internal/preflight/ci_only_das.txt"), "a .txt is not")
 }

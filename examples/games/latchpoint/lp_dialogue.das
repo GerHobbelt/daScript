@@ -88,8 +88,8 @@ def native_new_game() {
     delete world
     world = WorldState()
     delete histories
-    if (!runtime_save()) { runtime_load(before); reply_text = "Could not save the new game."; return }
-    reset_avatar()
+    if (!runtime_save(true)) { runtime_load(before); reply_text = "Could not save the new game."; return }
+    reset_avatar(path_join(dir_name(save_path), "scene-pose.json"))
     workshop_aperture = 0.0
     archive_aperture = 0.0
     starter_progress = 0.0
@@ -104,8 +104,9 @@ def native_new_game() {
 }
 
 def submit_interaction(kind, text : string; resident : int = -1) {
-    return if (!empty(pending_job) || !save_valid)
+    return if (!empty(pending_job))
     if (kind == "new_game") { native_new_game(); return }
+    return if (!save_valid)
     if (kind == "physical") {
         if (physical_at_avatar() != text) { reply_text = "Move closer to the component."; return }
         let before = runtime_snapshot()
@@ -187,6 +188,7 @@ def poll_dialogue() {
         }
         bridge_online = true
         if (conversation_stage == "asr") {
+            if (empty(strip(response.text))) { fail_native_reply("No speech recognized. Check the microphone input, or press E to type."); return }
             input_text = clone_string(response.text)
             editing = true
             pending_job = ""

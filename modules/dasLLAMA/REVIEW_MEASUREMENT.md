@@ -3,9 +3,12 @@
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
 doc: `ARCHITECTURE_MEASUREMENT.md`. Planned work: `PERF_LEDGER.md`.
 
-Figure rules here bind the surfaces this module owns - its code comments, the PR body of a diff
-under it, and a checked-in doc under this module. A number on a served page answers to
-`site/REVIEW.md` or `site-dasllama/REVIEW.md` (repo root) instead.
+Figure rules here bind every surface the diff under review writes a figure on - this module's
+code comments and checked-in docs, checked-in data whose contents a run produced (a captured
+response fixture, a record), the PR body, and any file another checklist routed to this one. A
+number on a page under `site/` or `site-dasllama/` (repo root) answers to that folder's
+checklist instead, and a number on a page a tool under `utils/` (repo root) ships answers to
+that tool's folder checklist.
 
 **A `PERF_LEDGER.md` entry never states a tok/s figure or a turn wall that the `-jit` script
 produced - a `-jit` A/B pair enters as its ratio, with the arms' absolute rates left in the
@@ -46,12 +49,14 @@ that picks a winner between candidate kernel forms.** That timing settles its ad
 decision in the report of the run that took it and in the PR that lands the kernel. The
 winner enters the ledger only through a re-measured board cell.
 
-**A diff that makes the engine serve tokens by a route no board cell exercises mints that cell
-in the same change.** A route is what a request takes end to end: a weight format, a modality,
-a family, a backend, a serving lane (q8 or f32), a GPU tower (a GPU-run vision or audio
-encoder), a sampler class (greedy, sampled) through the speculative round (a decode step that
-drafts several tokens and verifies them in one pass), or the path a run with no flags and no
-environment overrides takes.
+**A diff that makes the engine run end to end - serving a client, or measuring - by a route no
+board cell exercises mints that cell in the same change; a route the board cannot carry names,
+in the same change, the artifact that stands in for the cell - the record or gate output that
+proves the route ran end to end.** A route is anything that changes which code runs a whole
+prefill-plus-decode pass end to end - the format, modality, family, backend, serving lane, GPU tower, sampler class, compile tier,
+cross target, or the path a run with no flags and no environment overrides takes. The fat
+exe's stand-in is `tune_gate`'s fat-world report (`performance/profile_common.das`) plus the
+`sanity:` lines of its `lcpp_bench` run.
 
 **A diff that claims to make an already-served path faster, from an author whose box mints
 that path, re-mints a board row (`performance/records/<box>.json`) that exercises that path, in
@@ -61,25 +66,33 @@ skipping it. Where no row exercises the path, the diff mints one. The board is t
 public memory of what serving costs; a kernel win that never lands there is invisible to the
 next regression check.
 
-**A timing figure this module writes down as a measurement rather than as a prediction -
-tok/s, latency, a whole-turn model or engine comparison, and the 512-token prefill (pp512)
-and 128-token decode (tg128) rates - carries either a board cell behind it or a provenance
+**A timing figure of a served turn as a whole - tok/s, latency, a whole-turn model or engine
+comparison, the 512-token prefill (pp512) and 128-token decode (tg128) rates - that this module
+writes down as a measurement is a defect without either a board cell behind it or a provenance
 line, covering its passage or its section, naming harness, flags, box, and the exe or script
 that ran it.** The board cell states its quant mode and stamps box and engine provenance, so a
-number can never silently describe a format nobody serves or a kernel set nobody ships.
+number can never silently describe a format nobody serves or a kernel set nobody ships. A
+figure labeled as a prediction is not a reading, and this rule does not reach it.
 
-**A timing figure PRESENTED AS A MEASUREMENT of a served turn as a whole - tok/s, latency, a
-whole-turn model or engine comparison - is a defect wherever this module writes it down with
-neither a board cell behind it nor a provenance line, covering its passage or its section,
-naming harness, flags, box, and the exe or script that ran it.** The board cell states its
-quant mode and stamps box and engine provenance, so a number can never silently describe a
-format nobody serves or a kernel set nobody ships. A figure labeled as a prediction is not a
-reading, and this rule does not reach it.
-
-**A measured figure that is not a whole served-turn reading - a stage wall or share, a
-kernel-form delta, an acceptance rate, a tokens-per-round count, a gate knee (the input size at
-which a gate flips) - names the harness and flags that produced it.** A figure a committed
-board cell or ruler record produced names the record and row instead of the harness and flags. The naming
-sits in the figure's own sentence, in a table heading that covers the table's rows, in a
+**A number this module writes down that is not a whole served-turn reading - any figure a run
+or a build produced, timing or not - names the harness, the flags and the box that produced
+it.** A figure a committed board cell or ruler record produced names the record and row
+instead. The naming sits in the figure's own sentence, in a table heading that covers the table's rows, in a
 section-level provenance line that covers the paragraphs under it, or in a citation of the
 `PERF_LEDGER.md` entry whose provenance line covers it.
+
+**A diff that adds a race to a shipped exe's startup races on synthetic inputs only - never
+loading a model, never spawning a child process - and never races a `[tune]` kernel family, a
+race whose winner needs a recompiled clone; a GPU pso twin race, which only sets a runtime
+knob, is what a first start may do** (`ARCHITECTURE_MEASUREMENT.md` sec.2.42a). A shipped exe
+carries no vehicle model and no harness script, so a model or a child there is a hang or a
+silent skip, and a `[tune]` winner there would name a clone the baked exe does not carry.
+
+**A diff never adds a confirm - an end-to-end A/B served on a vehicle model in a spawned
+child - outside `harness/`.**
+
+**A diff that pins the kernel backend - `pin_kernel_backend`, `select_kernel_backend`, or
+`DASLLAMA_PIN_BACKEND` - pins it before the load it governs, and on a name the box has not
+registered refuses or skips rather than running on the default.** The loader repacks weights
+into the pinned backend's layout, so a pin set after the load never reaches them, and a
+misspelled pin that falls through measures the default backend under the pinned one's name.

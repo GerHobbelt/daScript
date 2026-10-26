@@ -1,7 +1,8 @@
 # dasLLVM Code Review Checklist
 
-**Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture doc:
-`ARCHITECTURE.md`. Planned work: `DEBUGGING.md` (sec. Roadmap).
+**Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture docs:
+`ARCHITECTURE.md`, `ARCHITECTURE_TARGET_FEATURES.md`. Planned work: `DEBUGGING.md` (sec. Roadmap),
+`fat_mode_plan.md`.
 
 - **A change under `modules/dasLLVM/` runs the module-owned suite** (command and build gate:
   `tests/README.md` here). The suite is outside the core `tests/` sweep, so no other lane
@@ -12,8 +13,17 @@
   takes the new branch.**
 
 - **A test under `tests/` (beside this file) never creates, overwrites, or deletes a
-  git-tracked path - it copies the fixture into a temp directory it makes and writes to the
-  copy.**
+  git-tracked path.**
+
+- **A test under `tests/` here that writes at all - through its own filesystem calls, not a
+  child process's - writes only under a directory it created for this process, and removes
+  it** - a shared path under `build/` is one two concurrent runs collide on.
+
+- **A test under `tests/` here that spawns a daslang child keeps the child's artifacts inside
+  the directory it created for this process: `-output <dir>/...` for a `-exe` build,
+  `-no-module-cache` or `-module-cache <dir>/...` for a run that compiles through the front-end
+  cache, and `-jit-no-cache` or a pinned `jit_output_path` for a `-jit` run.** A child writes
+  its caches relative to the cwd otherwise, which is the tree two concurrent runs share.
 
 - **A diff that adds or changes a branch on the target triple records in its PR body the
   cross-compile (`write_exe`) for that target that exercised the behavior.** The suite runs on
@@ -25,11 +35,11 @@
   it, while that phase's line still prints** (phase inventory: `ARCHITECTURE.md` sec.1).
   Option resolution before the first timer, and log lines, are not work.
 
-- **A change that can alter the machine code emitted for identical inputs bumps
-  `LLVM_JIT_CODEGEN_VERSION`** (`daslib/llvm_jit_run.das`; what counts as emitting:
-  `ARCHITECTURE.md` sec.1.2). Selecting among existing generators' `[llvm_code]` arguments -
-  the `[tune]` stamping - is not such a change: stamped arguments fold into the cache keys
-  per function.
+- **A change that can alter the machine code the JIT's DLL or split-obj cache serves back for
+  identical inputs bumps `LLVM_JIT_CODEGEN_VERSION`** (`daslib/llvm_jit_run.das`; what counts
+  as emitting: `ARCHITECTURE.md` sec.1.2). The constant folds only into those two keys;
+  selecting among existing generators' `[llvm_code]` arguments - the `[tune]` stamping - is not
+  such a change, because stamped arguments fold into the cache keys per function.
 
 - **A diff that adds an environment or config input to a JIT cache key folds it inside
   `jit_env_salt` (`daslib/llvm_jit_run.das`), never directly into either JIT key - the DLL
@@ -47,14 +57,16 @@
 - **A change to the tune framework - `daslib/llvm_tune.das` or its tests - is reviewed with
   `skills/internal/llvm_tune_internals.md`.**
 
-- **A test under `tests/` here that asserts output a macro produced during compilation - an
-  `llvm_tune:` line the `[tune]` or `[tune_scope]` apply prints, a `[tune]`-family compile
-  error - or asserts its absence, spawns its child daslang process with `-no-module-cache`; a
-  test whose subject is the cache itself pins its own file with `-module-cache <temp>` instead
-  and never takes the flag.** The front-end module cache is on by default and replays the
-  cached AST without re-running the macro, so a positive assertion lands on the first run and
-  never again, and a silence assertion passes vacuously. A line the runtime guard prints - the
-  covered-box announce, `re-tuning (--tune)` - is not macro output and needs no flag.
+- **A test under `tests/` here whose child compiles through the front-end module cache - any
+  child but a `-exe`, `-compile-only`, `-documentation`, debugger or AOT run - and asserts a
+  line a macro prints at compile time, or its absence, spawns that child with
+  `-no-module-cache`; a test whose subject is the cache itself pins its own file with
+  `-module-cache <temp>` instead and never takes the flag.** The default cache replays the
+  cached AST without re-running a macro, so a macro-time line - the `llvm_tune:` apply lines, a
+  `[tune]`-family compile error - lands on the first run and never again and a silence
+  assertion passes vacuously, while a line the backend or the runtime guard prints past the
+  cache - the `LLVM JIT:` announce, the covered-box announce, `re-tuning (--tune)` - is
+  re-produced every run and needs no flag.
 
 - **A diff that adds a top-level section to the tune sidecar (`<app>.tune.json`, written by
   `daslib/llvm_tune.das`) updates `modules/dasLLAMA/dasllama/dasllama_exchange_schema.das` in
@@ -89,9 +101,10 @@
   `ConstantExpr`, and the setter's cast writes through the wrong type into it
   (`ARCHITECTURE.md#gep-constant-fold`).
 
-- **A feature name used in a `requires=` list or a `g_target_x64_*` gate has its cpuid line in
-  `das_cpu_supports` (`src/builtin/module_builtin_runtime.cpp`, repo root) in the same diff**
-  (`ARCHITECTURE.md#x64-tier-gates`). A name the cpuid table does not know answers false on
+- **A feature name used in a `requires=` list or a `g_target_*` tier gate
+  (`daslib/llvm_jit_common.das`) has its cpuid line in `das_cpu_supports`
+  (`src/builtin/module_builtin_runtime.cpp`, repo root) in the same diff**
+  (`ARCHITECTURE_TARGET_FEATURES.md#x64-tier-gates`). A name the cpuid table does not know answers false on
   every box, so every perm that requires it silently declines to its fallback and no error names
   the cause.
 
@@ -101,13 +114,22 @@
   sign-alternating chain moves the last few bits of the result, and the interpreter and AOT
   answers do not move with it.
 
-- **A diff that adds or changes a `build_vector_*` emitter also adds two cells to
-  `tests/llvm_vector_math.das` (beside this file): one comparing the emitted result lane for
-  lane with the interpreted result, at every vector width the emitter serves, and one asserting
-  both answer NaN in the same lanes.** A clamp or a conversion written with ordered compares
-  turns a NaN lane into a number, and an accuracy bound reads that as success.
+- **A diff that adds or changes an intrinsic emitter whose daslang body is the reference
+  implementation - a `build_vector_*` emitter, an `idot` lowering - also adds a cell comparing
+  the emitted result with the interpreted result over the operand range the emitter serves
+  (every vector width for `build_vector_*`, the full int8 lattice for a dot), and for a float
+  emitter one asserting both answer NaN in the same lanes; a lowering only a cross target runs
+  states in the PR body the artifact that compared them.** A clamp or a conversion written with
+  ordered compares turns a NaN lane into a number, and an accuracy bound reads that as success;
+  an IR-shape test names the instruction and never a number.
 
-- **Weakening `REVIEW.das` (beside this file) is a defect:** dropping a check, dropping a
-  directory from its tracked-fixture list or removing the last tracked file under one (a guard
-  over nothing), or a finding text that no longer names what failed. What the gate enforces is
-  read from the gate itself.
+- **A change that makes `REVIEW.das` (beside this file) report fewer inputs is a defect:**
+  dropping a check, shrinking a scanned set or a tracked-fixture directory (a guard over nothing),
+  widening an exemption list without naming the exempted input's reason beside it, or a finding
+  text that no longer names what failed. What the gate enforces is read from the gate itself.
+
+- **A diff that builds an x64 or aarch64 machine's feature string appends the forced ones
+  (`x64_forced_plus_features` / `arm64_forced_plus_features`, `daslib/llvm_jit_common.das`) AFTER
+  the detected host features.** LLVM's `SubtargetFeatures` takes the last occurrence of a name, so
+  a forced feature placed first is silently overridden by detection. A wasm machine has no force
+  knob and no detected features, so the rule does not reach it.

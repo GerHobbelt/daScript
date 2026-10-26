@@ -246,6 +246,8 @@ Apple Accelerate / AMX float lane. `DASLLAMA_ACCEL` arms the whole group.
 | `DASLLAMA_TEST_FAMILY` | text | unset | Comma-separated filter restricting which model families run. |
 | `DASLLAMA_LLAMA2C_DIR` | path | unset | Directory of llama2.c reference checkpoints for the forward/decode parity tests. |
 | `DASLLAMA_WHISPER_DIR` | path | unset | Directory of whisper models for the audio tests. |
+| `DISPLAY` | text | unset | Ambient platform variable; read only by the storyteller restart test to tell whether a Linux box has a window server for the example's window. |
+| `WAYLAND_DISPLAY` | text | unset | Ambient platform variable (the Wayland twin of DISPLAY); read only by the storyteller restart test. |
 | `DASLLAMA_CORPUS_DIR` | path | unset | Directory of audio corpus files for the transcription tests. |
 | `TMPDIR` | path | /tmp | Scratch directory for test artifacts; set by the OS on macOS. |
 | `TEMP` | path | unset | Windows scratch-directory fallback when TMPDIR is unset (the test runner's log dir). |
@@ -263,7 +265,7 @@ Overrides for the dasllama.io exchange client.
 | Variable | Type | Default | Effect |
 |---|---|---|---|
 | `DASLLAMA_EXCHANGE_URL` | text | unset | Sidecar exchange base URL override (tests, mirrors); unset = the baked-in dasllama.io. Setting it is an expressed choice to use the exchange - the first-contact consent question is skipped (announced at boot). |
-| `DASLLAMA_EXCHANGE_ACCEPT` | text | unset | One-shot exchange accept-policy override: verified | any | off; unset = the app config's exchange_accept. The watchdog arms 'any' on a relaunch when the user adopts an unverified sidecar over finishing a tune. Setting it is an expressed choice to use the exchange - the first-contact consent question is skipped (announced at boot). |
+| `DASLLAMA_EXCHANGE_ACCEPT` | text | unset | One-shot exchange accept-policy override: verified | any | off; unset = the app config's exchange_accept. A host may arm 'any' for one relaunch to adopt an unverified sidecar over finishing a tune. Setting it is an expressed choice to use the exchange - the first-contact consent question is skipped (announced at boot). |
 
 ## daslang core knobs dasLLAMA honours
 

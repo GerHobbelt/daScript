@@ -28,6 +28,7 @@ The `--root` flag sets the project root directory (default: current directory). 
 | `cleanup` | `cleanup [--force] [--global]` | Remove `modules/` and `daspkg.lock` to reset a project |
 | `doctor` | `doctor` | Check environment (git, cmake, gh) |
 | `release` | `release [--out <dir>]` | Bundle project as a redistributable standalone (exe + shared modules + assets) |
+| `release --fat` | `release --fat <class> [--out <dir>]` | The same bundle as a fat exe: plain code for the CPU class, one clone per profiled class of every `[tune]` kernel, no mint, no sidecar - see "A fat release" below |
 | `release wasm` | `release wasm --root <dir> [--out <dir>] [--wasm-lib-dir <dir>]` | Cross-compile the project to a standalone wasm64 web app (`<name>.{html,js,wasm}`) - see WebAssembly section |
 | `introduce` | `introduce` | Register package in the public index (creates PR on daspkg-index) |
 | `withdraw` | `withdraw` | Remove package from the public index |
@@ -46,6 +47,7 @@ The `--root` flag sets the project root directory (default: current directory). 
 | `--root <path>` | Project root directory (default: current directory) |
 | `--force` | Force reinstall (overrides duplicate/version checks) |
 | `--global`, `-g` | Operate on global modules in `{das_root}/modules/` (see below) |
+| `--fat <class>` | `release` only: build a fat exe for the CPU class (`x86-avx2`, `arm-neon`, ...) - no mint, no sidecar; a kernel with no profile for its baseline clone refuses |
 | `--color` | Enable colored output |
 | `--no-color` | Disable colored output (useful for capturing output) |
 | `--verbose`, `-v` | Print detailed progress |
@@ -180,9 +182,11 @@ def initialize(project_path : string) {
 - Every `.shared_module` dylib the program transitively requires, at the path the exe expects (`modules/<X>/<X>.shared_module`).
 - Every asset matching the project's `release_include` globs.
 
-The recipient can run the bundled exe **without daslang installed**. PR #1 (exe-relative shared modules, merged 2026-05-05) is the prerequisite - the runtime resolves dylibs against the exe's own directory first.
+The recipient can run the bundled exe **without daslang installed** - the runtime resolves dylibs against the exe's own directory first.
 
 **Build-time tuning (the `[tune]` framework):** the `-exe` build's deps JSON reports every `[tune_scope]` with per-key completeness against the app tune sidecar; `cmd_release` always mints: it runs the tuners (`DAS_TUNE_MODE=tune`, `DAS_TUNE_MANIFEST=<sidecar>`), REBUILDS so the exe bakes the measured winners, and ships the sidecar beside the exe as `<bundle>.tune.json` (touched newer than the exe - a sidecar older than the binary reads as stale). `--quick` is the only inheriting mode, and only from a complete, fresh sidecar; a tuner refusal (noise gate / validation) fails the release rather than shipping fallbacks. The exe self-reports its baked stamps via `tune_status()`. See `skills/tune.md`.
+
+**A fat release (`--fat <class>`):** the exe is built under `DAS_JIT_BASELINE=<class>` and `DAS_TUNE_MODE=fat` - its plain code targets the class, every `[tune]` kernel carries one clone per class the library ships a profile for, at or above the baseline, and the exe picks the clone from cpuid at startup. Nothing mints and no sidecar ships: the deps JSON's `fat_unprofiled` list names any kernel whose baseline clone came from no profile, and one such kernel refuses the release. A library that registers a first-start hook (dasLLAMA's `set_runtime_race_hook`) races its runtime section - the Metal twin crowns among the knobs - at the exe's first start on the box it runs on and keeps it beside the exe; a library without one runs the knob defaults. `skills/tune.md`, *The fat exe*.
 
 ### `release()` hook in `.das_package`
 
@@ -195,8 +199,11 @@ def release() {
     release_name("MyApp")               // optional; defaults to package_name() / root dir
     release_include("data/**")          // ship matching files (glob; multiple calls accumulate)
     release_include("*.png")
-    release_include_from("utils/watchdog/watchdog.py")        // a file OUTSIDE the package
-    release_include_from("utils/watchdog/watchdog.py", "tools/wd.py")  // ... with an explicit dest
+    release_include_from("dastest/dastest.das")        // a file OUTSIDE the package
+    release_include_from("dastest/dastest.das", "tools/dastest.das")  // ... with an explicit dest
+    release_include_tool("watchdog")    // a built tool from the build's bin/, .exe added per platform
+    release_launcher("watchdog")        // macOS: the .app opens this shipped tool, not the exe (a supervisor)
+    release_program("my-bench", "tools/bench.das")   // a companion exe baked beside the main one under the same class, sharing the bundle's runtime libraries and modules
     release_exclude("data/secret/**")
     release_shared_module("dasSQLITE")  // force-include a dylib not auto-detected
     release_include_symbols()           // ship debug symbols into <bundle>/symbols/
@@ -231,13 +238,18 @@ If a module is loaded only at runtime (e.g. data files read while the .das is ne
 
 The bundle is the host platform only. Cross-compilation is deferred until daslang itself supports it; v1 has no platform-tag suffix or auto-archive (`--zip` etc.). Recipients can tar/zip the directory themselves.
 
-### Shipping a file from outside the package - `release_include_from()`
+### Shipping files from outside the package - `release_include_from()` / `release_include_tool()`
 
 `release_include` globs **downward from the package root**, so it cannot reach shared tooling that
 lives elsewhere in the tree. `release_include_from(source[, dest])` resolves `source` against
 `<das_root>` and copies it to `dest` (relative to the bundle root; defaults to `source`'s file
-name, and may name a subdirectory). This is how `utils/dasllama-server` (and the
-dictation bot in the das-telegram package) ships the one supervisor in `utils/watchdog/`.
+name, and may name a subdirectory).
+
+A built tool has a platform-dependent name and location - `bin/watchdog`, or the per-config
+subdirectory and `.exe` on an MSVC tree - so `release_include_tool("watchdog")` names it once:
+daspkg resolves the exe and copies it to the bundle root. This is how
+`utils/dasllama-server` (and the dictation bot in the das-telegram package) ships the one
+supervisor, `utils/watchdog/`'s static executable.
 
 A missing source **fails the release** with exit 1 rather than shipping a bundle quietly short a
 file - a `release_include` whose target has moved away silently ships nothing, which is the failure
@@ -338,13 +350,14 @@ def release() {
 
 `release_wasm_main` exists because the desktop entry often `require`s host-only stacks (live-reload, libhv HTTP, threaded jobque) that don't cross-compile. The web variant swaps those for a `live_stub` shim (plain GLFW window + frame clock + no-op `[live_command]`) and guards music off (threaded strudel needs the jobque worker; SFX is single-threaded and stays on). One `.das_package` drives both targets.
 
-**Module-side hooks** (in a module's own `.das_package`, accumulated across all linked modules):
+**Module-side hooks** (in a module's own `.das_package`, accumulated across all linked modules; an app's own `.das_package` may call `release_emcc_arg` too - its flags come last on the link line, so they win):
 
 | Hook | Effect |
 |---|---|
 | `release_emcc_arg("-sUSE_GLFW=3")` | Append an emcc link flag (dasGlfw declares this) |
 | `release_embed_file(src, dst)` | `--embed-file src@dst` into MEMFS (dasStbImage embeds its HUD font) |
-| `release_web_shell("path.html")` | Override the default canvas shell (`web/templates/wasm_canvas_shell.html`) |
+| `release_web_shell("path.html")` | Override the default canvas shell (`web/templates/wasm_canvas_shell.html`). The link exports `FS` and `ENV`, so a shell's `Module.preRun` can stage files into MEMFS (`Module.FS.writeFile`) and set environment knobs (`Module.ENV.X = ...` - the C environment is built from it at startup, later writes never reach `getenv`); hold the run with `addRunDependency` while fetching |
+| `release_wasm_disable_module("dasvulkan")` | Keep a host module out of the cross-compile so its guarded `require ?name` resolves as absent, as the wasm build sees it (the rail disables dashv itself; an app reaching vulkan, das_metal or das_accelerate names those) |
 
 ### Game source contract (cross-compiles UNCHANGED)
 

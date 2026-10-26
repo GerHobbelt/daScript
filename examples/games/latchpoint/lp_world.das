@@ -72,19 +72,36 @@ def actuator_available() : bool {
     return find_index(world.salvaged, "actuator") < 0
 }
 
-def reset_avatar() {
+def reset_avatar(pose_path : string = "") {
     avatar = float3(0.0, -9.0, 1.65)
     heading = 0.0
     pitch = -0.06
     patch_position = float3(-3.2, 0.2, 0.0)
     patch_heading = 0.0
-    save_avatar()
+    let destination = empty(pose_path) ? avatar_save_path() : pose_path
+    if (!save_avatar_to(destination)) { to_log(LOG_WARNING, "Could not save Latchpoint avatar position.") }
+}
+
+def avatar_save_allowed(menu_is_open : bool) : bool {
+    return !menu_is_open
+}
+
+def avatar_save_path() : string {
+    return path_join(get_das_root(), "examples/games/latchpoint/saves/scene-pose.json")
+}
+
+def save_avatar_to(path : string) : bool {
+    let pose = SavedPose(player = avatar, patch = patch_position, yaw = heading, tilt = pitch, patch_yaw = patch_heading)
+    return fwrite(path, sprint_json(pose, false))
+}
+
+def save_avatar_on_shutdown(menu_is_open : bool; path : string) : bool {
+    return false if (!avatar_save_allowed(menu_is_open))
+    return save_avatar_to(path)
 }
 
 def save_avatar() {
-    let pose = SavedPose(player = avatar, patch = patch_position, yaw = heading, tilt = pitch, patch_yaw = patch_heading)
-    let path = path_join(get_das_root(), "examples/games/latchpoint/saves/scene-pose.json")
-    if (!fwrite(path, sprint_json(pose, false))) { to_log(LOG_WARNING, "Could not save Latchpoint avatar position.") }
+    if (!save_avatar_to(avatar_save_path())) { to_log(LOG_WARNING, "Could not save Latchpoint avatar position.") }
 }
 
 def apply_saved_pose(pose : SavedPose) : bool {
@@ -100,7 +117,7 @@ def apply_saved_pose(pose : SavedPose) : bool {
 }
 
 def load_avatar() {
-    let path = path_join(get_das_root(), "examples/games/latchpoint/saves/scene-pose.json")
+    let path = avatar_save_path()
     return if (!fexist(path))
     var pose = SavedPose(version = 0)
     if (sscan_json(fread(path), pose)) { apply_saved_pose(pose) }

@@ -131,11 +131,15 @@ struct ReleaseSpec {
     emcc_args : array<string>           //!< extra emcc flags this module contributes to a `daspkg release wasm` link (e.g. "-sUSE_GLFW=3"); gathered from every referenced module
     embed_paths : array<string>         //!< "src@dst" embed pairs this module needs in the wasm MEMFS (e.g. a HUD font); gathered from every referenced module
     web_shell : string                  //!< optional emcc `--shell-file` HTML for `release wasm`; empty = daslang's minimal canvas shell
+    wasm_disabled_modules : array<string> //!< host module folders (`dasvulkan`) kept unloaded on the `release wasm` cross-compile, so a guarded `require ?name` resolves as absent there
     wasm_build_command : string         //!< shell command that builds this EXTERNAL module's wasm archives (run with cwd = module dir); empty = in-tree module built by `daspkg build --wasm`
     wasm_archives : array<string>       //!< archives required by wasm link; build outputs are module-relative, SDK archives may be named from the staged wasm lib dir
     requires_jit : bool                 //!< app is JIT-only (per-box [tune]/[llvm_code] kernels); a baked -exe would run broken, so `daspkg release` refuses it
     include_symbols : bool              //!< ship debug symbols for every shipped binary into `<bundle>/symbols/`
     external_files : array<string>      //!< "src@dst" pairs shipped from outside the package; src is relative to <das_root>, dst to the bundle root
+    tools : array<string>               //!< built tools shipped by bare name from <das_root>/bin/ (bin/Release/ in an MSVC tree) to the bundle root; the platform adds .exe
+    launcher : string                   //!< macOS .app: the shipped tool (one of `tools`) the .app opens in place of the exe - a supervisor that starts the exe itself
+    programs : array<string>            //!< "name@script" companions baked beside the main exe under the same class and mode, sharing the bundle's runtime libraries and modules
 }
 
 var _release_spec : ReleaseSpec
@@ -176,13 +180,28 @@ def release_include_if_missing(pattern : string) {
     _release_spec.include_if_missing_globs |> push(pattern)
 }
 
-//! Ship a file that lives OUTSIDE this package — `release_include` only globs downward from the package root, so shared tooling (e.g. `utils/watchdog/watchdog.py`) is unreachable to it. `source` is relative to `<das_root>`; `dest` is relative to the bundle root and defaults to `source`'s file name. Errors loudly if the source is missing, so a moved file fails the release instead of silently shipping nothing.
+//! Ship a file that lives OUTSIDE this package — `release_include` only globs downward from the package root, so shared tooling (e.g. `dastest/dastest.das`) is unreachable to it. `source` is relative to `<das_root>`; `dest` is relative to the bundle root and defaults to `source`'s file name. Errors loudly if the source is missing, so a moved file fails the release instead of silently shipping nothing.
 def release_include_from(source, dest : string) {
     _release_spec.external_files |> push("{source}@{dest}")
 }
 
 def release_include_from(source : string) {
     _release_spec.external_files |> push("{source}@")
+}
+
+//! Ship a tool the daslang build produced - `bin/<name>` (`bin/<name>.exe` on Windows, also looked for under `bin/Release/` in an MSVC tree) - to the bundle root, so a manifest names it once for every platform. A build without it fails the release rather than shipping a bundle short a tool. The supervisor is the worked example: `release_include_tool("watchdog")`.
+def release_include_tool(name : string) {
+    _release_spec.tools |> push(name)
+}
+
+//! Name the shipped tool a macOS `.app` opens in place of the exe - a supervisor that starts the exe itself, so a double click on the app supervises. The name must be one `release_include_tool` ships, or the release refuses before it builds. The flat Linux/Windows bundle is unaffected: the tool sits beside the exe either way.
+def release_launcher(tool : string) {
+    _release_spec.launcher = tool
+}
+
+//! Bake a companion program into the same bundle: `script` (relative to the package root; `..` may reach another tree) becomes `<name>.exe` beside the main exe (extensionless inside a macOS .app), built under the same CPU class and tune mode - after a mint, under the main program's manifest, with that sidecar shipped under the companion's name too - and sharing the runtime libraries and shared modules the bundle already carries: a companion costs one exe, nothing else. The shared modules it alone requires ship too; a tune scope only it declares refuses the release. `release wasm` ignores companions. The benchmark beside dasllama-server is the worked example: `release_program("dasllama-bench", "../../modules/dasLLAMA/benchmarks/lcpp_bench.das")`.
+def release_program(name, script : string) {
+    _release_spec.programs |> push("{name}@{script}")
 }
 
 def release_exclude(pattern : string) {
@@ -210,6 +229,13 @@ def release_emcc_arg(arg : string) {
 //! Declare a file a module needs embedded in the wasm MEMFS for `release wasm` (emcc `--embed-file src@dst`). `src` is relative to the module dir (this .das_package's location, like release_main / release_wasm_archive), so it resolves for an external module under <project>/modules/<dep> too; `dst` is the absolute MEMFS path the runtime opens at (e.g. dasStbImage embeds its HUD font at `/modules/dasStbImage/fonts/droidsansmono.ttf`).
 def release_embed_file(src, dst : string) {
     _release_spec.embed_paths |> push("{src}@{dst}")
+}
+
+//! Keep a host module (folder name, case-insensitive) out of the `release wasm` cross-compile:
+//! it runs on the host, where a module with no wasm build still satisfies a guarded `require ?name`.
+//! dashv is disabled by the rail; an app reaching vulkan, das_metal or das_accelerate names those.
+def release_wasm_disable_module(name : string) {
+    _release_spec.wasm_disabled_modules |> push(name)
 }
 
 //! Choose the emcc `--shell-file` HTML wrapper for `release wasm`. Empty (the

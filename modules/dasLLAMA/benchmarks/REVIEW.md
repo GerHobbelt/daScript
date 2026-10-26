@@ -10,16 +10,20 @@ everything else.
 call - wherever the diff puts it, applies `../REVIEW_GPU_RACE.md` too.**
 
 **A diff that adds or changes an instrument whose timed body runs a forward pass through a
-pipeline the dasLLAMA engine selected also calls `tune_gate()`
-(`../performance/profile_common.das`) before that instrument's first timed rep.** A pipeline
-the instrument compiled itself - or a reference tool's own runtime - is not one the engine
-selected. Without the gate the instrument measures fallback kernels silently. An instrument is a
-script whose output is a measured wall or rate.
+pipeline the dasLLAMA engine selected calls `tune_gate()` (`../performance/profile_common.das`)
+before that instrument's first timed rep, or - where the instrument cannot require this
+module's performance tree - stamps its rows with the tune state it measured on: the manifest
+or class profile whose winners the run compiled against.** An instrument is a file that times
+a run and reports a wall-clock time or rate as its result, printed or returned to a caller that
+prints it. A pipeline the instrument compiled itself - or a reference tool's own runtime - is
+not one the engine selected. Without the gate or the stamp the instrument measures fallback
+kernels silently.
 
 **A diff that adds or changes a race alternates its arms within one process - one timed round
-per arm, best-of across rounds.** A race is an instrument that compares two implementations of
-the same computation. Two separate runs measure how the machine changed between them as much as
-they measure the arms.
+per arm, best-of across rounds.** A race is an instrument that runs both implementations
+itself, in its own process, and compares them; an A/B arm is one run of an instrument under a
+named lever, compared against a paired run of the same instrument. One instrument is one or the
+other, never both.
 
 **A diff that adds or changes a race arm proves the arm's output on its report line, by what the
 arm computes:** an arm producing no comparable
@@ -71,22 +75,24 @@ no attribution across stages - is not a difference.
 and corpus - or withdraws the affected rows and names the withdrawal and its reason in the PR
 body.** A board cell is a timed cell of the published results board: one
 `../performance/gen_bench_records.das` spawns, or a manual `lcpp_bench.das` cell with its own
-`../PROFILE.md` section. What a cell times changes when a change to its code, to its input
-corpus, or to the pinned reference build - anything that decides which reference binary or
-reference environment the run measures, `DEFAULT_REF_SHA` in `setup_lcpp_ref.das` included -
-moves the measured quantity. The re-mint or withdrawal lands in
+`../PROFILE.md` section. What a cell times changes when a change inside its timed body, to its
+input corpus, or to the pinned reference build (`DEFAULT_REF_SHA` in `setup_lcpp_ref.das`, or
+anything else deciding which reference binary or environment the run measures) moves the
+measured quantity; a change outside the timed body - a flag, a require, the submit path - does
+not. The re-mint or withdrawal lands in
 `../performance/records/<box>.json`, the file the affected rows live in.
 
-**A diff that adds or changes an instrument makes it exit non-zero on a run that ends
-with zero result rows - wrong flags, failed load, a device that declines.** A run that matched
-nothing and reported success leaves a sidecar or a record untouched, and its caller cannot
-tell.
+**A diff that adds an instrument, or changes how one reports or exits, makes it exit non-zero
+on a run that ends with zero result rows - wrong flags, failed load, a device that declines.**
+A run that matched nothing and reported success leaves a sidecar or a record untouched, and
+its caller cannot tell.
 
-**A diff that adds or changes an A/B arm - one of an instrument's timed runs, distinguished by a
-named lever set to a value the paired run does not use, off/on or graded - makes that instrument
-exit non-zero when the lever does not change what the run executes.** A lever is the flag or
-environment switch that names the arm; a lever that silently no-ops prints a 1.00x row nobody
-can tell from a real tie.
+**A diff that adds an A/B arm - one of an instrument's timed runs, distinguished by a named
+lever set to a value the paired run does not use, off/on or graded - or changes how an arm
+reports or exits, makes that instrument exit non-zero when the lever does not change what the
+run executes; an instrument that runs that check before the arm prints a warning naming the
+inert lever instead.** A lever is the flag or environment switch that names the arm; a lever
+that silently no-ops prints a 1.00x row nobody can tell from a real tie.
 
 **A diff that adds or changes an A/B arm of an instrument over a prompt corpus makes that arm
 report one row per prompt, never one aggregate ratio alone.** Prompts differ in how much the

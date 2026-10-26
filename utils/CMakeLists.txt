@@ -16,6 +16,60 @@ add_custom_target(check_dasgen
     COMMENT "Checking generated builtin .inc files are up to date (dasgen)"
 )
 
+# watchdog: the supervisor as a standalone context on the full runtime - libDaScript, dasHV,
+# dasStdDlg (the tray icon) and dasStbImage (the icon file's PNG decoder) as static archives, no
+# compiler, no shared module, no lock on the files it deploys (the shape of
+# examples/standalone/06_full_runtime). Lands in bin/ and installs beside daslang. It needs no
+# LLVM, so it sits above the -exe utilities' early return; the module targets exist only when
+# their modules are enabled and included.
+if(TARGET libDasModuleHV AND TARGET libDasModuleStdDlg AND TARGET libDasModuleStbImage)
+    set(WATCHDOG_GEN "${CMAKE_CURRENT_BINARY_DIR}/_watchdog_ctx_generated")
+    file(MAKE_DIRECTORY "${WATCHDOG_GEN}")
+    file(GLOB WATCHDOG_DAS_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/utils/watchdog/*.das")
+    add_custom_command(
+        OUTPUT "${WATCHDOG_GEN}/main.das.cpp" "${WATCHDOG_GEN}/main.das.h"
+        COMMAND $<TARGET_FILE:daslang>
+            "${PROJECT_SOURCE_DIR}/utils/aot/main.das"
+            -- -ctx "${PROJECT_SOURCE_DIR}/utils/watchdog/main.das"
+            "${WATCHDOG_GEN}/"
+        DEPENDS daslang
+            ${WATCHDOG_DAS_SOURCES}
+            "${PROJECT_SOURCE_DIR}/utils/aot/main.das"
+            "${PROJECT_SOURCE_DIR}/daslib/aot_standalone.das"
+            "${PROJECT_SOURCE_DIR}/daslib/aot_cpp.das"
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+        COMMENT "Standalone AOT (full runtime): watchdog"
+        VERBATIM
+    )
+    add_executable(watchdog
+        "${PROJECT_SOURCE_DIR}/utils/watchdog/main.cpp" "${WATCHDOG_GEN}/main.das.cpp")
+    target_include_directories(watchdog PRIVATE
+        "${WATCHDOG_GEN}"
+        ${NEED_MODULES_PATH}
+        "${PROJECT_SOURCE_DIR}/modules/dasHV/hv/$<CONFIG>/include")
+    target_link_libraries(watchdog PRIVATE libDaScript ${SRC_LIBRARIES} libDasModuleHV libDasModuleStdDlg libDasModuleStbImage)
+    SETUP_CPP11(watchdog)
+    SETUP_BIN_RPATH(watchdog)
+    set_target_properties(watchdog PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin
+        FOLDER "utils")
+    if(NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
+        add_custom_command(TARGET watchdog POST_BUILD
+            COMMAND ${CMAKE_STRIP} $<TARGET_FILE:watchdog>
+            COMMENT "Stripping watchdog")
+    endif()
+    INSTALL(TARGETS watchdog RUNTIME DESTINATION ${DAS_INSTALL_BINDIR})
+    add_test(NAME watchdog_smoke
+        COMMAND ${CMAKE_COMMAND}
+            -DWATCHDOG=$<TARGET_FILE:watchdog>
+            -DDASLANG=$<TARGET_FILE:daslang>
+            -DDAS_ROOT=${PROJECT_SOURCE_DIR}
+            -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/watchdog_smoke
+            -P ${PROJECT_SOURCE_DIR}/utils/watchdog/smoke_test.cmake)
+    set_tests_properties(watchdog_smoke PROPERTIES LABELS "small" TIMEOUT 120)
+    add_dependencies(test-small watchdog)
+endif()
+
 # Build daslang utilities as standalone executables using -exe mode.
 # Each utility's entry .das is compiled via daslang -exe and the
 # resulting binary is placed next to the daslang compiler binary
@@ -133,8 +187,8 @@ add_dependencies(all_utils_exe dastest_exe)
 
 # Single-config generators only: UTIL_BIN_DIR embeds CMAKE_CFG_INTDIR on
 # multi-config, which install() cannot resolve — and release bundles are cut on
-# single-config (Ninja) lanes. Each tool's exe-or-not decision is recorded in
-# that tool's REVIEW.md.
+# single-config (Ninja) lanes. Each shipped tool's decision is recorded in that
+# tool's README.md, where utils/REVIEW.das reads it.
 if(NOT _DAS_UTILS_MULTI_CONFIG)
     set(DAS_UTILS_SHIPPED_EXES lint daspkg dascov detect-dupe das-fmt dastest)
     if(NOT DAS_SQLITE_DISABLED)
@@ -171,6 +225,7 @@ SET(DAS_UTILS_TO_TEST
     internal/ast-fuzz
     internal/requirefix
     internal/test-release
+    daspkg/test_daspkg.das
 )
 
 FOREACH(_das ${DAS_UTILS_TO_TEST})
@@ -186,3 +241,4 @@ ADD_CUSTOM_TARGET(run_utils_tests
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
     COMMENT "Running utils tests"
 )
+

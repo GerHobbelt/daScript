@@ -38,7 +38,7 @@ TEST_CASE("my feature does X") {
 
 Optionally drop `tests-cpp/small/test_my_feature.das` next to it; load via `getDasRoot() + "/tests-cpp/small/test_my_feature.das"`.
 
-Rebuild - `cmake --build build`. The new test appears in `ctest -N` automatically (no CMake edit needed).
+Rebuild - `cmake --build build`. The new test appears in `ctest -N` automatically; the glob needs no CMake edit. A test that must be compiled differently from the rest of the exe - a per-source flag such as the fast-math one on `test_isnan_fastmath.cpp` - adds its `set_source_files_properties` line to `tests-cpp/CMakeLists.txt`, and its TU `#error`s when built without the flag, so a moved or renamed file cannot silently build the ordinary way and stay green.
 
 **Don't include doctest with `DOCTEST_CONFIG_IMPLEMENT`** - that's owned exclusively by `doctest_main.cpp`. Including the header without that macro is the right pattern for every other TU.
 
@@ -64,7 +64,7 @@ add_dependencies(test-big my_stress_test)
 
 Big tests that are C++ executables **don't include doctest** - they keep their own `int main()` returning 0/1 to ctest.
 
-**A big test's `int main()` owns its module lifetime** - nothing runs `doctest_main.cpp` for it. An exe that resolves modules through the registry calls `Module::Initialize()` / `Module::Shutdown()` itself. An exe whose only context comes from a generated standalone AOT constructor calls neither: that constructor is self-contained and consults no module registry (example: `big/standalone_ctx/`).
+**A big test's `int main()` owns its module lifetime** - nothing runs `doctest_main.cpp` for it. An exe that resolves modules through the registry calls `Module::Initialize()` / `Module::Shutdown()` itself. An exe whose only context comes from a generated standalone AOT constructor calls neither: a context that reaches no C++ module beyond the builtin one consults no registry (example: `big/standalone_ctx/test_standalone_ctx.cpp`), and one that does registers what it links itself and shuts it down when the last context is destroyed (example: `examples/standalone/06_full_runtime/`, which doubles as a small-lane test; `big/standalone_ctx/test_standalone_modules.cpp` puts two such contexts in one binary). A test that registered the builtin module - `NEED_ALL_DEFAULT_MODULES` or `NEED_MODULE(Module_BuiltIn)` - owns the registry: it registers every module the context links and calls `Module::Initialize()` before constructing it; a module it missed stops the program at construction, by name (`standalone_modules_host_partial` pins that as a `WILL_FAIL` test).
 
 A big-labelled test is not gated by CI - only the small suite runs there. Run `ninja test-big` locally before pushing one.
 

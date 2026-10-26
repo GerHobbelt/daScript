@@ -5,7 +5,7 @@ options persistent_heap
 // preflight — run CI's gates locally before pushing. Gate ↔ CI-lane mapping
 // and the manual commands this tool automates: skills/internal/preflight.md.
 //
-// Fast tier (default): format --verify, lint on changed .das, clang
+// Fast tier (default): format --verify, lint on changed .das and .md, clang
 // frontend (syntax-only) pass on changed C++ — escalates to a full
 // src+tests-cpp sweep when a header changed, since a header edit can break
 // template instantiation in TUs the diff never touched. --full adds the
@@ -74,9 +74,6 @@ struct Config {
     @clarg_doc = "Stop at the first failing gate"
     fail_fast : bool
 
-    @clarg_doc = "Lint gate: skip the -exe compiled rail, keeping the host + linux-mirror interp rails — run before every push; PR-open preflight runs all three"
-    lint_skip_exe_rail : bool
-
     @clarg_doc = "List gates with tier and description, then exit"
     list_gates : bool
 
@@ -114,6 +111,7 @@ struct PreflightCtx {
     clang_is_cl : bool
     base : string
     changed_das : array<string>
+    changed_md : array<string>      // the lint gate reads these beside changed_das, as CI does
     changed_cpp : array<string>
     changed_all : array<string>     // every changed path vs base, any extension, plus untracked files - the reach tests read this
     changed_hdr : int
@@ -121,7 +119,6 @@ struct PreflightCtx {
     jit_jobs : int
     jit_max_file_time : float
     verbose : bool
-    lint_skip_exe_rail : bool
 }
 
 // ===== subprocess + small helpers =====
@@ -138,17 +135,6 @@ def run_argv(args : array<string>; timeout : float) : tuple<rc : int; out : stri
 
 def run_argv(args : array<string>) : tuple<rc : int; out : string> {
     return run_argv(args, 0.0)
-}
-
-// A dynamically-linked artifact spawned outside the daslang bin dir (the exe rail's
-// temp-path das-lint) resolves libDaScriptDyn only through the loader's environment —
-// prepend the bin dir so spawned children inherit it.
-def prepend_loader_search_path(bin_dir : string) {
-    let platform = get_platform_name()
-    let vname = platform == "windows" ? "PATH" : (platform == "darwin" ? "DYLD_LIBRARY_PATH" : "LD_LIBRARY_PATH")
-    let sep = platform == "windows" ? ";" : ":"
-    let cur = get_env_variable(vname)
-    set_env_variable(vname, empty(cur) ? bin_dir : "{bin_dir}{sep}{cur}")
 }
 
 def tool_available(exe, probe_flag : string) : bool {
@@ -336,7 +322,7 @@ def in_core_scope(path : string) : bool {
     return starts_with(g, "src/") || starts_with(g, "include/") || starts_with(g, "tests-cpp/")
 }
 
-def collect_changed_files(base : string; var das_files, cpp_files : array<string>&; var hdr_count : int&) {
+def collect_changed_files(base : string; var das_files, md_files, cpp_files : array<string>&; var hdr_count : int&) {
     var seen : table<string>
     let probe = run_argv(["git", "rev-parse", "--verify", "--quiet", base])
     var ranges : array<string>
@@ -356,6 +342,8 @@ def collect_changed_files(base : string; var das_files, cpp_files : array<string
             let ext = extension(f)
             if (ext == ".das") {
                 das_files |> push(f)
+            } elif (is_lint_input(f)) {
+                md_files |> push(f)
             } elif (ext == ".cpp" || ext == ".cc") {
                 cpp_files |> push(f)
             } elif (ext == ".h" || ext == ".hpp" || ext == ".inc") {
@@ -485,6 +473,27 @@ def gate_review_md(ctx : PreflightCtx) : GateResult {
         output = join(findings, "\n"))
 }
 
+//! CI's `Test review-md discovery` step, suite for suite
+let REVIEW_MD_TEST_SUITES <- ["utils/internal/review-md/test_scan.das", "utils/internal/review-md/test_gate.das",
+    "utils/internal/review-md/test_walkers.das", "utils/internal/make-pr/test_gates.das", "utils/internal/preflight/tests"]
+
+def gate_review_md_tests(ctx : PreflightCtx) : GateResult {
+    let t0 = ref_time_ticks()
+    if (!review_md_tests_reach(ctx.changed_all)) {
+        return GateResult(name = "review-md-tests", status = GateStatus.Skip, seconds = seconds_since(t0),
+            detail = "no REVIEW.das, walker, make-pr, preflight or dastest change vs {ctx.base}")
+    }
+    for (suite in REVIEW_MD_TEST_SUITES) {
+        let r = run_argv([ctx.daslang, "dastest/dastest.das", "--", "--failures-only", "--test", suite], 600.0)
+        if (r.rc != 0) {
+            return GateResult(name = "review-md-tests", status = GateStatus.Fail, seconds = seconds_since(t0),
+                detail = "{suite} is red (mirrors CI's extended_checks 'Test review-md discovery' step) - a gate or walker change needs its fixture updated too",
+                output = r.out)
+        }
+    }
+    return GateResult(name = "review-md-tests", status = GateStatus.Pass, seconds = seconds_since(t0))
+}
+
 def gate_md_ascii(ctx : PreflightCtx) : GateResult {
     let t0 = ref_time_ticks()
     let changed = run_argv(["git", "diff", "--name-only", "{ctx.base}..HEAD"])
@@ -583,19 +592,18 @@ def gate_format(ctx : PreflightCtx) : GateResult {
 // CI's lint verdict is rendered ONLY by the linux lane (extended_checks gates the step on
 // matrix.target == 'linux'), in the linux MODULE WORLD (no dasMetal — platform static_if
 // halves compile out, so their requires/args read unused there and nowhere else; dasVulkan
-// is in-tree and present on linux, so it is NOT disabled),
-// and TWICE (interp, then the -exe compiled das-lint, which resolves modules differently).
-// A host-flavor pass alone is structurally blind to both — so this gate runs three rails
-// (--lint-skip-exe-rail keeps just the interp two).
-// LINT019 is OFF on all three (mirrors CI): a changed-set ledger cannot see consumers
+// is in-tree and present on linux, so it is NOT disabled). A host-flavor pass alone is
+// structurally blind to that — so this gate runs two rails, host then linux-mirror.
+// LINT019 is OFF on both (mirrors CI): a changed-set ledger cannot see consumers
 // outside the PR — staleness belongs to the nightly whole-tree -j 1 pass.
 def gate_lint(ctx : PreflightCtx) : GateResult {
     let t0 = ref_time_ticks()
-    if (empty(ctx.changed_das)) {
+    if (empty(ctx.changed_das) && empty(ctx.changed_md)) {
         return GateResult(name = "lint", status = GateStatus.Skip, seconds = seconds_since(t0),
-            detail = "no .das files changed vs {ctx.base}")
+            detail = "no .das or .md files changed vs {ctx.base}")
     }
     var files <- [for (f in ctx.changed_das); f]
+    files |> push_from(ctx.changed_md)
     var host_args <- [ctx.daslang, "utils/lint/main.das", "--"]
     host_args |> push_from(files)
     host_args |> push("--quiet")
@@ -617,38 +625,8 @@ def gate_lint(ctx : PreflightCtx) : GateResult {
         return GateResult(name = "lint", status = GateStatus.Fail, seconds = seconds_since(t0),
             detail = "LINUX-lane lint warnings (host pass was clean — a platform static_if half hides the symbol here; nolint:...,LINT019 both-worlds spelling, see skills/internal/preflight.md)", output = mirror.out)
     }
-    if (!lint_runs_exe_rail(ctx.lint_skip_exe_rail)) {
-        return GateResult(name = "lint", status = GateStatus.Pass, seconds = seconds_since(t0),
-            detail = lint_pass_detail(length(files), false))
-    }
-    // the exe rail: CI compiles utils/lint into a standalone das-lint and lints AGAIN — the
-    // -exe world resolves modules differently (dasAudio et al are not baked in). `-exe`
-    // appends .exe on every platform (CI's LINUX lane invokes $BIN/das-lint.exe verbatim)
-    let lint_exe_base = unique_temp_path("preflight_das_lint", "")
-    let build = run_argv([ctx.daslang, "-exe", "-output", lint_exe_base, "utils/lint/main.das"])
-    if (build.rc != 0) {
-        remove("{lint_exe_base}.exe")
-        remove("{lint_exe_base}.o")
-        return GateResult(name = "lint", status = GateStatus.Fail, seconds = seconds_since(t0),
-            detail = "das-lint -exe build failed — the CI exe rail would fail the same way", output = build.out)
-    }
-    // the -exe artifact is dynamically linked (libDaScriptDyn); from the temp path the
-    // loader resolves it only via the environment — point it at the daslang bin dir
-    prepend_loader_search_path(dir_name(ctx.daslang))
-    var exe_args <- ["{lint_exe_base}.exe"]
-    exe_args |> push_from(files)
-    exe_args |> push("--quiet")
-    exe_args |> push("--disable")
-    exe_args |> push("LINT019")
-    let exe = run_argv(exe_args)
-    remove("{lint_exe_base}.exe")
-    remove("{lint_exe_base}.o")
-    if (exe.rc != 0) {
-        return GateResult(name = "lint", status = GateStatus.Fail, seconds = seconds_since(t0),
-            detail = "das-lint.exe rail warnings (interp rails were clean — the -exe module world differs)", output = exe.out)
-    }
     return GateResult(name = "lint", status = GateStatus.Pass, seconds = seconds_since(t0),
-        detail = lint_pass_detail(length(files), true))
+        detail = "{length(files)} file(s) clean on both rails (host, linux-mirror)")
 }
 
 // ===== ast-verify on changed .das (mirrors extended_checks "Run ast-verify on changed .das files") =====
@@ -1606,9 +1584,10 @@ def gate_table() : array<GateInfo> {
     return <- [
         GateInfo(name = "untracked", tier = "fast", doc = "no untracked files at PR time — commit, delete, or ignore each"),
         GateInfo(name = "format", tier = "fast", doc = "formatter --verify on tracked .das (mirrors CI)"),
-        GateInfo(name = "lint", tier = "fast", doc = "lint changed .das on three rails (host, linux-mirror, -exe), zero warnings; --lint-skip-exe-rail drops the exe rail"),
+        GateInfo(name = "lint", tier = "fast", doc = "lint changed .das and .md on two rails (host, linux-mirror), zero warnings"),
         GateInfo(name = "hash-refs", tier = "fast", doc = "no bare #N in branch commit messages that GitHub would mislink - ledger cites spell out or backtick"),
         GateInfo(name = "review-md", tier = "fast", doc = "REVIEW.das gates of every folder the diff touches (utils/internal/review-md; CI's extended_checks step runs every gate)"),
+        GateInfo(name = "review-md-tests", tier = "fast", doc = "the review-md discovery suites (walker fixtures, make-pr gate tests, preflight's own) when the diff touches a REVIEW.das or those tools (mirrors CI's extended_checks step)"),
         GateInfo(name = "md-ascii", tier = "fast", doc = "ci/fix_md_ascii.py --check when the diff touches .md (mirrors CI's Markdown ASCII gate in extended_checks)"),
         GateInfo(name = "ast-verify", tier = "fast", doc = "daslang -dry-run --ast-verify-batch on changed .das (parallel, 300s/file; mirrors CI) - an AST verify line, a crash, or a timeout fails"),
         GateInfo(name = "cpp-syntax", tier = "fast", doc = "clang frontend pass on changed C++; header change → full src+tests-cpp sweep"),
@@ -1779,8 +1758,7 @@ def main() : int { // nolint:STYLE037,STYLE038 — the gate loop + CLI surface; 
     var ctx = PreflightCtx(base = cfg.base, jobs = cfg.jobs,
                            jit_jobs = jit_jobs,
                            jit_max_file_time = jit_max_file_time,
-                           verbose = cfg.verbose,
-                           lint_skip_exe_rail = cfg.lint_skip_exe_rail)
+                           verbose = cfg.verbose)
     ctx.daslang = find_daslang(cfg.daslang_bin)
     if (empty(ctx.daslang)) {
         to_log(LOG_ERROR, "daslang binary not found — build it (cmake --build build --target daslang) or pass --daslang / set DASLANG\n")
@@ -1804,13 +1782,14 @@ def main() : int { // nolint:STYLE037,STYLE038 — the gate loop + CLI surface; 
     let clang_info = find_clang(cfg.clang, ctx.build_dir)
     ctx.clang = clang_info.exe
     ctx.clang_is_cl = clang_info.is_cl
-    collect_changed_files(cfg.base, ctx.changed_das, ctx.changed_cpp, ctx.changed_hdr)
+    collect_changed_files(cfg.base, ctx.changed_das, ctx.changed_md, ctx.changed_cpp, ctx.changed_hdr)
     ctx.changed_all <- collect_changed_paths(cfg.base)
 
     let tier = cfg.full ? "full" : "fast"
     let n_das = length(ctx.changed_das)
+    let n_md = length(ctx.changed_md)
     let n_cpp = length(ctx.changed_cpp)
-    to_log(LOG_INFO, "preflight: {tier} tier; daslang={ctx.daslang}; base={cfg.base}; {n_das} das / {n_cpp} cpp changed\n")
+    to_log(LOG_INFO, "preflight: {tier} tier; daslang={ctx.daslang}; base={cfg.base}; {n_das} das / {n_md} md / {n_cpp} cpp changed\n")
     let settings_label = fexist(settings_path) ? settings_path : "built-in defaults"
     to_log(LOG_INFO, "preflight: JIT workers={ctx.jit_jobs}; max-file-time={ctx.jit_max_file_time}s; settings={settings_label}\n")
 
@@ -1851,6 +1830,8 @@ def main() : int { // nolint:STYLE037,STYLE038 — the gate loop + CLI surface; 
                 r <- gate_hash_refs()
             } elif (info.name == "review-md") {
                 r <- gate_review_md(ctx)
+            } elif (info.name == "review-md-tests") {
+                r <- gate_review_md_tests(ctx)
             } elif (info.name == "md-ascii") {
                 r <- gate_md_ascii(ctx)
             } elif (info.name == "ast-verify") {

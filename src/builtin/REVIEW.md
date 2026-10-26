@@ -3,22 +3,23 @@
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture doc:
 `ARCHITECTURE.md`.
 
-- **A diff that adds or changes an `addExtern...`/`addInterop` registration under this folder
-  uses, for a plain-value bind, `addExternInline` or `addExternInlineEx` when the name its
-  file passes to `Module(...)` is an Inline module, and an `addExtern...` entry point whose
-  name does not contain `Inline` in every other module.** A bind is a C++ function registered
-  into a module with an `addExtern...` or `addInterop` entry point. The Inline modules are `$`
-  (builtin), `math`, `strings` and `jit`. A plain-value bind returns nothing at all, or a value
-  that is neither a reference nor a result the callee writes into the caller's result slot; it
-  is not an interop bind (`addInterop`), and not a generic container or equality helper
-  (`das_vector_*`, `das_equ*`, `das_nequ*`, `das_handle_equ*`, `das_handle_nequ*`).
+- **Weakening `review_nttp.das`'s bind-flavor scan, which `REVIEW.das` runs, is a defect - fix a
+  bind the scan reports by switching the bind.** The Inline modules are `$` (builtin), `math`,
+  `strings` and `jit`. In those, a plain-value bind - one returning nothing, or a value that is
+  neither a reference nor written into the caller's result slot - registers through
+  `addExternInline` or `addExternInlineEx`; in every other module it registers through
+  `addExtern`.
 
-- **Weakening `review_nttp.das`'s bind-flavor scan, which `REVIEW.das` runs, is a defect** -
-  fix a bind the scan reports by switching the bind, and never drop a module from
-  `review_nttp.das`'s `require` list, which sets the modules the scan covers.
+- **A diff that adds or changes a bind in a module the scan covers rebuilds the binary from
+  that diff before the folder's gate runs** - the scan reads the binds compiled into the running
+  binary, so a stale binary is a false green.
 
-- **A diff that adds a module under this folder adds it to `review_nttp.das`'s `require`
-  list, in the same change** - a module off the list is a module the scan never sees.
+- **A diff that adds a module under this folder adds it to `review_nttp.das`'s `require` list in
+  the same change - directly, or through the daslib wrapper that requires it.** A module the list
+  does not reach is a module the scan never sees.
+
+- **Never drop a module from `review_nttp.das`'s `require` list.** The list is what sets the
+  modules the scan covers.
 
 - **A diff that changes what `module_builtin_ast_serialize.cpp` streams - a field added,
   removed, reordered, re-typed, or given a new meaning - bumps the version `getVersion()`
@@ -30,12 +31,22 @@
   outside `DAS_MODULE_CACHE_POLICY_FIELDS` is a defect - put the field on the list instead** - the
   list drives both the record's policy stream and the compare that refuses a record written under
   other policies, so a field handled outside it is written without being compared, or compared
-  without being written. A diff that adds a field to `CodeOfPolicies` itself applies
-  `include/daScript/simulate/REVIEW.md`.
+  without being written.
 
 - **A diff that adds a diagnostic to `AstSerializer::serializeProgram` or
   `AstSerializer::serializeProgramImpl` in `module_builtin_ast_serialize.cpp`, or drops the
   `quietCache` gate from one already there, is a defect - gate every line those two functions
   print on the serializer's `quietCache`** - the default cache is on unasked for an ordinary run,
-  so an ungated line becomes output every user sees. A diff to `trySerializeProgramModule`
-  (`src/ast/ast_parse.cpp`) applies `src/ast/REVIEW.md` too.
+  so an ungated line becomes output every user sees.
+
+- **A diff that adds a builtin a `.das_module` descriptor can call to change the require
+  resolver or the module registry records the call between `begin_dynamic_module_recording`
+  and `end_dynamic_module_recording` (`module_builtin_fio.cpp`) as a row `read_manifest`
+  reads back and `init_dyn_modules` replays (`src/ast/dyn_modules.cpp`), in the same change.**
+  A replayed start never runs the descriptor, so an effect the recorder does not see is an
+  effect every warm start silently lacks.
+
+- **A diff that changes what `ModuleFileCache::defaultPath` folds into the module-cache key -
+  the binary, the command line, the environment names, or which script arguments count - updates
+  the cache-key paragraph of `ARCHITECTURE.md` in the same change.** The key is what stops a
+  native-compiled module serving a cross compile, so a wrong description of it gets trusted.

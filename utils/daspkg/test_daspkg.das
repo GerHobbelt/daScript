@@ -56,6 +56,41 @@ def moved_bundle_exe_path(moved_root, name : string) : string {
 }
 
 [test]
+def test_ship_tools(t : T?) {
+    t |> run("a tool ships by bare name from bin/, then bin/Release/, with the platform's exe suffix; a missing tool fails the release") @(t : T?) {
+        let tmp = create_temp_directory_result("daspkg tools ")
+        if (!(tmp is value)) {
+            t |> failure("could not create temp directory: {tmp as error}")
+            return
+        }
+        let root = tmp as value
+        let das_root = path_join(root, "root")
+        let bundle = path_join(root, "bundle")
+        let ext = get_platform_name() == "windows" ? ".exe" : ""
+        mkdir(das_root)
+        mkdir(path_join(das_root, "bin"))
+        mkdir(path_join(path_join(das_root, "bin"), "Release"))
+        mkdir(bundle)
+        fwrite(path_join(das_root, "bin/flat{ext}"), "flat")
+        fwrite(path_join(das_root, "bin/Release/msvc{ext}"), "msvc")
+        var shipped : array<string>
+        t |> equal(ship_tools("pkg", bundle, ["flat", "msvc"], shipped, das_root), 0, "both tools resolve")
+        t |> equal(length(shipped), 2)
+        t |> success(fexist(path_join(bundle, "flat{ext}")), "bin/<tool> lands at the bundle root")
+        t |> success(fexist(path_join(bundle, "msvc{ext}")), "bin/Release/<tool> lands at the bundle root")
+        var none : array<string>
+        t |> equal(ship_tools("pkg", bundle, ["absent"], none, das_root), 1, "a tool no build produced fails the release")
+        t |> equal(length(none), 0)
+        fwrite(path_join(root, "escaped{ext}"), "outside")
+        var unsafe_name : array<string>
+        t |> equal(ship_tools("pkg", bundle, ["../escaped"], unsafe_name, das_root), 1, "a name with a path separator is refused before any path is built")
+        t |> success(!fexist(path_join(bundle, "escaped{ext}")), "nothing was copied for the refused name")
+        let cleanup = rmdir_rec_result(root)
+        t |> success(cleanup is value && cleanup as value, "temp dir removed")
+    }
+}
+
+[test]
 def test_package_name_from_source(t : T?) {
     t |> run("github URL") @(t : T?) {
         t |> equal(package_name_from_source("github.com/user/dasImgui"), "dasImgui")
@@ -1781,6 +1816,12 @@ def test_run_das_package_release(t : T?) {
         tt |> equal(2, length(info.wasm_archives))
         tt |> equal("_wasm/liblibDasModuleTest.a", info.wasm_archives[0])
         tt |> equal("_wasm/liblibTestApp.a", info.wasm_archives[1])
+        // the two wasm-only knobs cross the same hand-written marshaller: a dropped copy would
+        // cross-compile with the module mounted and the flag missing, silently
+        tt |> equal(1, length(info.wasm_disabled_modules))
+        tt |> equal("dasvulkan", info.wasm_disabled_modules[0])
+        tt |> equal(1, length(info.emcc_args))
+        tt |> equal("--profiling-funcs", info.emcc_args[0])
     }
     t |> run("returns true with empty spec when release() is missing") @(tt : T?) {
         var info : PackageReleaseInfo
@@ -1865,6 +1906,240 @@ def test_cmd_release_pure_daslang(t : T?) {
     }
 }
 
+// the tool release_launcher names must be a real build product: the watchdog the tree builds
+// where dasHV, dasStdDlg and dasStbImage are in
+def private built_watchdog_path() : string {
+    let ext = get_platform_name() == "windows" ? ".exe" : ""
+    for (rel in ["bin/watchdog{ext}", "bin/Release/watchdog{ext}"]) {
+        let candidate = path_join(get_das_root(), rel)
+        if (fexist(candidate)) return candidate
+    }
+    return ""
+}
+
+[test]
+def test_cmd_release_launcher(t : T?) {
+    t |> run("release_launcher names the shipped tool the macOS .app opens; a tool not shipped refuses before the build") @(tt : T?) {
+        let tmp_root = "{get_das_root()}/_test_release_launcher"
+        let out_dir = "{get_das_root()}/_test_release_launcher_out"
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+        mkdir(tmp_root)
+        fopen("{tmp_root}/main.das", "wb") $(f) {
+            fwrite(f, "options gen2\n[export]\ndef main() \{\n    print(\"hello\\n\")\n\}\n")
+        }
+        fopen("{tmp_root}/.das_package", "wb") $(f) {
+            fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"launched\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n    release_launcher(\"watchdog\")\n\}\n")
+        }
+        let refused = cmd_release(tmp_root, out_dir)
+        tt |> equal(1, refused, "a launcher no release_include_tool ships is refused")
+        tt |> success(!fexist(bundle_exe_path(out_dir, "launched")), "and nothing was built")
+        if (empty(built_watchdog_path())) {
+            force_rmdir(tmp_root)
+            force_rmdir(out_dir)
+            tt |> skip("no built watchdog in this tree - the shipped-tool half of the launcher test needs bin/watchdog")
+            return
+        }
+        fopen("{tmp_root}/.das_package", "wb") $(f) {
+            fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"launched\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n    release_include_tool(\"watchdog\")\n    release_launcher(\"watchdog\")\n\}\n")
+        }
+        let rc = cmd_release(tmp_root, out_dir)
+        tt |> equal(0, rc, "cmd_release returns 0 with the tool shipped")
+        let artifacts = bundle_artifacts_dir(out_dir, "launched")
+        let ext = get_platform_name() == "windows" ? ".exe" : ""
+        tt |> success(fexist(path_join(artifacts, "watchdog{ext}")), "the launcher tool sits beside the exe")
+        tt |> success(fexist(bundle_exe_path(out_dir, "launched")), "the exe itself still ships")
+        if (get_platform_name() == "darwin") {
+            let plist = fread(path_join(bundle_root_dir(out_dir, "launched"), "Contents/Info.plist"))
+            let key_at = find(plist, "<key>CFBundleExecutable</key>")
+            tt |> success(key_at >= 0, "the plist names an executable")
+            let value_at = find(plist, "<string>", key_at)
+            tt |> success(value_at >= 0 && starts_with(slice(plist, value_at, length(plist)), "<string>watchdog</string>"),
+                "CFBundleExecutable is the launcher, so a double click on the .app starts the supervisor:\n{plist}")
+            tt |> success(find(plist, "<key>LSUIElement</key>") >= 0, "a launcher app is menu-bar-only - no Dock tile, no application menu:\n{plist}")
+        }
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+    }
+    t |> run("without a launcher the .app opens the exe itself and is an ordinary application") @(tt : T?) {
+        if (get_platform_name() != "darwin") {
+            tt |> skip("the Info.plist exists only in the macOS .app layout")
+            return
+        }
+        let tmp_root = "{get_das_root()}/_test_release_nolauncher"
+        let out_dir = "{get_das_root()}/_test_release_nolauncher_out"
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+        mkdir(tmp_root)
+        fopen("{tmp_root}/main.das", "wb") $(f) {
+            fwrite(f, "options gen2\n[export]\ndef main() \{\n    print(\"hello\\n\")\n\}\n")
+        }
+        fopen("{tmp_root}/.das_package", "wb") $(f) {
+            fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"plainapp\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n\}\n")
+        }
+        tt |> equal(0, cmd_release(tmp_root, out_dir), "cmd_release returns 0")
+        let plist = fread(path_join(bundle_root_dir(out_dir, "plainapp"), "Contents/Info.plist"))
+        tt |> success(find(plist, "<string>plainapp</string>") >= 0, "CFBundleExecutable is the exe:\n{plist}")
+        tt |> success(find(plist, "LSUIElement") < 0, "and it is not marked menu-bar-only")
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+    }
+}
+
+[test]
+def test_cmd_release_program(t : T?) {
+    t |> run("release_program bakes a companion exe beside the main one, in the manifest, sharing the runtime") @(tt : T?) {
+        let tmp_root = "{get_das_root()}/_test_release_program"
+        let out_dir = "{get_das_root()}/_test_release_program_out"
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+        mkdir(tmp_root)
+        fopen("{tmp_root}/main.das", "wb") $(f) {
+            fwrite(f, "options gen2\n[export]\ndef main() \{\n    print(\"hello\\n\")\n\}\n")
+        }
+        // the companion alone requires a shared module (stbimage): the bundle must ship it for the
+        // companion's sake, where the main program never asked for it
+        let stb_module = path_join(get_das_root(), "modules/dasStbImage/dasModuleStbImage.shared_module")
+        let stb_built = fexist(stb_module)
+        let tool_require = stb_built ? "require stbimage\n" : ""
+        fopen("{tmp_root}/tool.das", "wb") $(f) {
+            fwrite(f, "options gen2\n{tool_require}[export]\ndef main() \{\n    print(\"companion\\n\")\n\}\n")
+        }
+        fopen("{tmp_root}/.das_package", "wb") $(f) {
+            fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"withtool\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n    release_program(\"side-tool\", \"tool.das\")\n\}\n")
+        }
+        tt |> equal(0, cmd_release(tmp_root, out_dir), "cmd_release returns 0 with a companion")
+        let artifacts = bundle_artifacts_dir(out_dir, "withtool")
+        let companion_rel = get_platform_name() == "darwin" ? "side-tool" : "side-tool.exe"
+        tt |> success(fexist(bundle_exe_path(out_dir, "withtool")), "the main exe ships")
+        tt |> success(fexist(path_join(artifacts, companion_rel)), "the companion exe sits beside it as {companion_rel}")
+        tt |> success(!fexist(path_join(artifacts, "side-tool.o")), "the companion's object file is dropped")
+        let manifest = fread(path_join(artifacts, ".daspkg_release.manifest"))
+        tt |> success(find(manifest, companion_rel) >= 0, "the manifest records the companion, so a re-release cleans it:\n{manifest}")
+        if (stb_built) {
+            tt |> success(fexist(path_join(artifacts, "modules/dasStbImage/dasModuleStbImage.shared_module")), "the shared module only the companion requires ships")
+        } else {
+            tt |> success(true, "not covered here: the companion-only shared module needs a built dasStbImage")
+        }
+        tt |> success(fexist(path_join(artifacts, "side-tool.tune.json")) == fexist(path_join(artifacts, "withtool.tune.json")), "the companion carries the sidecar exactly when the main exe does")
+        var runtime_names : table<string>
+        var runtime_dupes = 0
+        fio::dir(artifacts) $(name) {
+            if (find(name, "libDaScriptDyn") >= 0) {
+                runtime_dupes += key_exists(runtime_names, name) ? 1 : 0
+                runtime_names |> insert(name)
+            }
+        }
+        tt |> success(!empty(runtime_names) && runtime_dupes == 0, "one set of runtime libraries serves both exes, none twice")
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+    }
+}
+
+[test]
+def test_cmd_release_program_refusals(t : T?) {
+    t |> run("a companion that fails to build ends the release with nothing of it left behind") @(tt : T?) {
+        let tmp_root = "{get_das_root()}/_test_release_program_broken"
+        let out_dir = "{get_das_root()}/_test_release_program_broken_out"
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+        mkdir(tmp_root)
+        fopen("{tmp_root}/main.das", "wb") $(f) {
+            fwrite(f, "options gen2\n[export]\ndef main() \{\n    print(\"hello\\n\")\n\}\n")
+        }
+        fopen("{tmp_root}/tool.das", "wb") $(f) {
+            fwrite(f, "options gen2\n[export]\ndef main() \{\n    this is not daslang\n\}\n")
+        }
+        fopen("{tmp_root}/.das_package", "wb") $(f) {
+            fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"withbroken\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n    release_program(\"side-tool\", \"tool.das\")\n\}\n")
+        }
+        tt |> equal(1, cmd_release(tmp_root, out_dir), "a companion that does not compile fails the release")
+        let artifacts = bundle_artifacts_dir(out_dir, "withbroken")
+        tt |> success(!fexist(path_join(artifacts, "side-tool.exe")) && !fexist(path_join(artifacts, "side-tool")) && !fexist(path_join(artifacts, "side-tool.o")), "no half-built companion stays in the bundle")
+        var leftover = 0
+        fio::dir(get_das_root()) $(name) {
+            if (name |> starts_with("_daspkg_release_deps_")) {
+                leftover ++
+            }
+        }
+        tt |> equal(0, leftover, "no deps JSON is left in the tree")
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+    }
+    t |> run("a companion with an unsafe name, the bundle's own name, a shipped tool's name, a twin's name, or a missing script is refused before the build") @(tt : T?) {
+        let tmp_root = "{get_das_root()}/_test_release_program_bad"
+        let out_dir = "{get_das_root()}/_test_release_program_bad_out"
+        for (bad in ["release_program(\"bad name\", \"main.das\")", "release_program(\"withtool\", \"main.das\")", "release_program(\"side-tool\", \"absent.das\")",
+                     "release_program(\"\", \"main.das\")", "release_program(\"side-tool.exe\", \"main.das\")", "release_program(\"a..b\", \"main.das\")",
+                     "release_program(\"side-tool\", \"main.das; rm -rf x\")",
+                     "release_include_tool(\"watchdog\")\n    release_program(\"watchdog\", \"main.das\")",
+                     "release_program(\"side-tool\", \"main.das\")\n    release_program(\"side-tool\", \"main.das\")"]) {
+            force_rmdir(tmp_root)
+            force_rmdir(out_dir)
+            mkdir(tmp_root)
+            fopen("{tmp_root}/main.das", "wb") $(f) {
+                fwrite(f, "options gen2\n[export]\ndef main() \{\n    print(\"hello\\n\")\n\}\n")
+            }
+            fopen("{tmp_root}/.das_package", "wb") $(f) {
+                fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"withtool\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n    {bad}\n\}\n")
+            }
+            tt |> equal(1, cmd_release(tmp_root, out_dir), "refused: {bad}")
+            tt |> success(!fexist(bundle_exe_path(out_dir, "withtool")), "and nothing was built for {bad}")
+        }
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+    }
+}
+
+[test]
+def test_cmd_release_refuses_jit_only(t : T?) {
+    t |> run("release_requires_jit() refuses the release before anything builds") @(tt : T?) {
+        let tmp_root = "{get_das_root()}/_test_release_jitonly"
+        let out_dir = "{get_das_root()}/_test_release_jitonly_out"
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+        mkdir(tmp_root)
+        fopen("{tmp_root}/main.das", "wb") $(f) {
+            fwrite(f, "options gen2\n[export]\ndef main() \{\n    print(\"hello\\n\")\n\}\n")
+        }
+        fopen("{tmp_root}/.das_package", "wb") $(f) {
+            fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"jitonly\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n    release_requires_jit()\n\}\n")
+        }
+        tt |> equal(1, cmd_release(tmp_root, out_dir), "a JIT-only package is refused")
+        tt |> success(!fexist(bundle_exe_path(out_dir, "jitonly")), "and nothing was built")
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+    }
+}
+
+[test]
+def test_cmd_release_refuses_unsafe_bundle_name(t : T?) {
+    // the bundle name is a .das_package string that reaches path_join, force_rmdir and shell
+    // command lines; the guard admits letters, digits, `_`, `-` and `.` only - a space or a
+    // shell metacharacter is refused before anything is built or removed
+    for (bad in ["bad name", "bad;name", "bad$(name)", "bad\"name"]) {
+        t |> run("refuses bundle name `{bad}`") @(tt : T?) {
+            let tmp_root = "{get_das_root()}/_test_release_badname"
+            let out_dir = "{get_das_root()}/_test_release_badname_out"
+            force_rmdir(tmp_root)
+            force_rmdir(out_dir)
+            mkdir(tmp_root)
+            fopen("{tmp_root}/main.das", "wb") $(f) {
+                fwrite(f, "options gen2\n[export]\ndef main() \{\n    print(\"hello\\n\")\n\}\n")
+            }
+            let escaped = replace(replace(bad, "\\", "\\\\"), "\"", "\\\"")
+            fopen("{tmp_root}/.das_package", "wb") $(f) {
+                fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"{escaped}\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n\}\n")
+            }
+            let rc = cmd_release(tmp_root, out_dir)
+            tt |> equal(1, rc, "cmd_release refuses the name")
+            tt |> success(!fexist(out_dir), "nothing was built or removed under {out_dir}")
+            force_rmdir(tmp_root)
+            force_rmdir(out_dir)
+        }
+    }
+}
+
 [test]
 def test_cmd_release_ships_minted_scope_manifest(t : T?) {
     t |> run("a tune scope's RESOLVED manifest ships beside the exe") @(tt : T?) {
@@ -1881,7 +2156,7 @@ def test_cmd_release_ships_minted_scope_manifest(t : T?) {
             fwrite(f, payload)
         }
         fopen("{tmp_root}/main.das", "wb") $(f) {
-            fwrite(f, "options gen2\nrequire llvm/daslib/llvm_tune\n[tune_scope(name=\"stubscope\", tuner=\"stub_tuner.das\")]\nstruct StubScope \{\n    unused : int\n\}\n[export]\ndef main() \{\n    print(\"hi\\n\")\n\}\n")
+            fwrite(f, "options gen2\nrequire daslib/tune\nrequire llvm/daslib/llvm_tune\n[tune_scope(name=\"stubscope\", tuner=\"stub_tuner.das\")]\nstruct StubScope \{\n    unused : int\n\}\n[export]\ndef main() \{\n    print(\"hi\\n\")\n\}\n")
         }
         fopen("{tmp_root}/stub_tuner.das", "wb") $(f) {
             fwrite(f, "options gen2\nrequire daslib/fio\n[export]\ndef main() \{\n    fopen(get_env_variable(\"DAS_TUNE_MANIFEST\"), \"wb\") $(mf) \{\n        fwrite(mf, fread(\"{tmp_root}/stub_payload.json\"))\n    \}\n\}\n")
@@ -1910,6 +2185,75 @@ def test_cmd_release_ships_minted_scope_manifest(t : T?) {
         tt |> success(int64(side_fs.mtime) > int64(exe_fs.mtime), "shipped sidecar mtime is strictly newer than the exe")
         force_rmdir(tmp_root)
         force_rmdir(out_dir)
+    }
+}
+
+// a fat release's fixture: a scope shipping class profiles under ./defaults and one [tune]
+// kernel over the add_plus_k selftest generator; `with_profile` decides whether the host's
+// lowest class gets a profile entry for the kernel
+def private write_fat_fixture(tmp_root : string; with_profile : bool) {
+    mkdir(tmp_root)
+    mkdir("{tmp_root}/defaults")
+    let arch = get_architecture_name()
+    let low = arch == "x86_64" ? "x86-avx2" : "arm-neon"
+    let features = arch == "x86_64" ? "avx2;f16c;fma;sse4.2" : "neon;dotprod;fullfp16;lse"
+    if (with_profile) {
+        fwrite("{tmp_root}/defaults/{low}.tune-defaults.json",
+            "\{ \"kernels\" : \{ \"fat_kernel\" : \"k2\" \}, \"provenance\" : \{ \"features\" : \"{features}\" \} \}")
+    }
+    fwrite("{tmp_root}/main.das", "options gen2\nrequire daslib/tune\nrequire llvm/daslib/llvm_tune\n[tune_scope(name=\"fatscope\", defaults=\"./defaults\")]\nstruct FatScope \{\n    unused : int\n\}\n[tune_perm(k = 0), tune_perm(k = 1), tune_perm(k = 2), tune(gen = \"llvm_code_selftest::add_plus_k\", fallback = \"k1\")]\ndef fat_kernel(a, b : int) : int \{\n    return a + b\n\}\n[export, tune_policy(missing = \"fallback\")]\ndef main() \{\n    print(\"R \{fat_kernel(length(get_command_line_arguments()), 3)}\\n\")\n\}\n")
+    fwrite("{tmp_root}/.das_package", "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"fatstub\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n\}\n")
+}
+
+[test]
+def test_cmd_release_fat(t : T?) {
+    let arch = get_architecture_name()
+    let low = arch == "x86_64" ? "x86-avx2" : "arm-neon"
+    t |> run("--fat ships the class profile's clones, mints nothing, and ships no sidecar") @(tt : T?) {
+        let tmp_root = "{get_das_root()}/_test_release_fat"
+        let out_dir = "{get_das_root()}/_test_release_fat_out"
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+        write_fat_fixture(tmp_root, true)
+        let rc = cmd_release(tmp_root, out_dir, false, false, low)
+        tt |> equal(0, rc, "cmd_release --fat {low} returns 0")
+        tt |> success(!fexist("{tmp_root}/main.tune.json"), "a fat release mints no sidecar beside the script")
+        let bundle_dir = dir_name(bundle_exe_path(out_dir, "fatstub"))
+        tt |> success(!fexist(path_join(bundle_dir, "fatstub.tune.json")), "the bundle ships no tune sidecar")
+        tt |> success(fexist(bundle_exe_path(out_dir, "fatstub")), "the fat exe is in the bundle")
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+    }
+    t |> run("--fat refuses a kernel the baseline class has no profile entry for") @(tt : T?) {
+        let tmp_root = "{get_das_root()}/_test_release_fat_none"
+        let out_dir = "{get_das_root()}/_test_release_fat_none_out"
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+        write_fat_fixture(tmp_root, false)
+        let rc = cmd_release(tmp_root, out_dir, false, false, low)
+        tt |> success(rc != 0, "a fallback-stamped baseline clone refuses the release")
+        let bundle_dir = dir_name(bundle_exe_path(out_dir, "fatstub"))
+        tt |> success(!fexist(path_join(bundle_dir, RELEASE_MANIFEST)), "the refused release never finishes its bundle")
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+    }
+    t |> run("--fat refuses a class name that is not a name before anything builds") @(tt : T?) {
+        let tmp_root = "{get_das_root()}/_test_release_fat_unsafe"
+        let out_dir = "{get_das_root()}/_test_release_fat_unsafe_out"
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+        write_fat_fixture(tmp_root, true)
+        for (bad in ["x86-avx2 DAS_X=1", "x86-avx2;echo", "x86-avx2\"", "../x86-avx2"]) {
+            tt |> success(cmd_release(tmp_root, out_dir, false, false, bad) != 0, "'{bad}' is refused")
+        }
+        tt |> success(!fexist(bundle_exe_path(out_dir, "fatstub")), "no exe was built for a refused class name")
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+    }
+    t |> run("the gate names the kernel and the class, and passes a fully profiled scope") @(tt : T?) {
+        let refusal = release_fat_refusal("fatscope", "fat_kernel;other_kernel", low)
+        tt |> success(find(refusal, "scope `fatscope` has no {low} profile entry for fat_kernel, other_kernel") >= 0, "the refusal names the scope, the class and the kernels: {refusal}")
+        tt |> equal(release_fat_refusal("fatscope", "", low), "", "a scope whose baseline clones all came from a profile passes")
     }
 }
 

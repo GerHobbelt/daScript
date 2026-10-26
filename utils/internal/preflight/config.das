@@ -50,6 +50,18 @@ def public reach_hit(changed : array<string>; reach : array<string>) : bool {
     return has_path_under_any(changed, reach) || has_path_under_any(changed, CORE_REACH)
 }
 
+//! the review-md discovery suites' reach: the tools they test, the framework they run on, and a REVIEW.das anywhere -
+//! test_walkers copies utils/REVIEW.das into its fixture, so a gate edit is red only there
+let public REVIEW_MD_TESTS_REACH <- ["utils/internal/review-md/", "utils/internal/make-pr/", "utils/internal/preflight/", "dastest/"]
+
+def public review_md_tests_reach(changed : array<string>) : bool {
+    return true if (reach_hit(changed, REVIEW_MD_TESTS_REACH))
+    for (p in changed) {   // git names paths with forward slashes on every host
+        return true if (p == "REVIEW.das" || (p |> ends_with("/REVIEW.das")))
+    }
+    return false
+}
+
 //! The pure half of the compile sweep's root filter: a `.das` under the swept trees that is not a test,
 //! not generated, and not a module tree reached through a junction inside an example.
 def public is_sweep_root_path(path : string) : bool {
@@ -184,20 +196,6 @@ def public valid_jit_max_file_time_override(value : float) : bool {
     return value == -1.0 || value >= 0.0
 }
 
-//! The pure half of the lint gate's rail selection: `--lint-skip-exe-rail`
-//! keeps the host + linux-mirror interp rails and drops the -exe compiled one.
-def public lint_runs_exe_rail(skip_exe_rail : bool) : bool {
-    return !skip_exe_rail
-}
-
-//! The lint gate's Pass detail — the only observable that distinguishes a
-//! full three-rail pass from a rail-skipping one (both return GateStatus.Pass).
-def public lint_pass_detail(n_files : int; ran_exe_rail : bool) : string {
-    return (ran_exe_rail
-        ? "{n_files} file(s) clean on all three rails (host, linux-mirror, exe)"
-        : "{n_files} file(s) clean on interp rails (host, linux-mirror); exe rail skipped")
-}
-
 //! Resolve the read-only per-user config. ``DAS_PREFLIGHT_CONFIG`` overrides
 //! the platform default for hermetic tests and unusual installations.
 def public default_preflight_config_path() : string {
@@ -285,4 +283,11 @@ def public load_preflight_settings(path : string; var error : string&) : Preflig
     }
 
     return settings
+}
+
+//! CI's changed-set lint reads `.das` and `.md` alike (extended_checks: `-- '*.das' '*.md'`); a
+//! changed file of either kind goes to the lint gate, and nothing else does
+def is_lint_input(path : string) : bool {
+    let ext = extension(path)
+    return ext == ".das" || ext == ".md"
 }

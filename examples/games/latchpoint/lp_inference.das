@@ -44,11 +44,12 @@ def launch_inference(route, payload : string; binary : bool = false) {
 }
 
 def launch_inference_job(route, payload : string; binary : bool; timeout : int) : InferenceJob {
+    let delete_upload = route == "/audio/transcriptions" && normalize(payload) == normalize(path_join(get_das_root(), "logs/latchpoint-input/microphone.wav"))
     var output = unsafe(stream_create())
     var done = job_status_create()
     done |> append(1)
     let job = InferenceJob(stream = unsafe(reinterpret<uint64>(output)), done = unsafe(reinterpret<uint64>(done)))
-    new_thread() <| @capture(= output, = done, = route, = payload, = binary, = timeout) {
+    new_thread() <| @capture(= output, = done, = route, = payload, = binary, = timeout, = delete_upload) {
         var result = InferenceResponse()
         try {
             let client = OpenAIClient(base_url = "http://127.0.0.1:18082/v1", timeout_seconds = timeout)
@@ -71,7 +72,7 @@ def launch_inference_job(route, payload : string; binary : bool; timeout : int) 
         } recover {
             result.error = "Inference request failed."
         }
-        if (route == "/audio/transcriptions" && payload == path_join(get_das_root(), "logs/latchpoint-input/microphone.wav")) { remove(payload) }
+        if (delete_upload) { remove(payload) }
         output |> push_archive(result)
         output |> release()
         done |> notify_and_release()
@@ -87,6 +88,33 @@ def collect_inference_job(job : InferenceJob) : InferenceResponse {
     output |> try_pop_archive() $(var response : InferenceResponse) { result := response }
     unsafe { stream_remove(output); job_status_remove(done) }
     return <- result
+}
+
+def release_inference_job(var job : InferenceJob&) {
+    return if (job.stream == 0ul || job.done == 0ul)
+    if (inference_job_ready(job)) {
+        var inscope ignored <- collect_inference_job(job)
+    } else {
+        var output = unsafe(reinterpret<Stream?>(job.stream))
+        var done = unsafe(reinterpret<JobStatus?>(job.done))
+        new_thread() <| @capture(= output, = done) {
+            done |> join()
+            unsafe {
+                stream_remove(output)
+                job_status_remove(done)
+            }
+        }
+        output |> release()
+        done |> release()
+    }
+    job = InferenceJob()
+}
+
+def release_player_inference() {
+    var job = InferenceJob(stream = inference_stream, done = inference_done)
+    release_inference_job(job)
+    inference_stream = 0ul
+    inference_done = 0ul
 }
 
 def poll_inference(blk : block<(var response : InferenceResponse) : void>) : bool {

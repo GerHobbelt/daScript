@@ -4,11 +4,17 @@ Companion to `ARCHITECTURE.md`; section numbers are that document's.
 
 ### 2.5 There is ONE benchmark rig, and the records are the baseline {#one-benchmark-rig}
 
-`benchmarks/lcpp_bench.das` is the only thing that measures performance. It is a *mirror* of
-the upstream `llama-bench` - the same test shapes, rep counts and timing boundaries, applied to
-our engine - so `pp` is one batched prefill of `-p` tokens from an empty cache per rep and `tg`
-is `-n` single-token forwards with no logit read, each row one untimed warmup plus `-r` timed
-reps. The real `llama-bench` runs only when `--ref <path>` is passed; that is how the upstream
+`benchmarks/lcpp_bench.das` is the only thing that produces a recorded measurement. It is a
+*mirror* of the upstream `llama-bench` - the same test shapes, rep counts and timing
+boundaries, applied to our engine - so `pp` is one batched prefill of `-p` tokens from an empty
+cache per rep and `tg` is `-n` single-token forwards with no logit read, each row one untimed
+warmup plus `-r` timed reps. The rows' protocol lives in one place, `dasllama/dasllama_bench.das`
+(the synthetic ids, the warmups, the timed reps, the warmup logit check, the row statistic), and
+two drivers run it: `lcpp_bench` from its loop, and dasllama-server's in-process `/bench` one
+step per tick on the model it serves. Only `lcpp_bench`'s rows become records: the server's are
+a self-measure the operator reads on the control page, stamped with the device, the KV codec,
+the exec tier and the tune state they ran under, and they enter no board, ledger or exchange.
+The real `llama-bench` runs only when `--ref <path>` is passed; that is how the upstream
 columns were produced, and they are pinned, not re-measured.
 
 `performance/gen_bench_records.das` sweeps a board by spawning that rig once per cell, and
@@ -26,7 +32,9 @@ its stored mean (fail past 5%, warn past 3%, gains flagged as suspicious). Upstr
 the store is never written, and a text cell's timed child runs `--frozen` - a prepare pass bakes
 and warms its image first (the batch starts wiped), so the timed cell never converts; ASR and
 image-chat cells bake what they need mid-cell, like their publishing legs. A second
-harness would produce numbers that cannot be compared to any of this.
+harness with its own protocol would produce numbers that cannot be compared to any of this;
+the server's self-measure shares the protocol and is still not a record, because its session,
+its device and its tune state are whatever the operator's box serves.
 
 **The tune stamp gates the comparison.** A manifest older than the binary fails every cell, and
 an untuned invocation stamps the shipped class profile (a box the profile does not cover
@@ -47,9 +55,10 @@ stripped through `vkd_pipes_rebuild`) interleaved in one process, two rounds eac
 `DECVEC` verdict comes from one instrument. A new arm joins one of the three.
 
 **A measured number proves its kernel provenance through `tune_gate()`
-(`performance/profile_common.das`), one arm per world it can run in.** Three worlds, because
-`tune_status()` populates in exactly one of them: a standalone exe checks the sidecar the
-release shipped beside it; a `DAS_TUNE_MANIFEST` run checks that file; a plain script checks
+(`performance/profile_common.das`), one arm per world it can run in.** Four worlds, because
+`tune_status()` populates in two of them: a standalone exe checks the sidecar the release
+shipped beside it; a fat exe (sec.2.42a) checks that every kernel's most capable active class
+row is a profile stamp; a `DAS_TUNE_MANIFEST` run checks that file; a plain script checks
 that every `[tune]` row stamps a manifest winner. An invocation no arm covers refuses - or
 worse, measures on fallback kernels - which is why every measuring entry point calls the gate
 before its first timed rep. Two rig shapes fall outside "measuring entry point" by the
@@ -242,6 +251,10 @@ profile (`performance/defaults`), the annotation's `fallback` `;`-chain, then `D
 FILE its answer came from, so a verbose compile names which of the two stamped each kernel. A box
 the shipped profile covers therefore compiles tuned kernels without racing anything, and a box it
 does not cover falls to the fallback chain - never to another box's winners.
+With no tune framework in the build the first three steps do not exist - no policy env, no sidecar,
+no profile - so the ladder is the `perm=` pin, then the `fallback` chain's first UNCONDITIONAL entry
+(a `suffix:requires` seat cannot be judged with no feature probe), then `DEFAULT_PERM`, and the
+compile reports nothing.
 
 ### 2.41 The mint's own wall rides in the sidecar's provenance {#mint-wall-provenance}
 
@@ -251,3 +264,30 @@ written: `mint_gen_ms` (the generator half), `mint_kernels_ms` (the loop-hint ha
 box's tune-history directory carry them too, so the box's longitudinal record answers what
 shipping a profile cost without re-running the mint - a console line that scrolled past is not
 that record.
+
+### 2.42a A fat exe races its runtime section at first start {#fat-first-start}
+
+A fat exe (`DAS_TUNE_MODE=fat`, `modules/dasLLVM/ARCHITECTURE_TARGET_FEATURES.md` sec.11) ships
+its kernels baked per CPU class and carries no tuner and no policy rail, so nothing would ever
+mint the sidecar's `"runtime"` section - the Metal twin crowns among its knobs, a 2-4x
+kernel-form gain of a tensor twin over its simdgroup kernel per twin-race row on the M5 Max
+(`harness/tune_kernels.das`, the metal_crowns family) - and a shipped Mac exe would run
+uncrowned forever. The section needs no rebuild, so the exe
+mints it itself: `dasllama_fat_start` registers `dasllama_fat_first_start` with the box-profile
+apply (`set_runtime_race_hook`) from its `[init]`, and the engine umbrella
+(`dasllama_transformer`) requires the module so every engine program carries the registration -
+the shipped bench requires the umbrella, never the facade; `apply_box_profile_runtime_checked` fires the hook when the
+sidecar is absent, another box's, or carries no runtime section, then reads the file the hook
+wrote. The hook answers false outside a fat exe (`tune_fat_built()`); inside one it runs
+`dasllama_race_runtime_section`: the Metal twin races (`dasllama_metal_crown_race` - both halves,
+synthetic, no model) under the tune progress display, then `dasllama_runtime_snapshot` - the same
+writer the mint's kernel half ends with - merged into the app sidecar beside the exe with the
+kernels section untouched. The next start reads it and races nothing. A box without a Metal
+device records the knob defaults, so the file still documents the box. An unwritable location
+keeps the crowns for the process and says so; `DAS_TUNE_MANIFEST` moves the file.
+
+What a first start never does: load a model, spawn a child, or race a kernel. The tuner's
+confirms - the generator half's end-to-end prefill A/B, the kernel half's serving and MTP depth
+confirms - each spawn a daslang child on a harness script and a vehicle model, and they are the
+harness's alone; under `harness/dasllama_tuner.das` on the M5 Max they were 147 of the
+metal_crowns family's 161 s, the twin race itself 14 s.

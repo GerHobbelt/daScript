@@ -53,7 +53,7 @@ Task-specific instructions are in skill files under `skills/`. Read the relevant
 | `skills/mcp_tools.md` | Full MCP tool table + live-API reference |
 | `skills/das_formatting.md` | Creating or modifying any `.das` file |
 | `skills/comment_style_hygiene.md` | Writing or reviewing comments, names, or local code shape in ANY language |
-| `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums; shipping without the compiler (`libDaScriptNano`) |
+| `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums; shipping without the compiler (`libDaScriptNano`, or a standalone context on the full runtime) |
 | `skills/daslib_modules.md` | Using `daslib/` modules (linq, json, regex, etc.) |
 | `skills/das_macros.md` | Compile-time macros, AST manipulation, qmacro/quote, gc_node patterns |
 | `skills/daspkg.md` | Creating `.das_package` manifests, daspkg commands |
@@ -209,7 +209,7 @@ For path/filename ops use `fio` helpers (`base_name`/`dir_name`/`path_join`/...)
 - `utils/benchctl/` - benchmark result database + statistical comparison (needs the sqlite module)
 - `utils/dasllama-server/` - OpenAI-compatible dasLLAMA inference server (JIT-only; `deploy-jit.ps1` builds a standalone bundle)
 - `utils/dasllama-convert/` - offline GGUF -> `.dlim` model prep
-- `utils/watchdog/` - Python supervisor for long-running daslang programs (`python utils/watchdog/watchdog.py --cwd <program-dir>`)
+- `utils/watchdog/` - supervisor for long-running daslang programs: the static `bin/watchdog --cwd <program-dir>` (no compiler, no shared module, no lock on the files a deploy replaces), or `daslang utils/watchdog/main.das -- --cwd <program-dir>` under the interpreter
 - `utils/jobque-timeline/` - per-lane jobque trace viewer (ImGui)
 - `utils/vscode-daslang-test/` - VSCode Test Explorer extension for dastest (source; build per its README)
 - `tree-sitter-daslang/` - tree-sitter grammar, shared library, highlighting queries (`sgconfig.yml` at the SDK root wires ast-grep to it)

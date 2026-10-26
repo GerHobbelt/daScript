@@ -1,1 +1,1 @@
-Returns ``true`` if a module with the given name is registered, ``false`` otherwise.
+Returns ``true`` if a module with the given name is registered, or waits in a ``.das_module`` manifest for the first ``require`` that names it, ``false`` otherwise. Unlike ``typeinfo builtin_module_exists(name)`` it loads nothing.
