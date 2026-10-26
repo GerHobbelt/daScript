@@ -56,10 +56,29 @@ var private log_file : FILE const? = null
 var private log_path : string
 var private log_name : string
 var private log_open_failed = false
-var private log_min_level = LOG_INFO
+var private log_min_level = env_min_level()
 var private log_category_overrides : table<string; int>
 var private log_fallback_to_stderr = true
 var private log_tee = false
+var private log_echo_stderr = false
+
+def private env_min_level() : int {
+    var text = get_env_variable("DAS_LOGGER_LEVEL")
+    if (empty(text)) {
+        text = get_env_variable("DAS_LOG_LEVEL")
+    }
+    if (empty(text)) {
+        return LOG_WARNING
+    }
+    let name = to_lower(text)
+    if (name == "trace") return LOG_TRACE
+    if (name == "debug") return LOG_DEBUG
+    if (name == "info") return LOG_INFO
+    if (name == "warning") return LOG_WARNING
+    if (name == "error") return LOG_ERROR
+    if (name == "critical") return LOG_CRITICAL
+    return to_int(name)
+}
 
 def private level_name(level : int) : string {
     return "critical" if (level >= LOG_CRITICAL)
@@ -139,6 +158,9 @@ def private emit(level : int; category, message : string; fields : JsonValue?) {
     if (log_file != null) {
         fwrite(log_file, line)
         fflush(log_file)
+        if (log_echo_stderr) {
+            fwrite(fstderr(), "[{level_name(level)}] {strip_right(message)}\n")   // a to_log line carries its own newline
+        }
         return
     }
     if (log_fallback_to_stderr) {
@@ -181,7 +203,8 @@ def logger_get_name() : string {
 
 def logger_set_min_level(level : int) {
     //! Global minimum level. Records below this are dropped before
-    //! formatting. Default ``LOG_INFO``.
+    //! formatting. Default ``LOG_WARNING``, or the level ``DAS_LOGGER_LEVEL`` /
+    //! ``DAS_LOG_LEVEL`` names.
     log_min_level = level
 }
 
@@ -198,6 +221,13 @@ def logger_set_category_level(category : string; level : int) {
 def logger_clear_category_levels() {
     //! Remove all per-category overrides.
     log_category_overrides |> clear
+}
+
+def logger_set_echo_stderr(enabled : bool) {
+    //! Echo every record the file receives to stderr as one plain ``[level] message`` line - a
+    //! tool's ``--verbose``: stdout stays untouched, unlike :func:`logger_set_tee`, which lets the
+    //! runtime's own sink print. Off by default; no effect while the file is not open.
+    log_echo_stderr = enabled
 }
 
 def logger_set_stderr_fallback(enabled : bool) {

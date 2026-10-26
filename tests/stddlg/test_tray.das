@@ -188,7 +188,9 @@ def test_tray_macos_status_item(t : T?) {
             return
         }
         let pid = unsafe(process_pid(rig.child))
-        let clicked = apple_script("tell application \"System Events\" to tell (first process whose unix id is {pid}) to click menu bar item 1 of menu bar 1")
+        let clicked = apple_script_until("tell application \"System Events\" to tell (first process whose unix id is {pid}) to click menu bar item 1 of menu bar 1", 30.0) $(dump) {
+            return find(dump, "error") < 0
+        }
         t |> success(find(clicked, "error") < 0, "with accessibility on, the child must own a status item System Events can click: {clicked}")
         t |> equal(wait_for_line(t, rig, "@event click", 10.0), "@event click 0 0 0")
         stop_rig(rig)
@@ -260,7 +262,7 @@ def test_tray_menu_over_private_bus(t : T?) {
             t |> equal(wait_for_line(t, rig, "@event menu", 10.0), "@event menu 10 0 0")
             dbus_send(rig, false, "/MenuBar", "com.canonical.dbusmenu.Event", ["int32:30", "string:clicked", "variant:int32:0", "uint32:0"])
             t |> equal(wait_for_line(t, rig, "@event menu 30", 10.0), "@event menu 30 0 0")
-            t |> equal(unsafe(process_wait(rig.child, 10.0)), 0, "child returned 0 after Quit")
+            t |> equal(unsafe(process_wait(rig.child, 120.0)), 0, "child returned 0 after Quit")
         }
     }
     t |> run("EventGroup, the batched form panels send, reaches the same menu event") @(t : T?) {

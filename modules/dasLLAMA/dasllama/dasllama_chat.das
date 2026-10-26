@@ -773,6 +773,28 @@ def add_user_image_rows_(m : Model; var c : ChatSession; var rows : array<float>
     c.image_grid = grid
 }
 
+//! Queue PRE-ENCODED audio soft-token rows (what `encode_audio` emits — `dim`-wide on every
+//! family, length-checked) for the next respond(). MOVES `rows`; works on a plain chat — no
+//! tower needed: the carrier path for a model whose audio arm the AudioEmbedder serves.
+def add_user_audio_rows_(m : Model; var c : ChatSession; var rows : array<float>; n_rows : int64) {
+    if (c.n_image_rows > 0l) {
+        panic("dasLLAMA chat: an image is already queued this turn - one media kind per turn")
+    }
+    if (empty(c.tmpl.audio_pre.parts) || !audio_vocab_ok(m, c.tmpl)) {
+        panic("dasLLAMA chat: this model's chat template declares no usable audio span markers - it has no audio arm")
+    }
+    if (long_length(rows) != n_rows * m.config.dim) {
+        panic("dasLLAMA chat: {n_rows} audio rows need {n_rows * m.config.dim} floats (dim {m.config.dim}), got {length(rows)}")
+    }
+    if (c.n_audio_rows > 0l) {   // a second clip in the same turn appends its rows
+        c.audio_rows |> push_from(rows)
+        delete rows
+    } else {
+        c.audio_rows <- rows
+    }
+    c.n_audio_rows += n_rows
+}
+
 //! Queue audio (16 kHz mono f32 PCM) for the next respond() — encoded to soft tokens NOW,
 //! spliced at the head of the next user turn (before its text). Composes with add_user in the
 //! same turn; call inside with_job_que() (the encoder threads its kernels).
@@ -865,15 +887,70 @@ def set_thinking_(var c : ChatSession; on : bool) {
     c.enable_thinking = on
 }
 
-//! The stop ids in force for the NEXT generation: the template's stops, plus its thinking-off
-//! extras while the next turn is NOT a thinking turn (gemma-4 cuts at a stray channel marker in
-//! instruct mode — including "thinking on" that never armed: missing vocab, un-rendered gate).
+//! Every stop id for the NEXT generation as one list: the template's stops plus the thinking-off
+//! extras of a non-thinking turn (`nothink_stop_ids_`). The generation loops split the two:
+//! the template's stops end the turn outright, the extras go through `nothink_stop_here_`.
 def effective_stop_ids_(c : ChatSession) : array<int64> {
     var out := c.stop_ids
+    out |> push_from(nothink_stop_ids_(c))
+    return <- out
+}
+
+//! The template's own stop ids for the NEXT generation: a token among them ends the turn outright.
+def turn_stop_ids_(c : ChatSession) : array<int64> {
+    return <- clone_to_move(c.stop_ids)
+}
+
+//! The template's thinking-off extras (gemma-4's channel markers) while the next turn is NOT a
+//! thinking turn; empty on a thinking turn.
+def private nothink_stop_ids_(c : ChatSession) : array<int64> {
+    var out : array<int64>
     if (!think_turn_active_(c)) {
-        out |> push_from(c.stop_ids_nothink)
+        out := c.stop_ids_nothink
     }
     return <- out
+}
+
+//! The instruct-mode stop guard over a turn's channel markers: a marker before the first content
+//! piece opens a leading thought the reply matcher splits, a marker after content ends the turn.
+struct NothinkStopGuard {
+    ids : array<int64>       // the thinking-off extras; empty = every token passes
+    ts : ThinkStream = ThinkStream()   // the family's reply matcher, armed, tracking whether content began
+    content_seen : bool = false
+}
+
+//! The guard for `c`'s NEXT turn: armed on an instruct-shaped turn of a family with `stop_nothink`.
+def make_nothink_guard_(c : ChatSession) : NothinkStopGuard {
+    return <- make_nothink_guard_(c.tmpl, nothink_stop_ids_(c))
+}
+
+//! The low-level form: the template's reply matcher over `ids` (tests hand the ids in directly).
+def make_nothink_guard_(tmpl : ChatTemplate; ids : array<int64>) : NothinkStopGuard {
+    var g = NothinkStopGuard()
+    g.ids := ids
+    if (!empty(g.ids)) {
+        g.ts = make_think_stream_(tmpl, true)
+    }
+    return <- g
+}
+
+//! true = `id` ends the turn: a guarded marker sampled after content. Every other token passes
+//! through the matcher, which is how a leading `<|channel>thought…<channel|>` block stays reasoning
+//! rather than a stop - an E-series model opens a media turn with one even in instruct mode.
+def nothink_stop_here_(var g : NothinkStopGuard; id : int64; piece : string) : bool {
+    if (empty(g.ids)) {
+        return false
+    }
+    if (g.content_seen && find_index(g.ids, id) >= 0) {
+        return true
+    }
+    var rsn = ""
+    var cnt = ""
+    think_feed_(g.ts, piece, rsn, cnt)
+    if (!empty(strip(cnt))) {
+        g.content_seen = true
+    }
+    return false
 }
 
 //! Queue a user message for the next respond().
@@ -1071,10 +1148,11 @@ def make_think_stream_(tmpl : ChatTemplate; thinking : bool) : ThinkStream {
                        state = TS_START)
 }
 
-//! The reply matcher for `c`'s NEXT turn: armed only when the turn is a thinking turn
-//! (`think_turn_active_` — toggle on, markers in the vocab, gate rendered or rendering).
+//! The reply matcher for `c`'s NEXT turn: armed on a thinking turn (`think_turn_active_`) and on
+//! an instruct turn of a family whose channel markers are guarded stops (`stop_nothink`) - the
+//! tolerated leading thought splits like any other.
 def make_think_stream_(c : ChatSession) : ThinkStream {
-    return make_think_stream_(c.tmpl, think_turn_active_(c))
+    return make_think_stream_(c.tmpl, think_turn_active_(c) || !empty(c.stop_ids_nothink))
 }
 
 // Longest k < length(mark) where the view's tail from `from` ends with mark's first k characters —
@@ -1444,10 +1522,23 @@ def private assemble_media_embd(m : Model; c : ChatSession; head, tail : array<i
     embed_text_rows_strided(m, tail, embd, n_head + n_media, rw)
 }
 
+//! One generated token of a respond: false ends the turn - the template's own stop, or a
+//! guarded channel marker after content - else the piece joins the reply and the caller's block.
+def private admit_piece_(stops : array<int64>; var guard : NothinkStopGuard; var reply_parts : array<string>;
+                         blk : block<(piece : string) : bool>; id : int64; piece : string) : bool {
+    for (sid in stops) {
+        return false if (id == sid)
+    }
+    return false if (nothink_stop_here_(guard, id, piece))
+    reply_parts |> push(piece)
+    return invoke(blk, piece)
+}
+
 def private respond_media_or_text_(m : Model; var c : ChatSession; params : SamplingParams;
                                    blk : block<(piece : string) : bool>) : string {
-    // local clone so the streaming callback captures no part of `c` (c.session is passed to generate)
-    var inscope stops <- effective_stop_ids_(c)
+    // local clones so the streaming callback captures no part of `c` (c.session is passed to generate)
+    var inscope stops := c.stop_ids
+    var inscope guard <- make_nothink_guard_(c)
     var inscope reply_parts : array<string>
     if (c.n_audio_rows > 0l || c.n_image_rows > 0l) {
         // media turn: spans around the splice; ONE kind per turn (the add_user_* pair enforces it)
@@ -1469,11 +1560,7 @@ def private respond_media_or_text_(m : Model; var c : ChatSession; params : Samp
         let span_lo = is_image ? n_head : 0l
         let span_hi = is_image ? n_head + n_media : 0l
         generate_embd_(m, c.session, embd, npos, params, c.max_new, span_lo, span_hi, is_image ? c.image_grid : int2(0)) $(id, piece) {
-            for (sid in stops) {
-                return false if (id == sid)
-            }
-            reply_parts |> push(piece)
-            return invoke(blk, piece)
+            return admit_piece_(stops, guard, reply_parts, blk, id, piece)
         }
         c.audio_rows |> clear()
         c.n_audio_rows = 0l
@@ -1484,11 +1571,7 @@ def private respond_media_or_text_(m : Model; var c : ChatSession; params : Samp
         render_prompt(m, c, pre)
         render_think_suppress(m, c, pre)
         generate_(m, c.session, pre, params, c.max_new) $(id, piece) {
-            for (sid in stops) {
-                return false if (id == sid)
-            }
-            reply_parts |> push(piece)
-            return invoke(blk, piece)
+            return admit_piece_(stops, guard, reply_parts, blk, id, piece)
         }
     }
     consume_pending_(c)

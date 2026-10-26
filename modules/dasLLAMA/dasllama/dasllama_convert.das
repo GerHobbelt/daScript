@@ -10,6 +10,7 @@ require daslib/f16_cvt   // f16<->f32 halfword codecs — the Q5_K encoder + eve
 require daslib/jobque_boost public   // quantize_k5_plane threads its superblock loop
 require dasllama/dasllama_par        // maybe_parallel_for (+ its emitted dispatch counters)
 require dasllama/dasllama_math       // get_dispatch_lanes — the requant wrappers shape their fan-out
+require dasllama/dasllama_math_default   // dequant_kq_row_grp - the repacked plane's group gather behind kq_plane_row_f32
 require dasllama/dasllama_kqformat public   // KqFmt + the plane stride truth (K4_QSB et al.) — re-exported down the gguf chain
 require dasllama/dasllama_tune       // [tuned]: the f16 row converts carry per-box loop hints
 require dasllama/dasllama_tune_scope  // nolint:STYLE030 — the dasllama [tune_scope] must be on the AST before this module's [tuned] kernels pick their perms
@@ -1173,6 +1174,55 @@ def quantize_q8_0(src : array<float> | #; n : int64) : Q8Tensor {
     return <- qt
 }
 
+//! Row r of a K-quant plane pair as f32 into dst[doff..]: `mr` = the interleave the plane was repacked to (1 = disk order; a Model's
+//! frozen `kq_active_mr`, a TTS plane's active layout), `sb0` = the plane's first superblock inside a larger pair (a model blob's
+//! region), `metal_blob` = the split GPU scale form.
+def kq_plane_row_f32(f : KqFmt; kq, ks : array<uint8>; nin, nout, mr : int64; r : int64; var dst : array<float>; doff : int64;
+                     sb0 : int64 = 0l; metal_blob : bool = false) {
+    let nsb = nin / kq_elems(f)
+    let packed_rows = mr > 1l ? (nout / mr) * mr : 0l
+    if (r < packed_rows) {
+        let sbg = sb0 + (r / mr) * mr * nsb
+        unsafe {
+            dequant_kq_row_grp(int64(kq_schema_id(f)), addr(kq[sbg * kq_qsb(f)]), addr(ks[sbg * kq_ssb(f)]), r % mr, mr, nin, addr(dst[doff]))
+        }
+    } else {
+        for (s in range64(nsb)) {
+            dequant_kq_plane_sb(f, kq, ks, sb0 + r * nsb + s, metal_blob, dst, doff + s * kq_elems(f))
+        }
+    }
+}
+
+//! Row r of a Q8_0 plane pair [nout][nin] as f32 at dst, each quant times its block's f32 scale: `q` / `s` the quants and
+//! scales as `lay` repacked them - the grp<mr> interleave for the whole groups (`kgroup`-byte columns, biased by `wbias`),
+//! row-major for the tail; the pointer core, so a row range runs on each job lane.
+def q8_plane_row_f32(q : int8 const?; s : float const?; nin, nout : int64; lay : Q8RepackLayout; r : int64; var dst : float?) {
+    let nb = nin / 32l
+    let mr = lay.mr
+    let kg = lay.kgroup
+    unsafe {
+        if (r < (nout / mr) * mr) {
+            let rg = r % mr
+            let gq = q + (r / mr) * mr * nin + rg * kg
+            for (bi in range64(nb)) {
+                let d = s[((r / mr) * nb + bi) * mr + rg]
+                for (c in range64(bi * 32l / kg, (bi + 1l) * 32l / kg)) {
+                    for (j in range64(kg)) {
+                        dst[c * kg + j] = float(int8(uint8(int(gq[c * kg * mr + j]) ^ int(lay.wbias)))) * d
+                    }
+                }
+            }
+        } else {
+            for (bi in range64(nb)) {
+                let d = s[r * nb + bi]
+                for (j in range64(bi * 32l, bi * 32l + 32l)) {
+                    dst[j] = float(q[r * nin + j]) * d
+                }
+            }
+        }
+    }
+}
+
 //! Quantize a flat fp32 tensor to Q8_0 directly into pre-allocated slices: quants land at
 //! qdst[qoff..], scales at sdst[soff..]. No allocation — the memory-honest loader uses this to
 //! quantize one tensor at a time into the model's shared qblob/qscales. n must be a multiple of 32.
@@ -1524,6 +1574,18 @@ def cvt_f32_to_f16_sat(var d : uint16?; s : float const?; n : int64) {
             d[i] = uint16(f32_to_f16(clamp(s[i], -65504.0, 65504.0)))
         }
     }
+}
+
+//! the saturating f16 image of a staged f32 slab, one halfword an element - the halfword twin a device upload takes
+def cvt_f32_to_f16_sat_array(src : array<float>) : array<uint16> {
+    var out : array<uint16>
+    out |> reserve_resize(long_length(src))
+    if (!empty(src)) {
+        unsafe {
+            cvt_f32_to_f16_sat(addr(out[0]), addr(src[0]), long_length(src))
+        }
+    }
+    return <- out
 }
 
 //! CPU mirror of the GPU dev-W q8 dequant (MetalDequantQ8H), bit-exact: the scale narrows to

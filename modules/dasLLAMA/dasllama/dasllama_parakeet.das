@@ -46,7 +46,9 @@ struct ParakeetToken {
     plog : float
 }
 
-struct private PkLayerOffs {
+//! One conformer block's blob offsets: GEMM regions index qblob on a q8 load, blob on fp32
+//! (identical walks on fp32); the d-vectors, u/v biases and the depthwise taps always index blob.
+struct PkLayerOffs {
     nf1_w : int64
     nf1_b : int64
     ff1a_w : int64   // 1024 -> 4096
@@ -215,7 +217,7 @@ def private register_parakeet_image_tags {
     register_image_family_tag("parakeet-f32")
 }
 
-def private pk_layer_offsets(m : ParakeetModel; l : int64) : PkLayerOffs {
+def pk_layer_offsets(m : ParakeetModel; l : int64) : PkLayerOffs {
     let d = m.n_state
     let ff = 4l * d
     let dh = d / m.n_head
@@ -285,9 +287,7 @@ def private pk_repack_all(var st : ParakeetStaging) {
     let d = st.e.n_state
     let ff = 4l * d
     let nch = st.e.n_sub_ch
-    let w1 = (st.e.n_mel - 1l) / 2l + 1l
-    let w2 = (w1 - 1l) / 2l + 1l
-    let w3 = (w2 - 1l) / 2l + 1l
+    let w3 = conv_s2_out(conv_s2_out(conv_s2_out(st.e.n_mel)))
     let feat = w3 * nch                       // pre_w input dim (encode's xf row width)
     pk_repack(st, st.e.c3_w, nch, nch)
     pk_repack(st, st.e.c6_w, nch, nch)
@@ -502,6 +502,7 @@ def private pk_read_gemm(recs : table<string; PkTensorRec>; b : array<uint8> | #
 //! With ``q8`` the encoder/joint GEMM weights transcode to Q8_0 straight from the mapped file (~4x CPU fast path); conv im2col, depthwise, LSTM, and joint_net stay fp32 (a few % of encode).
 //! Like ``load_model``, caches a box/knob-specific PREPARED IMAGE for fast reload; ``DASLLAMA_IMAGE=0`` disables it, a ``.dlim`` path loads one directly.
 def load_parakeet_model(path : string; q8 : bool = false) : ParakeetModel {
+    pk_announce_lane(q8)
     let tag = q8 ? "parakeet-q8" : "parakeet-f32"
     if (path |> ends_with(".dlim")) {
         // named directly — no source bin to regenerate from, so a wrong identity panics
@@ -904,8 +905,8 @@ def parakeet_log_mel(samples : array<float> | #; m : ParakeetModel; var st : Par
 // (conv_sub_bench); threads over oy rows (bit-exact at any lane count).
 def private pk_conv2d_c1_s2_relu(var out : array<float>; x : array<float>; blob : PlaneF;
                                  w_off, b_off : int64; iw, ih, cout : int64) {
-    let ow = (iw - 1l) / 2l + 1l
-    let oh = (ih - 1l) / 2l + 1l
+    let ow = conv_s2_out(iw)
+    let oh = conv_s2_out(ih)
     pk_ensure(out, oh * ow * cout)
     unsafe {
         var op = addr(out[0])
@@ -986,8 +987,8 @@ def private pk_dw_pos(var op : float?; xp, wp, bp : float const?; oy, ox, iw, ih
 // interior threads over oy rows (independent — bit-exact at any lane count)
 def private pk_conv2d_dw_s2(var out : array<float>; x : array<float>; blob : PlaneF;
                             w_off, b_off : int64; iw, ih, ch : int64) {
-    let ow = (iw - 1l) / 2l + 1l
-    let oh = (ih - 1l) / 2l + 1l
+    let ow = conv_s2_out(iw)
+    let oh = conv_s2_out(ih)
     let oy_end = (ih - 2l) / 2l + 1l   // last oy with iy=2*oy+1 in bounds, exclusive
     let ox_end = (iw - 2l) / 2l + 1l
     let rs = iw * ch
@@ -1100,27 +1101,25 @@ def private pk_bias_relu(var y : array<float>; blob : PlaneF; b_off, d, npos : i
 def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
     let d = m.n_state
     let nch = m.n_sub_ch
-    let n_head = m.n_head
-    let dh = d / n_head
     // the conformer block loop walks the subsampled frame count
     dispatch_phase_encode((st.mel.n_len + m.subsampling - 1l) / m.subsampling)
 
     // conv subsampling ([time][mel] rows are already the [ih][iw][c=1] layout)
     var tp = ref_time_ticks()
-    let t1 = (st.mel.n_len - 1l) / 2l + 1l
-    let w1 = (m.n_mel - 1l) / 2l + 1l          // 64
+    let t1 = conv_s2_out(st.mel.n_len)
+    let w1 = conv_s2_out(m.n_mel)
     pk_conv2d_c1_s2_relu(st.y0, st.mel.data, m.blob, m.c0_w, m.c0_b, m.n_mel, st.mel.n_len, nch)
     pk_conv2d_dw_s2(st.y2, st.y0, m.blob, m.c2_w, m.c2_b, w1, t1, nch)
-    let w2 = (w1 - 1l) / 2l + 1l               // 32
-    let t2 = (t1 - 1l) / 2l + 1l
+    let w2 = conv_s2_out(w1)
+    let t2 = conv_s2_out(t1)
     pk_ensure(st.y3, t2 * w2 * nch)
     pk_scan("y0", st.y0, t1 * w1 * nch)
     pk_scan("y2", st.y2, t2 * w2 * nch)
     pk_mm_rq(m, st.y3, m.c3_w, st.y2, st.xqi, st.xsi, nch, nch, t2 * w2)   // 1x1 conv = per-position channel mix
     pk_bias_relu(st.y3, m.blob, m.c3_b, nch, t2 * w2)
     pk_conv2d_dw_s2(st.y5, st.y3, m.blob, m.c5_w, m.c5_b, w2, t2, nch)
-    let w3 = (w2 - 1l) / 2l + 1l               // 16
-    let t3 = (t2 - 1l) / 2l + 1l
+    let w3 = conv_s2_out(w2)
+    let t3 = conv_s2_out(t2)
     pk_ensure(st.y6, t3 * w3 * nch)
     pk_mm_rq(m, st.y6, m.c6_w, st.y5, st.xqi, st.xsi, nch, nch, t3 * w3)
     pk_bias_relu(st.y6, m.blob, m.c6_b, nch, t3 * w3)
@@ -1163,6 +1162,69 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
     }
     asr_prof_add("pk.pos_emb", tp)
 
+    var gpu_served = false
+    if (g_pk_gpu_set) {
+        gpu_served = invoke(g_pk_gpu, m, st, tt, ww)
+    }
+    if (!gpu_served) {
+        pk_blocks_cpu(m, st, tt, ww, n_real)
+    }
+    return tt
+}
+
+//! the GPU block hook: after the subsample front + pre-projection + pos table, the 24 conformer blocks on st.x
+typedef ParakeetGpuBlocksFn = function<(m : ParakeetModel; var st : ParakeetState; tt, ww : int64) : bool>
+typedef ParakeetServesFn = function<() : bool>
+var private g_pk_gpu : ParakeetGpuBlocksFn
+var private g_pk_serves : ParakeetServesFn
+var private g_pk_gpu_set = false
+var private g_pk_serves_set = false
+
+[arch(at="../ARCHITECTURE_MEDIA.md#tower-gpu-hook")]
+def register_parakeet_gpu(fn : ParakeetGpuBlocksFn; serves : ParakeetServesFn) {
+    g_pk_gpu = fn
+    g_pk_serves = serves
+    g_pk_gpu_set = true
+    g_pk_serves_set = true
+}
+
+//! Would the Metal driver serve the block loop — the lane policy asks (a serving driver wants
+//! the f32 blob, so the un-pinned lane defaults to exact); false on CPU builds or knob-off.
+def parakeet_gpu_serves() : bool => g_pk_serves_set && invoke(g_pk_serves)
+
+var private g_pk_pin = GemmLane.unset
+
+//! Pin the parakeet weight format for subsequent loads: q8 (the CPU serving lane) vs the fp32
+//! lane the parity legs and the GPU driver read. ``reset_parakeet_q8`` returns to the policy
+//! default (exact when the Metal driver serves).
+def set_parakeet_q8(on : bool) {
+    g_pk_pin = lane_pin(on)
+}
+
+def reset_parakeet_q8() {
+    g_pk_pin = GemmLane.unset
+}
+
+[arch(at="../ARCHITECTURE_MEDIA.md#tower-weight-lane")]
+def parakeet_serves_q8() : bool => lane_serves_q8(g_pk_pin, !parakeet_gpu_serves())
+
+[arch(at="../ARCHITECTURE_MEDIA.md#tower-weight-lane")]
+def private pk_announce_lane(q8 : bool) {
+    var why = "the CPU default (DASLLAMA_METAL_TOWER off, or no Metal FastConformer driver)"
+    if (g_pk_pin != GemmLane.unset) {
+        why = "pinned via set_parakeet_q8"
+    } elif (parakeet_gpu_serves()) {
+        why = "the Metal FastConformer driver serves f32 planes"
+    }
+    to_log(LOG_INFO, "dasLLAMA parakeet: GEMM lane {q8 ? "q8" : "f32 planes"} - {why}\n")
+}
+
+def private pk_blocks_cpu(m : ParakeetModel; var st : ParakeetState; tt, ww, n_real : int64) {
+    let d = m.n_state
+    let n_head = m.n_head
+    let dh = d / n_head
+    var tp = ref_time_ticks()
+
     // scratch
     pk_ensure(st.xb, tt * d)
     pk_ensure(st.h, tt * 4l * d)
@@ -1174,9 +1236,7 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
     pk_ensure(st.quh2, tt * dh)
     pk_ensure(st.vh, tt * dh)
     pk_ensure(st.kth, dh * tt)
-    // per-job B-row slabs, NOT tt-row matrices (job li owns slab li; 4-aligned row groups
-    // stay bit-exact). Jobs never exceed blocks — 10-wide dispatches over a short clip's 3
-    // blocks cost ~20 ms/clip at jfk length (measured on the M4 board).
+    //! per-job B-row slabs: job li owns slab li; 4-aligned row groups stay bit-exact
     let atn_jobs = min(int64(lanes_for_work(tt * dh * (2l * tt + ww), 0)),
         (tt + PK_ATN_BLOCK - 1l) / PK_ATN_BLOCK)
     pk_ensure(st.scores, atn_jobs * PK_ATN_BLOCK * tt)
@@ -1254,8 +1314,7 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                 let plp = addr<float const?>(st.posl[0])
                 let bup = plane_at(m.blob, lo.bias_u + hi * dh)
                 let bvp = plane_at(m.blob, lo.bias_v + hi * dh)
-                // transposed head views ((Q+u), (Q+v), Kᵀ, V_h, pos_hᵀ) — the row GEMMs read
-                // these in full, so they build before the compute dispatch
+                //! the transposed head views build in full before the row GEMMs read them
                 var th = ref_time_ticks()
                 maybe_parallel_for(0, int(tt), lanes_for_work(tt * dh * 4l, 0)) $(rb, re) {
                     unsafe {
@@ -1283,9 +1342,6 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                 }
                 asr_prof_add("pk.attn_heads.pos", th)
                 th = ref_time_ticks()
-                // content scores (Q+u)·Kᵀ + rel scores (Q+v)·pos_hᵀ + softmax + P·V_h — atn_jobs
-                // jobs over B-row blocks into per-job slabs: gemm_f32 never mixes accumulation
-                // across 4-row groups, so 4-aligned starts stay bit-exact and scratch is O(jobs·B).
                 let nblkb = (tt + PK_ATN_BLOCK - 1l) / PK_ATN_BLOCK
                 let npj = (nblkb + atn_jobs - 1l) / atn_jobs
                 maybe_parallel_for(0, int(atn_jobs), int(atn_jobs)) $(jb, je) {
@@ -1379,9 +1435,6 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                     }
                 }
             }
-            // depthwise conv1d k9 over time (reads xb rows t±kpad — barrier from the GLU
-            // dispatch above), folded BN + silu; f4 row core on the all-taps-in-range
-            // interior when k==9, guarded scalar rows otherwise (borders / odd k / odd d)
             let f4ok = nk == 9l && d4ok
             maybe_parallel_for(0, int(tt), lanes_for_work(tt * d * (nk + 4l), 0)) $(rb, re) {
                 unsafe {
@@ -1456,9 +1509,6 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
         pk_scan("out", l, st.x, tt * d)
         asr_prof_add("pk.ffn", tp)
     }
-
-    // the encoder rows stay in st.x — the TDT decode reads them from there
-    return tt
 }
 
 // ===== prediction network + joint + TDT greedy =====

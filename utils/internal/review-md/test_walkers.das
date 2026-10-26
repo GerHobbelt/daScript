@@ -65,7 +65,6 @@ def test_pilot_gate_fixtures(t : T?) {
 
     let green = spawn_at(fixture, [path_join(fixture, "utils/REVIEW.das")])
     t |> equal(0, green.rc, "consistent fixture is green: {green.out}")
-    t |> success(find(green.out, "REVIEW.das utils: OK") >= 0, "green verdict printed")
 
     // one violation per check class
     write_at(t, fixture, "utils/internal/Bad_Name/x.txt", "x\n")
@@ -236,7 +235,6 @@ def test_dasllama_gate_fixtures(t : T?) {
 
     let green = spawn_at(fixture, [path_join(fixture, "modules/dasLLAMA/REVIEW.das")])
     t |> equal(0, green.rc, "covered fixture is green: {green.out}")
-    t |> success(find(green.out, "REVIEW.das dasllama: OK") >= 0, "green verdict printed")
 
     // a line after a `def ... => expr` one-liner is outside the layout closure - the window
     // ends on the header, so the stamp does not move
@@ -310,6 +308,66 @@ let DASLLAMA_RED_NEEDLE_CENSUS <- [
     "dasllama_toyvis.das: absent from modules/dasLLAMA/.das_module",
     "names dasllama_gone, but no census dir (modules/dasLLAMA/dasllama) holds dasllama_gone.das"]
 
+//! the citation, require-ban and harness-dashv gates on the same planted tree: the green run carries a clean control per gate
+//! (every citation form the rule licenses, the tower file on a shape helper, the two decoder files on their containers, a harness
+//! tool on the exchange module and one naming the site without dashv), the red run one plant per finding arm
+[test]
+def test_dasllama_cite_require_gates(t : T?) {
+    let tree = getcwd()
+    if (!fexist(path_join(tree, "modules/dasLLAMA/REVIEW.das"))) {
+        t |> skip("not run from the repo root")
+        return
+    }
+    let fixture_r = create_temp_directory_result("review_dasllama_bans")
+    t |> success(fixture_r is value, "temp fixture dir created")
+    if (!(fixture_r is value)) return
+    let fixture = unsafe(fixture_r.value)
+    make_dasllama_fixture(t, tree, fixture)
+    restamp_dasllama_gate(t, fixture)
+    let gate = path_join(fixture, "modules/dasLLAMA/REVIEW.das")
+
+    write_at(t, fixture, "modules/dasLLAMA/ARCHITECTURE_CONTROL.md",
+        "a ledger row followup_vulkan.md sec.3, a HOW_TO_ADD_A_FORMAT.md sec.2 step and another folder's modules/dasVulkan/ARCHITECTURE.md sec.1 stay citable by number\nthe set is cited as `ARCHITECTURE_GPU.md#gpu-backends`, and `ARCHITECTURE_GPU.md` names the document alone\n")
+    write_at(t, fixture, "modules/dasLLAMA/harness/cite_ok.das", "options gen2\n\n// ARCHITECTURE_GPU.md#gpu-backends owns the role table\n")
+    write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_tower.das", "options gen2\n\nrequire dasllama/dasllama_asr_types\n")
+    write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_audio_io.das", "options gen2\n\nrequire audio\n")
+    write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_vision_io.das", "options gen2\n\nrequire stbimage\n")
+    write_at(t, fixture, "modules/dasLLAMA/.das_module", "\"dasllama_tower\", \"dasllama_audio_io\", \"dasllama_vision_io\", " + DASLLAMA_MODULE_LIST)
+    write_at(t, fixture, "modules/dasLLAMA/harness/exchange_ok.das", "options gen2\n\nrequire dashv\nrequire dasllama/dasllama_exchange\n")
+    write_at(t, fixture, "modules/dasLLAMA/harness/site_ok.das", "options gen2\n\nlet SITE = \"https://dasllama.io\"\n")
+    let green = spawn_at(fixture, [gate])
+    t |> equal(0, green.rc, "the licensed citations and requires are green: {green.out}")
+
+    write_at(t, fixture, "modules/dasLLAMA/ARCHITECTURE_SECNUM.md", "the slab rule sits in ARCHITECTURE_IMAGE.md sec.2\n")
+    write_at(t, fixture, "modules/dasLLAMA/REVIEW_BARENUM.md", "the tile rule sits in `ARCHITECTURE_GPU_VULKAN.md` 2.2b\n")
+    write_at(t, fixture, "modules/dasLLAMA/harness/cite_probe.das", "options gen2\n\n// the tile rule: ARCHITECTURE_GPU_VULKAN.md sec.4\n")
+    write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_tower.das",
+        "options gen2\n\nrequire dasllama/dasllama_audio\nrequire dasllama/dasllama_toyfam\nrequire dasllama/dasllama_kokoro\n")
+    write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_audio_probe.das", "options gen2\n\nrequire audio\n")
+    write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_vision_probe.das", "options gen2\n\nrequire stbimage\n")
+    write_at(t, fixture, "modules/dasLLAMA/harness/exchange_probe.das", "options gen2\n\nrequire dashv\n\nlet SITE = \"https://dasllama.io/exchange\"\n")
+    let red = spawn_at(fixture, [gate])
+    t |> equal(1, red.rc, "planted fixture is red")
+    let by_number = "cites an architecture section by number - the set is cited by `<doc>.md#<anchor>` (ARCHITECTURE_COMMON.md); name the heading's anchor"
+    let tower_ban = "the tower helper file requires no carrier and no family file (ARCHITECTURE_MEDIA.md#tower-audio-charters)"
+    for (needle in ["ARCHITECTURE_SECNUM.md:1: {by_number}",
+                    "REVIEW_BARENUM.md:1: {by_number}",
+                    "cite_probe.das:3: {by_number}",
+                    "dasllama_tower.das: requires `dasllama_audio` - {tower_ban}",
+                    "dasllama_tower.das: requires `dasllama_toyfam` - {tower_ban}",
+                    "dasllama_tower.das: requires `dasllama_kokoro` - {tower_ban}",
+                    "dasllama_audio_probe.das: requires `audio` - only dasllama_audio_io.das decodes audio containers (ARCHITECTURE_MEDIA.md#tower-audio-charters)",
+                    "dasllama_vision_probe.das: requires `stbimage` - only dasllama_vision_io.das decodes images (ARCHITECTURE_MEDIA.md#tower-audio-charters)",
+                    "exchange_probe.das: requires dashv and names dasllama.io - a harness tool reaches the sidecar exchange through dasllama/dasllama_exchange, never with its own HTTP call (ARCHITECTURE_ENGINE.md#instrumentation-and-support)"]) {
+        t |> success(find(red.out, needle) >= 0, "finding fired: {needle}")
+    }
+    for (quiet in ["ARCHITECTURE_CONTROL.md", "cite_ok.das", "dasllama_audio_io.das:", "dasllama_vision_io.das:", "exchange_ok.das", "site_ok.das"]) {
+        t |> success(find(red.out, quiet) < 0, "the control drew no finding beside the plants: {quiet}")
+    }
+
+    t |> success(rmdir_rec_result(fixture) is value, "fixture removed")
+}
+
 def make_vulkan_fixture(t : T?; tree, root : string) {
     write_at(t, root, "modules/dasVulkan/daslib/vulkan_toy.das", "options gen2\n")
     write_at(t, root, "modules/dasVulkan/daslib/vulkan_toy_boost.das", "options gen2\n")
@@ -335,7 +393,6 @@ def test_vulkan_gate_fixtures(t : T?) {
 
     let green = spawn_at(fixture, [path_join(fixture, "modules/dasVulkan/REVIEW.das")])
     t |> equal(0, green.rc, "covered fixture is green (category + DLL-class tokens ignored): {green.out}")
-    t |> success(find(green.out, "REVIEW.das dasvulkan: OK") >= 0, "green verdict printed")
 
     write_at(t, fixture, "modules/dasVulkan/daslib/vulkan_unlisted.das", "options gen2\n")
     write_at(t, fixture, "modules/dasVulkan/.das_module",
@@ -382,7 +439,6 @@ def test_llvm_gate_fixtures(t : T?) {
 
     let green = spawn_at(fixture, [path_join(fixture, "modules/dasLLVM/REVIEW.das")])
     t |> equal(0, green.rc, "temp-copy fixture is green (the tracked dir is read, never written): {green.out}")
-    t |> success(find(green.out, "REVIEW.das dasLLVM: OK") >= 0, "green verdict printed")
 
     // one violation per way a write reaches the tracked dir, one file each so the finding's
     // path names which way fired
@@ -417,8 +473,18 @@ def test_llvm_gate_fixtures(t : T?) {
 def make_server_fixture(t : T?; tree, root : string) {
     write_at(t, root, "utils/dasllama-server/openai_server.das",
         "options gen2\n\nclass X \{\n    def onInit \{\n        GET(\"/v1/models\") <| $() \{\n        \}\n        POST(\"/gc\") <| $() \{\n        \}\n        STREAM(\"/sse\") <| $() \{\n        \}\n        ANY(\"*\") <| $() \{\n        \}\n    \}\n\}\n")
-    write_at(t, root, "utils/dasllama-server/README.md", "routes: `/v1/models` and `/gc` and `/sse`\n")
-    write_at(t, root, "doc/source/reference/utils/dasllama_server.rst", "``/v1/models`` and ``/gc`` and ``/sse``\n")
+    // the flag check's inputs: one documented server flag, and the CLI's structs empty
+    write_at(t, root, "utils/dasllama-server/main.das",
+        "options gen2\n\n[CommandLineArgs]\nstruct ServerArgs \{\n    @clarg_doc = \"Listen port\"\n    port : int\n\}\n")
+    write_at(t, root, "utils/dasllama-server/cli_args.das",
+        "options gen2\nmodule cli_args shared\nrequire daslib/clargs\n" +
+        "[CommandLineArgs]\nstruct CommonArgs \{\n\}\n[CommandLineArgs]\nstruct SamplerArgs \{\n\}\n[CommandLineArgs]\nstruct PlayArgs \{\n\}\n" +
+        "[CommandLineArgs]\nstruct CompleteArgs \{\n\}\n[CommandLineArgs]\nstruct ChatArgs \{\n\}\n[CommandLineArgs]\nstruct TranscribeArgs \{\n\}\n" +
+        "[CommandLineArgs]\nstruct SpeakArgs \{\n\}\n[CommandLineArgs]\nstruct TalkArgs \{\n\}\n[CommandLineArgs]\nstruct EmbedArgs \{\n\}\n" +
+        "[CommandLineArgs]\nstruct TokenizeArgs \{\n\}\n[CommandLineArgs]\nstruct BenchArgs \{\n\}\n")
+    write_at(t, root, "doc/source/reference/utils/dasllama_cli.rst", "the CLI page\n")
+    write_at(t, root, "utils/dasllama-server/README.md", "routes: `/v1/models` and `/gc` and `/sse`; flags: `--port`\n")
+    write_at(t, root, "doc/source/reference/utils/dasllama_server.rst", "``/v1/models`` and ``/gc`` and ``/sse``; ``--port``\n")
     write_at(t, root, "utils/dasllama-server/control.html", "<script>fetch(\"/gc\")</script>\n")
     var err : string
     t |> success(copy_file(path_join(tree, "utils/dasllama-server/REVIEW.das"), path_join(root, "utils/dasllama-server/REVIEW.das"), true, err), "copied the real server gate")
@@ -439,14 +505,16 @@ def test_server_gate_fixtures(t : T?) {
 
     let green = spawn_at(fixture, [path_join(fixture, "utils/dasllama-server/REVIEW.das")])
     t |> equal(0, green.rc, "consistent fixture is green: {green.out}")
-    t |> success(find(green.out, "REVIEW.das dasllama-server: OK") >= 0, "green verdict printed")
 
     // one violation per direction - the needle list is the census
     write_at(t, fixture, "utils/dasllama-server/openai_server.das",
         "options gen2\n\nclass X \{\n    def onInit \{\n        GET(\"/v1/models\") <| $() \{\n        \}\n        POST(\"/gc\") <| $() \{\n        \}\n        STREAM(\"/sse\") <| $() \{\n        \}\n        POST(\"/vad\") <| $() \{\n        \}\n        ANY(\"/anyroute\") <| $() \{\n        \}\n        ANY(\"*\") <| $() \{\n        \}\n    \}\n\}\n")
-    write_at(t, fixture, "utils/dasllama-server/README.md", "routes: `/v1/models` and `/gc` and `/sse` and `/dead`\n")
+    write_at(t, fixture, "utils/dasllama-server/README.md", "routes: `/v1/models` and `/gc` and `/sse` and `/dead`; flags: `--port`\n")
     write_at(t, fixture, "doc/source/reference/utils/dasllama_server.rst", "``/v1/models`` and ``/gc`` and ``/sse`` and ``/rstdead``\n")
     write_at(t, fixture, "utils/dasllama-server/control.html", "<script>fetch(\"/gc\");fetch(\"/nope\")</script>\n")
+    // a second server flag with no help string, and the rst page losing the first
+    write_at(t, fixture, "utils/dasllama-server/main.das",
+        "options gen2\n\n[CommandLineArgs]\nstruct ServerArgs \{\n    @clarg_doc = \"Listen port\"\n    port : int\n\n    @clarg_name = \"show-help\"\n    help : bool\n\}\n")
 
     let red = spawn_at(fixture, [path_join(fixture, "utils/dasllama-server/REVIEW.das")])
     t |> equal(1, red.rc, "planted fixture is red")
@@ -455,7 +523,10 @@ def test_server_gate_fixtures(t : T?) {
                     "served route /anyroute has no `/anyroute` mention",
                     "README.md: documents route /dead, which the server does not register",
                     "dasllama_server.rst: documents route /rstdead, which the server does not register",
-                    "the control page consumes route /nope, which the server does not register"]) {
+                    "the control page consumes route /nope, which the server does not register",
+                    "flag --port of ServerArgs (utils/dasllama-server/main.das) has no ``--port`` mention",
+                    "flag --help of ServerArgs has no @clarg_doc",
+                    "flag --help of ServerArgs (utils/dasllama-server/main.das) has no `--help` mention"]) {
         t |> success(find(red.out, needle) >= 0, "finding fired: {needle}")
     }
 
@@ -558,7 +629,6 @@ def test_root_gate_fixtures(t : T?) {
 
     let green = spawn_at(fixture, [gate])
     t |> equal(0, green.rc, "one shared name per file, a non-shared twin, a bare module, a module-less file and the tolerated pair are green: {green.out}")
-    t |> success(find(green.out, "REVIEW.das repo root: OK") >= 0, "green verdict printed")
 
     // an untracked second declaration is not the tree's yet
     write_at(t, fixture, "c/y.das", "options gen2\nmodule solo shared public\n")

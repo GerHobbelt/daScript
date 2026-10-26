@@ -29,7 +29,7 @@
    deletes.** `finish_pending_step` (dasllama_metal_common) lands the in-flight batch step by
    memcpy-ing KV rows and logits through `BatchLanding.sessions[i]` - raw borrowed pointers - and
    the batch driver's pre-encoded step parks the same pointers, uncommitted, in the other slot
-   (`ARCHITECTURE_GPU_MTP_DECODE.md` sec.2.38a). Nothing
+   (`ARCHITECTURE_GPU_MTP_DECODE.md#batch-pre-encode`). Nothing
    quiesces on session death, `metal_decode_flush` (the public landing call) has zero callers,
    and every test helper deletes its sessions right after `eval_batch_` with a step potentially
    pending - a landing after those deletes writes into freed heap. Empirically quiet today
@@ -501,8 +501,9 @@
     image row (hand-minted in the gemma3v arc; still stamps `parsec` + a pre-branch sha, and
     the image sweep's catalog does not reach it).
 
-41. **Audio-in-chat serves the whisper-class `AudioTower` families only - the qwen3a conformer
-    (Qwen3-Omni) and gemma4a have no chat splice.** Surfaced by the omni showcase test (the
+41. **`add_user_audio` (samples in) serves the whisper-class `AudioTower` families only - the
+    qwen3a conformer (Qwen3-Omni) has no chat splice, and gemma4a hears only through the
+    pre-encoded rows seam (`add_user_audio_rows` off an `AudioEmbedder`).** Surfaced by the omni showcase test (the
     vision arc): `add_user_audio_`/`create_chat_(model, tower)` ride `AudioTower`
     (qwen2a/ultravox/voxtral); `load_audio_tower` reads the legacy `clip.projector_type` key
     the dual-tower Omni mmproj does not carry, and the qwen3a conformer is a different type
@@ -898,7 +899,7 @@
     `trace_marker`, `JOBQUE_PROFILING`-compiled, `utils/jobque-timeline` with per-category stats),
     the `prof_add` / `forward_profile_*` decode buckets (197 sites in 17 files) and the
     `asr_prof_add` encode buckets (147 sites in 12 files, the TTS generator's `tts.gen.*` among
-    them) - and `REVIEW.md`'s clock rule plus `ARCHITECTURE_MEASUREMENT.md` sec.2.10 name all
+    them) - and `REVIEW.md`'s clock rule plus `ARCHITECTURE_MEASUREMENT.md#sanctioned-instrumentation-rails` name all
     three, which is how the second and third were built without anyone noticing. Done, as its own
     PR: (1) every `prof_add` / `asr_prof_add` site becomes a marker category (a `TRACE_TAG_*` block
     per family beside the ASR ones); (2) the consumers of the bucket tables - the `PROF` rows in
@@ -990,8 +991,7 @@
     kitten's tail trim (`TRIM_TAIL`, 5000 samples) runs per chunk, as the reference runs it per
     `generate` call - a listening-test item, since a chunked paragraph loses 208 ms per chunk;
     (2) `st2_bind` runs at three call sites instead of a post-bind hook in `parse_image`, so a
-    fourth `load_image` path would get an unbound carrier that dies at the first GEMM; (3)
-    `utils/dasllama-server/txt2wav.das` has no test (the `wav2txt.das` precedent); (4) the
+    fourth `load_image` path would get an unbound carrier that dies at the first GEMM; (4) the
     server caps `input` at 4096 characters but nothing caps the normalized length or the chunk
     count, and normalization expands numbers and currency about tenfold; (5)
     `tests/jit_tests/intrinsics.das` keeps its exp2/log2/pow JIT-vs-interpreter comparisons
@@ -1316,8 +1316,8 @@
 116. **Audit-agent item, not a lint rule: a cap whose message says "characters" but whose test is
    `length(<string>)`.** `length()` on a string is bytes; the server counted bytes against
    `TTS_MAX_INPUT_CHARS` while the page counted UTF-16 units, so one paste was accepted by one
-   side and refused by the other. The facade already had `cpt_length` for exactly this and the
-   server did not reach it. A rule would have to guess semantics from a name, so this is an item
+   side and refused by the other. The engine already had `cpt_count` (`dasllama_unicode.das`) for
+   exactly this and the server did not reach it. A rule would have to guess semantics from a name, so this is an item
    for the review-round auditors' checklist.
 117. **Gate candidates the review round's dragons surfaced, one line each.** (a) dasLLAMA:
    `check_test_placement` - a `[test]` file requiring `dasllama/*` outside `tests/`, licensed
@@ -1334,7 +1334,7 @@
    or `lint.rst` section whose id no module still emits). (g) `utils/REVIEW.das`: a test file under
    `utils/` named in no workflow row, or only in a `--compile-only` row. (h) `site-dasllama`: a
    `_stories/*.md` entry with neither a figures comment nor a date and sha. (i) `dasLLVM`: every
-   `[EnvConfig]` field of `llvm_env.das` named in `ARCHITECTURE.md` sec.3; every `requires=` /
+   `[EnvConfig]` field of `llvm_env.das` named in `ARCHITECTURE.md#inherited-invariants`; every `requires=` /
    `g_target_x64_*` feature name present in `das_cpu_supports`. (j) `dasllama-server`: a fixture's
    top-level key absent from `README.md`. (k) `REVIEW_IMAGE`: an addition on the left of a
    `> msize` compare in `dasllama_image.das`; `REVIEW_TTS`: `styletts2_synthesize` carries
@@ -1619,7 +1619,7 @@
     here.
 146. **ACCEPTED, not planned: the dev-W bake set follows the minting program, not the box.** The
     split-scale `devwf16` panels bake only where the Metal prefill module registered its CPU
-    mirror (`ARCHITECTURE_IMAGE.md` sec.2.1h), so a program on the same box built without that
+    mirror (`ARCHITECTURE_IMAGE.md#image-devw-plane`), so a program on the same box built without that
     module mints a thinner image at the SAME identity and every site it skipped serves off the
     runtime dequant until a program carrying the mirror re-mints. Ruled acceptable: a `.dlim` is
     a box-local cache, so the thinner image costs a dequant pass and never a different answer.
@@ -1628,11 +1628,11 @@
 147. **Checklist grooming - the structural findings the rule-document round did not open a file
     for.** Each is a followability class from `skills/review_md.md` (repo root), named by file
     and rule head; none blocks a verdict today, and each is settled by a rewrite, not a ruling.
-    (a) `REVIEW_GPU.md` "A change that can alter what a served GPU decode or prefill path
+    (a) `REVIEW_GPU.md` "A change that can alter what a GPU decode or prefill call on a session
     computes or selects" - the criterion is carried by an enumeration of the things that count
     and a second enumeration of the things that do not; state the property instead. (b)
     `REVIEW_GPU.md` "A diff that changes a tile, grid, threadgroup, or uniform constant shows
-    the value at that constant's authoritative site" - four sentences of where to read each
+    the value at every authoritative site its kind has" - four sentences of where to read each
     constant kind; the how-to belongs in `ARCHITECTURE_GPU.md`. (c) `REVIEW_GPU.md` "Never
     decide a kernel row's validity or owner by scanning the per-bucket base and count arrays"
     and "Never test the validity of a row in the bucket-ordered buffer ... against the pad
@@ -1767,7 +1767,7 @@
     `dasllama_config.das`) is a global, a setter with its clamp and a getter written by hand,
     and `apply_box_profile_runtime_at` walks the same facts a third time. Done looks like: one
     knob declaration (name, default, clamp, env name, JSON key) generating the pair and the
-    profile apply, the `[EnvConfig]` shape `ARCHITECTURE_RUNTIME.md` sec.2.9 uses; the unused
+    profile apply, the `[EnvConfig]` shape `ARCHITECTURE_RUNTIME.md#env-knobs` uses; the unused
     `set/get_embed_par_threshold` pair goes with it.
 161. **`kq_fmt_of`'s native-knob gates branch on the format by hand.** Which formats a box's knobs
     admit natively is an if-ladder over the enum where every other lookup walks `kq_desc`. Done
@@ -1796,3 +1796,49 @@
     commit and a dirty flag into the bundle, the released exe stamps that and never HEAD (the
     `-jit` script keeps HEAD), and `gen_bench_records` refuses a mint whose exe carries a dirty
     stamp or whose HEAD moved since the exe was built.
+
+165. **The TTS tests to fix at the end of the Metal-gaps arc, after its dedup pass.**
+   `tests/test_storyteller_restart.das`'s cell "a restart while the speech thread is still
+   loading its model skips the replaced story's queued sentences" is red on master (the same red
+   with the tower pinned off and on a master worktree): its premise - a speech thread starved
+   while the story is written, so a restart at frame 100 finds queued sentences to skip - no
+   longer holds on this box, and the cell asserts a skip that never comes. Done = the cell
+   constructs the starvation it asserts (a synthesis slowed under the test's control, or a
+   restart placed by the witness lines rather than a frame count), and the tts area runs green
+   through `tests/run.das -- --area tts`.
+
+166. **A `--tts` path in `benchmarks/lcpp_bench.das`.** The bench has no TTS cell, so every TTS
+   turn wall in `PERF_LEDGER.md` comes from `harness/tts_synth.das` under
+   `REVIEW_MEASUREMENT.md`'s harness carve-out and no board row records what a synthesis costs.
+   Done = `lcpp_bench --tts -m <gguf>` serves the g2p corpus's first N sentences at a named
+   voice and prints the per-sentence wall and the real-time factor as its other modalities do,
+   `gen_bench_records` carries a `tts` workload, and the StyleTTS2 ledger entry cites the row.
+
+167. **A sampler arm on `benchmarks/lcpp_bench.das`'s tg row.** The bench's only sampler knob
+    is `--mtp-temp`, a temperature alone, so no board row holds a sampled decode rate and the
+    candidate-list sampler's `PERF_LEDGER.md` entry reads its rates off `dasllama-cli`'s stats
+    line. Done = `--temp/--top-k/--top-p` on the tg row, a `tg128@sampled` cell beside `tg128`,
+    and the ledger entry re-minted from it.
+168. **`harness/tune_kernels.das`'s validation re-times CPU benches after the backend pin.**
+   `run_validation` re-runs the changed CPU benches after `dot_q8q8_laneq4x4` has pinned one
+   matmul backend for the rest of the process, so a re-timed bench runs against the pinned
+   backend instead of the one it would have picked - the ordering `harness/REVIEW.md`'s timing
+   rule forbids for a new timing. Done = the validation pass orders its re-runs ahead of the
+   pinning bench, or re-runs them in a child process, and a cell holds the order.
+169. **`generate_spirv` gained a positional `precise : bool` ahead of `var reflection`.** The
+   `precise` shader property (`modules/dasSpirv/ARCHITECTURE.md`, the `precise` section) landed
+   as a positional parameter before `var reflection : SpirvReflection` in `generate_spirv`'s
+   signature, so every external caller of the emitter - a module repo compiling kernels against
+   dasSpirv - stops compiling until it passes the flag: the sweep `skills/internal/abi_break_sweep.md`
+   describes is owed. A trailing defaulted parameter (after `kernel_self`) would have kept every
+   caller compiling. Done = the sweep run over the external module repos, or the parameter moved
+   to the defaulted tail before the next release.
+
+170. **The jfk twin cells read a clip nobody can fetch.** `tests/_tower_twin.das` reads `jfk.wav`
+   from the models dir, a copy each box stocks by hand, and `test_whisper.das` reads
+   `gemma4a_test2.wav` from the ASR corpus folder, the one corpus clip with no traceable
+   provenance (`performance/profile_common.das`). `tests/REVIEW_MEDIA_CELLS.md` admits only a clip
+   the test builds, the repository tracks, or `performance/setup_asr_rig.das` fetches, so both
+   cells stand against it until the rig fetches jfk (it is whisper.cpp's sample) and the gemma4a
+   clip is replaced by a traceable one or built by the test. Done = both clips come from the rig
+   or the repository and the cells' expectations are re-pinned on them.

@@ -4,16 +4,13 @@ on:
   push:
     branches: [master]
   pull_request:
-  # 04:00 UTC — after build.yml (02:00), the daspkg index (02:30) and imgui (03:00).
-  # The nightly is what SEEDS the sccache slots below. Their save is master-only,
-  # but the master PUSH run is usually skipped by pre_job as a concurrent duplicate
-  # of the PR that just merged (4 of 15 recent merges actually ran), so seeding was
-  # left to chance. A cron run is on master, has no concurrent twin, and lands the
-  # slot every night. It also hosts the checks too slow to sit on every PR,
-  # and the whole windows lane (nightly-only — see the matrix).
-  schedule:
-    - cron: '0 4 * * *'
   workflow_dispatch:
+  # nightly.yml calls it with lane extended_nightly; its cron run is what seeds the master slots
+  workflow_call:
+    inputs:
+      lane:
+        type: string
+        default: extended
 defaults:
   run:
     shell: bash
@@ -49,7 +46,8 @@ jobs:
         # two statements: a substitution inside echo would hide the script's exit code
         run: |
           set -eu
-          matrix=$(python3 ci/ci_matrix.py extended '${{ github.event_name }}')
+          lane='${{ inputs.lane || 'extended' }}'
+          matrix=$(python3 ci/ci_matrix.py "$lane")
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   ###########################################################
@@ -202,7 +200,8 @@ jobs:
       uses: actions/cache/restore@v4
       with:
         path: ${{ runner.temp }}/sccache
-        key: sccache-extended-${{ matrix.target }}-${{ matrix.architecture }}
+        key: sccache-extended-${{ matrix.target }}-${{ matrix.architecture }}@${{ github.run_id }}
+        restore-keys: sccache-extended-${{ matrix.target }}-${{ matrix.architecture }}@
 
     - name: "Build: Daslang (Release)"
       run: |
@@ -218,7 +217,6 @@ jobs:
             cmake --no-warn-unused-cli -B./build -G "${{ matrix.cmake_generator }}" -DCMAKE_BUILD_TYPE:STRING=Release \
               -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
               $ACTIVE_MODULES -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-            cmake --build ./build --config Release --target daslang daslang_static dasbind_probe --parallel
             ;;
           linux)
             echo "BIN=./bin" >> $GITHUB_ENV
@@ -235,7 +233,6 @@ jobs:
               -DDAS_CLANG_BIND_DISABLED=ON \
               -DDAS_GLFW_DISABLED=OFF \
               -G "${{ matrix.cmake_generator }}" $ACTIVE_MODULES
-            cmake --build ./build --config Release --target daslang daslang_static dasbind_probe
             ;;
           *)
             echo "BIN=./bin" >> $GITHUB_ENV
@@ -244,23 +241,30 @@ jobs:
               -DCMAKE_OSX_ARCHITECTURES="${{ matrix.architecture_string }}" \
               -DDAS_GLFW_DISABLED=OFF \
               -G "${{ matrix.cmake_generator }}" $ACTIVE_MODULES
-            cmake --build ./build --config Release --target daslang daslang_static dasbind_probe
             ;;
         esac
+        cmake --build ./build --config Release --target daslang daslang_static dasbind_probe --parallel
 
-    - name: "Refresh sccache slot"
-      if: matrix.role != 'modules' && github.ref == 'refs/heads/master'
-      env:
-        GH_TOKEN: ${{ github.token }}
-        SCKEY: sccache-extended-${{ matrix.target }}-${{ matrix.architecture }}
-      run: gh cache delete "$SCKEY" -R ${{ github.repository }} || true
     - name: "Save sccache objects"
       if: matrix.role != 'modules' && github.ref == 'refs/heads/master'
       uses: actions/cache/save@v4
       with:
         path: ${{ runner.temp }}/sccache
-        key: sccache-extended-${{ matrix.target }}-${{ matrix.architecture }}
+        key: sccache-extended-${{ matrix.target }}-${{ matrix.architecture }}@${{ github.run_id }}
 
+    - name: "Prune older sccache slots"
+      if: matrix.role != 'modules' && github.ref == 'refs/heads/master'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SCKEY: sccache-extended-${{ matrix.target }}-${{ matrix.architecture }}@
+      run: |
+        # best effort, and the newest entry survives whatever this run saved: a save that produced
+        # nothing must not wipe the last good slot, and a listing hiccup must not fail the lane
+        set +e
+        gh cache list -R ${{ github.repository }} --key "$SCKEY" --limit 100 --json id,createdAt \
+          --jq 'sort_by(.createdAt) | reverse | .[1:] | .[].id' \
+          | while read -r id; do gh cache delete "$id" -R ${{ github.repository }}; done
+        true
     - name: "Install python packages"
       run: |
         set -eux
@@ -278,13 +282,5 @@ jobs:
       # gh release calls refuse to run in Actions without a token
       env:
         GH_TOKEN: ${{ github.token }}
-      run: cmake --build ./build --config Release --target run_extended_${{ matrix.role }}
+      run: cmake --build ./build --config Release --target run_extended_${{ matrix.role }} --parallel
 
-  nightly_issue:
-    needs: [pre_job, extended_checks]
-    if: failure() && github.event_name == 'schedule'
-    permissions:
-      issues: write
-    uses: ./.github/workflows/nightly_issue.yml
-    with:
-      lane: extended_checks.yml

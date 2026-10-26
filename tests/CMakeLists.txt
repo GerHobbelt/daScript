@@ -24,15 +24,22 @@ if(NOT DAS_TOOLS_DISABLED)
     set(_DAS_TEST_DIR ${PROJECT_SOURCE_DIR}/tests)
     set(_DAS_TEST_COMMON --color --failures-only --test ${_DAS_TEST_DIR})
 
+    set(_DAS_TEST_HOSTS daslang)
+    foreach(_host daslang-live watchdog dasbind_probe)
+        if(TARGET ${_host})
+            list(APPEND _DAS_TEST_HOSTS ${_host})
+        endif()
+    endforeach()
+
     add_das_target(run_tests_interpreter
-        COMMAND $<TARGET_FILE:daslang> ${_DAS_DASTEST} -- ${_DAS_TEST_COMMON} --timeout ${DAS_TEST_TIMEOUT}
-        DEPENDS daslang
+        COMMAND ${DAS_SANITIZER_ENV} $<TARGET_FILE:daslang> ${_DAS_DASTEST} -- ${_DAS_TEST_COMMON} --timeout ${DAS_TEST_TIMEOUT}
+        DEPENDS ${_DAS_TEST_HOSTS}
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMENT "Running tests (interpreter)"
     )
     add_das_target(run_tests_interpreter_isolated
-        COMMAND $<TARGET_FILE:daslang> ${_DAS_DASTEST} -- ${_DAS_TEST_COMMON} --isolated-mode --timeout ${DAS_TEST_TIMEOUT_ISOLATED}
-        DEPENDS daslang
+        COMMAND ${DAS_SANITIZER_ENV} $<TARGET_FILE:daslang> ${_DAS_DASTEST} -- ${_DAS_TEST_COMMON} --isolated-mode --timeout ${DAS_TEST_TIMEOUT_ISOLATED}
+        DEPENDS ${_DAS_TEST_HOSTS}
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMENT "Running tests (interpreter, isolated retry)"
     )
@@ -85,13 +92,13 @@ if(NOT DAS_TOOLS_DISABLED)
         # test — max crash isolation, and a batch crash re-dispatches per-file).
         add_das_target(run_tests_jit
             COMMAND ${_DAS_SAN_ENV} $<TARGET_FILE:daslang> ${_DAS_DASTEST} -jit -- ${_DAS_JIT_FLAGS} ${_DAS_JIT_COMMON} --isolated-mode --batch 4 --timeout ${DAS_TEST_JIT_TIMEOUT}
-            DEPENDS daslang
+            DEPENDS ${_DAS_TEST_HOSTS}
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
             COMMENT "Running tests (JIT, isolated-parallel)"
         )
         add_das_target(run_tests_jit_isolated
             COMMAND ${_DAS_SAN_ENV} $<TARGET_FILE:daslang> ${_DAS_DASTEST} -jit -- ${_DAS_JIT_FLAGS} ${_DAS_JIT_COMMON} --isolated-mode --timeout ${DAS_TEST_JIT_TIMEOUT_ISOLATED}
-            DEPENDS daslang
+            DEPENDS ${_DAS_TEST_HOSTS}
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
             COMMENT "Running tests (JIT, isolated retry)"
         )
@@ -125,8 +132,15 @@ endif()
 # LLVM-AOT (LLVM-backend .o) mirror of run_tests_aot: test bodies bound from the
 # statically-linked self-registering objects and run jitted. Opt-in, not in CI.
 if(TARGET test_llvm_aot)
+    # under tsan the whole corpus outruns the 1800 s suite watchdog, and its process-spawning
+    # tests miss their own deadlines; the sweep keeps tests/language, as the JIT sweep does
+    if(DAS_USE_SANITIZER STREQUAL "tsan")
+        set(_DAS_LLVM_AOT_TEST_DIR ${PROJECT_SOURCE_DIR}/tests/language)
+    else()
+        set(_DAS_LLVM_AOT_TEST_DIR ${PROJECT_SOURCE_DIR}/tests/)
+    endif()
     add_das_target(run_tests_llvm_aot
-        COMMAND ${DAS_SANITIZER_ENV} $<TARGET_FILE:test_llvm_aot> -use-aot ${PROJECT_SOURCE_DIR}/dastest/dastest.das -- --use-aot --color --failures-only --isolated-mode --batch 4 --timeout 1800 --test-list ${LLVM_AOT_TEST_LIST} --test ${PROJECT_SOURCE_DIR}/tests/
+        COMMAND ${DAS_SANITIZER_ENV} $<TARGET_FILE:test_llvm_aot> -use-aot ${PROJECT_SOURCE_DIR}/dastest/dastest.das -- --use-aot --color --failures-only --isolated-mode --batch 4 --timeout 1800 --test-list ${LLVM_AOT_TEST_LIST} --test ${_DAS_LLVM_AOT_TEST_DIR}
         DEPENDS test_llvm_aot
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMENT "Running tests (LLVM-AOT)"

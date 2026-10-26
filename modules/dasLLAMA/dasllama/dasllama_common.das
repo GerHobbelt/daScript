@@ -1360,6 +1360,18 @@ def mb_delta(now, base : int64) : string {
     return "{sign}{abs(d) >> 20l} MB, {pct}"
 }
 
+//! A family's serving-lane pin for subsequent loads: q8 quants or the file's own exact planes, the family's
+//! policy deciding while unset. `set_<family>_q8` pins, `reset_<family>_q8` unpins.
+enum GemmLane {
+    unset
+    exact
+    q8
+}
+
+def lane_serves_q8(pin : GemmLane; policy : bool) : bool => pin != GemmLane.unset ? pin == GemmLane.q8 : policy
+
+def lane_pin(on : bool) : GemmLane => on ? GemmLane.q8 : GemmLane.exact
+
 //! Array form of the tuned pointer copy in dasllama_math: n floats from src[soff..] into dst[doff..].
 def copy_floats(src : array<float> | #; soff : int64; var dst : array<float>; doff, n : int64) {
     if (n <= 0l) {
@@ -1502,6 +1514,17 @@ def private runtime_race_writes() : bool {
     return g_runtime_race_armed && invoke(g_runtime_race_hook)
 }
 
+var private g_sidecar_place_hook : function<() : void>
+
+//! Install what chooses the app sidecar's location before the default apply reads it
+//! (`dasllama_fat_start` registers the fat exe's per-user placement); returns the previous hook.
+//! It runs at the apply, after every `[init]`, so it may ask what an exe's own `[init]` decided.
+def public set_sidecar_place_hook(hook : function<() : void>) : function<() : void> {
+    let old = g_sidecar_place_hook
+    g_sidecar_place_hook = hook
+    return old
+}
+
 //! Why the checked apply declined the box sidecar - the `TuneSidecarReason` name, "" when it
 //! did not decline (or was never asked).
 def public box_profile_runtime_declined() : string {
@@ -1511,6 +1534,9 @@ def public box_profile_runtime_declined() : string {
 //! The default (no path) route checks the sidecar's standing; an explicit path applies as given.
 def apply_box_profile_runtime(path : string = "") {
     if (path == "") {
+        if (g_sidecar_place_hook != null) {
+            invoke(g_sidecar_place_hook)
+        }
         apply_box_profile_runtime_checked(box_profile_path())
     } else {
         apply_box_profile_runtime_at(path)
@@ -1932,6 +1958,12 @@ struct SamplingParams {
     penalty_last_n : int64 = 64l   // penalty window (most recent N generated tokens)
 }
 
+//! One survivor of the sampler's top-k selection: the token and its logit, then its probability.
+struct SampleCand {
+    id : int64
+    v : float
+}
+
 //! A Session's identity for its device-resident deltanet state; the finalizer drops the GPU tier's
 //! copies that state owns before its addresses can be reused.
 struct DnOwner {
@@ -1958,7 +1990,8 @@ struct Session {
     attn_uniform_lo : int64   // meaningful only while attn_uniform_end > 0
     rng : int4                // sampling RNG state (seeded in make_run_state; reseed via set_seed)
     recent : array<int64>     // recently generated tokens, for the repetition penalty
-    sample_scratch : array<float>  // vocab-sized scratch for top-k selection
+    sample_scratch : array<float>  // vocab-sized scratch for the reference sampler (top-k off)
+    @scratch cand : array<SampleCand>   //! the top-k sampler's candidate list, a reused buffer: the k largest logits (ties at the k-th kept), ascending by id after selection
     sampled : bool            //! the last sample_'s pick can differ from the raw argmax (a temperature, or a penalty at temp 0 - not a bare argmax): the Metal driver's greedy chain stands down
     @do_not_delete spec_params : SamplingParams?   //! the caller's sampler, set before a speculative round for its accept walk to draw with; null or a bare argmax (temp <= 0, penalties off) keeps the argmax-match walk
     mtp_pre_drawn : bool           //! the accept walk drew this session's next token already: the next sample_ returns mtp_pre_tok and clears this
@@ -2398,6 +2431,7 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
         s.value_cache |> reserve_resize(c.seq_len * vrow)
     }
     s.sample_scratch |> resize(c.vocab_size)
+    s.cand |> reserve(64)
     s.rng = random_seed(1234)
     return <- s
 }
@@ -3969,38 +4003,15 @@ def embed_row(t : Model; token : int64; var dst : float?) {
             dequant_q8_row(t, t.emb_q8_off + token * dim, dim, dst)
         }
     } elif (cls_kq(t)) {
+        // trimmed: embq/embs hold the region's pair verbatim, rebased to 0; else the pair sits at wcls_off in the model's plane, split-scale when metal_blob
         let fmt = t.emb_fmt
-        let i = kq_slot("embed_row", fmt)
-        let mr = kq_active_mr(t, fmt)   // 1 when not repacked — unread past the guard then
-        if (t.kq_repacked && token < (t.config.vocab_size / mr) * mr) {
-            // repacked plane: gather via the grp<mr> layout (tail rows below stay disk-order, verbatim)
-            unsafe {
-                let nsb = dim / 256l
-                let g = token / mr
-                // trimmed: embq/embs hold the region's plane pair verbatim, rebased to 0
-                let sb0t = t.planes_trimmed ? 0l : t.wcls_off / 256l
-                let sbg = (sb0t + g * mr * nsb)
-                let qo = sbg * kq_qsb(fmt)
-                let so = sbg * kq_ssb(fmt)
-                if (t.planes_trimmed) {
-                    dequant_kq_row_grp(int64(kq_schema_id(fmt)), addr(t.embq[qo]), addr(t.embs[so]), token % mr, mr, dim, dst)
-                } else {
-                    dequant_kq_row_grp(int64(kq_schema_id(fmt)), addr(t.kq[i].q[qo]), addr(t.kq[i].s[so]), token % mr, mr, dim, dst)
-                }
-            }
+        var row = unsafe(temp_array(dst, dim, type<float>))
+        let mr = kq_active_mr(t, fmt)
+        if (t.planes_trimmed) {
+            kq_plane_row_f32(fmt, t.embq, t.embs, dim, t.config.vocab_size, mr, token, row, 0l)
         } else {
-            unsafe {
-                var row = temp_array(dst, dim, type<float>)
-                // trimmed: embq/embs hold the region's plane pair verbatim (the row form), rebased to 0
-                let sb0 = t.planes_trimmed ? (token * dim) / 256l : (t.wcls_off + token * dim) / 256l
-                for (s in range64(dim / 256l)) {
-                    if (t.planes_trimmed) {
-                        dequant_kq_plane_sb(fmt, t.embq, t.embs, sb0 + s, false, row, s * 256l)
-                    } else {
-                        dequant_kq_plane_sb(fmt, t.kq[i].q, t.kq[i].s, sb0 + s, t.metal_blob, row, s * 256l)
-                    }
-                }
-            }
+            let i = kq_slot("embed_row", fmt)
+            kq_plane_row_f32(fmt, t.kq[i].q, t.kq[i].s, dim, t.config.vocab_size, mr, token, row, 0l, t.wcls_off / kq_elems(fmt), t.metal_blob)
         }
     } else {
         copy_floats(dst, unsafe(addr(t.fblob[t.tok_emb_off + token * dim])), dim)

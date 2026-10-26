@@ -27,6 +27,7 @@ namespace das {
     DAS_API uint64_t get_context_share_counter ( Context * context );
 
     DAS_API char * builtin_das_root ( Context * context, LineInfoArg * at );
+    DAS_API char * builtin_executable_path ( Context * context, LineInfoArg * at );
     DAS_API char * builtin_get_das_version ( Context * context, LineInfoArg * at );
     DAS_API void builtin_throw ( char * text, Context * context, LineInfoArg * at );
     DAS_API void builtin_print ( char * text, Context * context, LineInfoArg * at );
@@ -56,6 +57,11 @@ namespace das {
     DAS_API int64_t builtin_table_long_capacity ( const Table & arr );
     DAS_API void builtin_table_clear ( Table & arr, Context * context, LineInfoArg * at );
     DAS_API vec4f builtin_table_reserve ( Context & context, SimNode_CallBase * call, vec4f * args );
+    DAS_API uint64_t native_thread_stack_size();
+    DAS_API urange64 native_allocator_stats();
+    DAS_API urange64 native_allocator_extent();
+    DAS_API urange64 context_memory_sizes(Context * context);
+    DAS_API urange64 context_idle_fork_memory(int kind, Context * context);
     DAS_API void heap_stats ( Context & context, uint64_t * bytes );
     DAS_API bool heap_collect_if_needed(Context * context, LineInfoArg * at);
     DAS_API urange64 heap_operation_counts(bool strings, Context * context);

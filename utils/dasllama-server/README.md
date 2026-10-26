@@ -12,36 +12,63 @@ reach into engine internals, the facade is complete.
 
 ## Get it
 
-The server ships as a standalone download from the rolling
-`dasllama-server` release, refreshed with every daslang release:
+The server ships as the `dasllama` package, refreshed with every daslang release:
+
+| Platform | Install |
+|---|---|
+| macOS, Apple silicon | `brew install --cask borisbat/daslang/dasllama` (the tray app), or `brew install borisbat/daslang/dasllama` (the commands) |
+| Windows x64 | `scoop bucket add daslang https://github.com/borisbat/scoop-daslang`, then `scoop install dasllama` |
+| Debian, Ubuntu | `sudo apt install ./dasllama_<version>_<arch>.deb`, from the release page |
+| Fedora | `sudo dnf install ./dasllama-<version>-1.<arch>.rpm`, from the release page |
+| Linux (Homebrew) | `brew install borisbat/daslang/dasllama` |
+| any, with Python | `pip install dasllama` |
+
+Or unpack an archive from the rolling `dasllama-server` release:
 <https://github.com/GaijinEntertainment/daScript/releases/tag/dasllama-server>
 
 | Platform | Asset |
 |---|---|
-| macOS, Apple silicon | `dasllama-server-darwin-arm64.zip` |
-| Windows x64 | `dasllama-server-windows-x64.zip` |
-| Linux x86_64 | `dasllama-server-linux-x86_64.tar.gz` |
-| Linux arm64 | `dasllama-server-linux-arm64.tar.gz` |
+| macOS, Apple silicon | `dasllama-darwin-arm64.zip` |
+| Windows x64 | `dasllama-windows-x64.zip` |
+| Linux x86_64 | `dasllama-linux-x86_64.tar.gz` |
+| Linux arm64 | `dasllama-linux-arm64.tar.gz` |
 
-The Linux bundles need glibc 2.35 or newer (Debian 12, Ubuntu 22.04 and later), the system
+Every form carries the same four programs, on PATH as `dasllama-server`, `dasllama-cli`,
+`dasllama-bench` and `dasllama-watchdog` wherever a package manager installed them. Inside an
+archive they are `dasllama-server.exe`, `dasllama-cli.exe`, `dasllama-bench.exe` and `watchdog`
+(`watchdog.exe` on Windows) on Linux and Windows alike; the macOS `.app` carries them without the
+suffix in `Contents/MacOS`.
+
+The Linux builds need glibc 2.35 or newer (Debian 12, Ubuntu 22.04 and later), the system
 OpenSSL 3 (`libssl3` on Debian and Ubuntu, `openssl-libs` on Fedora) and `curl` for the catalog
-downloads; the macOS and Windows bundles carry their own OpenSSL.
+downloads - the `.deb` and `.rpm` pull them in; the macOS and Windows builds carry their own
+OpenSSL.
 
-Unpack it and start the supervisor beside the server - `watchdog` (`watchdog.exe`), or on
-macOS the `dasllama-server.app` itself, whose launcher is the watchdog. The server binary
-beside it is `dasllama-server.exe` on Linux and Windows alike (the macOS app carries it as
-`Contents/MacOS/dasllama-server`). The watchdog keeps the server up, puts the dasllama mark in
-the notification area, and a click on it opens the control page, <http://127.0.0.1:8080/>.
-With no model configured the server starts in **setup mode** (below): pick a model from the
-catalog, it downloads into `~/.dasllama/models`, and *serve this model* restarts into it. The
-config it writes, `dasllama-server.toml` beside the exe, and the tune sidecar beside it survive
-an upgrade unpacked over the old directory on Linux and Windows; on macOS a new `.app` replaces
-the old one whole, so copy the two files out of `Contents/MacOS` first and back in after.
+Start the supervisor - `dasllama-watchdog` (`watchdog` in an archive), or on macOS the
+`dasllama-server.app` itself, whose launcher is the watchdog; `brew services start dasllama`
+starts it at login. The watchdog keeps the server up, puts the dasllama mark in the notification
+area, and a click on it opens the control page, <http://127.0.0.1:8080/>. With no model
+configured the server starts in **setup mode** (below): pick a model from the catalog, it
+downloads into `~/.dasllama/models`, and *serve this model* restarts into it.
+
+Everything the programs write lives under `~/.dasllama` (`%USERPROFILE%\.dasllama` on Windows),
+never beside them, so an installed copy stays read-only and an upgrade keeps it all:
+
+| Path | What |
+|---|---|
+| `models/` | the catalog downloads, and the `.dlim` images baked beside them |
+| `dasllama-server.toml` | the config the control page saves |
+| `tune/<program>.tune.json` | the box's runtime section - the Metal kernel crowns raced at the first start, the knobs |
+| `logs/` | `dasllama-server.log`, `dasllama-cli.log`, the watchdog's log and crash bundles, libhv's daily log |
+
+A config is looked for in the working directory first, then in `~/.dasllama`, then beside the
+program; `--config` names one outright. A config or sidecar an earlier download kept beside the
+exe still reads - the sidecar is copied to `tune/` at the first start.
 
 The exe is a fat build (`daspkg release --fat`): plain code for the platform's baseline CPU
 class - `x86-avx2` on x86, `arm-neon` on arm64 - with one clone of every `[tune]` kernel per
 class the engine ships a profile for (`x86-vnni512`, `x86-amx`, `arm-i8mm`), picked from cpuid
-at start. On a Mac the Metal crowns are raced once at the first start and kept beside the exe.
+at start. On a Mac the Metal crowns are raced once at the first start and kept in `~/.dasllama/tune`.
 That is the good default, and it is as far as a solid executable goes: **a fat build cannot
 tune**. Its kernels are baked, there is no tuner in it, and `--tune`, the sidecar exchange
 and a re-tune have nothing to act on (the control page's exchange levers refuse). To tune
@@ -90,6 +117,69 @@ of yours), then either allow it under System Settings > Privacy & Security after
 refused start, or clear the flag once - `xattr -dr com.apple.quarantine dasllama-server.app`.
 Windows SmartScreen shows an unknown publisher: *More info*, *Run anyway*.
 
+## The command line: dasllama-cli
+
+`dasllama-cli` sits beside the server in every bundle (`dasllama-cli.exe` on Linux and Windows,
+`dasllama-server.app/Contents/MacOS/dasllama-cli` on a Mac) and from the source tree runs as
+`bin/daslang -jit utils/dasllama-server/cli.das -- <command> ...`. It is the same engine, the
+same facade and the same backend pick as the server, without the HTTP layer: one model, one
+conversation, one process, so a shell script or a cron job can ask a model, hear a clip or speak
+a line without a server up.
+
+| Command | What it does | Its flags |
+|---|---|---|
+| `complete` | complete a prompt, streamed; `--image <file>` with `--image-mmproj` asks about a picture | `--prompt` / `-p` (or `--file` / `-f`, or the first bare argument), `--image`, `--image-mmproj`, `--quiet` (the completion alone, no counters) |
+| `chat` | a conversation from the terminal (/help lists the slash commands: /image, /audio, /read, /save, /load, /regen, /clear, /system, /stats, /speak on), or from `--script <file>` one message per line; `--tts` speaks every reply to `reply_<n>.wav` | `--system`, `--script`, `--image-mmproj` (arms /image), `--audio-mmproj` (arms /audio; the E-series mmproj serves both, pass it twice), `--tts`, `--voice` / `-v`, `--speed`, `--out-dir` (where `reply_<n>.wav` land, default the cwd), `--hide-thinking` (a thinking model's reasoning streams before the answer by default), `--no-think` (answer directly on a hybrid model), `--quiet` |
+| `transcribe` | an audio file to text through an ASR model (`--asr`, `--mmproj` for a GGUF pair) | `--asr` / `-a`, `--mmproj`, `--file` / `-f` (or the first bare argument), `--out` / `-o` (the transcript to a file instead of stdout), `--lang` / `-l` (a hint where the model takes one; a self-detecting model refuses it) |
+| `speak` | text to a 16-bit WAV through a TTS model (`--tts`, `--voice`, `--speed`) | `--tts`, `--text` (or `--file` / `-f`, or the first bare argument), `--out` / `-o` (default `out.wav`), `--voice` / `-v` (an unknown voice is refused with the model's voices), `--speed` (refused on a model that takes none), `--tts-lane q8 \| f32`, `--prof` (the generator's per-op profile) |
+| `talk` | the chain: `--in <audio>` heard by `--asr`, answered by `--model`, spoken by `--tts` into `--out`; `--prompt <text>` skips the hearing | `--asr` / `-a`, `--mmproj`, `--in` / `-i` (or the first bare argument), `--prompt` / `-p`, `--system`, `--lang` / `-l`, `--tts`, `--voice` / `-v`, `--speed`, `--out` / `-o` (default `reply.wav`), `--no-think`, `--quiet` (no transcript, stage times or counters) |
+| `embed` | a text's embedding vector, one float per line or `--json` | `--text` (or `--file` / `-f`, or the first bare argument), `--json` |
+| `tokenize` | a text's token ids and pieces | `--text` (or `--file` / `-f`, or the first bare argument), `--ids` (the ids alone, space-separated), `--no-special` (no BOS / leading specials) |
+| `bench` | the llama-bench rows on a model - `pp512`, `tg128`, and `tg128@N` with `--npl N` - `-o md` for the table; `dasllama-bench` stays the records instrument | `--plen` / `-p` (default 512), `--ngen` / `-n` (default 128), `--reps` / `-r` (default 5), `--npl` (streams of the batched row), `--output` / `-o` `txt \| md` |
+
+Every example below runs as written on a box whose models directory carries the named files
+(`utils/dasllama-server/test_cli.das` runs each one):
+
+```sh
+dasllama-cli complete -m SmolLM2-135M-Instruct-Q8_0.gguf --quiet "The capital of France is"
+dasllama-cli speak --tts kitten-nano.gguf -o hello.wav "Hello from the command line."
+dasllama-cli transcribe --asr Qwen3-ASR-0.6B-Q8_0.gguf --mmproj mmproj-Qwen3-ASR-0.6B-bf16.gguf question.wav
+dasllama-cli talk --asr Qwen3-ASR-0.6B-Q8_0.gguf --mmproj mmproj-Qwen3-ASR-0.6B-bf16.gguf --model Qwen3.5-0.8B-Q8_0.gguf --tts kokoro-82m.gguf --in question.wav --out answer.wav
+dasllama-cli chat -m gemma-4-E2B-it-Q4_K_M.gguf --image-mmproj mmproj-gemma-4-E2B-it-bf16.gguf --audio-mmproj mmproj-gemma-4-E2B-it-bf16.gguf
+dasllama-cli bench -m SmolLM2-135M-Instruct-Q8_0.gguf --npl 2 -o md
+```
+
+Every command takes the shared flags the server takes for the same knobs, with the server's
+meanings and defaults (the table under *Run from the source tree*): `--config` / `-c`, `--model` /
+`-m`, `--quant` / `-q`, `--kv-dtype`, `--gpu auto | off | metal | metal-required | vulkan` (the
+same auto pick: Metal on a Mac, Vulkan on a card, CPU otherwise; `--gpu vulkan` serves a model
+that fits the card whole from the device, the conversation's cache with it), `--metal`, the Vulkan
+detail knobs `--gpu-layers`, `--gpu-stream`, `--gpu-dn`, `--gpu-attn`, `--gpu-dense`,
+`--gpu-vram-mb`, `--ctx`, `--threads` / `-t`, `--models-dir`, `--tune`, and two of its own:
+`--verbose` echoes the engine's log records to stderr as they land, and `--help` (`-?` or
+`--show-help` from the source tree: the daslang host takes `--help` for itself) lists a command's
+flags with the groups it takes. `complete`, `chat` and `talk` take the sampler - `--temp`,
+`--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--presence-penalty`, `--frequency-penalty`,
+`--seed` / `-s`, `--max-tokens` / `-n` - and a knob left unset takes the command's default: greedy
+for `complete`, temperature 0.7 / top-k 20 / top-p 0.95 for `chat` and `talk` (under greedy
+decoding a thinking model loops on its own draft). `chat`, `speak` and `talk` take the speaker
+flags: `--play` also plays each spoken reply through the speaker once its WAV has landed (the
+run blocks until the clip ends; a box with no device says so and keeps writing the files), and
+`--null-audio` drives the null backend for a test box. A bare model name resolves under
+`--models-dir` (`~/.dasllama/models`, where the catalog downloads land). The `dasllama-server.toml`
+in the current directory, else in `~/.dasllama`, else beside the program - the server's own lookup - fills whatever
+the flags leave empty - the
+model (a `[[models]]` roster's default entry included), its `image_mmproj`, the `asr` and `tts`
+models, the backend, the lane cap - so on a box the setup page configured, `dasllama-cli chat`
+with no flags talks to the served model on the served backend; explicit flags win, `--config`
+names another file. The answer goes to stdout alone, so it pipes; the CLI's progress lines and
+the token counters go to stderr (`--quiet` drops the counters); the engine's own notices - a
+missing Metal profile, a GPU decline - land in `dasllama-cli.log` (`~/.dasllama/logs` from an
+installed build, the das root's `logs/` from the source tree), the way the server's do, and `--verbose` echoes them to stderr as they land (from the source tree the
+tune policy guard still prints its one status line first). A fat bundle's first `dasllama-cli` run on a Mac races the Metal crowns once into
+`~/.dasllama/tune/dasllama-cli.tune.json`, like the server's does, and never again; from the source
+tree it keeps its own tune sidecar beside `cli.das`.
+
 ## Run from the source tree
 
 ```sh
@@ -103,11 +193,18 @@ Run under `-jit` - the interpreter is refused, it is far too slow for inference.
 
 | Flag | Short | Default | Meaning |
 |---|---|---|---|
-| `--config` | `-c` | *auto* | TOML config file; keys mirror the long flag names, explicit CLI flags override. Without the flag, a `dasllama-server.toml` in the cwd or next to the program loads automatically |
+| `--config` | `-c` | *auto* | TOML config file; keys mirror the long flag names, explicit CLI flags override. Without the flag, a `dasllama-server.toml` in the cwd, in `~/.dasllama` or next to the program loads automatically |
 | `--model` | `-m` | *(required)* | GGUF model to serve (here or in `--config`) |
 | `--port` | `-p` | `8080` | Listen port |
 | `--quant` | `-q` | `q8` | Weight quantization: `fp32` \| `q8` \| `q4` - plus the loader's file-format spellings `q4_k` \| `q5_k` \| `q6_k` \| `mxfp4` \| `f16` \| `bf16` (all serve on the `q8` kquant-native tier) |
 | `--gpu` | - | `auto` | GPU backend: auto (default: metal/vulkan when detected, else CPU) \| off \| metal \| metal-required \| vulkan. vulkan serves a model that fits the card whole from the GPU, every stream's cache with it; the control page's model card says what a slot got (a set --metal flag keeps the legacy env-driven path). Details: *The gpu key* below |
+| `--metal` | - | `off` | Metal serving mode when `--gpu` is unset: `off` \| `auto` (the GPU when a path's gates pass, the CPU otherwise) \| `required` (a call the GPU cannot serve is a hard failure). A set flag keeps the legacy env-driven path |
+| `--gpu-layers` | - | *auto* | vulkan: resident MoE expert-stack layers, offloaded from the end (config key `gpu_layers`; *The gpu key* below) |
+| `--gpu-stream` | - | *auto* | vulkan: streamed prefill MoE layers below the resident set (config key `gpu_stream`) |
+| `--gpu-dn` | - | on | vulkan: deltanet (recurrent) layers through the device chain |
+| `--gpu-attn` | - | on | vulkan: full-attention layers through the device chain |
+| `--gpu-dense` | - | off | vulkan: dense attention-side planes resident |
+| `--gpu-vram-mb` | - | *device* | vulkan: resident-weight VRAM cap override in MB (default: query the device) |
 | `--kv-dtype` | - | `f16` | KV-cache codec: `f32` \| `f16` \| `q8_0` \| `tq4` (rotated 4-bit; needs pow2 head_size) |
 | `--asr` | `-a` | - | ASR model (whisper/parakeet/qwen3-asr) - enables the `/v1/audio/*` routes |
 | `--asr-workers` | - | `1` | Long-lived ASR request threads; each owns a model and reusable session. Set `2` for two parallel transcriptions |
@@ -121,18 +218,21 @@ Run under `-jit` - the interpreter is refused, it is far too slow for inference.
 | `--streams` | `-s` | `4` | Max concurrent generation streams |
 | `--threads` | `-t` | `16` | Worker-lane cap for the matmul dispatch (`-1` = all cores) - decode is bandwidth-bound, so an uncapped dispatch just fights the rest of the box |
 | `--team-dispatch` | - | `hybrid` | `hybrid`: LLM uses the worker team while the ASR and TTS workers run inline; `team`: all callers use serialized team publishes; `inline`: every caller runs independently |
+| `--affinity` | - | `-1` | Worker CPU affinity: `-1` = the platform default (QoS on darwin, off elsewhere), `0` = off, `1` = an ideal-CPU hint, `2` = a hard mask (`DAS_JOBQUE_AFFINITY` overrides) |
 | `--chunk` | - | `64` | Prefill quantum in tokens - decode stalls at most this per tick |
 | `--page-rows` | - | `64` | KV page size in positions for paged serving |
 | `--prefix` | - | *auto* | Prefix-cache retention cap in pages (auto: one full context per stream; `-1` = unbounded) |
 | `--flat` | - | - | Flat preallocated KV sessions - disables paged serving and the prefix cache |
 | `--mtp` | - | *auto* | MTP/NextN self-speculative decode. Unset, a slot turns it on when it runs one stream (`streams = 1`) host-cached and leaves it off otherwise: at one stream the draft-and-verify round cuts decode time on the dense Qwen3.5 MTP models (0.8B 1.20x, 4B 1.21x, 9B 1.10x - `modules/dasLLAMA/followup_metal.md` row 26), at several streams the plain batched step is faster (`modules/dasLLAMA/PERF_LEDGER.md`, the batched arcs), and a device-resident slot (`--gpu vulkan`) keeps plain decode, since an armed round keeps every stream's cache on the host. `true` / `false` set it outright. It needs a model with an in-file NextN head (the `-MTP-` GGUFs); on any other model the server logs one line and serves plain. Greedy requests are output-invariant; a sampled request (`temperature` > 0, penalties included) draws each verify row with its own sampler and keeps the plain sampled distribution, at a lower acceptance rate. `/v1/stats` reports `mtp_drafted`/`mtp_accepted` |
+| `--lcpp-bin` | - | - | Path to a llama.cpp `llama-bench` binary: the control page's benchmark button then runs the A/B child (our bench, then llama-bench on the same GGUF) instead of the in-process rows; source-tree daslang only (config key `lcpp_bin`) |
 | `--models-dir` | - | `~/.dasllama/models` | Where the model catalog downloads land (`DASLLAMA_MODELS_DIR` overrides both this and the config key) |
 | `--tune` | - | - | Re-tune this box's dasLLAMA kernels, then relaunch (the JIT run; a fat build carries no tuner and ignores it) |
 | `--help` | `-?` | - | Show help and exit |
 
 A config file replaces long command lines; keys are the long flag names with underscores.
-A `dasllama-server.toml` in the cwd (or next to the program - the exe dir in a release
-bundle) loads automatically; `--config other.toml` picks a different one.
+A `dasllama-server.toml` in the cwd, in `~/.dasllama` (where the control page saves it) or next
+to the program loads automatically, first found wins; `--config other.toml` picks a different
+one.
 
 ```toml
 model = "D:/models/SmolLM2-135M-Instruct-Q8_0.gguf"
@@ -240,9 +340,10 @@ team/FIFO policy and applies only the worker's selected team-dispatch participat
 
 The server runs under the shared watchdog in `utils/watchdog/`, in the release bundle and in a
 JIT deployment alike. The watchdog needs no arguments: in the bundle it finds the baked exe
-beside it, in a JIT deployment `main.das` beside `bin/Release/daslang.exe`, and `watchdog.json`
-pins the name so logs land in `logs/dasllama-watchdog.log`, turns the tray on and names
-`tray.ico` as its mark. A JIT deployment on Windows:
+beside it (`discover_program` picks the server among its companions, the CLI and the bench), in a
+JIT deployment `main.das` beside `bin/Release/daslang.exe`, and `watchdog.json` pins the name,
+puts its log, pid file and crash bundles under `~/.dasllama/logs` (`state_dir`), turns the tray
+on and names `tray.ico` as its mark. A JIT deployment on Windows:
 
 ```powershell
 Set-Location E:/dasllama-server
@@ -292,9 +393,9 @@ sidecar, share, re-tune - refuse on a fat release, which has no tune of its own.
 
 A JIT deployment instead stages the toolchain - `main.das`, `bin/Release/daslang.exe` plus the
 runtime DLLs and shared modules, `watchdog.exe`, `watchdog.json`, `control.html`, `tray.ico` -
-into the target directory (`deploy-jit.ps1` does it on Windows). Either way, keep the deployed
-`dasllama-server.toml` and `dasllama-server.tune.json` across upgrades, and stop a running
-server first; Windows locks the DLLs.
+into the target directory (`deploy-jit.ps1` does it on Windows); keep its `main.tune.json`, the
+box's tuned kernels, across upgrades. Either way, stop a running server first - Windows locks the
+DLLs; the config and the bundle's tune state live in `~/.dasllama` and survive the upgrade.
 
 ## Endpoints
 
@@ -323,7 +424,7 @@ server first; Windows locks the DLLs.
 | `GET`  | `/v1/stats` | Scheduler counters (`gen_tokens`, `prefill_tokens`, TTFT last/avg, ...) plus `model`/`active_model`/`ctx`/`uptime_s`/`draining` identity fields, memory footprint (`weights_bytes`, `kv_bytes`, das heaps, `gpu_vram_bytes`/`gpu_budget_bytes`), `gpu_cpu_passes` (the calls the armed GPU path handed back to the CPU since the model armed, `{reason, words, count}` per reason that fired - `words` is the reason as the control page prints it; empty means the device served every call), a `hardware` line (CPU * lanes * GPU), `asr_workers`, `asr_ready`, `asr_active`, `asr_pending`, speech counters (`tts_done_jobs` - syntheses served since boot, `tts_audio_s` - the speech seconds they carried), a `tts` block present ONLY while a speech model is configured - and still there when its worker could not load it (`id`, `ready`, `pending`, `done_jobs`, `audio_s`, `voices[]` and `sample_rate` as the loaded model declares them, `cloning` (the model takes a voice from a clip), `speed` (a `speed` other than 1.0 is honoured; false for a Pocket model, which refuses one) and `lang` (the first language it declares), the `lane` its worker pinned or, before there is an answer, the one the boot asked for, and `error` - the loader's reason, present only when the configured model failed to load, which the control page's offer card reads instead of claiming the model is still on its way) - the control page's speech studio gates on `ready`, media counters (`media_pending`, `media_rows`, `mrope_streams` - streams whose media rode the qwen mrope grid walk), and `models[]` - one entry per slot: `file` (source GGUF base name - the page's serve-live gate), `is_active`, `holds_gpu`, requested `backend` vs `backend_effective` (`cpu`/`gpu:rails`/`gpu:resident`), `served` (how the slot is served, in plain words: where the weights sit and where the streams' caches do - the control page prints it on the model card), `served_note` (why it is not served better: the whole-model driver's decline with its remedy, the tower or self-speculation that keeps the caches on the host, fewer K/V regions than streams; empty when nothing holds the slot back), `device_kv` (every stream's K/V cache lives on the GPU, a region each), `vision` and `audio` (the towers that slot actually loaded - the catalog row's chip reads them, and `audio` is what tells the chat mic to attach a clip instead of transcribing it), per-slot cache counters, `last_used_s`, switch count/avg ms |
 | `GET`  | `/v1/streams` | Per-stream poll surface: `model` (the slot it runs on), state (`queued`/`prefilling`/`decoding`/`finished`), token counts, TTFT, and capped text tails (prompt head + generated tail); finished streams linger ~10 s flagged `finished`. Plus `cache`: the prefix-cache donation chains (tokens, live pages, hits, age, preview) and `asr`: recent ASR jobs (state, audio s, wall ms, RTF) |
 | `GET`  | `/config` | Effective config with per-key source (`default`/`cli`/`toml`) - one entry per row of the flags table above, `tts` (the speech model path), `tts_lane` (`q8` | `f32`) and `tts_voices_dir` (the clip directory a cloning model reads) included - plus the `[[models]]` roster, model files beside the served one, active rail (gguf vs prepared `.dlim`), GPU tier status (`supported` + `reason` when the loaded model can't ride it) |
-| `POST` | `/config` | Validate a `{key: value}` JSON body and write it as an **authoritative** TOML (`authoritative = true`) to the config path (or `dasllama-server.toml` beside the program on a config-less start). Applies on the next restart |
+| `POST` | `/config` | Validate a `{key: value}` JSON body and write it as an **authoritative** TOML (`authoritative = true`) to the config path (or `~/.dasllama/dasllama-server.toml` on a config-less start). Applies on the next restart |
 | `POST` | `/restart` | Drain like `/shutdown`, then exit with code **4** - the watchdog relaunches, picking up the saved config (3 stays the tune-restart code) |
 | `GET`  | `/exchange` | The sidecar-exchange surface: policy (url/accept/submit/configured), the consent state (`consent`: accepted/declined/empty, `consent_notice`: the first-contact text), + the current tune sidecar's identity and share state (sha, origin, box/applied_box, version gate, shared-yet) |
 | `GET`  | `/exchange/matches` | Live lookup of this box against the exchange (a network call - seconds; the control page requests it explicitly) |
@@ -463,8 +564,10 @@ Instruct generation branch such as Qwen3 Instruct-2507 defaults off), and a pres
 top-level or the llama.cpp spelling
 `"chat_template_kwargs": {"enable_thinking": ...}` - overrides it. `false` on a
 `<think>`-family appends the template's empty think block so the model answers directly;
-`false` on gemma-4 prefills the closed empty thought channel (the instruct opt-out). A no-op
-for models whose vocab has no think tokens.
+`false` on gemma-4 prefills the closed empty thought channel (the instruct opt-out); a gemma-4
+that opens its reply with a thought block anyway (the E-series does on a media turn) still
+answers, the block coming back as `reasoning_content`, and a channel marker after the answer
+ends the turn. A no-op for models whose vocab has no think tokens.
 
 A thinking reply's reasoning span comes back as **`reasoning_content`** (the
 DeepSeek/llama.cpp framing) with `content` clean of the family's markers: on the
@@ -556,6 +659,19 @@ absent; set `DASLLAMA_MODELS_DIR`):
   `/v1/audio/phonemes` document against the facade's own normalizer and chunker, and a
   second boot on the `f32` lane proving the pin reaches the worker. Needs `kitten-nano.gguf` and
   the front-end packs beside it.
+- `test_cli_args.das` - dasllama-cli's model-free half, run everywhere: the plan a command line
+  parses to, the bare-token walk, the help surfaces, the config file's keys and roster, the
+  model-path resolution, and the chat loop's line logic (commands, the `"""` block, the saved
+  transcript).
+- `test_cli.das` - dasllama-cli end to end, one child process per cell as a user runs it: every
+  command on the fastest small models (`SmolLM2-135M-Instruct-Q8_0.gguf`, `kitten-nano.gguf`,
+  `Qwen3-ASR-0.6B-Q8_0.gguf` with its mmproj), the `talk` chain on those and on
+  `Qwen3.5-0.8B-Q8_0.gguf` + `kokoro-82m.gguf`, the speaker cells (`speak`, `talk` and a
+  two-reply `chat` under `--play --null-audio`), the `--verbose` echo with the streams split, and
+  the tower cells on `gemma-4-E2B-it-Q4_K_M.gguf` with `mmproj-gemma-4-E2B-it-bf16.gguf` (the
+  picture through the vision tower, the JFK clip through the audio tower, spoken back by
+  `pocket-tts-en-q8.gguf`, and a `--no-think --hide-thinking` image turn whose leading thought
+  block stays off the screen). Runs on the stocked box at release time.
 - `test_openai_server_mtp.das` - the self-speculation default: a NextN-headed slot drafts at one
   stream and decodes plain at four, an explicit `mtp` wins either way, and a head-less model
   serves plain under the default; read off `/v1/stats`'s `mtp_drafted`. Needs

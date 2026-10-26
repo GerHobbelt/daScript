@@ -202,11 +202,12 @@ def add_bias_rows(var y : array<float>; blob : PlaneF; b_off, d, npos : int64) {
     add_bias_rows_at(y, plane_at(blob, b_off), d, npos)
 }
 
-def private add_bias_rows_at(var y : array<float>; bp : float const?; d, npos : int64) {
+//! The pointer core: the bias row at `bp` onto `npos` rows of y from row `r0` on.
+def add_bias_rows_at(var y : array<float>; bp : float const?; d, npos : int64; r0 : int64 = 0l) {
     if (npos <= 0l || d <= 0l) return
     let d4 = d - d % 4l
     unsafe {
-        var yp = addr(y[0])
+        var yp = addr(y[r0 * d])
         maybe_parallel_for(0, int(npos), lanes_for_work(npos * d, get_gemv_lane_cap())) $(rb, re) {
             unsafe {
                 for (p in range64(int64(rb), int64(re))) {
@@ -427,6 +428,18 @@ def tower_stage_f32_pad_row_stride(var blob : array<float>; src : array<float>;
     }
 }
 
+//! The plane form: ``rows`` rows of ``src_stride`` floats read from ``src`` at ``src_off``, each landing at its padded pitch.
+def tower_stage_f32_pad_row_stride(var blob : array<float>; src : PlaneF; src_off,
+                                   wo, rows, src_stride, dst_stride : int64) {
+    unsafe {
+        var dp = addr(blob[wo])
+        let sp = plane_at(src, src_off)
+        for (r in range64(rows)) {
+            copy_floats(dp + r * dst_stride, sp + r * src_stride, src_stride)
+        }
+    }
+}
+
 //! Zero ``n`` floats at ``at`` — pad tails of staged planes.
 def tower_zero_span(var a : array<float>; at, n : int64) {
     if (n <= 0l) {
@@ -615,6 +628,9 @@ def tower_bake_half_twin(blob : array<float>; var wblob : array<uint16>; bf16 : 
         }
     }
 }
+
+//! the output length of a k3 / stride-2 / pad-1 conv stage over an axis of `l`
+def conv_s2_out(l : int64) : int64 => (l - 1l) / 2l + 1l
 
 //! im2col over an interleaved-RGB [h × w × 3] canvas into token-major rows in [C][KH][KW]
 //! order (row index c·p² + ky·p + kx), one row per non-overlapping p×p patch walking the canvas

@@ -157,6 +157,9 @@ def template copy_floats_template(var d : float ?; s : float const ?; n : int64)
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def copy_floats(var d : float?; s : float const?; n : int64) {}
 
+//! `n` rounded up to a multiple of `m`: a tile lattice, a row pad, an allocation grain
+def round_up(n, m : auto(TT)) : TT => (n + m - TT(1)) / m * m
+
 //! Exact capacity, then size: the buffer sized once and never regrown.
 def reserve_resize(var a : array<auto(numT)>; n : int | int64) {
     a |> reserve(n)
@@ -1537,6 +1540,11 @@ def clear_bake_backend_override() {
 //! The Q8 interleave (mr) of the ACTIVE backend's weight layout — cached at activation from
 //! KernelBackend.q8_layout (4 for every hand tier; the stamped mr on the gen backend).
 def active_q8_layout_mr() : int64 => g_bake_cpu_override ? g_bake_cpu.q8_mr : g_active_q8_layout_mr
+
+typedef Q8RepackLayout = tuple<repacked : bool; mr : int64; kgroup : int64; wbias : int64>
+
+//! The q8 repack layout a gather and its residency key share: the active one when repacked, the disk-order rows (mr 1, kgroup 4, no bias) when not.
+def active_q8_repack_layout(repacked : bool) : Q8RepackLayout => (repacked = repacked, mr = repacked ? active_q8_layout_mr() : 1l, kgroup = repacked ? active_q8_kgroup() : 4l, wbias = repacked ? active_q8_wbias() : 0l)
 
 //! The active backend's kq plane interleave for `fmt` (4/5/6) — per-format since the kq v2
 //! family split; the loader freezes these onto the Model at repack time.

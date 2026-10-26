@@ -81,10 +81,13 @@ if(NOT DAS_TOOLS_DISABLED)
             utils/dasllama-server/test_openai_server_audio.das
             utils/dasllama-server/test_openai_server_speech.das
             utils/dasllama-server/test_openai_server_mtp.das
+            utils/dasllama-server/test_cli.das
         FILES
+            utils/dasllama-server/test_cli_args.das
             utils/dasllama-server/test_exchange_client.das
             utils/dasllama-server/test_model_catalog.das
             utils/dasllama-server/test_setup_mode.das
+            utils/dasllama-server/test_user_state.das
             utils/dasllama-server/test_model_override.das
             utils/dasllama-server/test_slot_served.das
         JIT_FILES utils/dasllama-server/test_worker_dispatch.das)

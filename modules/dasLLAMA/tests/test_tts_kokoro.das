@@ -12,9 +12,7 @@ require dasllama/dasllama_styletts2   // the model driven straight from a phonem
 require dasllama/dasllama_math   // setup_dasllama_jobque_
 require daslib/jobque_boost
 require daslib/fio
-require daslib/rtti   // this_context().last_exception: the voice refusals are read as text
 require strings
-require math
 require _tts_parity
 require _model_tier
 
@@ -24,7 +22,10 @@ require _model_tier
 // performance/build_tts_data.das through harness/convert_kokoro.py and harness/kokoro_oracle.py):
 // the token rule against the reference pipeline, the parity rail of `_tts_parity.das` against
 // the PyTorch reference with captured noise, and a facade smoke cell that speaks one sentence
-// through the front end's own inventory.
+// through the front end's own inventory. The facade and GPU cells also need the front-end
+// packs (`tts_g2p.bin`, `tts_postag.bin`) beside the model; the GPU cells run on Metal or Vulkan,
+// skip where no device serves or the driver registers no seat for the stage, and red where a
+// present seat declines a stage.
 
 def private gguf_path() : string {
     return path_join(models_dir(), "kokoro-82m.gguf")
@@ -40,16 +41,7 @@ def private kokoro_ids_of(ps : string) : array<int> {
     return <- kokoro_token_ids(g_family, ps)
 }
 
-def private panic_text_of(blk : block<() : void>) : string {
-    var why = ""
-    try {
-        invoke(blk)
-    } recover {
-        why = this_context().last_exception |> rtrim
-    }
-    return why
-}
-
+//! the speech-sanity read of one synthesis: every sample finite (asserted), the peak returned for the cell's own bar
 // The samples the model speaks for one phoneme string in one voice - the facade's chunk path with
 // its dialect pick taken out, so a synthesis can be held against the string it should have read.
 // Noise never moves the length, so the seed here need not be the facade's.
@@ -126,8 +118,7 @@ def test_kokoro_symbols(t : T?) {
 [test]
 def test_kokoro_oracle(t : T?) {
     t |> run("against the PyTorch reference, captured noise") @(t : T?) {
-        if (!stat(gguf_path()).is_valid) {
-            t |> skip("kokoro-82m.gguf not present")
+        if (!model_available(t, gguf_path())) {
             return
         }
         delete g_family
@@ -144,20 +135,17 @@ def test_kokoro_oracle(t : T?) {
     }
 }
 
-// the model and both front-end packs: every facade cell below needs all three
-def private facade_data_missing(t : T?) : bool {
-    if (!stat(gguf_path()).is_valid || !stat(path_join(models_dir(), "tts_g2p.bin")).is_valid ||
-        !stat(path_join(models_dir(), "tts_postag.bin")).is_valid) {
-        t |> skip("kokoro-82m.gguf or the front-end packs not present")
-        return true
+[test]
+def test_kokoro_synthesis_metal(t : T?) {
+    t |> run("kokoro: the synthesis on the Metal tower vs the CPU chain, the served lane") @(t : T?) {
+        tts_gpu_synthesis(t, gguf_path(), "The tower serves the generator, and the words still land.", "af_heart")
     }
-    return false
 }
 
 [test]
 def test_kokoro_facade(t : T?) {
     t |> run("text in, speech out") @(t : T?) {
-        if (facade_data_missing(t)) {
+        if (tts_data_missing(t, gguf_path())) {
             return
         }
         with_job_que() {
@@ -182,13 +170,7 @@ def test_kokoro_facade(t : T?) {
             var inscope audio <- synthesize(m, "The quick brown fox jumps over the lazy dog, twice.", "af_heart")
             t |> equal(audio.sample_rate, 24000)
             t |> success(length(audio.pcm) > 24000 && length(audio.pcm) < 240000, "{length(audio.pcm)} samples")
-            var finite = true
-            var peak = 0.0
-            for (v in audio.pcm) {
-                finite = finite && abs(v) < 10.0   // a NaN fails the comparison too
-                peak = max(peak, abs(v))
-            }
-            t |> success(finite, "every sample finite")
+            let peak = speech_peak(t, audio)
             t |> success(peak > 0.05, "peak {peak}: the model spoke")
             to_log(LOG_INFO, "kokoro facade: {length(audio.pcm)} samples, peak {peak}; {timings_line(audio.timings, audio.sample_rate)}\n")
         }
@@ -198,7 +180,7 @@ def test_kokoro_facade(t : T?) {
 [test]
 def test_kokoro_dialects(t : T?) {
     t |> run("a British voice speaks the British inventory, and the vocabulary carries it") @(t : T?) {
-        if (facade_data_missing(t)) {
+        if (tts_data_missing(t, gguf_path())) {
             return
         }
         with_job_que() {
@@ -222,13 +204,7 @@ def test_kokoro_dialects(t : T?) {
             }
             t |> success(!same_tokens, "the two dialects feed the model different tokens")
             var inscope audio <- synthesize(m, line, "bf_emma")
-            var finite = true
-            var peak = 0.0
-            for (v in audio.pcm) {
-                finite = finite && abs(v) < 10.0   // a NaN fails the comparison too
-                peak = max(peak, abs(v))
-            }
-            t |> success(finite, "every sample finite")
+            let peak = speech_peak(t, audio)
             t |> success(peak > 0.05 && length(audio.pcm) > 24000, "bf_emma spoke {length(audio.pcm)} samples, peak {peak}")
             // and the dialect the VOICE pins is the one the synthesis read: the two inventories
             // predict different durations, so the sample count says which string reached the model
@@ -242,9 +218,19 @@ def test_kokoro_dialects(t : T?) {
 }
 
 [test]
+def test_seat_stats_refusal(t : T?) {
+    t |> run("a seat name no stage carries panics, so a misspelt key cannot read as zero counters") @(t : T?) {
+        let why = panic_text() {
+            styletts2_gpu_stats("generators")
+        }
+        t |> success(find(why, "no GPU seat named 'generators'") >= 0, "the refusal names the key: {why}")
+    }
+}
+
+[test]
 def test_kokoro_voice_refusals(t : T?) {
     t |> run("a voice the front end cannot phonemize refuses, naming the language its pack speaks") @(t : T?) {
-        if (facade_data_missing(t)) {
+        if (tts_data_missing(t, gguf_path())) {
             return
         }
         with_job_que() {
@@ -253,12 +239,12 @@ def test_kokoro_voice_refusals(t : T?) {
             var inscope c <- caps(m)
             t |> success(find_index(m.model.voice_names, "jf_alpha") >= 0, "the model carries the Japanese pack")
             t |> success(find_index(c.voices, "jf_alpha") < 0, "and caps does not offer it")
-            let ja = panic_text_of() {
+            let ja = panic_text() {
                 feint("{tts_voice_lang(m, "jf_alpha")}")
             }
             t |> success(find(ja, "unknown voice 'jf_alpha'") >= 0, "the refusal names the voice: {ja}")
             t |> success(find(ja, "speaks ja") >= 0, "and the language the pack speaks: {ja}")
-            let nobody = panic_text_of() {
+            let nobody = panic_text() {
                 feint("{tts_voice_lang(m, "no-such-voice")}")
             }
             t |> success(find(nobody, "unknown voice 'no-such-voice'") >= 0, "a voice the model lacks refuses first: {nobody}")

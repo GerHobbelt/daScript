@@ -31,7 +31,7 @@ require jit
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let public LLVM_JIT_CODEGEN_VERSION : uint64 = 0x8eul   // 0x8e: ++ and -- on a pointer lower to a GEP, not a runtime call
+let public LLVM_JIT_CODEGEN_VERSION : uint64 = 0x90ul   // 0x90: prologue and epilogue are IR helpers
 
 let public JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -190,6 +190,8 @@ def public jit_env_salt(opt_level : int; size_level : int; emit_prologue : bool;
     h = (h ^ uint64(CONTEXT_OFFSET_OF_STOP_FLAGS)) * JIT_FNV_PRIME
     h = (h ^ uint64(CONTEXT_OFFSET_OF_EVAL_TOP)) * JIT_FNV_PRIME
     h = (h ^ uint64(SIMFUNCTION_OFFSET_OF_JIT_FUNCTION)) * JIT_FNV_PRIME
+    h = (h ^ uint64(ARRAY_MAGIC)) * JIT_FNV_PRIME
+    h = (h ^ uint64(ARRAY_LOCK_EXEMPT_FLAGS)) * JIT_FNV_PRIME
     // full host-CPU identity when the TargetMachine bakes it - the cpuid bits below cover only the matrix-tier features; a wider box's object is an illegal instruction on a narrower one
     if (use_host_cpu) {
         let host_cpu = LLVMGetHostCPUName()
@@ -710,6 +712,7 @@ struct public JitPlan {
     jit_all_functions : bool
     debug_info : bool
     dump_ir : bool
+    dump_ir_path : string
     gen_exe : bool
     gen_lib : bool
     lib_static : bool
@@ -781,14 +784,17 @@ def private resolve_split_options(var plan : JitPlan; cli_opts : JitCliOptions; 
 
 //! the plan for `prog`; `announce` prints the one-time lines (the baseline class, the exe host
 //! CPU) - the first computation in a run passes true, a recomputation false
-def public make_jit_plan(prog : Program?; var ctx : Context?; announce : bool) : JitPlan {   // nolint:STYLE038 - one flat resolution of every emission input; a split would hide which inputs key the cache
-    var plan : JitPlan
-    plan.aot_host = prog.policies.aot && prog.policies.jit_enabled
+def public make_jit_plan(prog : Program?; var ctx : Context?; announce : bool) : JitPlan {
     let r <- parse_args(type<JitCliOptions>)
-    let cli_opts = r |> unwrap_or_default
-    plan.jit_all_functions = prog.policies.jit_jit_all_functions
-    plan.debug_info = cli_opts.debug_info |> unwrap_or(prog.policies.jit_debug_info)
-    plan.dump_ir = cli_opts.dump_ir |> unwrap_or(false)
+    return <- make_jit_plan(prog, ctx, announce, r |> unwrap_or_default)
+}
+
+def public make_jit_plan(prog : Program?; var ctx : Context?; announce : bool; cli_opts : JitCliOptions) : JitPlan {   // nolint:STYLE038 - one flat resolution of every emission input; a split would hide which inputs key the cache
+    var plan = JitPlan(aot_host = prog.policies.aot && prog.policies.jit_enabled,
+        jit_all_functions = prog.policies.jit_jit_all_functions,
+        debug_info = cli_opts.debug_info |> unwrap_or(prog.policies.jit_debug_info),
+        dump_ir = cli_opts.dump_ir |> unwrap_or(false),
+        dump_ir_path = cli_opts.dump_ir_path |> unwrap_or(""))
     if (announce && prog.policies.jit_dll_mode && !das_is_dll_build()) {
         // a legitimate configuration (static daslang), but the cost is worth naming: no DLL
         // cache exists, so every -jit run pays full in-memory codegen
@@ -812,7 +818,7 @@ def public make_jit_plan(prog : Program?; var ctx : Context?; announce : bool) :
     // --jit-compile-only: build + verify + optimize (+dump), write/load/install nothing —
     // the program runs interpreted. Also bypasses the DLL cache probe, so the
     // generators always run (this is the cross-emission smoke rail).
-    plan.compile_only = cli_opts.compile_only |> unwrap_or(false)
+    plan.compile_only = cli_opts.compile_only |> unwrap_or((prog._options |> find_arg("jit_compile_only")) ?as tBool ?? false)
     // Offline AOT: emit the whole used function set to a .o for static linking, with a
     // load ctor registering them into the AOT library. Mutually exclusive with dll
     // mode (no in-memory engine work, no instrument).
@@ -822,9 +828,7 @@ def public make_jit_plan(prog : Program?; var ctx : Context?; announce : bool) :
     plan.size_level = cli_opts.size_level |> unwrap_or(prog.policies.jit_size_level)
     // This policy must be set before compilation so stack-frame sizes include the prologue.
     plan.emit_prologue = prog.policies.emit_prologue
-    // If you're sure `dynamic` functions is not reachable set this flag
-    // to `true` and fail in runtime on `jit_trap` if they turns
-    // out to be reachable.
+    // strict: a standalone exe with a no_jit function fails the build (collect_standalone_functions)
     plan.exe_strict = true
     plan.config_out_path = string(prog.policies.jit_output_path)
     plan.output_path = plan.config_out_path |> empty() ? ".jitted_scripts/{prog.thisNamespace}" : plan.config_out_path

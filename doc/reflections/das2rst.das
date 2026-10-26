@@ -32,6 +32,7 @@ require daslib/ansi_colors
 require daslib/tty
 require daslib/jobque_boost
 require daslib/jobque_profile
+require daslib/runtime_memory
 require daslib/apply_in_context
 require daslib/cross_context
 require daslib/module_group
@@ -192,7 +193,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Character set groups", mod, %regex~(is_alpha|is_number|is_white_space|is_char_in_set)$%%),
         group_by_regex("das::string manipulation", mod, %regex~(peek|set)$%%),
         group_by_regex("String builder", mod, %regex~(build_string|write|write_char|write_chars|write_escape_string)$%%),
-        group_by_regex("Heap reporting", mod, %regex~(heap|string_heap|memory_report|tag_array|tag_table|max_unreserved_size|set_max_unreserved_size|frame_position)%%),
+        group_by_regex("Heap reporting", mod, %regex~(heap|string_heap|memory_report|tag_array|tag_table|max_unreserved_size|set_max_unreserved_size|frame_position|native_thread_stack_size|native_allocator_stats|native_allocator_extent|context_memory_sizes|context_idle_fork_memory)%%),
         group_by_regex("Vector and matrix math", mod, %regex~(float3x4|float4x4|identity|inverse|rotate|translation|transpose)$%%),
         group_by_regex("16/8-bit lattice converts", mod, %regex~(short2_sat|short3_sat|short4_sat|ushort2_sat|ushort3_sat|ushort4_sat|byte2_sat|byte3_sat|byte4_sat|byte8_sat|ubyte2_sat|ubyte3_sat|ubyte4_sat|ubyte8_sat|half8_lo|half8_hi)$%%),
         group_by_regex("16/8-bit lattice integer dots", mod, %regex~(idot|idot4|shuffle)$%%),
@@ -200,7 +201,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Smart ptr infrastructure", mod, %regex~(add_ptr_ref|smart_ptr|get_const_ptr|move|move_new|get_ptr$)%%),
         group_by_regex("Macro infrastructure", mod, %regex~(is_folding|is_compiling|is_in_completion|is_in_lint_check|is_building_documentation|is_reporting_compilation_errors)%%),
         group_by_regex("Profiler", mod, %regex~(profile|reset_profiler|dump_profile_info|collect_profile_info)$%%),
-        group_by_regex("System infrastructure", mod, %regex~(panic|print|feint|sprint|sprint_json|sscan_json|to_log|to_compiler_log|diagnostics_to_stderr|diagnostics_to_file|error|terminate|breakpoint|stackwalk|get_stackwalk|get_das_root|get_das_version|is_in_aot|aot_enabled|is_intern_strings|is_safe_hash|eval_main_loop|shared_module_extension)$%%),
+        group_by_regex("System infrastructure", mod, %regex~(panic|print|feint|sprint|sprint_json|sscan_json|to_log|to_compiler_log|diagnostics_to_stderr|diagnostics_to_file|error|terminate|breakpoint|stackwalk|get_stackwalk|get_das_root|get_executable_path|get_das_version|is_in_aot|aot_enabled|is_intern_strings|is_safe_hash|eval_main_loop|shared_module_extension)$%%),
         group_by_regex("Memory manipulation", mod, %regex~(intptr|memcmp|variant_index|set_variant_index|hash|hash_combine64|memcpy|memmove|lock_data|map_to_array|map_to_ro_array)$%%),
         group_by_regex("Binary serializer", mod, %regex~(binary_load|binary_save)$%%),
         group_by_regex("Path and command line", mod, %regex~(get_command_line_arguments|with_argv)$%%),
@@ -283,7 +284,8 @@ def document_module_dashv(_root : string) {
         group_by_regex("Request configuration", mod, %regex~(set_basic_auth|set_bearer_token_auth|set_timeout|set_connect_timeout|allow_redirect|set_param|get_param|each_param)$%%),
         group_by_regex("Cookies", mod, %regex~(add_cookie|get_cookie|each_cookie)$%%),
         group_by_regex("Form data", mod, %regex~(set_form_data|set_form_file|get_form_data|each_form_field|save_form_file|set_url_encoded|get_url_encoded)$%%),
-        group_by_regex("SSE response writer", mod, %regex~(respond|sse_event|end_headers|write_chunked|set_writer_keepalive_timeout|close_writer|release_writer|is_writer_connected)$%%)
+        group_by_regex("SSE response writer", mod, %regex~(respond|sse_event|end_headers|write_chunked|set_writer_keepalive_timeout|close_writer|release_writer|is_writer_connected)$%%),
+        group_by_regex("Logging", mod, %regex~(hv_set_log_file)$%%)
     )
     document("HTTP and WebSocket library (libhv)", mod, "dashv.rst", groups)
 }
@@ -335,9 +337,9 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
         group_by_regex("Vision and audio encoders", mod, %regex~(encode_image|encode_audio)$%%),
-        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_assistant|render_turn|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
+        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_user_audio_rows|add_assistant|render_turn|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
-        group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids)$%%),
+        group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids|turn_stop_ids|make_nothink_guard|nothink_stop_here)$%%),
         group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|set_jobque_spin_gpu_us|get_jobque_spin_gpu_us|get_jobque_spin_in_force|set_single_thread|get_single_thread|select_matmul_backend_for_load|kernel_backend_available)$%%),
         group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed)$%%),
         group_by_regex("Operations: serving from the device", mod, %regex~(create_device_session|gpu_device_sessions|gpu_dn_room|gpu_device_prefill_continues|gpu_device_prefill_window|gpu_device_kv_park|gpu_device_kv_adopt|gpu_device_session_ctx|gpu_device_session_dtype|set_gpu_resident_regions|set_gpu_ctx_max|gpu_resident_decline|gpu_cpu_passes)$%%)
@@ -373,6 +375,8 @@ def document_module_dasllama(_root : string) {
             "The incremental reasoning/content splitter for a streamed reply (``make_think_stream``): feed decoded pieces through ``think_feed``, flush with ``think_finish``. Holds partial reasoning markers back across chunk boundaries; a non-thinking family yields a pass-through stream.")
         dasllama_type_stanza(f, "struct-dasllama_chat-ThinkSplit", "ThinkSplit",
             "One reply split at its reasoning boundary, as returned by ``split_reasoning``: ``reasoning`` holds the thinking span (empty when the model answered directly), ``content`` the answer.")
+        dasllama_type_stanza(f, "struct-dasllama_chat-NothinkStopGuard", "NothinkStopGuard",
+            "The instruct-mode stop guard over a family's channel markers (``make_nothink_guard``): a loop that samples tokens itself checks ``turn_stop_ids`` first, then asks ``nothink_stop_here`` - a marker before the reply's first content piece is a leading thought the reply matcher splits, one after content ends the turn. Unarmed (every token passes) on a thinking turn and on families with no such markers.")
         dasllama_type_stanza(f, "struct-dasllama_tools-ToolReply", "ToolReply",
             "A fully classified tool-capable reply, as returned by ``parse_calls``: the ``reasoning`` span, the ``content``, and the ``calls`` the model made (empty when it answered directly).")
         dasllama_type_stanza(f, "struct-dasllama_tools-ToolCall", "ToolCall",
@@ -414,6 +418,7 @@ def document_module_dasllama_tts(_root : string) {
         group_by_regex("Text front end", mod, %regex~(tts_normalize|tts_phonemize|tts_chunks)$%%),
         group_by_regex("Synthesis", mod, %regex~(synthesize|synthesize_stream|tts_release_scratch|tts_set_chunk_chars)$%%),
         group_by_regex("The served lane", mod, %regex~(set_tts_q8|reset_tts_q8|tts_serves_q8)$%%),
+        group_by_regex("GPU seats", mod, %regex~(tts_seats|tts_seat_index|tts_seat_call|tts_seat_served|tts_seat_stats|tts_seat_names)$%%),
         group_by_regex("Timings", mod, %regex~(rtf|timings_line)$%%)
     )
     documents("dasLLAMA text to speech: models, voices, synthesis", mod, "dasllama_tts.rst", groups)
@@ -476,6 +481,7 @@ def document_module_ast(_root : string) {
     var mod = [get_module("ast_core"), find_module("ast")]
     var groups <- array<DocGroup>(
         group_by_regex("Compilation and file access", mod, %regex~(compile|compile_file|parse_file|parse_file_no_prerequisites|make_file_access|require_module_now)$%%),
+        group_by_regex("Building programs from AST nodes", mod, %regex~(make_program|make_module|make_main_module)$%%),
         group_by_regex("Call generation", mod, %regex~(make_call)$%%),
         group_by_regex("Visitor pattern", mod, %regex~visit.*%%),
         group_by_regex("Expression generation", mod, %regex~(force_generated|get_expression_annotation|make_type_info_structure|stamp_missing_at)%%),
@@ -698,6 +704,12 @@ def document_module_jobque_profile(_root : string) {
         group_by_regex("Markers", mod, %regex~(profile_marker|profile_marker_id)$%%)
     )
     document("Self-describing jobque profiling", mod, "jobque_profile.rst", groups)
+}
+
+def document_module_runtime_memory(_root : string) {
+    var mod = find_module("runtime_memory")
+    var groups <- array<DocGroup>(group_by_regex("Context snapshots", mod, %regex~(context_memory|context_idle_forks)$%%))
+    document("Context and idle-fork memory observations", mod, "runtime_memory.rst", groups)
 }
 
 def document_module_apply_in_context(_root : string) {
@@ -1434,7 +1446,7 @@ def document_module_logger(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Setup", mod, %regex~.*(logger_init|logger_init_tee|logger_set_name|logger_set_path|logger_get_path|logger_get_name)$%%),
         group_by_regex("Level filters", mod, %regex~.*(logger_set_min_level|logger_get_min_level|logger_set_category_level|logger_clear_category_levels)$%%),
-        group_by_regex("Output control", mod, %regex~.*(logger_set_stderr_fallback|logger_set_tee|logger_flush|logger_close|logger_capture_diagnostics)$%%),
+        group_by_regex("Output control", mod, %regex~.*(logger_set_stderr_fallback|logger_set_tee|logger_set_echo_stderr|logger_flush|logger_close|logger_capture_diagnostics)$%%),
         group_by_regex("Log calls", mod, %regex~.*(logger_log|logger_trace|logger_debug|logger_info|logger_warning|logger_error|logger_critical)$%%),
         group_by_regex("Stdout hook", mod, %regex~.*(logger_install_hook)$%%)
     )
@@ -1670,7 +1682,7 @@ def document_module_stbimage_ttf(_root : string) {
 def document_module_audio(_root : string) {
     var mod = get_module("audio")
     var groups <- array<DocGroup>(
-        group_by_regex("Audio device", mod, %regex~(sound_initalize|sound_finalize|mixer_context|sound_set_null_device|audio_is_single_threaded|sound_playback_underrun_frames)$%%),
+        group_by_regex("Audio device", mod, %regex~(sound_initalize|sound_finalize|mixer_context|sound_set_null_device|audio_is_single_threaded|sound_playback_underrun_frames|sound_playback_diagnostics)$%%),
         group_by_regex("Capture", mod, %regex~(sound_record|sound_is_recording)%%),
         group_by_regex("Decoder", mod, %regex~ma_decoder%%),
         group_by_regex("Resampler", mod, %regex~ma_resampler%%),
@@ -1701,7 +1713,7 @@ def document_module_audio_boost(_root : string) {
         group_by_regex("Reverb", mod, %regex~(set_reverb|set_reverb_preset)$%%),
         group_by_regex("Chorus", mod, %regex~(set_chorus|set_chorus_default)$%%),
         group_by_regex("Attenuation", mod, %regex~(compute_attenuation|default_attenuation|inverse_distance_attenuation|linear_attenuation|quadratic_attenuation|inverse_square_attenuation)$%%),
-        group_by_regex("Status monitoring", mod, %regex~(set_status_update|clear_status|unset_status_update|set_audio_stats_box)$%%),
+        group_by_regex("Status monitoring", mod, %regex~(set_status_update|clear_status|unset_status_update|set_audio_stats_box|set_audio_memory_box|get_playback_diagnostics)$%%),
         group_by_regex("Command batching", mod, %regex~(begin_batch|end_batch|batch)$%%),
         group_by_regex("PCM stream", mod, %regex~(append_to_pcm|append_box_to_pcm)$%%),
         group_by_regex("Decoding", mod, %regex~(decode_audio)$%%),
@@ -1817,7 +1829,7 @@ def document_module_strudel_player(_root : string) {
         group_by_regex("One-shots", mod, %regex~strudel_(one_shot|active_tracks)$%%),
         group_by_regex("Orbit levels", mod, %regex~strudel_(fade_orbit|set_orbit_gain|orbit_gain)$%%),
         group_by_regex("State serialization", mod, %regex~strudel_(save_state|restore_state|save_sf2_state|restore_sf2_state)$%%),
-        group_by_regex("Debug and diagnostics", mod, %regex~.*strudel_(debug_memory|reset_memory_baseline|get_worker_heap_bytes|get_diagnostics|debug_sample_peaks|debug_master_peak|debug_output_peak|debug_voices)$%%)
+        group_by_regex("Debug and diagnostics", mod, %regex~.*strudel_(debug_memory|reset_memory_baseline|get_worker_heap_bytes|get_worker_memory|get_diagnostics|debug_sample_peaks|debug_master_peak|debug_output_peak|debug_voices)$%%)
     )
     document("Top-level playback harness: tracks, BPM/CPS, and threaded audio", mod, "strudel_player.rst", groups)
 }
@@ -2068,6 +2080,7 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_is_local(root)
     document_module_jobque_boost(root)
     document_module_jobque_profile(root)
+    document_module_runtime_memory(root)
     document_module_json_boost(root)
     document_module_json(root)
     document_module_jsonrpc(root)

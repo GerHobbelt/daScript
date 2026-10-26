@@ -105,6 +105,7 @@ One section per module: what the module is for, then its public symbols grouped 
 - [result](#result) - Monadic `Result<T, E>` — a value (`ok`) or an error (`err`).
 - [rst](#rst) - The RST module implements the documentation generation pipeline for daslang.
 - [rtti](#rtti) - The RTTI module exposes runtime type information and program introspection facilities.
+- [runtime_memory](#runtime_memory) - Context and retained idle-fork memory snapshots for runtime diagnostics.
 - [safe_addr](#safe_addr) - The SAFE_ADDR module provides compile-time checked pointer operations.
 - [sha_256](#sha_256) - FIPS 180-4 SHA-256 in pure daslang: one-shot hashing of strings and byte arrays to lowercase hex, plus a streaming init/update/final state for data that arrives in pieces.
 - [soa](#soa) - The SOA (Structure of Arrays) module transforms array-of-structures data layouts into structure-of-arrays layouts for better cache performance.
@@ -338,6 +339,8 @@ The BUILTIN module contains core runtime functions available in all daslang prog
 
 ### Heap reporting
 
+- `context_idle_fork_memory` - Samples idle fork contexts retained by the caller under the pool lock.
+- `context_memory_sizes` - Returns the calling context's stack capacity in bytes in `x` and global storage size in bytes in `y`.
 - `frame_position` - Returns the call site's frame position -- the value the garbage collector's locals gate reads from a stack frame's line handoff -- resolved at simulate time within the calling function's own numbering.
 - `heap_allocation_count` - Returns the total number of heap allocations performed by the current context since it was created.
 - `heap_allocation_stats` - Returns heap allocation statistics as a `urange64`, where the `x` component is total bytes allocated and the `y` component is total bytes freed.
@@ -350,6 +353,9 @@ The BUILTIN module contains core runtime functions available in all daslang prog
 - `heap_total_allocated` - Total bytes the context's value heap has reserved from the OS (aligned), including currently-free space.
 - `max_unreserved_size` - Returns the context's `max_unreserved_size` limit in bytes: an array `resize` that has to grow past this many bytes without a prior `reserve` panics.
 - `memory_report` - Prints a report of memory allocations for the current context; when `errorsOnly` is true, only GC-related errors are included.
+- `native_allocator_extent` - Returns the Emscripten linear-memory heap base address in `x` and current program break in `y`.
+- `native_allocator_stats` - Returns Emscripten allocator allocated bytes in `x` and free bytes in `y` from `mallinfo`.
+- `native_thread_stack_size` - Returns the current Emscripten thread's native stack capacity in bytes, or zero on other platforms.
 - `set_max_unreserved_size` - Sets the context's `max_unreserved_size` limit to `bytes`: an array `resize` that has to grow past this many bytes without a prior `reserve` panics.
 - `string_heap_allocation_count` - Returns the total number of individual string allocations performed on the current context's string heap.
 - `string_heap_allocation_stats` - Returns string heap allocation statistics as a `urange64` where `x` is total bytes allocated and `y` is total bytes deleted.
@@ -433,6 +439,7 @@ The BUILTIN module contains core runtime functions available in all daslang prog
 - `feint` - No-op replacement for `print`.
 - `get_das_root` - Returns the file-system path to the daslang root directory, where `daslib` and other standard libraries are located.
 - `get_das_version` - Returns the daslang SDK version as a string in "major.minor.patch" format (e.g.
+- `get_executable_path` - Returns the absolute path of the running executable with symlinks resolved (on Windows the module file name), or an empty string where the platform exposes none.
 - `get_stackwalk` - Returns the current call stack as a string — the same report `stackwalk` prints, captured instead of logged.
 - `is_in_aot` - Returns `true` if the compiler is currently generating ahead-of-time (AOT) compiled code.
 - `is_intern_strings` - Returns `true` if string interning is enabled in the current context, meaning identical strings share the same memory.
@@ -836,6 +843,7 @@ The FIO module implements file input/output and filesystem operations. It provid
 - `ftell` - Returns the current byte offset of the file pointer for the given FILE, equivalent to C ftell.
 - `funbuffered` - Turns off the C stream buffer on the stream, so every read goes to the descriptor and `fpoll` sees every byte the stream holds: nothing waits in a stdio buffer the poll cannot see.
 - `fwrite` - Writes raw binary data from a POD value to a file.
+- `fwrite_if_changed`
 - `getchar` - Reads and returns the next character from standard input as an integer, equivalent to C getchar.
 - `is_reparse_point` - Returns true if the path is a symbolic link — and on Windows, any reparse point: a junction, a mount point, or a less common flavor such as a cloud-file placeholder.
 - `is_reparse_point_result`
@@ -1181,6 +1189,10 @@ The DASHV module provides HTTP and WebSocket networking built on top of the `lib
 - `set_writer_keepalive_timeout` - Sets how long a retained streaming response writer may remain inactive before it expires.
 - `sse_event` - Writes one Server-Sent Events frame (the data payload plus an optional event name; an empty name emits an unnamed event) to the streaming response writer.
 - `write_chunked` - Writes one chunk of body data to the streaming response writer using chunked transfer encoding.
+
+### Logging
+
+- `hv_set_log_file` - Sends libhv's own log to a daily file <path>.YYYYMMDD.log (the directory must exist) instead of libhv.YYYYMMDD.log in the working directory.
 
 ## openai_common
 
@@ -1860,6 +1872,7 @@ Module audio
 - `ma_limiter` - Look-ahead brick-wall limiter.
 - `ma_phaser` - Four-stage all-pass phaser with resonant feedback and triangle LFO.
 - `ma_waveshaper` - tanh-based stereo waveshaper for soft saturation.
+- `PlaybackDiagnostics` - Threaded browser audio-device counters, timings and buffering state; unavailable fields are zero.
 
 ### Audio device
 
@@ -1867,6 +1880,7 @@ Module audio
 - `mixer_context` - Get the audio mixer thread's context.
 - `sound_finalize` - Shut down the audio device and release resources.
 - `sound_initalize` - Initialize the audio device with a mixer callback.
+- `sound_playback_diagnostics` - Samples threaded browser audio-device counters and ring occupancy.
 - `sound_playback_underrun_frames` - Number of output frames the device played as silence because the mixer had not refilled the ring in time.
 - `sound_set_null_device` - Forces the audio system to use miniaudio's null backend — a timer-driven playback device with no real hardware — on the next audio_system_create / with_audio_system.
 
@@ -2034,6 +2048,7 @@ Module audio_boost
 ### Structures
 
 - `AudioChannelStatus`
+- `PlaybackBufferStats` - Threaded browser audio-device counters, timings and buffering state; unavailable fields are zero.
 - `AudioSystemStats`
 - `Attenuation`
 
@@ -2101,6 +2116,8 @@ Module audio_boost
 ### Status monitoring
 
 - `clear_status` - Drop the stored snapshot; the box reads back empty until the next publish.
+- `get_playback_diagnostics` - Samples threaded browser device counters; unavailable counters are zero.
+- `set_audio_memory_box` - Publish ContextMemory once per second, independently of the optional stats box.
 - `set_audio_stats_box` - Register a box to receive periodic AudioSystemStats updates from the audio thread.
 - `set_status_update` - Publish this sound's status into `status` until `unset_status_update`.
 - `unset_status_update` - unset status for sound
@@ -2460,6 +2477,7 @@ Module strudel_player
 - `strudel_debug_voices` - Log the number of active sample/oscillator voices on each track (debug helper).
 - `strudel_get_diagnostics` - Returns a read-only producer/consumer telemetry snapshot; threaded playback reads it from the separate diagnostics `SeqBox`.
 - `strudel_get_worker_heap_bytes` - The playback worker's heap, as of its last tick; 0 in main-thread mode, where the caller's own heap is the one in play.
+- `strudel_get_worker_memory` - Worker-owned heaps; zero in main-thread mode to avoid counting that heap twice.
 - `strudel_reset_memory_baseline` - Reset memory-tracking baseline to the current heap state.
 
 ## strudel_midi
@@ -3154,6 +3172,7 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `add_assistant` - Inject a KNOWN assistant reply (no generation): prefill the pending user turn and `text` into the KV cache, then close the turn — like `respond` but with a supplied reply.
 - `add_user` - Queue a user message for the next `respond`.
 - `add_user_audio` - Queue audio (16 kHz mono f32 PCM) for the next `respond` — encoded to soft tokens immediately and spliced at the head of the turn before any `add_user` text.
+- `add_user_audio_rows` - Queue PRE-ENCODED audio soft-token rows (what `encode_audio` emits — `dim`-wide on every family, length-checked) for the next `respond`.
 - `add_user_image` - Queue an image for the next `respond` — geometry, letterbox and the embedder run NOW, spliced at the head of the next user turn.
 - `add_user_image_rows` - Queue PRE-ENCODED image soft-token rows (what `encode_image` emits — deepstack models: `(1+n)·dim`-wide, length-checked) with the family's mrope `grid` ((0,0) = sequential) for the next `respond`.
 - `create_chat` - Start a conversation over `model`: resolves the chat template (GGUF-embedded, falling back to the arch registry) and creates the session.
@@ -3175,12 +3194,15 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 
 ### Reasoning (thinking models)
 
-- `effective_stop_ids` - The stop ids in force for the NEXT generation: the template's stops plus its thinking-off extras while thinking is off.
-- `make_think_stream` - The incremental reasoning/content splitter for `chat`'s next turn — feed streamed pieces through `think_feed`, flush with `think_finish`.
+- `effective_stop_ids` - Every stop id for the NEXT generation as one list: the template's stops plus the thinking-off extras while thinking is off.
+- `make_nothink_guard` - The instruct-mode stop guard for `chat`'s next turn over the family's channel markers (gemma-4): unarmed on a thinking turn.
+- `make_think_stream` - The incremental reasoning/content splitter for `chat`'s next turn (`think_feed` per piece, `think_finish` at the end).
+- `nothink_stop_here` - true = `id` ends the turn: a guarded channel marker sampled after the reply's first content piece.
 - `split_reasoning` - Split a complete reply at its reasoning boundary per the model family's reply format (`<think>` pair, Harmony channels, gemma-4's thought channel).
 - `think_drain` - Drain a COMPLETE reply through the splitter in one call: feed + finish + the strip rule (both halves strip when a reasoning span was consumed).
 - `think_feed` - Feed one streamed piece through the splitter; the out-strings are OVERWRITTEN with this piece's reasoning/content deltas (either may be empty while a partial marker is held).
 - `think_finish` - Flush the splitter at end-of-generation (OVERWRITES the out-strings with the final deltas): an unclosed reasoning span classifies as reasoning — the truncated-tail rule.
+- `turn_stop_ids` - The template's own stop ids for the NEXT generation (`<turn|>`, `<eos>` and their kin): a token among them ends the turn outright.
 
 ### Operations: prepared images and dispatch
 
@@ -3231,7 +3253,7 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 
 ## dasllama_tts
 
-Text to speech in pure daslang: load a converted StyleTTS2-lineage GGUF (KittenTTS nano and mini, Kokoro-82M), run text through the das-native front end (normalizer, part-of-speech tagger, grapheme-to-phoneme), and synthesize mono f32 PCM per sentence chunk, timed per model stage. Run with `-jit`; `utils/dasllama-server/txt2wav.das` is the canonical program shape, and the server's `/v1/audio/speech` route serves the same facade.
+Text to speech in pure daslang: load a converted StyleTTS2-lineage GGUF (KittenTTS nano and mini, Kokoro-82M), run text through the das-native front end (normalizer, part-of-speech tagger, grapheme-to-phoneme), and synthesize mono f32 PCM per sentence chunk, timed per model stage. Run with `-jit`; `dasllama-cli speak` (`utils/dasllama-server/cli.das`) is the canonical program shape, and the server's `/v1/audio/speech` route serves the same facade.
 
 
 ### Constants
@@ -3248,6 +3270,7 @@ Text to speech in pure daslang: load a converted StyleTTS2-lineage GGUF (KittenT
 - `TtsVoicePrompt` - Portable Pocket codec latents.
 - `TtsCaps` - What a loaded TTS model can do: its voices (canonical names; aliases resolve in the family file), the PCM rate it emits, the languages it speaks, whether it clones a voice from audio, and whether a speed means anything to it.
 - `TtsTimings` - Where a synthesis spent its time, in microseconds of wall clock, model loading excluded: the text front end, then each model stage.
+- `TtsGpuSeats`
 - `TtsAudio` - Synthesized speech: mono f32 PCM at `sample_rate`, with the time it took.
 - `TtsNoise` - The source noise a synthesis consumed - captured from the oracle for a parity run, or drawn from the session's own generator into a carrier every synthesis reuses.
 - `KittenFamily`
@@ -3288,6 +3311,15 @@ Text to speech in pure daslang: load a converted StyleTTS2-lineage GGUF (KittenT
 - `reset_tts_q8` - Drop the `set_tts_q8` pin: the next load follows the policy default again.
 - `set_tts_q8` - Pin the GEMM weights' format for subsequent TTS loads of every family: Q8_0 quants (their own prepared image beside the GGUF) or the file's f32 planes; `reset_tts_q8` returns to the policy default.
 - `tts_serves_q8` - Would the next TTS load serve its rows GEMMs as q8 - the pin when set, the policy otherwise.
+
+### GPU seats
+
+- `tts_seat_call`
+- `tts_seat_index`
+- `tts_seat_names`
+- `tts_seat_served`
+- `tts_seat_stats`
+- `tts_seats`
 
 ### Timings
 
@@ -3415,6 +3447,7 @@ The RTTI module exposes runtime type information and program introspection facil
 - `Program.getThisModule` - Property-like accessor that returns the `Module` pointer for the module currently being inferred in the given `Program`.
 - `Program.getDebugger` - Property-like accessor that returns `true` if the debugger is attached and enabled for the given `Program`.
 - `Program.getOptimize` - Property-like accessor that returns `true` when the optimizer runs for the given `Program`: false under the host's `no_optimizations` policy or any of the program's `options optimize = false`, `options no_optimization`, `options no_optimizations`.
+- `Program.failed` - Property-like accessor that returns `true` when the `Program` failed to compile; its errors are in `Program.errors`.
 - `Program` - Object representing full information about Daslang program during and after compilation (but not the simulated result of the program).
 - `AnnotationArgumentInfo` - One argument of an annotation, deep-copied into the context debug heap (never points into the AST).
 - `CodeOfPolicies` - Object which holds compilation and simulation settings and restrictions.
@@ -3889,6 +3922,7 @@ The AST module provides access to the abstract syntax tree representation of das
 - `TypeDecl.isLocal` - Returns whether the given type is a local type that can be allocated on the stack.
 - `TypeDecl.hasClasses` - Returns whether the type definition contains any class types.
 - `TypeDecl.isSafeToDelete` - Returns whether a value of the given type is safe to delete, meaning that deleting it does not require an unsafe block.
+- `TypeDecl.needInScope` - Returns whether a local of the given type must be declared `inscope` (or sit under `unsafe`) when `strict_smart_pointers` is on, meaning that the type holds a smart pointer anywhere inside it.
 - `TypeDecl.hasNonTrivialCtor` - Returns whether the type definition contains any non-trivial constructors.
 - `TypeDecl.hasNonTrivialDtor` - Returns whether the type definition contains any non-trivial destructors.
 - `TypeDecl.hasNonTrivialCopy` - Returns whether the type definition contains any non-trivial copy operations.
@@ -4018,6 +4052,12 @@ The AST module provides access to the abstract syntax tree representation of das
 - `parse_file` - Parses a daslang file and stops there — no type inference, no optimization, no simulation.
 - `parse_file_no_prerequisites` - Parses one file alone and stops there: no prerequisite walk, no type inference, no macro run, and the host's module-cache stream is hidden for the duration.
 - `require_module_now` - Compiles `module_name` - a `shared` module, named by its file - and its prerequisites into the process at the point of the call, or answers the module already there, under `codeOfPolicies`; a null `fileAccess` means the compiling program's own.
+
+### Building programs from AST nodes
+
+- `make_main_module` - Inside `make_program`, builds the program's own module in the block and compiles it as an executable; returns the program, ready for `simulate`, or failed with its errors in `Program.errors`.
+- `make_module` - Inside `make_program`, builds a named module in the block and compiles it at once, like a required file; returns the module for `add_module_require`, or null when it failed (the errors come back on the program `make_main_module` returns).
+- `make_program` - Opens a scope for building a program from AST nodes instead of source text: loads `builtin.das` into its own module group, then runs the block, where `make_module` and `make_main_module` build the modules.
 
 ### Call generation
 
@@ -6069,6 +6109,21 @@ The JOBQUE_PROFILE module wraps the low-level `jobque_trace_*` builtins into a s
 - `profile_marker` - Stamp an instant unit boundary on the caller lane (no-op when tracing is off).
 - `profile_marker_id` - Register/look up a marker kind (e.g.
 
+## runtime_memory
+
+Context and retained idle-fork memory snapshots for runtime diagnostics. Sample on the owning context and publish value copies across threads.
+
+
+### Structures
+
+- `ContextMemory` - Memory sizes in bytes, sampled on the owning context.
+- `IdleForkMemory` - Memory retained by idle forks; active jobs are excluded.
+
+### Context snapshots
+
+- `context_idle_forks` - Idle job contexts retained by this owner.
+- `context_memory` - Samples the calling context.
+
 ## json_boost
 
 The JSON_BOOST module extends JSON support with operator overloads for convenient field access (`?.` / `?[]`), null-coalescing (`??`), and generic conversions in both directions: `JV(value)` builds a `JsonValue?` tree from a struct, tuple, array, table, or vector, and `from_JV(js, default)` reads one back into a typed value. Field annotations on the struct steer both directions (see below), and the builtin `sprint_json` honours the same annotations.
@@ -6579,6 +6634,7 @@ The logger module provides a structured, file-backed logging facility for daslan
 - `logger_capture_diagnostics` - Send the runtime's own diagnostics — a leak dump, a fatal, what it reports about itself — as raw text to `<log>.diag.log`, or to stderr when that cannot open.
 - `logger_close` - Close the log file.
 - `logger_flush` - Explicit flush.
+- `logger_set_echo_stderr` - Echo every record the file receives to stderr as one plain `[level] message` line - a tool's `--verbose`: stdout stays untouched, unlike `logger_set_tee`, which lets the runtime's own sink print.
 - `logger_set_stderr_fallback` - Enable / disable writing to stderr when the log file can't be opened.
 - `logger_set_tee` - Tee mode: hooked `print`/`to_log` lines go to the log file AND still reach stdout/stderr (the default hook behavior diverts them to the file only — right for stdio-transport tools, wrong for interactive servers watched on a console).
 

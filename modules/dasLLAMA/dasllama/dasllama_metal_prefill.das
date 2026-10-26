@@ -14,7 +14,8 @@ require daslib/typemacro_boost
 require dasllama/dasllama_common
 require dasllama/dasllama_math
 require dasllama/dasllama_metal_common
-require dasllama/dasllama_metal_kernels  // the shared kq decode helpers (grid tables, ksign7m) for the tensor twins
+require dasllama/dasllama_gpu_math
+require dasllama/dasllama_metal_kernels  // the shared kq decode helpers (grid tables, ksign7) for the tensor twins
 require dasllama/dasllama_metal_lens
 require dasllama/dasllama_load   // register_devw_kq_mirror: the image bake's CPU twin of the split-scale dequant passes
 
@@ -30,7 +31,7 @@ require dasllama/dasllama_load   // register_devw_kq_mirror: the image bake's CP
 //                         (rowstat mints rowmax + 1/sum; AV applies exp at P staging)
 //   metal_swiglu        ~ swiglu                   (g = g/(1+exp(-g)) * u)
 //   metal_add           ~ add_inplace
-// Reductions ride simd_sum / a max butterfly over simd_shuffle_xor with hardcoded masks 16..1 —
+// Reductions ride simd_sum / simd_max and the kernel home's threadgroup folds (tg_sum_all / tg_max_all) —
 // Apple-GPU simdgroups are width 32 (asserted at driver init). Kernels with barriers/simd ops are
 // NOT sequentially CPU-replayable; their oracles are the dasLLAMA CPU functions themselves
 // (modules/dasLLAMA/tests/test_metal_prefill_kernels.das).
@@ -38,6 +39,8 @@ require dasllama/dasllama_load   // register_devw_kq_mirror: the image bake's CP
 
 [metal_dispatch(name = "pf_enc_bf16_mm_c", pso = "g_pf_pso_bf16_mm", tgmem = "metal_bf16_mulmm_msl_tgmem", tg = 128, grid = "mp/32, nd/64", params = "mp : int64, nd : int64")]
 class MetalBf16MulMm : MetalMmTileBase {
+    typedef TILET = float16
+    typedef SGT = simdgroup_half8x8
     @ssbo @binding = 0 @role = "weight" @off = "wboff" wbh : array<ushort4> //!< bf16 W rows, ushort4 view (row r elem k at (r*kdim+k)/4)
     @ssbo @binding = 2 @role = "read" xf : array<float4>   //!< raw f32 activations, float4 view
     @ssbo @binding = 3 @role = "write" y : array<float>
@@ -482,13 +485,11 @@ class MetalPleGatherQ40 : MetalPleGatherKqT {
 }
 
 [metal_dispatch(name = "pf_enc_ple_finish", pso = "g_pf_pso_ple_finish", tgmem = "metal_ple_finish_msl_tgmem", tg = "ple", grid = "nlayers, npos", params = "nlayers : int64, npos : int64, ple : int64")]
-class MetalPleFinish {
+class MetalPleFinish : MetalTgReduceBase {
     @ssbo @binding = 0 @role = "read" proj : array<float>  //!< [mp x n_layers*ple] position-major model_proj·embd
     @ssbo @binding = 1 @role = "weight" pnorm : array<float> //!< [ple] proj-norm weight
     @ssbo @binding = 2 @role = "readwrite" y : array<float>     //!< [n_layers x npos x ple] side input, in place
     @uniform @binding = 4 ka : PleArgs
-    @workgroup partial : float[32]
-    @workgroup inv_sh : float
 
     [metal_kernel(name="metal_ple_finish_msl")]
     def metal_ple_finish {
@@ -496,23 +497,9 @@ class MetalPleFinish {
         let p = gl_WorkGroupID.y
         let i = gl_LocalInvocationID.x      //! tg = ple threads (gate: ple % 32 == 0, <= 1024)
         let v = proj[p * (ka.nlayers * ka.ple) + l * ka.ple + i] * ka.inv_sd
-        let ss = simd_sum(v * v)
-        if (gl_SubgroupInvocationID == 0u) {
-            partial[gl_SubgroupID] = ss
-        }
-        barrier()
-        if (i == 0u) {
-            var tot = 0.0
-            var sgi = 0u
-            while (sgi < gl_NumSubgroups) {
-                tot += partial[sgi]
-                sgi++
-            }
-            inv_sh = rsqrt(tot / float(ka.ple) + ka.eps)
-        }
-        barrier()
+        let inv = tg_rms_inv(v * v, ka.ple, ka.eps)
         let yi = (l * ka.npos + p) * ka.ple + i
-        y[yi] = (y[yi] + pnorm[i] * (v * inv_sh)) * ka.inv_s2
+        y[yi] = (y[yi] + pnorm[i] * (v * inv)) * ka.inv_s2
     }
 }
 
@@ -1274,7 +1261,7 @@ class template MetalKqMulMmIq3xxsTensorT : MetalKqMulMmSplitTensorBase {
         let tb0 = tbase + j * 72u + (sub >> 1u) * 32u + kh
         for [unroll_full] (k in range(4)) {
             let q3 = ile * 2u + uint(k) / 2u
-            let sgb = ksign7m((aux3 >> (7u * q3)) & 127u)
+            let sgb = ksign7((aux3 >> (7u * q3)) & 127u)
             let nib = uint(k) % 2u == 0u ? sgb & 15u : sgb >> 4u
             let gw = gridw3xt[(qsw >> (8u * uint(k))) & 255u]
             let fsd = iq_sign_apply(float4(dsc), nib)
@@ -1364,7 +1351,7 @@ class template MetalKqMulMmIq2sTensorT : MetalKqMulMmSplitTensorBase {
             let idx2 = (((qw2 >> (8u * l2)) & 255u) | ((qh2 << (8u - 2u * l2)) & 0x300u)) * 2u + uint(k) % 2u
             let sgb2 = (sgw2 >> (8u * l2)) & 255u
             let nib = uint(k) % 2u == 0u ? sgb2 & 15u : sgb2 >> 4u
-            let sw = iq3s_sw(iq2s_gw(int(idx2)), nib)
+            let sw = iq3s_signed(iq2s_gw(int(idx2)), nib)
             for [unroll_full] (c in range(4)) {
                 twb[tb0 + uint(k) * 4u + uint(c)] = float16(dsc * iq3s_sx(sw, uint(c)))
             }
@@ -1439,9 +1426,9 @@ class template MetalKqMulMmIq2xsTensorT : MetalKqMulMmSplitTensorBase {
         for [unroll_full] (k in range(4)) {
             let w16 = (qw2 >> (16u * (uint(k) / 2u))) & 0xFFFFu
             let idx2 = (w16 & 511u) * 2u + uint(k) % 2u
-            let sgb2 = ksign7m(w16 >> 9u)
+            let sgb2 = ksign7(w16 >> 9u)
             let nib = uint(k) % 2u == 0u ? sgb2 & 15u : sgb2 >> 4u
-            let sw = iq3s_sw(iq2xs_gw(int(idx2)), nib)
+            let sw = iq3s_signed(iq2xs_gw(int(idx2)), nib)
             for [unroll_full] (c in range(4)) {
                 twb[tb0 + uint(k) * 4u + uint(c)] = float16(dsc * iq3s_sx(sw, uint(c)))
             }
@@ -1516,9 +1503,9 @@ class template MetalKqMulMmIq2xxsTensorT : MetalKqMulMmSplitTensorBase {
         for [unroll_full] (k in range(4)) {
             let q3 = ile * 2u + uint(k) / 2u
             let bidx = (gw2 >> (8u * q3)) & 255u
-            let sgb2 = ksign7m((aux2 >> (7u * q3)) & 127u)
+            let sgb2 = ksign7((aux2 >> (7u * q3)) & 127u)
             let nib = uint(k) % 2u == 0u ? sgb2 & 15u : sgb2 >> 4u
-            let sw = iq3s_sw(iq2xxs_gw(int(bidx * 2u + uint(k) % 2u)), nib)
+            let sw = iq3s_signed(iq2xxs_gw(int(bidx * 2u + uint(k) % 2u)), nib)
             for [unroll_full] (c in range(4)) {
                 twb[tb0 + uint(k) * 4u + uint(c)] = float16(dsc * iq3s_sx(sw, uint(c)))
             }
@@ -2224,7 +2211,9 @@ class MetalMoeMulMmK6THR : MetalMoeMulMmK6TensorT {
     override REM = true
 }
 
-class MetalMoeMulMmBase : MetalMmTileBase {
+class template MetalMoeMulMmBase : MetalMmTileBase {
+    typedef TILET = float16
+    typedef SGT = simdgroup_half8x8
     @ssbo @binding = 3 @role = "read" xf : array<float4>
     @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ka : MoeMmArgs
@@ -2530,14 +2519,15 @@ class MetalMoeMulMmMx4 : MetalMoeMulMmBase {
 
 [metal_dispatch(name = "enc_rope", pso = "g_pf_pso_rope", tg = 64, grid = "npairs/64", params = "npairs : int64")]
 class MetalRope {
-    @ssbo @binding = 0 @role = "readwrite" @off = "voff" v : array<float>     //!< [ntok x n], roped in place
-    @ssbo @binding = 1 @role = "weight" tcos : array<float>  //!< [ntok x head_size/2]
+    @ssbo @binding = 0 @role = "readwrite" @off = "voff" v : array<float>     //!< [ntok x stride] roped in place over n columns from voff
+    @ssbo @binding = 1 @role = "weight" tcos : array<float>  //!< [ntok x head_size/2], written once at attach
     @ssbo @binding = 2 @role = "weight" tsin : array<float>
-    @uniform @binding = 3 n : uint          //!< row width (qd or kv_dim), % head_size
+    @uniform @binding = 3 n : uint          //!< roped width (qd or kv_dim), % head_size
     @uniform @binding = 4 head_size : uint
     @uniform @binding = 5 npairs : uint     //!< ntok * n/2 — grid guard
     @uniform @binding = 6 neox : uint       //!< pair (j, j+half) instead of (2j, 2j+1); same table row j
     @uniform @binding = 7 @default = head_size rot : uint   //!< partial rotary width; null bind = full rope (== head_size)
+    @uniform @binding = 8 @default = n stride : uint   //!< the row stride; null bind = the rows are the roped width
 
     [metal_kernel(name="metal_rope_msl")]
     def metal_rope {
@@ -2553,7 +2543,7 @@ class MetalRope {
         let h = rem / half
         let j = rem % half
         let in_rotary = j < halfr   //! rotates the (j, j+rot/2) pair; the rest identity-cover [rot, hs)
-        let hb = p * n + h * head_size
+        let hb = p * stride + h * head_size
         let i = neox != 0u ? (in_rotary ? hb + j : hb + rot + (j - halfr)) : hb + 2u * j
         let i2 = neox != 0u ? (in_rotary ? i + halfr : i + (half - halfr)) : i + 1u
         let fcr = in_rotary ? tcos[p * halfr + j] : 1.0
@@ -2611,17 +2601,7 @@ class template MetalQkRopeT {
         var v1 = x[i2]
         let live = p < ka.nreal   //! workgroup-uniform - the barrier below never diverges
         if (live && ka.donorm != 0u) {
-            let s1 = simd_sum(v0 * v0 + v1 * v1)
-            if (gl_SubgroupInvocationID == 0u) {
-                part[gl_SubgroupID] = s1
-            }
-            barrier()
-            var total = 0.0
-            var sg = 0u
-            while (sg < gl_NumSubgroups) {
-                total += part[sg]
-                sg++
-            }
+            let total = tg_sum_all(v0 * v0 + v1 * v1, part)
             let inv = 1.0 / sqrt(total / float(hs) + ka.eps)
             v0 = w[i - hb] * (v0 * inv)
             v1 = w[i2 - hb] * (v1 * inv)
@@ -2651,20 +2631,14 @@ class MetalQkRopeHX : MetalQkRopeT {
     override HX = true
 }
 
+//! x [nrows x n] += b [n] (the tower driver binds biases inside the model blob)
 [metal_dispatch(name = "enc_add_bias_rows", pso = "g_pf_pso_addbias", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalAddBiasRows {
-    @ssbo @binding = 0 @role = "readwrite" @off = "off" @span = "total*4" x : array<float>     //!< [nrows x n], updated in place (bound at the panel offset)
-    @ssbo @binding = 1 @role = "weight" @off = "boff" b : array<float>     //!< [n] (the tower driver binds biases inside the model blob)
-    @uniform @binding = 2 n : uint
-    @uniform @binding = 3 total : uint      //!< nrows * n — grid guard
+class MetalAddBiasRows : MetalRowMapT {
+    def override combine(a, b : float) : float => a + b
 
     [metal_kernel(name="metal_add_bias_rows_msl")]
     def metal_add_bias_rows {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        x[gid] += b[gid % n]
+        row_map_body()
     }
 }
 
@@ -2766,7 +2740,7 @@ def pf_p_weight(sr : float; jglob, qpos, window : uint; softcap : float; uend, u
     if (jglob < jlo || jglob >= cnt) {
         return 0.0
     }
-    let tv = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sr * 2.0 / softcap))) : sr
+    let tv = softcap > 0.0 ? softcap_exp(sr, softcap) : sr
     return exp(tv - m) * inv
 }
 
@@ -2777,7 +2751,6 @@ class MetalAttnRowstat {
     @ssbo @binding = 2 @role = "write" stat : array<float>  //!< [n_heads x qrows x 2]: rowmax, 1/sum
     @ssbo @binding = 20 @role = "weight" @default = g_one sink : array<float> //!< [nheads]; null = identity
     @workgroup red : float[4]
-    @workgroup bcast : float
 
     [metal_kernel(name="metal_attn_rowstat_msl")]
     def metal_attn_rowstat {
@@ -2793,51 +2766,21 @@ class MetalAttnRowstat {
         var j = jlo + lid
         while (j < cnt) {
             let sr = float(att[rowbase + j])
-            m = max(m, ka.softcap > 0.0 ? ka.softcap * (1.0 - 2.0 / (1.0 + exp(sr * 2.0 / ka.softcap))) : sr)
+            m = max(m, ka.softcap > 0.0 ? softcap_exp(sr, ka.softcap) : sr)
             j += nthreads
         }
-        m = max(m, simd_shuffle_xor(m, 16u))
-        m = max(m, simd_shuffle_xor(m, 8u))
-        m = max(m, simd_shuffle_xor(m, 4u))
-        m = max(m, simd_shuffle_xor(m, 2u))
-        m = max(m, simd_shuffle_xor(m, 1u))
-        if (gl_SubgroupInvocationID == 0u) {
-            red[gl_SubgroupID] = m
-        }
-        barrier()
-        if (lid == 0u) {
-            var mm = red[0]
-            var sgi = 1u
-            while (sgi < gl_NumSubgroups) {
-                mm = max(mm, red[sgi])
-                sgi++
-            }
-            if (ka.hass != 0u) {
-                mm = max(mm, sink[h])
-            }
-            bcast = mm
-        }
-        barrier()
-        let rowmax = bcast
+        let mm = tg_max_all(m, red)
+        let rowmax = ka.hass != 0u ? max(mm, sink[h]) : mm
         var sum = 0.0
         j = jlo + lid
         while (j < cnt) {
             let sr = float(att[rowbase + j])
-            sum += exp((ka.softcap > 0.0 ? ka.softcap * (1.0 - 2.0 / (1.0 + exp(sr * 2.0 / ka.softcap))) : sr) - rowmax)
+            sum += exp((ka.softcap > 0.0 ? softcap_exp(sr, ka.softcap) : sr) - rowmax)
             j += nthreads
         }
-        sum = simd_sum(sum)
-        if (gl_SubgroupInvocationID == 0u) {
-            red[gl_SubgroupID] = sum
-        }
         barrier()
+        var tot = tg_sum_all(sum, red)
         if (lid == 0u) {
-            var tot = 0.0
-            var sgi = 0u
-            while (sgi < gl_NumSubgroups) {
-                tot += red[sgi]
-                sgi++
-            }
             if (ka.hass != 0u) {
                 tot += exp(max(sink[h] - rowmax, -80.0))
             }
@@ -2972,6 +2915,8 @@ class MetalAttnQKMmTH : MetalAttnQKMmTensorT {
 
 [metal_dispatch(name = "enc_qk_mm_c", pso = "g_pf_pso_qkmm", tgmem = "metal_attn_qk_mm_msl_tgmem", tg = 128, grid = "mp/32, nk64/64, heads", params = "mp : int64, nk64 : int64, heads : int64")]
 class MetalAttnQKMm : MetalMmTileBase {
+    typedef TILET = float16
+    typedef SGT = simdgroup_half8x8
     @ssbo @binding = 0 @role = "read" q : array<float4>    //!< [mp x qd/4], roped
     @ssbo @binding = 1 @role = "read" k : array<float4>    //!< [nk64 x kv_dim/4], roped (existing rows + the chunk)
     @ssbo @binding = 2 @role = "write" att : array<float16>   //!< [n_heads x qrows x np32] raw scores out, f16 slab
@@ -3128,6 +3073,8 @@ class MetalAttnAVMmTP : MetalAttnAVMmTensorT {
 
 [ |> template_struct_instance]
 class template MetalAttnAVMmSgT : MetalMmTileBase {
+    typedef TILET = float16
+    typedef SGT = simdgroup_half8x8
     @ssbo @binding = 0 @role = "read" att : array<float16>  //!< [n_heads x qrows x np32] RAW scores, f16 slab
     @ssbo @binding = 1 @role = "read" v : array<float4>    //!< [nk64 x kv_dim/4] raw V (existing rows + the chunk)
     @ssbo @binding = 2 @role = "write" xb : array<float>    //!< [mp x qd] attention output
@@ -3434,26 +3381,6 @@ class MetalTowerWinAttn {
     }
 }
 
-//! Gather full rows by index: y[r] = x[src[r]] — the stem's window-sort reorder, one thread
-//! per element.
-[metal_dispatch(name = "enc_tower_row_gather", pso = "g_pf_pso_twr_gather", tg = 256, grid = "total/256", params = "total : int64")]
-class MetalTowerRowGather {
-    @ssbo @binding = 0 @role = "read" x : array<float>
-    @ssbo @binding = 1 @role = "write" y : array<float>
-    @ssbo @binding = 2 @role = "read" src : array<uint>   //!< [nrows] source row per destination row
-    @uniform @binding = 3 d : uint
-    @uniform @binding = 4 total : uint    //!< nrows*d
-
-    [metal_kernel(name="metal_tower_row_gather_msl")]
-    def metal_tower_row_gather {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        y[gid] = x[src[gid / d] * d + gid % d]
-    }
-}
-
 //! The gemma4a Conformer attention's argument block (the sliding causal window + sinusoidal RPE).
 struct G4aAttnArgs {
     d : uint            //!< model width (rows are compact [npos x d])
@@ -3504,7 +3431,7 @@ class MetalG4aAttn {
             }
             //! tanh via the exp identity (the CPU softcap's form; Metal tanh NaNs past ~44)
             let raw = cs + rs
-            let sc = ka.cap * (1.0 - 2.0 / (1.0 + exp(raw * 2.0 / ka.cap)))
+            let sc = softcap_exp(raw, ka.cap)
             sarr[j - j0] = sc
             m = max(m, sc)
             j++
@@ -3593,102 +3520,188 @@ class MetalG4aSilu : MetalEw1BaseT {
     }
 }
 
-struct CnAttnArgs {
+//! The FastConformer rel-pos attention's shape: compact rows [npos x d], the GEMM pads
+//! (mp rows, nkp key columns, wwpad rel columns) and the CPU form's one scale.
+struct FcAttnArgs {
     d : uint            //!< model width (rows are compact [npos x d])
-    hs : uint           //!< head size (<= 128 — the accumulator array's bound)
+    hs : uint           //!< head size (a multiple of 64 - the AV GEMM's ndim)
     npos : uint
+    mp : uint           //!< npos padded to 32 (the GEMM row pad)
+    nkp : uint          //!< npos padded to 64 (the content-score GEMM's ndim, the AV GEMM's kdim)
+    ww : uint           //!< 2 npos - 1 rel positions
+    wwpad : uint        //!< ww padded to 64 (the rel-score GEMM's ndim)
     scale : float       //!< 1/sqrt(hs), applied to content + rel scores together (the CPU form)
 }
 
-//! The canary FastConformer rel-pos (Transformer-XL) attention: one thread per (q row, head) —
-//! FULL bidirectional scores (Q+u)·K + (Q+v)·pos[npos-1-q+j] with an online softmax (the score
-//! row never materializes), u/v biases read off the blob at per-dispatch offsets.
-[metal_dispatch(name = "enc_cn_attn", pso = "g_pf_pso_cn_attn", tg = 64, grid = "np64, heads", params = "np64 : int64, heads : int64")]
-class MetalCnAttn {
+//! The attention shape from the compact geometry: the GEMM pads derive here and nowhere else.
+def fc_attn_args(d, hs, npos : int64) : FcAttnArgs {
+    let np = uint(npos)
+    let ww = 2u * np - 1u
+    return FcAttnArgs(d = uint(d), hs = uint(hs), npos = np, mp = (np + 31u) / 32u * 32u,
+        nkp = (np + 63u) / 64u * 64u, ww = ww, wwpad = (ww + 63u) / 64u * 64u, scale = 1.0 / sqrt(float(hs)))
+}
+
+//! One head's operands for the three attention GEMMs, packed contiguous and zero-padded: (Q+u)
+//! and (Q+v) [mp x hs], K_h [nkp x hs], V_hᵀ [hs x nkp], the projected rel table pos_h [wwpad x hs].
+//! One thread per (row, j) over the tallest panel; u/v biases read off the blob.
+[metal_dispatch(name = "enc_fc_pack", pso = "g_pf_pso_fc_pack", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalFcPack {
     @ssbo @binding = 0 @role = "read" q : array<float>      //!< [npos x d] compact
     @ssbo @binding = 1 @role = "read" k : array<float>      //!< [npos x d] compact
     @ssbo @binding = 2 @role = "read" v : array<float>      //!< [npos x d] compact
-    @ssbo @binding = 3 @role = "write" ao : array<float>    //!< [npos x d] attention out
-    @ssbo @binding = 4 @role = "read" posl : array<float>   //!< [(2 npos - 1) x d] the layer's projected rel table
-    @ssbo @binding = 5 @role = "weight" @off = "buoff" bu : array<float>   //!< [d] bias_u (content)
-    @ssbo @binding = 6 @role = "weight" @off = "bvoff" bv : array<float>   //!< [d] bias_v (rel)
-    @uniform @binding = 7 ka : CnAttnArgs
+    @ssbo @binding = 3 @role = "read" posl : array<float>   //!< [ww x d] the layer's projected rel table
+    @ssbo @binding = 4 @role = "weight" @off = "buoff" bu : array<float>   //!< [d] bias_u (content)
+    @ssbo @binding = 5 @role = "weight" @off = "bvoff" bv : array<float>   //!< [d] bias_v (rel)
+    @ssbo @binding = 6 @role = "write" qu : array<float>    //!< [mp x hs]
+    @ssbo @binding = 7 @role = "write" qv : array<float>    //!< [mp x hs]
+    @ssbo @binding = 8 @role = "write" kh : array<float>    //!< [nkp x hs]
+    @ssbo @binding = 9 @role = "write" vt : array<float>    //!< [hs x nkp]
+    @ssbo @binding = 10 @role = "write" ph : array<float>   //!< [wwpad x hs]
+    @uniform @binding = 11 ka : FcAttnArgs
+    @uniform @binding = 12 h : uint                         //!< the head this dispatch packs
 
-    [metal_kernel(name="metal_cn_attn_msl")]
-    def metal_cn_attn {
-        let i = gl_GlobalInvocationID.x
-        let h = gl_WorkGroupID.y
-        if (i >= ka.npos) {
+    [metal_kernel(name="metal_fc_pack_msl")]
+    def metal_fc_pack {
+        let gid = gl_GlobalInvocationID.x
+        let hs = ka.hs
+        if (gid >= ka.wwpad * hs) {   //! the grid guard: the tallest panel's extent
             return
         }
-        let d = ka.d
-        let hs = ka.hs
-        let hoff = h * hs
-        let base = ka.npos - 1u - i
-        var acc : float[128]
-        var n = 0u
-        while (n < hs) {
-            acc[n] = 0.0
-            n++
+        let r = gid / hs
+        let j = gid % hs
+        let c = h * hs + j
+        if (r < ka.npos) {
+            let qval = q[r * ka.d + c]
+            qu[gid] = qval + bu[c]
+            qv[gid] = qval + bv[c]
+            kh[gid] = k[r * ka.d + c]
+            vt[j * ka.nkp + r] = v[r * ka.d + c]
+        } else {
+            if (r < ka.mp) {
+                qu[gid] = 0.0
+                qv[gid] = 0.0
+            }
+            if (r < ka.nkp) {
+                kh[gid] = 0.0
+                vt[j * ka.nkp + r] = 0.0
+            }
         }
-        var m = -1.5e38
-        var den = 0.0
-        var j = 0u
-        while (j < ka.npos) {
-            var cs = 0.0
-            var rs = 0.0
-            n = 0u
-            while (n < hs) {
-                let qv = q[i * d + hoff + n]
-                cs += (qv + bu[hoff + n]) * k[j * d + hoff + n]
-                rs += (qv + bv[hoff + n]) * posl[(base + j) * d + hoff + n]
-                n++
-            }
-            let s = (cs + rs) * ka.scale
-            if (s > m) {
-                let r = exp(m - s)
-                den *= r
-                n = 0u
-                while (n < hs) {
-                    acc[n] *= r
-                    n++
-                }
-                m = s
-            }
-            let w = exp(s - m)
-            den += w
-            n = 0u
-            while (n < hs) {
-                acc[n] += w * v[j * d + hoff + n]
-                n++
-            }
-            j++
-        }
-        let inv = 1.0 / den
-        n = 0u
-        while (n < hs) {
-            ao[i * d + hoff + n] = acc[n] * inv
-            n++
+        if (r < ka.ww) {
+            ph[gid] = posl[r * ka.d + c]
+        } else {
+            ph[gid] = 0.0
         }
     }
 }
 
-//! The canary conv module's depthwise k=9 CENTERED conv over time + the folded BatchNorm
-//! (bn_w/bn_b carry the fold) + SiLU — one kernel, the CPU loop's exact form.
-[metal_dispatch(name = "enc_cn_dw", pso = "g_pf_pso_cn_dw", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalCnDw {
+//! The rel-pos softmax row: p[k] = softmax_k((sc[q][k] + sr[q][npos-1-q+k]) * scale) over the
+//! live keys, zeros in the key pad and in every pad row - one threadgroup per padded row, the
+//! max and the sum reduced across the simdgroups.
+[metal_dispatch(name = "enc_fc_softmax", pso = "g_pf_pso_fc_softmax", tgmem = "metal_fc_softmax_msl_tgmem", tg = 256, grid = "mp", params = "mp : int64")]
+class MetalFcSoftmax : MetalTgReduceBase {
+    @ssbo @binding = 0 @role = "read" sc : array<float>     //!< [mp x nkp] content scores (Q+u)·K_hᵀ
+    @ssbo @binding = 1 @role = "read" sr : array<float>     //!< [mp x wwpad] rel scores (Q+v)·pos_hᵀ
+    @ssbo @binding = 2 @role = "readwrite" p : array<float> //!< [mp x nkp] the probability rows (the exp pass writes, the normalize pass scales in place)
+    @uniform @binding = 3 ka : FcAttnArgs
+
+    [metal_kernel(name="metal_fc_softmax_msl")]
+    def metal_fc_softmax {
+        let r = gl_WorkGroupID.x
+        let lid = gl_LocalInvocationID.x
+        let nt = gl_WorkGroupSize.x
+        let nkp = ka.nkp
+        let prow = r * nkp
+        if (r >= ka.npos) {
+            var z = lid
+            while (z < nkp) {
+                p[prow + z] = 0.0
+                z += nt
+            }
+            return
+        }
+        let crow = r * nkp
+        let rrow = r * ka.wwpad + (ka.npos - 1u - r)
+        var m = -3.0e38
+        var k = lid
+        while (k < ka.npos) {
+            m = max(m, (sc[crow + k] + sr[rrow + k]) * ka.scale)
+            k += nt
+        }
+        let mx = tg_max(m)
+        var l = 0.0
+        k = lid
+        while (k < ka.npos) {
+            let e = exp((sc[crow + k] + sr[rrow + k]) * ka.scale - mx)
+            p[prow + k] = e
+            l += e
+            k += nt
+        }
+        barrier()
+        let tot = tg_sum(l)
+        let inv = 1.0 / tot
+        k = lid
+        while (k < ka.npos) {
+            p[prow + k] *= inv
+            k += nt
+        }
+        k = ka.npos + lid
+        while (k < nkp) {
+            p[prow + k] = 0.0
+            k += nt
+        }
+    }
+}
+
+//! The heads' AV rows [heads x mp x hs] back into the compact [mp x d] attention output, zeros
+//! in the pad rows so the output projection stages no recycled bytes.
+[metal_dispatch(name = "enc_fc_unpack", pso = "g_pf_pso_fc_unpack", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalFcUnpack {
+    @ssbo @binding = 0 @role = "read" oh : array<float>     //!< [heads x mp x hs]
+    @ssbo @binding = 1 @role = "write" ao : array<float>    //!< [mp x d] compact, zero past npos
+    @uniform @binding = 2 ka : FcAttnArgs
+
+    [metal_kernel(name="metal_fc_unpack_msl")]
+    def metal_fc_unpack {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= ka.mp * ka.d) {   //! the grid guard: the padded output's extent
+            return
+        }
+        let r = gid / ka.d
+        if (r >= ka.npos) {
+            ao[gid] = 0.0
+            return
+        }
+        let c = gid % ka.d
+        let hs = ka.hs
+        ao[gid] = oh[((c / hs) * ka.mp + r) * hs + c % hs]
+    }
+}
+
+//! The FastConformer conv module's depthwise k=9 CENTERED conv over time + the folded BatchNorm
+//! (bn_w/bn_b carry the fold) + SiLU — one kernel, the CPU loop's exact form. The stamp axis is
+//! the tap layout: canary's channel-major [d x nk], parakeet's load-time tap-major [nk x d].
+[ |> template_struct_instance]
+class template MetalCnDwT {
     @ssbo @binding = 0 @role = "read" x : array<float>      //!< [npos x d] GLU output
     @ssbo @binding = 1 @role = "write" y : array<float>     //!< [npos x d]
-    @ssbo @binding = 2 @role = "weight" @off = "woff" w : array<float>     //!< [d x nk] taps
+    @ssbo @binding = 2 @role = "weight" @off = "woff" w : array<float>     //!< [d x nk] taps, or [nk x d] under TAP_MAJOR
     @ssbo @binding = 3 @role = "weight" @off = "bnwoff" bnw : array<float> //!< [d] folded BN scale
     @ssbo @binding = 4 @role = "weight" @off = "bnboff" bnb : array<float> //!< [d] folded BN shift
     @uniform @binding = 5 d : uint
-    @uniform @binding = 6 nk : uint         //!< taps (odd; canary 9)
+    @uniform @binding = 6 nk : uint         //!< taps (odd; 9 on both families)
     @uniform @binding = 7 npos : uint
     @uniform @binding = 8 total : uint      //!< grid guard: npos * d
+    @template_constant TAP_MAJOR : bool = false
 
-    [metal_kernel(name="metal_cn_dw_msl")]
-    def metal_cn_dw {
+    def tap(c, kk : uint) : float {
+        static_if (TAP_MAJOR) {
+            return w[kk * d + c]
+        } else {
+            return w[c * nk + kk]
+        }
+    }
+
+    def dw_body {
         let gid = gl_GlobalInvocationID.x
         if (gid >= total) {
             return
@@ -3701,12 +3714,30 @@ class MetalCnDw {
         while (kk < nk) {
             let src = t + kk   //! src row = t + kk - kpad, guarded in unsigned form
             if (src >= kpad && src - kpad < npos) {
-                acc += w[c * nk + kk] * x[(src - kpad) * d + c]
+                acc += tap(c, kk) * x[(src - kpad) * d + c]
             }
             kk++
         }
         let bv2 = acc * bnw[c] + bnb[c]
         y[gid] = bv2 / (1.0 + exp(-bv2))
+    }
+}
+
+[metal_dispatch(name = "enc_cn_dw", pso = "g_pf_pso_cn_dw", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalCnDw : MetalCnDwT {
+    [metal_kernel(name="metal_cn_dw_msl")]
+    def metal_cn_dw {
+        dw_body()
+    }
+}
+
+[metal_dispatch(name = "enc_pk_dw", pso = "g_pf_pso_pk_dw", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalPkDw : MetalCnDwT {
+    override TAP_MAJOR = true
+
+    [metal_kernel(name="metal_pk_dw_msl")]
+    def metal_pk_dw {
+        dw_body()
     }
 }
 
@@ -3974,9 +4005,11 @@ var private g_pf_pso_cat2 : MetalComputePipeline?
 var private g_pf_pso_twr_flash : MetalComputePipeline?   //!< the tower flash (DK=DV=72 monomorph)
 var private g_pf_pso_twr_kvhc : MetalComputePipeline?    //!< its K/V per-head-contiguous f16 restride
 var private g_pf_pso_twr_win : MetalComputePipeline?     //!< the qwen2.5 ViT per-window attention
-var private g_pf_pso_twr_gather : MetalComputePipeline?  //!< its stem's window-sort row gather
-var private g_pf_pso_cn_attn : MetalComputePipeline?     //!< the canary rel-pos (XL) full attention
+var private g_pf_pso_fc_pack : MetalComputePipeline?     //!< the FastConformer rel-pos attention's per-head operand pack
+var private g_pf_pso_fc_softmax : MetalComputePipeline?  //!< its shift-add + scale + softmax rows
+var private g_pf_pso_fc_unpack : MetalComputePipeline?   //!< its AV rows back to the compact output
 var private g_pf_pso_cn_dw : MetalComputePipeline?       //!< its centered depthwise k9 + folded BN + SiLU
+var private g_pf_pso_pk_dw : MetalComputePipeline?       //!< the same on parakeet's tap-major taps
 var private g_pf_pso_g4a_attn : MetalComputePipeline?    //!< the gemma4a sliding-window RPE attention
 var private g_pf_pso_g4a_glu : MetalComputePipeline?     //!< its conv-module GLU halves
 var private g_pf_pso_g4a_dw : MetalComputePipeline?      //!< its causal depthwise k=5
@@ -4370,8 +4403,8 @@ def public metal_prefill_shutdown {
     release_handles(g_pf_pso_moe_mm_iq2s_t, g_pf_pso_moe_mm_iq2s_th, g_pf_pso_moe_mm_iq2s_th128, g_pf_pso_moe_mm_iq2s_thr)
     release_handles(g_pf_pso_moe_mm_iq2xs_t, g_pf_pso_moe_mm_iq2xs_th, g_pf_pso_moe_mm_iq2xs_th128, g_pf_pso_moe_mm_iq2xs_thr)
     release_handles(g_pf_pso_moe_mm_iq2xxs_t, g_pf_pso_moe_mm_iq2xxs_th, g_pf_pso_moe_mm_iq2xxs_th128, g_pf_pso_moe_mm_iq2xxs_thr)
-    release_handles(g_pf_pso_twr_flash, g_pf_pso_twr_kvhc, g_pf_pso_twr_win, g_pf_pso_twr_gather)
-    release_handles(g_pf_pso_cn_attn, g_pf_pso_cn_dw)
+    release_handles(g_pf_pso_twr_flash, g_pf_pso_twr_kvhc, g_pf_pso_twr_win)
+    release_handles(g_pf_pso_fc_pack, g_pf_pso_fc_softmax, g_pf_pso_fc_unpack, g_pf_pso_cn_dw, g_pf_pso_pk_dw)
     release_handles(g_pf_pso_g4a_attn, g_pf_pso_g4a_glu, g_pf_pso_g4a_dw, g_pf_pso_g4a_silu, g_pf_pso_g4a_axpy)
     release_handles(g_pf_pso_g4a_mag, g_pf_pso_g4a_logmel, g_pf_pso_g4a_lnrelu)
     release_handles(g_pf_pso_q3a_shuffle, g_pf_pso_q3a_finish, g_pf_pso_q3a_pow, g_pf_pso_q3a_logmel_t)
@@ -4542,9 +4575,11 @@ def private metal_prefill_init : bool {   // nolint:STYLE038 — flat one-compil
     g_pf_pso_twr_flash = compile_stamp(metal_tower_flash_msl, ok)
     g_pf_pso_twr_kvhc = compile_stamp(metal_tower_kv_hc_msl, ok)
     g_pf_pso_twr_win = compile_stamp(metal_tower_win_msl, ok)
-    g_pf_pso_twr_gather = compile_stamp(metal_tower_row_gather_msl, ok)
-    g_pf_pso_cn_attn = compile_stamp(metal_cn_attn_msl, ok)
+    g_pf_pso_fc_pack = compile_stamp(metal_fc_pack_msl, ok)
+    g_pf_pso_fc_softmax = compile_stamp(metal_fc_softmax_msl, ok)
+    g_pf_pso_fc_unpack = compile_stamp(metal_fc_unpack_msl, ok)
     g_pf_pso_cn_dw = compile_stamp(metal_cn_dw_msl, ok)
+    g_pf_pso_pk_dw = compile_stamp(metal_pk_dw_msl, ok)
     g_pf_pso_g4a_attn = compile_stamp(metal_g4a_attn_msl, ok)
     g_pf_pso_g4a_glu = compile_stamp(metal_g4a_glu_msl, ok)
     g_pf_pso_g4a_dw = compile_stamp(metal_g4a_dw_msl, ok)
@@ -4808,11 +4843,12 @@ def pf_bf16_half_ready() : bool => psos_ready(fixed_array(g_pf_pso_bf16_mm_th, g
 //! simdgroup kernels, no tensor crown required).
 def pf_tower_flash_ready() : bool => psos_ready(fixed_array(g_pf_pso_twr_flash, g_pf_pso_twr_kvhc))
 
-def pf_tower_win_ready() : bool => psos_ready(fixed_array(g_pf_pso_twr_win, g_pf_pso_twr_gather))
+def pf_tower_win_ready() : bool => psos_ready(fixed_array(g_pf_pso_twr_win, g_pso_row_gather))
 
-//! The canary FastConformer kernel set compiled — its blocks driver's device gate (LN, GLU,
-//! SiLU, axpy ride the shared/g4a kernels).
-def pf_cn_ready() : bool => psos_ready(fixed_array(g_pf_pso_cn_attn, g_pf_pso_cn_dw, g_pf_pso_g4a_glu, g_pf_pso_g4a_silu, g_pf_pso_g4a_axpy))
+//! The FastConformer kernel set compiled — the blocks driver's device gate (LN, GLU, SiLU, axpy
+//! ride the shared/g4a kernels); the depthwise stamp follows the family's tap layout.
+def pf_fc_ready(tap_major : bool) : bool => psos_ready(fixed_array(g_pf_pso_fc_pack, g_pf_pso_fc_softmax, g_pf_pso_fc_unpack, g_pso_f32mm,
+    tap_major ? g_pf_pso_pk_dw : g_pf_pso_cn_dw, g_pf_pso_g4a_glu, g_pf_pso_g4a_silu, g_pf_pso_g4a_axpy))
 
 //! The gemma4a Conformer kernel set compiled — its tower driver's device gate.
 def pf_g4a_ready() : bool => psos_ready(fixed_array(g_pf_pso_g4a_attn, g_pf_pso_g4a_glu, g_pf_pso_g4a_dw, g_pf_pso_g4a_silu, g_pf_pso_g4a_axpy))
@@ -4979,7 +5015,7 @@ def private pf_devw_panel(enc : MetalComputeEncoder?; bwblob : MetalBuffer?; wbo
     return true
 }
 
-//! the split-scale formats whose dev-W dequant rides the mul_mm tensor scaffold (sec.2.2aa)
+//! the split-scale formats whose dev-W dequant rides the mul_mm tensor scaffold (ARCHITECTURE_GPU_PREFILL.md#prefill-kq-tensor-scaffold)
 def private pf_kq_split_fmt(fmt : KqFmt) : bool {
     return (fmt == KqFmt.iq4xs || fmt == KqFmt.k3 || fmt == KqFmt.iq3s || fmt == KqFmt.iq3xxs || fmt == KqFmt.iq4nl
         || fmt == KqFmt.q40 || fmt == KqFmt.k2 || fmt == KqFmt.iq2s || fmt == KqFmt.iq2xs || fmt == KqFmt.iq2xxs)
@@ -6508,9 +6544,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     //! sliding layers rope with the swa row pair, whose rows are the class's own hs/2 wide
                     var bcos_l = lsl && dual_rope ? bcos_swa : bcos
                     var bsin_l = lsl && dual_rope ? bsin_swa : bsin
-                    enc_rope(enc, bq, 0ul, bcos_l, bsin_l, u_qd_l, u_hs_l, u_npairs_q_l, u_neox, u_rot, npos * qd_l / 2l)
+                    enc_rope(enc, bq, 0ul, bcos_l, bsin_l, u_qd_l, u_hs_l, u_npairs_q_l, u_neox, u_rot, null, npos * qd_l / 2l)
                     if (!kvsh) {
-                        enc_rope(enc, bks[l], koff, bcos_l, bsin_l, u_kvd_l, u_hs_l, u_npairs_k_l, u_neox, u_rot, npos * kvd_l / 2l)
+                        enc_rope(enc, bks[l], koff, bcos_l, bsin_l, u_kvd_l, u_hs_l, u_npairs_k_l, u_neox, u_rot, null, npos * kvd_l / 2l)
                     }
                 }
                 if (!recr && g_pf_skip != "attn" && g_pf_skip != "nongemm") {
@@ -7164,7 +7200,7 @@ var private g_pf_env_half_x = true
 var private g_pf_env_dev_w = true
 var private g_pf_env_devw_res_bytes = 0ul   //!< DASLLAMA_METAL_DEVW_RESIDENT budget (MB env, bytes here); 0 = off
 var private g_pf_env_tall = true
-var private g_pf_tall_crowned : bool     //!< the box's "hmm_tall" crown (ARCHITECTURE_GPU_PREFILL.md sec.2.2c)
+var private g_pf_tall_crowned : bool     //!< the box's "hmm_tall" crown (ARCHITECTURE_GPU_PREFILL.md#prefill-gemm-ladder)
 
 def private pf_tall_on : bool => g_pf_env_tall && g_pf_tall_crowned
 var private g_pf_env_qkr = true
@@ -7182,7 +7218,7 @@ let DEVW_BIG_ROWS = 2048l
 let DEVW_LONG_K = 4096l
 let DEVW_LONG_K_ROWS = 1024l
 let DEVW_MAX_TILES = 32l
-var private TALLKQ_MIN_PANEL = 96ul * 1024ul * 1024ul //! DRAM-residency knee, raced on panel BYTES (ARCHITECTURE_GPU_PREFILL.md sec.2.2c/2.2d)
+var private TALLKQ_MIN_PANEL = 96ul * 1024ul * 1024ul //! DRAM-residency knee, raced on panel BYTES (ARCHITECTURE_GPU_PREFILL.md#prefill-gemm-ladder)
 var private g_pf_env_span = true
 var private g_pf_env_logits = true
 var private g_pf_env_attn = true

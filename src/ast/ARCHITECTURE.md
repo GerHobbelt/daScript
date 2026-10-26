@@ -1,7 +1,8 @@
 # src/ast - the front end's AST
 
 Contract: `ARCHITECTURE_COMMON.md` (repo root). This document carries the mechanisms of this
-folder that a rule cites; `ARCHITECTURE_INFER.md` carries the inference mechanisms code cites.
+folder that a rule cites; `ARCHITECTURE_INFER.md` carries the inference mechanisms code cites,
+and `ARCHITECTURE_BUILT.md` the programs a host builds from AST nodes.
 The rest of inference, with parsing and simulation, is in `skills/internal/cpp_codebase_notes.md` (repo-only).
 
 ## 1. The module-cache read in `trySerializeProgramModule` (`ast_parse.cpp`) {#module-cache-read}
@@ -100,19 +101,18 @@ the descriptor's bytes and on four process-wide inputs a descriptor can read - i
 (`project_path`), the das root (`get_das_root()`), the binary kind (`das_is_dll_build()`) and the
 cross-compile target (`get_cross_platform_name()`, which `dasOpenGL`'s descriptor consults to
 register its module for the web target only) - so the file sits next to the descriptor, and a
-read-only tree simply compiles on every start. The binary kind also picks the file's name: a
-dynamic-module build writes `.das_module.manifest`, a static build (`daslang_static`, its
-modules linked in) `.das_module.static.manifest`, so the two kinds sharing one tree - a CI lane
-running both suites at once, a box with both binaries - never rewrite each other's rows, and each
-replays its own from its second start on. Its key
+read-only tree simply compiles on every start. The binary kind and the compile target pick the
+file's name - `.das_module.manifest`, `.das_module.static.manifest` for `daslang_static`, the
+platform name before `.manifest` for a `--jit-target` run (`.das_module.emscripten.manifest`) -
+so the kinds and targets sharing one tree (both suites at once, a sweep mixing native and wasm
+runs) never rewrite each other's rows, and each replays its own from its second start on. Its key
 is the descriptor's size and content hash (`hash_block64`, no stat) plus those four inputs, one
 line each (`root`, `dll`, `dasroot`, `target`), plus one `dep` line per file the descriptor's
 compile read - every module in its program with a file name, the daslib ones included - carrying
 that file's size and hash as the scan's `FileAccess` serves it (hashed once per file per
 access, whatever the descriptor count); a mismatch on any of them recompiles that descriptor
-and rewrites its manifest, so a native run and a `--jit-target` run of one tree alternate
-rewrites rather than serve each other's rows, and a descriptor whose rows come from a module it
-requires recompiles when that module changes. The file is line-oriented, tab-separated, with a
+and rewrites its manifest, so a descriptor whose rows come from a module it requires recompiles
+when that module changes. The file is line-oriented, tab-separated, with a
 format version (`MANIFEST_HEADER`) on its first line and an `end` line carrying the row count
 (`dep` lines are key, not rows); a missing `end`, a count mismatch, an unknown row kind, a wrong
 field count or a `dm` row whose `on_error` is not one of `RegisterOnError`'s three values is
@@ -260,7 +260,7 @@ the JIT's emitter is it. A late require nested in a compile - a macro during a p
 program's `isCompiling`), a macro module's `[init]` during its record's read (the reader's
 `readingRecord`) - would write its records ahead of the requirer's, which the reader meets at
 the requirer's position, or read mid-record; so a nested walk hides the stream for its duration
-(`LateRequireEnvScope`), parses its modules from source, once per process, and pushes no
+(`CompileEnvScope`), parses its modules from source, once per process, and pushes no
 record. A module whose parse failed pushes no record either, whatever the walk.
 
 ## 4. Program-scoped symbol state (`ast.h`, `ast_export.cpp`, `ast_allocate_stack.cpp`) {#program-scoped-symbol-state}

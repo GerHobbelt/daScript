@@ -39,37 +39,36 @@ NIGHTLY_ONLY_BUILD = sorted(
 
 class BuildMatrix(unittest.TestCase):
     def test_per_pr_cells(self):
-        for event in ("pull_request", "push"):
-            self.assertEqual(names(ci_matrix.build_cells(event)), PR_BUILD, event)
+        self.assertEqual(names(ci_matrix.build_cells(False)), PR_BUILD)
 
     def test_nightly_adds_exactly_the_slow_cells(self):
-        for event in ("schedule", "workflow_dispatch"):
-            self.assertEqual(names(ci_matrix.build_cells(event)), sorted(PR_BUILD + NIGHTLY_ONLY_BUILD), event)
+        release = [n for n in PR_BUILD if "-Release-" in n]
+        self.assertEqual(names(ci_matrix.build_cells(True)), sorted(release + NIGHTLY_ONLY_BUILD))
 
     def test_nightly_only_cells_are_marked(self):
-        marked = names(c for c in ci_matrix.build_cells("schedule") if c.get("nightly_only") == "ON")
+        marked = names(c for c in ci_matrix.build_cells(True) if c.get("nightly_only") == "ON")
         self.assertEqual(marked, NIGHTLY_ONLY_BUILD)
-        self.assertFalse(any(c.get("nightly_only") for c in ci_matrix.build_cells("pull_request")))
+        self.assertFalse(any(c.get("nightly_only") for c in ci_matrix.build_cells(False)))
 
     def test_every_cell_names_a_runner_and_a_generator(self):
-        for cell in ci_matrix.build_cells("schedule"):
+        for cell in ci_matrix.build_cells(True):
             self.assertTrue(cell.get("runner"), cell)
             self.assertEqual(cell.get("cmake_generator"), "Ninja", cell)
             self.assertEqual(cell.get("build_system"), "cmake", cell)
 
     def test_windows_release_64_is_the_llvm_free_gate(self):
-        cell = [c for c in ci_matrix.build_cells("pull_request")
+        cell = [c for c in ci_matrix.build_cells(False)
                 if c["target"] == "windows" and c["architecture"] == 64 and c["cmake_preset"] == "Release"][0]
         self.assertEqual((cell["llvm_disabled"], cell["jit_disabled"]), ("ON", "ON"))
 
     def test_release_cells_carry_archive_fields(self):
-        for cell in ci_matrix.build_cells("pull_request"):
+        for cell in ci_matrix.build_cells(False):
             self.assertIn("release_target", cell, cell)
             self.assertIn("release_arch", cell, cell)
             self.assertIn("archive_ext", cell, cell)
 
     def test_sanitizer_cells_carry_no_archive_fields(self):
-        for cell in ci_matrix.build_cells("schedule"):
+        for cell in ci_matrix.build_cells(True):
             if cell["sanitizers"] != "none":
                 self.assertNotIn("release_target", cell, cell)
                 self.assertEqual(cell["build_name"], "linux_" + cell["sanitizers"])
@@ -86,19 +85,17 @@ class BuildMatrix(unittest.TestCase):
 
 class ExtendedMatrix(unittest.TestCase):
     def test_per_pr_is_two_darwin_roles(self):
-        for event in ("pull_request", "push"):
-            cells = ci_matrix.extended_cells(event)
-            self.assertEqual([(c["target"], c["role"]) for c in cells], [("darwin15", "core"), ("darwin15", "modules")], event)
+        cells = ci_matrix.extended_cells(False)
+        self.assertEqual([(c["target"], c["role"]) for c in cells], [("darwin15", "core"), ("darwin15", "modules")])
 
     def test_nightly_is_one_full_job_per_platform(self):
-        for event in ("schedule", "workflow_dispatch"):
-            cells = ci_matrix.extended_cells(event)
-            self.assertEqual([(c["target"], c["role"]) for c in cells],
-                             [("linux", "all"), ("darwin15", "all"), ("windows", "all")], event)
+        cells = ci_matrix.extended_cells(True)
+        self.assertEqual([(c["target"], c["role"]) for c in cells],
+                         [("linux", "all"), ("darwin15", "all"), ("windows", "all")])
 
     def test_every_cell_names_a_runner(self):
-        for event in ("pull_request", "schedule"):
-            for cell in ci_matrix.extended_cells(event):
+        for nightly in (False, True):
+            for cell in ci_matrix.extended_cells(nightly):
                 self.assertTrue(cell.get("runner"), cell)
                 self.assertIn("architecture", cell, cell)
 
@@ -112,10 +109,19 @@ class WorkflowShapes(unittest.TestCase):
             return f.read()
 
     def test_both_workflows_read_their_matrix_from_pre_job(self):
-        for name, kind in (("build.yml", "build"), ("extended_checks.yml", "extended")):
+        for name, job in (("build_matrix.yml", "matrix"), ("extended_checks.yml", "pre_job")):
             text = self.read(name)
-            self.assertIn("matrix: ${{ fromJSON(needs.pre_job.outputs.matrix) }}", text, name)
-            self.assertIn("ci/ci_matrix.py %s" % kind, text, name)
+            self.assertIn("matrix: ${{ fromJSON(needs.%s.outputs.matrix) }}" % job, text, name)
+            self.assertIn("ci/ci_matrix.py ", text, name)
+
+    def test_only_nightly_yml_carries_a_cron(self):
+        # a workflow with a cron of its own is one a #nightly PR never arms
+        for name in sorted(os.listdir(WORKFLOWS)):
+            if not name.endswith(".yml") or name == "nightly.yml":
+                continue
+            text = self.read(name)
+            self.assertFalse(re.search(r"^  schedule:", text, re.M), "%s carries a cron of its own" % name)
+            self.assertFalse("uses: ./.github/workflows/nightly_issue.yml" in text, "%s files its own nightly issue" % name)
 
     def test_role_conditions_exclude_one_role_only(self):
         # `matrix.role == 'core'` would drop the step from the nightly `all` job; the only admitted
@@ -130,21 +136,63 @@ class WorkflowShapes(unittest.TestCase):
     def test_every_cache_restore_runs_on_the_cron_too(self):
         # the nightly cells are the slow ones; a restore gated off `schedule` is the old cold-build
         # policy coming back
-        for name in ("build.yml", "extended_checks.yml"):
+        for name in ("build.yml", "build_matrix.yml", "nightly.yml", "extended_checks.yml"):
             text = self.read(name)
             for block in re.findall(r"- name: \"(?:Restore|Cache) [^\"]*\"\n((?:      .*\n)+)", text):
                 self.assertNotIn("github.event_name != 'schedule'", block, name)
 
     def test_one_sanitizer_phase_writes_the_shared_slot(self):
-        text = self.read("build.yml")
-        self.assertIn("if: github.ref == 'refs/heads/master' && matrix.phase != 'slow' && matrix.phase != 'backend'", text)
-        self.assertNotIn("matrix.nightly_only", text)
+        text = self.read("build_matrix.yml")
+        self.assertIn("github.ref == 'refs/heads/master' && matrix.phase != 'slow' && matrix.phase != 'backend'", text)
+        self.assertNotIn("matrix.nightly_only != 'ON'", text)
 
     def test_the_three_test_steps_gate_on_the_phase(self):
+        text = self.read("build_matrix.yml")
+        self.assertIn("(matrix.phase == 'all' || matrix.phase == 'tests')", text)
+        self.assertIn("inputs.lane == 'build_nightly' && matrix.phase == 'slow'", text)
+        self.assertIn("inputs.lane == 'build_nightly' && matrix.phase == 'backend'", text)
+
+    def test_slots_are_saved_under_a_run_key_and_restored_by_prefix(self):
+        # a delete-then-save refresh left the key empty for the length of a build, and a run
+        # cancelled between the two left it empty for good; a run-unique key with a prefix restore
+        # never has a gap, and the prune after the save keeps one entry per slot
+        for name in ("build.yml", "build_matrix.yml", "nightly.yml", "extended_checks.yml"):
+            text = self.read(name)
+            self.assertNotIn("Refresh sccache slot", text, name)
+            restores = re.findall(r"- name: \"Restore sccache objects\"\n((?:      .*\n)+)", text)
+            saves = re.findall(r"- name: \"Save sccache objects\"\n((?:      .*\n)+)", text)
+            prunes = text.count('- name: "Prune older sccache slots"')
+            self.assertTrue(restores, name)
+            self.assertEqual(len(saves), len(restores), name)
+            self.assertEqual(prunes, len(saves), name)
+            for block in restores:
+                self.assertRegex(block, r"key: sccache-[^\n]+@\$\{\{ github\.run_id \}\}\n", name)
+                self.assertRegex(block, r"restore-keys: sccache-[^\n]+@\n", name)
+            for block in saves:
+                self.assertRegex(block, r"key: sccache-[^\n]+@\$\{\{ github\.run_id \}\}\n", name)
+
+    def test_every_workflow_restores_sccache_by_prefix(self):
+        # a consumer in another workflow that restores a slot by its exact old name would go cold
+        # the moment the writer moved to run keys
+        for name in sorted(os.listdir(WORKFLOWS)):
+            if not name.endswith(".yml"):
+                continue
+            text = self.read(name)
+            for block in re.findall(r"uses: actions/cache/restore@v4\n((?:      .*\n)+)", text):
+                if "key: sccache-" not in block:
+                    continue
+                self.assertRegex(block, r"key: sccache-[^\n]+@\$\{\{ github\.run_id \}\}\n", name)
+                self.assertRegex(block, r"restore-keys: sccache-[^\n]+@\n", name)
+
+    def test_master_push_builds_are_not_cancelled_by_the_next_merge(self):
         text = self.read("build.yml")
-        self.assertIn("if: matrix.phase == 'all' || matrix.phase == 'tests'", text)
-        self.assertIn("(matrix.phase == 'all' || matrix.phase == 'slow')", text)
-        self.assertIn("(matrix.phase == 'all' || matrix.phase == 'backend')", text)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text)
+
+    def test_the_slot_is_saved_after_the_lane_compiled(self):
+        # Build only configures; the lane targets compile, so a save placed before them lands
+        # an empty slot
+        text = self.read("build_matrix.yml")
+        self.assertLess(text.index('- name: "Nightly Backend Sweeps"'), text.index('- name: "Save sccache objects"'))
 
     # the checks that run only on the nightly cron, pinned by name: moving another off the
     # per-PR path is a deliberate edit here, with its preflight mirror or platform reason stated
@@ -173,20 +221,20 @@ class CommandLine(unittest.TestCase):
 
     def test_emits_one_json_line_the_workflow_can_fromjson(self):
         for kind in ("build", "extended"):
-            out = self.run_tool(kind, "pull_request")
+            out = self.run_tool(kind)
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertEqual(out.stdout.count("\n"), 1)
             self.assertIn("include", json.loads(out.stdout))
 
     def test_rejects_an_unknown_matrix(self):
-        self.assertEqual(self.run_tool("release", "push").returncode, 2)
+        self.assertEqual(self.run_tool("release").returncode, 2)
 
-    def test_rejects_a_missing_event(self):
-        self.assertEqual(self.run_tool("build").returncode, 2)
+    def test_rejects_a_missing_lane(self):
+        self.assertEqual(self.run_tool().returncode, 2)
 
     def test_each_kind_emits_its_own_cell_shape(self):
-        build = json.loads(self.run_tool("build", "pull_request").stdout)["include"]
-        extended = json.loads(self.run_tool("extended", "pull_request").stdout)["include"]
+        build = json.loads(self.run_tool("build").stdout)["include"]
+        extended = json.loads(self.run_tool("extended").stdout)["include"]
         self.assertTrue(all("sanitizers" in c and "role" not in c for c in build))
         self.assertTrue(all("role" in c and "sanitizers" not in c for c in extended))
 

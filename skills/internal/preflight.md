@@ -59,32 +59,37 @@ working-tree copy.
 
 | Workflow | Trigger | Jobs |
 |---|---|---|
-| `build.yml` (per-PR) | every PR commit (`pull_request`) + pushes to `master` | `build` matrix (`ci/ci_matrix.py build`: Debug + Release on linux, linux_arm, darwin15, darwin26; windows 32 Release, windows 64 Release), `bundle_smoke`, `build_linux_gcc` |
-| `build.yml` (nightly) | `schedule` cron (daily 02:00 UTC) | `build_windows_mingw` + `build_windows_clangcl` (gated OFF per-PR) **plus the full build matrix - the per-PR cells, the sanitizer cells (linux Release asan/tsan/ubsan, each three jobs: `tests`, `slow`, `backend`, sharing one sccache slot), the fast-math cell (linux Release `-DDAS_FAST_MATH=ON`) and windows 64 Debug - whose Release cells run the full AOT sweep** ("Slow Release Tests") **and the three backend sweeps** ("Nightly Backend Sweeps"). Breaks surface within ~24 h, not at PR time |
-| `nightly_imgui.yml` | `schedule` cron (daily 03:00 UTC) + `workflow_dispatch` | dasImgui playwright suite on ubuntu + macos - section below |
+| `build.yml` (per-PR) | every PR commit (`pull_request`) + pushes to `master` | `build` matrix (`build_matrix.yml`, lane `build`: Debug + Release on linux, linux_arm, darwin15, darwin26; windows 32 Release, windows 64 Release), `bundle_smoke`, `build_linux_gcc` |
+| `nightly.yml` | `schedule` cron (daily 02:00 UTC), `workflow_dispatch`, and a `pull_request` whose body says `#nightly` or that carries `run-nightly` / `nightly-failure` | `build` matrix (`build_matrix.yml`, lane `build_nightly`: the per-PR Release cells running `run_build_nightly` - the full AOT sweep and the three backend sweeps - plus the sanitizer cells - each three jobs, `tests`, `slow`, `backend`, sharing one sccache slot - the fast-math cell and windows 64 Debug), `build_windows_relwithdebinfo_nightly`, `build_windows_release_llvm_nightly`, `build_windows_mingw`, `build_windows_clangcl`, `lint` (`check_lint_tree`), and calls to `extended_checks.yml` (lane `extended_nightly`), `nightly_daspkg_index.yml`, `nightly_imgui.yml`, `nightly_playground.yml` and `nightly_vulkan.yml` - the only cron. Breaks surface within ~24 h, not at PR time |
+| `build_matrix.yml` | `workflow_call` from `build.yml` and `nightly.yml`, with the lane | the build matrix job - section below |
+| `nightly_imgui.yml` | `workflow_call` from `nightly.yml` + `workflow_dispatch` | dasImgui playwright suite on ubuntu + macos - section below |
 | `extended_checks.yml` (per-PR) | every PR | two darwin15-arm64 jobs, `core` and `modules` (`ci/ci_matrix.py extended`), ALL release modules ON - section below |
-| `extended_checks.yml` (nightly) | `schedule` cron (daily 04:00 UTC) + `workflow_dispatch` | one job each on linux, darwin15 and windows running every step (role `all`), including the ones too slow for a PR: tutorial dry-runs, the run form of examples, coverage, the nano cross-compile, the AST verify tree sweep, doc-verify |
+| `extended_checks.yml` (nightly) | `workflow_call` from `nightly.yml` | one job each on linux, darwin15 and windows running every step (role `all`), including the ones too slow for a PR: tutorial dry-runs, the run form of examples, coverage, the nano cross-compile, the AST verify tree sweep, doc-verify |
 | `wasm_build.yml` | every PR | emscripten build of `web/` on 3 OSes, the vecmath backend battery and `tests/language` under node, + `wasm_cross` |
 | `build_eastl.yml` | every PR | EASTL shadow-config build + no-fileio build (linux clang) |
 | `doc.yml` | only if `doc/**`, `daslib/**`, `src/builtin/**`, `modules/dasImgui/**`, `modules/dasVulkan/**`, or `modules/dasLLAMA/dasllama/**` changed | the doc gates |
 | `playground-e2e.yml` | only if `site/**` / `web/examples/ui/**` changed | Playwright on the web playground |
 | `dasweb-verify-browser.yml` | `pull_request` touching `utils/internal/dasweb-verify/browser/**`, `web/examples/ui/samples/data.json`, or the workflow file itself; `workflow_dispatch` | `node_test`: `node --test` in `utils/internal/dasweb-verify/browser` - section below |
-| `dasllama_server_release.yml` | `release: prereleased`, `workflow_dispatch` (`publish` input), and a branch push that edits the file itself or what the bundle carries (`utils/dasllama-server/**`, `utils/watchdog/**`, `utils/daspkg/**`, `daslib/daspkg.das`, `modules/dasHV/**`, `modules/dasLLAMA/benchmarks/lcpp_bench.das`, `modules/dasLLAMA/dasllama/dasllama_bench.das`; `.md` edits excepted) | four cells (linux x86_64 and arm64 on ubuntu-22.04, darwin arm64, windows x64): daslang with the release modules, `daspkg release --fat x86-avx2 \| arm-neon` of `utils/dasllama-server` (the server, the watchdog, the `dasllama-bench` companion), smoke, package; a release or a `publish` dispatch uploads to the rolling `dasllama-server` release (and the daslang release being cut). Local mirror: `bin/daslang utils/daspkg/main.das -- release --fat <class> --root utils/dasllama-server --out <dir>` on the box, then the smoke by hand - the server on a spare port answering `/v1/stats` in setup mode, `dasllama-bench -m none.gguf --help` exiting 0 |
+| `dasllama_server_release.yml` | `release: prereleased`, `workflow_dispatch` (`publish` input), and a branch push editing a non-`.md` file the workflow's `paths:` filter names (the workflow itself, what the bundle carries, `ci/packaging/**`) | four cells (linux x86_64 on ubuntu-22.04, linux arm64 on ubuntu-22.04-arm, darwin arm64, windows x64): daslang with the release modules, `daspkg release --fat x86-avx2 \| arm-neon` of `utils/dasllama-server`, the smoke run from a copy with a fresh HOME (write-protected off Windows), the `dasllama` archive, `.deb` + `.rpm` (linux) and pip wheel with their smokes; a release or a `publish` dispatch uploads the archives to the rolling `dasllama-server` release, and a release also uploads every asset to the daslang release being cut; then, on a release event only, `pypi_route` + `publish_pypi` by tag shape, and `publish_manifests` - section below |
 | `release.yml` | `release: prereleased` and `workflow_dispatch` (build + smoke; publishes nothing) | four cells (linux x86_64, linux arm64, darwin26 arm64, windows x86_64): build, the test suite under `-jit`, bundle + smoke, `.deb` / `.rpm` / pip wheel, sha256 per asset, the `.rpm` and wheel smokes, upload; then `pypi_route` + `publish_pypi` by tag shape - section below |
-| `nightly_issue.yml` | `workflow_call`, from every lane with a cron (`build.yml`, `extended_checks.yml`, `nightly_daspkg_index.yml`, `nightly_imgui.yml`, `nightly_lint.yml`, `nightly_playground.yml`, `nightly_vulkan.yml`) once a `schedule` run of that lane has a failed job | keeps ONE open `nightly-failure` issue for the whole nightly, titled `The nightly is red`: the first red lane files it, every lane after that files nothing while it is open. Close the issue when the nightly is green. No local mirror |
+| `nightly_issue.yml` | `workflow_call`, from `nightly.yml` once a `schedule` run has a failed job | keeps ONE open `nightly-failure` issue for the whole nightly, titled `The nightly is red`: the first red night files it with a link to each failed job, and every red night after that comments on it with its own while it is open. Close the issue when the nightly is green. No local mirror |
 
-> A manual **`workflow_dispatch`** of `build.yml` runs the **whole** workflow - every per-PR job, both nightly toolchains, *and* the full AOT sweep. The cron `schedule` runs the two toolchains, the full build matrix and `bundle_smoke` (the cron run is what seeds its sccache slot); `build_linux_gcc` is gated off `schedule`.
+> A manual **`workflow_dispatch`** of `nightly.yml` runs every nightly lane; `build.yml` carries no cron.
 
-## build.yml - the build matrix
+## build_matrix.yml - the build matrix
 
 Per-lane steps: build -> JIT sweep (mints its own dll cache) -> interpreter sweep
 -> `ctest -L small`. Per-PR lanes also build `test_aot_subset` (tests/language,
 part of ALL) as a compile+link gate, and run no AOT tests.
 
-**The build matrix runs four targets: `run_tests_sweeps`, `test-small` and, on the
-nightly, `run_tests_slow` and `run_backend_sweeps`.** Which sweeps `run_tests_sweeps` runs is
-decided in cmake, not in the workflow: no JIT where dasLLVM is off (the sweep targets live under
-`if(NOT DAS_LLVM_DISABLED)`) or on Debug; no interpreter sweep under a sanitizer.
+**The build matrix runs `run_build` (`run_tests_sweeps`, `test-small`), retried as
+`run_build_isolated` (`run_tests_sweeps_isolated`, `test-small`) when it fails, and, on the nightly
+lane, `run_build_nightly` (`run_tests_slow`, `run_backend_sweeps`, `test_aot_subset`).** The retry
+is the workflow's `||`, not a cmake target: the windows 64 Debug cell's first pass outgrows the
+1800 s watchdog every run, and the isolated pass is the one that finishes. Which sweeps
+`run_tests_sweeps` runs is decided in cmake, not in the workflow: no JIT where dasLLVM is off (the
+sweep targets live under `if(NOT DAS_LLVM_DISABLED)`) or on Debug; no interpreter sweep under a
+sanitizer.
 
 **The configure is one command for every cell.** The flags a cell varies by value -
 `CMAKE_BUILD_TYPE`, `DAS_LLVM_DISABLED`, `DAS_USE_SANITIZER`, `DAS_FAST_MATH` - are on that
@@ -100,12 +105,12 @@ configure.
 | Small C++ tests | `cmake --build build --config Release --target test-small` | drop `--build-config` on single-config generators. **Run after touching `tests-cpp/`** - MSVC tolerates C++ clang/gcc reject; `skills/internal/writing_cpp_tests.md` |
 | AOT sweep (full) | `cmake --build build --config Release --target run_tests_slow` - the full `test_aot` build, the AOT sweep over tests/, then the big C++ tests | nightly + manual dispatch only, so this is the **only** pre-push gate for AOT regressions outside tests/language - don't skip it |
 | AOT subset gate | `cmake --build build --config Release --target test_aot_subset` (add `--target run_tests_aot_subset` to sweep tests/language too) | what per-PR lanes build |
-| LLVM-AOT sweep | `cmake --build build --config Release --target run_backend_sweeps` runs all three; alone: `cmake --build build --config Release --target run_tests_llvm_aot` | nightly + dispatch. Emits a native `.o` per test through the LLVM backend instead of the C++ proxy, then sweeps tests/ against them |
+| LLVM-AOT sweep | `cmake --build build --config Release --target run_backend_sweeps` runs all three; alone: `cmake --build build --config Release --target run_tests_llvm_aot` | nightly + dispatch. Emits a native `.o` per test through the LLVM backend instead of the C++ proxy, then sweeps tests/ against them - tests/language only under tsan, where the whole corpus outruns the suite watchdog |
 | Standalone sweep - C++ (`-ctx`) | `cmake --build build --config Release --target run_backend_sweeps`; alone: `cmake --build build --config Release --target run_standalone_sweep_aot` | nightly + dispatch. Emits, compiles, links and launches a standalone context per file of test_aot's corpus. `-DDAS_STANDALONE_SWEEP_FILTER=<regex>` narrows it |
 | Standalone sweep - LLVM (`-lib`) | `cmake --build build --config Release --target run_backend_sweeps`; alone: `cmake --build build --config Release --target standalone_sweep_jit` | nightly + dispatch. Same corpus through `daslang -lib`: emits each as a native library, loads it back through its generated bindings and drives it. Needs LLVM |
 | Debug lanes | `cmake --build build --config Debug --target daslang`, then the sweep against `bin/Debug/daslang.exe` - Debug coexists in-checkout with Release (`bin/Debug/`, `_debug.shared_module`) | Debug bypasses the fused interpreter permutations: a fused-path-only fix passes Release everywhere and trips Debug, and fused-path bugs need Release. Touched `src/simulate/simulate_fusion_*`? run both |
 | Fast-math lane (linux Release, `-ffast-math`) - nightly | Linux/WSL: `CC=gcc CXX=g++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDAS_FAST_MATH=ON`, then `--target run_tests_interpreter` and `ctest -L small` | the tree gets the host's relaxed-float flag, the way an embedder passing `-ffast-math` builds it (dagor does). gcc, not clang: clang's `-Wnan-infinity-disabled` fires on every inf literal the tree and its vendored third-party spell, and neither is ours to patch. Vector-vs-scalar bit equality legitimately diverges here - gate such an arm on the `HOST_FAST_MATH` constant and skip. Nightly + dispatch only |
-| Sanitizer lanes (linux Release asan/tsan/ubsan) - nightly | WSL: `CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDAS_USE_SANITIZER=<asan\|tsan\|ubsan>`, then the JIT sweep on `tests/language` | not mirrorable on Windows/mac. CI applies LSan suppressions (`format_error`, `uriParseSingleUriA`, `uriMakeOwner`). Nightly + dispatch only (40-55 minute jobs); force one early with `gh workflow run build.yml` |
+| Sanitizer lanes (linux Release asan/tsan/ubsan) - nightly | WSL: `CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDAS_USE_SANITIZER=<asan\|tsan\|ubsan>`, then the JIT sweep on `tests/language` | not mirrorable on Windows/mac. CI applies LSan suppressions (`format_error`, `uriParseSingleUriA`, `uriMakeOwner`). Nightly + dispatch only (40-55 minute jobs); force one early with `gh workflow run nightly.yml` |
 | linux_arm / darwin lanes | mac: same commands as linux; from Windows not mirrorable | ARM reds (LLVM SelectionDAG, alignment) are CI-only signals |
 
 ## build.yml - bundle_smoke (linux)
@@ -115,7 +120,13 @@ Release-modules build -> `cmake --install --prefix ./daslang_bundle --strip` ->
 install-layout gate - run it when touching CMake `install(...)` rules,
 `ci/release_modules.txt`, or module loading.
 
-## build.yml - build_windows_mingw (nightly)
+## nightly.yml - lint
+
+"Lint the whole tree" runs `check_lint_tree`, the whole tree in one process. Local mirror:
+`cmake --build build --config Release --target check_lint_tree`; `run_nightly` and `run_all`
+include it.
+
+## nightly.yml - build_windows_mingw
 
 msys2 CLANG64 build with dasClangBind + dasLLVM ON, full interp/JIT/AOT sweeps,
 plus two things no other lane runs: the `bind_clangbind.das` self-binder
@@ -124,7 +135,7 @@ freshness check (`git diff --exit-code -- modules/dasClangBind/src/`) and
 below. After regenerating dasClangBind bindings run the self-binder per
 `skills/internal/clang_bind_build.md`.
 
-## build.yml - build_windows_clangcl (nightly)
+## nightly.yml - build_windows_clangcl
 
 preflight's `cpp-syntax` gate mirrors this lane's frontend: clang-cl `/Zs`
 (parse + semantic analysis + template instantiation, no codegen) on changed C++,
@@ -211,7 +222,6 @@ test rather than a check that silently stopped running.
 | AST verify tree sweep - **not a PR gate** (the per-PR arm is the row above) | `cmake --build build --config Release --target check_ast_verify_tree` - one daslang per file, 120 s each; an `AST verify` line, a crash or a timeout fails, compile errors are expected (many tests assert one) | runs on `extended_checks.yml`'s 04:00 cron: one daslang process per test file, each re-parsing daslib. Force it early with `gh workflow run extended_checks.yml`. Run locally after touching macro or AST-building code - `skills/das_macros.md` |
 | Authored-doc code blocks - **not a PR gate** | `cmake --build build --config Release --target check_doc_verify` (exit 0 = every authored RST page's das blocks compile; report at `build/doc_verify/report.json`) | nightly cron + `workflow_dispatch`, posix cells only: ~35 min, one daslang spawn per page. Run locally after editing `doc/source/reference/**` or `doc/source/stdlib/handmade/**`, or after daslib/module API changes docs quote - `skills/internal/doc_sweep.md` |
 | MCP tools test | `cmake --build build --config Release --target run_tests_mcp_tools` (it builds `tree_sitter_daslang` first - the grammar library plus the `sgconfig.yml` its post-build step stamps, without which ast-grep knows no `daslang` language) | the `modules` role; MCP signature changes break it silently - run after editing `utils/mcp/` |
-| daspkg suite | `cmake --build build --config Release --target run_tests_daspkg` | the `modules` role; the release gates (`--fat` among them) |
 | DAP MCP bridge | `cmake --build build --config Release --target run_tests_dap_bridge` | posix only |
 | boulder-dash samples | `cmake --build build --config Release --target run_tests_boulder_dash` | both copies - `examples/games/` and the playground's |
 | Example games wired to the site | `cmake --build build --config Release --target check_example_games` | `examples/games/REVIEW.das`; the card id every place it is written down |
@@ -295,21 +305,50 @@ from apt, no Fedora runner) -> "Set up Python for the wheel" -> "Build pip wheel
 "Checksum every release asset" ->
 "Smoke-test pip wheel" -> "Upload wheel for the PyPI publish job" (every run) -> "Upload
 release assets" (release events only). `pypi_route` reads the tag shape, `publish_pypi`
-uploads the wheel set. The packaging scripts are `ci/packaging/`
+uploads the wheel set, `publish_manifests` (release events only) pushes the Homebrew formula and
+the scoop manifest to `borisbat/homebrew-daslang` and `borisbat/scoop-daslang` with the
+`PACKAGING_TOKEN` secret, a token that can push to both. The packaging scripts are `ci/packaging/`
 (`README.md` there is the per-release ritual).
 
 | CI step | Local mirror |
 |---|---|
 | Install binaries + Smoke-test installed bundle | `cmake --build build --config Release --target check_bundle_smoke` (the `build.yml` `bundle_smoke` gate) |
-| Build .deb | linux only: `bash ci/packaging/deb_build.sh build/daslang_bundle <tag> <out>` |
-| Build .rpm + Smoke-test .rpm | linux with `rpm`: `bash ci/packaging/rpm_build.sh build/daslang_bundle <tag> <out>`, then the smoke by hand - `rpm -qpl` naming `/usr/bin/daslang` and `/usr/bin/daslang-live`, `rpm2cpio <rpm> \| cpio -idm` in a scratch dir, `./opt/daslang/bin/daslang --version`, `readlink usr/bin/daslang` = `/opt/daslang/bin/daslang`; the spec alone, any OS: `cmake --build build --config Release --target check_rpm_spec` |
+| Build .deb | linux only: `bash ci/packaging/deb_build.sh build/daslang_bundle <tag> <out>`; the control file alone, any unix: `cmake --build build --config Release --target check_deb_control` |
+| Build .rpm + Smoke-test .rpm | linux with `rpm`: `bash ci/packaging/rpm_build.sh build/daslang_bundle <tag> <out>`, then the smoke by hand - `rpm -qpl` naming `/usr/bin/daslang` and `/usr/bin/daslang-live`, `rpm2cpio <rpm> \| cpio -idm` in a scratch dir, `./opt/daslang/bin/daslang --version`, `readlink usr/bin/daslang` = `/opt/daslang/bin/daslang`; the spec alone, any unix: `cmake --build build --config Release --target check_rpm_spec` |
 | Build pip wheel + Smoke-test pip wheel | `python ci/packaging/wheel_build.py build/daslang_bundle <tag> <out>` + `pip install <out>/*.whl` in a venv; the repack rules alone: `cmake --build build --config Release --target check_wheel_repack` |
-| Checksum every release asset, the uploads, `pypi_route`, `publish_pypi` | none - runner-side plumbing over the assets above |
+| Checksum every release asset | `bash ci/packaging/checksum_assets.sh <out>` |
+| the uploads, `pypi_route`, `publish_pypi` | none - runner-side plumbing over the assets above |
+| `publish_manifests` | `bash ci/packaging/publish_manifests.sh daslang <tag>` - renders from the release's `.sha256` assets and prints the diff against the tap and bucket without pushing; the render alone: `cmake --build build --config Release --target check_manifest_render` |
 
 The workflow's wiring - step order, conditions, the runner-side smokes - has no per-PR lane;
-the packaging scripts do (`check_rpm_spec`, `check_wheel_repack`, `check_bundle_smoke` above).
+the packaging scripts do - the `check_*` targets above.
 Prove a wiring change with a `workflow_dispatch` of `release.yml` on the branch - it builds and
 smokes every cell and publishes nothing - or with the next RC cut.
+
+## dasllama_server_release.yml
+
+Each cell: release-modules build -> "Release the server as a fat <class> bundle" -> "Smoke-test
+the bundle" (from a copy with a fresh HOME: the bundle unchanged after, the logs under
+`<home>/.dasllama`, nothing in the working directory) -> "Package" -> "Build .deb and .rpm" +
+"Smoke-test the .deb and .rpm" (linux: apt installs the `.deb`, the commands run from PATH, the
+server boots through its `/usr/bin` link) -> "Set up Python for the wheel" -> "Build pip wheel"
+-> "Smoke-test pip wheel" -> "Checksum every asset" -> "Upload wheel for the PyPI publish job"
+-> "Upload workflow artifact" -> the uploads. `pypi_route` + `publish_pypi` publish the
+`dasllama` wheels, `publish_manifests` pushes the dasllama formula, cask and scoop manifest -
+all three on release events only, the last with `PACKAGING_TOKEN`.
+
+| CI step | Local mirror |
+|---|---|
+| Release the server as a fat bundle + Smoke-test the bundle | `bin/daslang utils/daspkg/main.das -- release --fat <class> --root utils/dasllama-server --out <dir>`, then from a write-protected copy with `HOME` pointed at a scratch dir: `watchdog --help`, `dasllama-cli --help`, `dasllama-bench -m none.gguf --help`, the server and then the watchdog each answering `/v1/stats` in setup mode; the copy's `find` listing identical before and after, `$HOME/.dasllama/logs/libhv.*.log` present, no `libhv.*.log` or `logs/` in the working directory |
+| Build .deb and .rpm + Smoke-test the .deb and .rpm | `bash ci/packaging/deb_build.sh --package dasllama <dir>/dasllama-server <tag> <out>` (Debian-family linux) and `rpm_build.sh` the same (`rpm` installed); the renders, any unix: `cmake --build build --config Release --target check_deb_control check_rpm_spec`; the install smoke needs a Debian-family linux box |
+| Build pip wheel + Smoke-test pip wheel | `python ci/packaging/wheel_build.py --package dasllama <dir>/dasllama-server <tag> <out>` (`<dir>` itself on a Mac) + `pip install` in a venv; the repack rules: `check_wheel_repack` |
+| Checksum every asset | `bash ci/packaging/checksum_assets.sh <out>` |
+| the uploads, `pypi_route`, `publish_pypi` | none - runner-side plumbing |
+| `publish_manifests` | `bash ci/packaging/publish_manifests.sh dasllama <tag>` (dry run: the diff, no push); the render: `check_manifest_render` |
+
+A branch push that touches the carried paths runs every cell but the upload to the daslang
+release being cut, the rolling `dasllama-server` publish and the three publish jobs; a `publish`
+dispatch adds the rolling publish, and nothing else.
 
 ## nightly_imgui.yml
 
@@ -324,10 +363,7 @@ Local mirror - also `preflight --full`'s `imgui` gate, the suite's only pre-push
 check:
 
 ```bash
-cmake --build build --config Release --target daslang daslang-live
-bin/Release/daslang dastest/dastest.das -- --test modules/dasImgui/tests --headless \
-  --isolated-mode --isolated-mode-threads 4 --timeout 600 \
-  --exclude glfw_synth --exclude key_hud --exclude embedded_terminal
+cmake --build build --config Release --target run_tests_imgui_integration
 ```
 
 ## dasweb-verify-browser.yml

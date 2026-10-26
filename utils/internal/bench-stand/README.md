@@ -16,7 +16,7 @@ failed and what moved. Review rules: `REVIEW.md`.
   the viewer's markup into a host page's `#stand`. The same two files back daslang.io's
   `site/nightly.html` (repo root), whose stylesheet tokens they adopt through `var(--token,
   fallback)`. The folder's `REVIEW.md` is not copied to the box.
-- `run_stand.sh` - one pass on a ref, the thing cron calls (section 3); `caddy.snippet` is the public route.
+- `stand.cmake` - one pass over the current tree, run by the `run_bench_stand` target (section 5); `caddy.snippet` is the public route.
 
 ## 2. Data model
 
@@ -41,8 +41,6 @@ likewise believes the marker its program prints, not the exit code.
 
 `site/data.json` - `Dataset`: run summaries (with failures, skips, lane states), groups, series
 (columnar: `runs` indexes `Dataset.runs`, `ns`, `spread`).
-`site/status.json` is written by `run_stand.sh` at start and end (`running` / `finished`, run id,
-exit), so a night whose build failed is still visible.
 
 ### 2.1 Reading the numbers
 
@@ -58,30 +56,29 @@ not run the suite (the driver's way to record a failed build) and exits 1.
 
 ## 3. The box
 
-`dasweb-1` (the daslang.io origin) runs `run_stand.sh master` from the `bench` user's cron under
-`/srv/bench-stand`: `src/` (the clone), `runs/`, `site/` (what Caddy serves at `/bench/`),
-`logs/`. The night builds Release (RelWithDebInfo arms the C++ allocation tracker, whose exit-time
-report costs the run time) with the module set the benchmarks require, then `run`, then `report`;
-`bin/` survives the checkout's clean, so a night whose build fails still renders a red night with
-the previous binary. There is no CI runner and no ssh path into the box: the repository is public.
+`zen4` runs the night; `dasweb-1` (the daslang.io origin) only serves it. On zen4, cron runs
+`~/bench-stand/nightly.sh` at 03:00 box time over `~/bench-stand/{src,runs,site,logs}`: the script
+resets `src` to `origin/master`, builds `daslang`, the module libraries the benchmarks require
+(SQLITE, PUGIXML, Audio, Minfft, Terminal, UnitTest, LLVM) and `test_aot_bench` (Release:
+RelWithDebInfo arms the C++ allocation tracker, whose exit-time report costs the run time), writes
+`meta.json`, then runs `benchctl run` - or `run --failed` after a red build, so the night is recorded
+either way - then `report`, copies the viewer files from this folder's `site/`, writes `status.json`,
+and publishes. Its arguments go to `benchctl run`. Logs: `~/bench-stand/logs/<date>.log` and
+`build-<run_id>.log`. The script is box-local, not in the tree; `run_bench_stand` (section 5) is the
+same night as one cmake target for a box that builds in-tree.
 
-One-time setup, as root:
+Publishing is two `rsync`s over ssh to `boris@dasweb-1`, `runs/` first and then `site/` with its
+`site/runs -> ../runs` symlink (excluding the symlink 404s every record link), with the deploy key
+`~/.ssh/bench_stand_deploy`, which dasweb-1's `authorized_keys` restricts to
+`rrsync /srv/bench-stand`. dasweb-1 holds `/srv/bench-stand/{site,runs}` and serves them through
+`caddy.snippet`, pasted into the `daslang.io` block of its Caddyfile. dasweb-1 builds nothing and has
+no CI runner; the repository is public.
 
-```sh
-useradd -r -m -d /srv/bench-stand -s /bin/bash bench
-# llvm-22-dev is required: the night builds with -DDAS_LLVM_DISABLED=OFF, and without it
-# there is no jit lane. apt.llvm.org carries it for noble, as in extended_checks.
-apt-get install -y git cmake ninja-build g++ ccache llvm-22-dev
-su - bench -c 'git clone https://github.com/GaijinEntertainment/daScript src && mkdir -p runs site logs'
-su - bench -c '/srv/bench-stand/src/utils/internal/bench-stand/run_stand.sh master'   # first pass by hand
-echo '0 5 * * * bench /srv/bench-stand/src/utils/internal/bench-stand/run_stand.sh master >> /srv/bench-stand/logs/cron.log 2>&1' > /etc/cron.d/bench-stand
-```
+zen4 needs `llvm-22-dev` (apt.llvm.org carries it for bookworm; without it there is no jit lane),
+`cmake`, `ninja-build`, `clang` and the module libraries' dev packages.
 
-then paste `caddy.snippet` into the `daslang.io` block of the Caddyfile and `systemctl reload caddy`.
-
-Arguments after the ref go to `benchctl run` - `run_stand.sh master --filter core/math/ --repeat 1`
-is a slice of a night. `BENCH_STAND_HOME` moves the layout, `BENCH_STAND_BUILD=skip` reuses the
-last build; both are for local dry runs.
+`BENCH_STAND_ARGS` goes to `benchctl run` - `-DBENCH_STAND_ARGS="--filter core/math/ --repeat 1"` is
+a slice of a night. `BENCH_STAND_OUT` is where `runs/` and `site/` go (default `build/bench-stand`).
 
 ## 4. Configuration - `utils/benchctl/suite.json`
 
@@ -94,14 +91,11 @@ naming a file that no longer exists is an error.
 ## 5. Running locally
 
 ```sh
-bin/daslang utils/internal/bench-stand/main.das -- run --meta meta.json --out /tmp/stand/runs/n1.json --filter core/math/ --repeat 2
-bin/daslang utils/internal/bench-stand/main.das -- report --runs /tmp/stand/runs --out-data /tmp/stand/site/data.json
-cp utils/internal/bench-stand/site/* /tmp/stand/site/ && ln -sfn ../runs /tmp/stand/site/runs
-bin/daslang dastest/dastest.das -- --test utils/internal/bench-stand
+cmake -B build -DBENCH_STAND_ARGS="--filter core/math/ --repeat 1"
+cmake --build build --target run_bench_stand
 ```
 
-`meta.json` is what `run_stand.sh` writes: `{"run_id", "started", "commit": {"sha", "date",
-"subject", "author"}, "machine": {...}, "build": {"status", "seconds", "log_tail"}}`; any
-subset parses. The whole pipeline runs locally too: `BENCH_STAND_HOME=<scratch>
-BENCH_STAND_BUILD=skip run_stand.sh <branch> --filter core/math/` with `<scratch>/src` a clone
-holding a built `bin/daslang`.
+It benchmarks the checkout as it is into `build/bench-stand/` (`runs/`, `site/`, and the
+`meta.json` it writes: `{"run_id", "started", "commit": {"sha", "date", "subject", "author"},
+"machine": {...}, "build": {"status"}}`; any subset parses). Serve `build/bench-stand/site/` to
+view it. The tool's tests: `bin/daslang dastest/dastest.das -- --test utils/benchctl/tests`.

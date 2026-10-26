@@ -1,6 +1,8 @@
 options gen2
 options _dasllama_internal = true
 
+module _vk_kq_fixtures shared public   //! shared: the harness's probe fixture (a shared module) requires it
+
 require daslib/f16_cvt
 require math
 
@@ -10,6 +12,9 @@ require math
 
 //! a float rounded through f16 and back - the value the device reads where it stages a plane in halves
 def f16r(v : float) : float => f16_to_f32(f32_to_f16(v))
+
+//! the scalar silu the CPU references spell where a kernel's gate rides it one element at a time
+def silu(v : float) : float => v / (1.0 + exp(-v))
 
 // the small set for gate/up/x scale planes
 def pow2_small(i : int64) : float {

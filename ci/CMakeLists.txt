@@ -16,6 +16,8 @@ das_lane_python(check_shipped_skills "Testing the shipped-skills gate" "ci/test_
 das_lane_python(check_md_ascii "Markdown ASCII gate" "ci/test_fix_md_ascii.py" "ci/fix_md_ascii.py --check")
 das_lane_python(check_wheel_repack "Testing the pip wheel repack" "ci/test_wheel_build.py")
 das_lane_python(check_rpm_spec "Testing the rpm spec render" "ci/test_rpm_build.py")
+das_lane_python(check_deb_control "Testing the deb control render" "ci/test_deb_build.py")
+das_lane_python(check_manifest_render "Testing the Homebrew and scoop manifest render" "ci/test_render_manifests.py")
 
 add_custom_target(check_bundle_smoke
 COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_BINARY_DIR}/daslang_bundle
@@ -70,22 +72,26 @@ function(das_lane_group name comment)
 endfunction()
 
 set(DAS_EXTENDED_CORE
-    check_workflow_matrix check_shipped_skills check_md_ascii check_wheel_repack check_rpm_spec
+    check_workflow_matrix check_shipped_skills check_md_ascii check_wheel_repack check_manifest_render
     check_example_games check_dasllama_site run_tests_bench_updater
     run_tests_pr_babysit check_dasgen run_tests_review_md run_tests_dastest
     check_lint_changed check_ast_verify_changed check_gated_das check_review_gates
     check_standalone_exes check_format check_format_exe run_utils_tests)
 if(NOT WIN32)
-    # check_model_mint: its test stands in a shell script for daslang, which Windows cannot exec
-    list(APPEND DAS_EXTENDED_CORE run_tests_dap_bridge check_model_mint)
+    # check_model_mint: its test stands in a shell script for daslang, which Windows cannot exec;
+    # check_rpm_spec, check_deb_control: Linux packages, and their fixtures' exec bits mean nothing on NTFS
+    list(APPEND DAS_EXTENDED_CORE run_tests_dap_bridge check_model_mint check_rpm_spec check_deb_control)
 endif()
 
 set(DAS_EXTENDED_MODULES
     run_tests_dasllama_env_registry run_tests_llvm_env_registry run_tests_glfw_touch
-    run_tests_dasllama_facade_lint run_tests_boulder_dash run_tests_daspkg
+    run_tests_dasllama_facade_lint run_tests_boulder_dash
     run_tests_mcp_tools run_tests_dasweb_verify run_tests_dasllama_ladder
     run_tests_dasweb_buildd run_tests_dasweb_playground run_sequence_smoke
     run_tests_dasllama_server run_tests_serdeser run_tests_static)
+if(TARGET run_tests_llvm_jit_backend)
+    list(APPEND DAS_EXTENDED_MODULES run_tests_llvm_jit_backend)
+endif()
 if(APPLE)
     list(APPEND DAS_EXTENDED_MODULES run_tests_llvm_vector_math)
 endif()
@@ -106,13 +112,28 @@ das_lane_group(run_extended_all "Running every extended check"
 das_lane_group(run_build "Running the build lane"
     run_tests_sweeps test-small)
 das_lane_group(run_build_nightly "Running the build lane's nightly sweeps"
-    run_tests_slow run_backend_sweeps)
+    run_tests_slow run_backend_sweeps test_aot_subset)
+das_lane_group(run_build_sanitizers "Running the sanitizer lane"
+    run_tests_interpreter test-small)
+das_lane_group(run_build_clangcl "Running the clang-cl lane"
+    run_build run_tests_aot)
+das_lane_group(run_build_mingw "Running the mingw lane"
+    run_build run_tests_aot check_clangbind_fresh run_tests_cbind_const_preproc)
+# The isolated retry of a lane whose sweep failed: the workflow chains `<lane> || <lane>_isolated`
+# (cmake has no retry primitive inside one target). The windows 64 Debug cell needs it every run -
+# its first pass outgrows the 1800 s watchdog and only the isolated pass finishes.
+das_lane_group(run_build_isolated "Retrying the build lane's sweeps in isolated mode"
+    run_tests_sweeps_isolated test-small)
+das_lane_group(run_build_sanitizers_isolated "Retrying the sanitizer lane's sweep in isolated mode"
+    run_tests_interpreter_isolated test-small)
+das_lane_group(run_build_mingw_isolated "Retrying the mingw lane's sweeps in isolated mode"
+    run_build_isolated run_tests_aot check_clangbind_fresh run_tests_cbind_const_preproc)
 das_lane_group(run_site "Running the site lane's checks"
     run_imgui2rst run_vulkan2rst stage_doc_assets)
 das_lane_group(run_nightly "Running everything CI runs only on the cron"
-    run_build_nightly ${DAS_EXTENDED_NIGHTLY})
+    run_build_nightly ${DAS_EXTENDED_NIGHTLY} check_lint_tree)
 das_lane_group(run_all "Running every lane this configure can build"
-    run_extended_all run_doc run_build run_build_nightly)
+    run_extended_all run_doc run_build run_build_nightly check_lint_tree)
 
 # A lane runs daslang against the tree's own shared modules and descriptors. Under a single
 # ninja invocation a relink lands while another lane is reading that module, and its descriptor
@@ -125,13 +146,21 @@ get_property(_das_modules GLOBAL PROPERTY DAS_SHARED_MODULE_TARGETS)
 if(_das_modules)
     add_dependencies(das_build_products ${_das_modules})
 endif()
+# the hosts and probe libraries tests load by name: tests/dasbind's [extern] bindings dlopen
+# dasbind_probe, and a sweep that only compiles the corpus (the sanitizer backend job) still
+# has to resolve them
+foreach(_host daslang-live watchdog dasbind_probe)
+    if(TARGET ${_host})
+        add_dependencies(das_build_products ${_host})
+    endif()
+endforeach()
 foreach(_lane ${DAS_EXTENDED_CORE} ${DAS_EXTENDED_MODULES} ${DAS_EXTENDED_NIGHTLY}
               test-small test-big check_bundle_smoke
               run_tests_interpreter run_tests_interpreter_isolated
               run_tests_jit run_tests_jit_isolated
               run_tests_aot run_tests_aot_subset run_tests_llvm_aot
               run_tests_slow run_standalone_sweep_aot standalone_sweep_jit
-              check_ast_verify_tree run_examples dry_run_tutorials
+              check_ast_verify_tree check_lint_tree run_examples dry_run_tutorials
               check_docs_generated run_imgui2rst run_vulkan2rst stage_doc_assets)
     if(TARGET ${_lane})
         add_dependencies(${_lane} das_build_products)

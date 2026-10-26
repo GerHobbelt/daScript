@@ -24,6 +24,7 @@ require daslib/clargs
 require daslib/env_registry public
 require daslib/option public
 require daslib/rtti
+require daslib/fio
 require strings
 
 // ===== Engine =====
@@ -86,7 +87,7 @@ struct public EngineEnv {
 [EnvConfig(env_prefix = "DASLLAMA")]
 struct public GpuTierEnv {
     @clarg_default_doc = "off"
-    @clarg_doc = "One switch for the measured-best GPU rail set; any DASLLAMA_GPU_* knob still overrides individually. On a Vulkan build it is also the want the vision tower driver reads before any device init: the vision towers' block loops serve on the device only while it is on, and decline `device` otherwise."
+    @clarg_doc = "One switch for the measured-best GPU rail set; any DASLLAMA_GPU_* knob still overrides individually. On a Vulkan build it is also the want the tower driver reads before any device init: the vision and audio towers' block loops serve on the device only while it is on, and decline `device` otherwise."
     gpu : Option<bool>
 
     @clarg_default_doc = "-1 (auto)"
@@ -198,7 +199,7 @@ struct public MetalEnv {
     @clarg_doc = "Serve the non-causal media span on the prefill driver (AttnArgs.uend); 0 declines it to the CPU arm, which then needs declared CPU intent."
     span : bool = true
 
-    @clarg_doc = "Serve tower/embedder encodes on the Metal tower driver - the gemma4uv chain, the gemma4v ViT and gemma3v SigLIP block loops (their exact-plane lanes), the whisper-class block loops, and the conv frontends (whisper im2col + the qwen3a conv2d, which serves the q8 default); 0 pins the CPU tower."
+    @clarg_doc = "Serve tower/embedder encodes on the Metal tower driver - the gemma4uv chain, the gemma4v ViT and gemma3v SigLIP block loops (their exact-plane lanes), the whisper-class block loops, the gemma4a Conformer and the canary / parakeet FastConformer block loops (their f32 lanes), the whole StyleTTS2 (kitten / kokoro) synthesis - PL-BERT, the text and duration encoders, the duration head, prosody, the decoder, the harmonic source, the generator and the inverse STFT - on both weight lanes, the Pocket TTS codec and frame loop, and the conv frontends (whisper im2col + the qwen3a conv2d, which serves the q8 default); 0 pins the CPU tower."
     tower : bool = true
 
     @clarg_doc = "Serve the qwen3v tower's block/merger GEMMs from the image's baked f16 twin plane on the crowned tensor mul_mm twins (the mint bakes the twin only for f16-sourced GEMMs, so it holds the file's own values; needs a tensor crown - a box without one, or an image without the plane, keeps the f32 route); 0 pins the f32 GEMM route - the A/B rail."
@@ -371,8 +372,11 @@ struct public VulkanEnv {
     @clarg_doc = "Vulkan flash attention: the decode fa kernel pick AND the cm2 prefill fa tile; 0 falls back to the chunked/scalar paths."
     vk_fa : bool = true
 
-    @clarg_doc = "Serve the vision towers' block loops (gemma4v, gemma3v, qwen3v, qwen25v) on the Vulkan tower driver - the announce is `dasLLAMA vulkan tower: <family> serves on the device`, once per model when it first serves; 0 pins the CPU tower chain, announced once as the knob decline."
+    @clarg_doc = "Serve the vision towers' block loops (gemma4v, gemma3v, qwen3v, qwen25v), the audio towers' (the whisper-class towers, gemma4a, canary) and the TTS seats (the StyleTTS2 families kitten and kokoro, Pocket) on the Vulkan tower and TTS drivers - the announce is `dasLLAMA vulkan tower: <family> serves on the device`, once per model when it first serves; 0 pins the CPU chains, announced once as the knob decline."
     vk_tower : bool = true
+
+    @clarg_doc = "Serve the whisper decoder side (the per-window cross-KV and the decode step) on the Vulkan ASR-decoder driver - the announce is `dasLLAMA vulkan wdec: the whisper decoder serves on the device`, once per model; 0 pins the CPU decoder, announced once as the knob decline."
+    vk_wdec : bool = true
 
     @clarg_doc = "Merged k|v prefill GEMM - one dispatch over the adjacent k+v arena planes; 0 pins the split k + v dispatches for a same-build A/B."
     vk_kv_merge : bool = true
@@ -776,12 +780,12 @@ struct public CoreEnv {
 
     @clarg_env = "HOME"
     @clarg_path
-    @clarg_doc = "Ambient platform variable; read only to derive the default Hugging Face cache when HF_HOME is unset."
+    @clarg_doc = "Ambient platform variable; read to derive the per-user ~/.dasllama directory (when USERPROFILE is unset) and the default Hugging Face cache when HF_HOME is unset."
     home : string = ""
 
     @clarg_env = "USERPROFILE"
     @clarg_path
-    @clarg_doc = "Ambient platform variable (Windows twin of HOME); read only to derive dasllama-server's default models dir."
+    @clarg_doc = "Ambient platform variable (Windows twin of HOME); read only to derive the per-user ~/.dasllama directory."
     user_profile : string = ""
 
     @clarg_default_doc = "conservative default"
@@ -803,6 +807,10 @@ struct public CoreEnv {
 
     @clarg_doc = "Kernel-tuning mode. The [tune] framework owns these; see skills/tune.md."
     tune_mode : string = ""
+
+    @clarg_default_doc = "warning (daslang's to_log floor); tests/run.das sets info for itself and its children when unset"
+    @clarg_doc = "The to_log floor daslang reads per call (trace, debug, info, warning, error or critical); see skills/internal/environment_variables.md."
+    log_level : string = ""
 
     @clarg_doc = "Kernel-tuning policy override. The [tune] framework owns these; see skills/tune.md."
     tune_policy : string = ""
@@ -827,6 +835,28 @@ let public g_env_prof = env_config(type<ProfilingEnv>)
 let public g_env_test = env_config(type<TestEnv>)
 let public g_env_exchange = env_config(type<ExchangeEnv>)
 let public g_env_core = env_config(type<CoreEnv>)
+
+//! The per-user dasLLAMA directory under `home`: the standalone programs' models, config, tune
+//! state and logs, so an install directory can stay read-only.
+def public dasllama_home_dir_from(home : string) : string {
+    return path_join(home, ".dasllama")
+}
+
+//! `<home>/.dasllama`, home being USERPROFILE (Windows), else HOME.
+def public dasllama_home_dir() : string {
+    return dasllama_home_dir_from(!empty(g_env_core.user_profile) ? g_env_core.user_profile : g_env_core.home)
+}
+
+//! A dasLLAMA app's config `name`, looked for in the working directory, then in `dasllama_home`,
+//! then in `anchor_dir` (beside the program or its script); "" when none exists. The one lookup
+//! the server, its CLI and the tune exchange share.
+def public dasllama_find_config(name, dasllama_home, anchor_dir : string) : string {
+    for (dir in [".", dasllama_home, anchor_dir]) {
+        let path = dir == "." ? name : path_join(dir, name)
+        return path if (stat(path).is_valid)
+    }
+    return ""
+}
 
 //! The rig/probe/test models-dir resolution (DASLLAMA_MODELS_DIR, else the primary rig's dir),
 //! trailing separator guaranteed — callers concat "{models_dir_resolved()}{file}". The server's

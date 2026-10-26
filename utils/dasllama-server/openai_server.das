@@ -7,6 +7,7 @@ module openai_server
 require dasllama/dasllama       // the public facade — the main dasLLAMA surface this tool touches
 require dasllama/dasllama_scheduler   // continuous-batching scheduler (layer 3 over the facade)
 require dasllama/dasllama_bench       // the llama-bench rows the in-process /bench runs on the served model
+require user_state                    // write_config - the /config save
 require dashv/dashv_boost public
 require daslib/json_boost
 require daslib/toml             // write_toml: POST /config persists the authoritative config
@@ -14,6 +15,7 @@ require ?llvm dasllama/dasllama_exchange   // nolint:STYLE030,LINT019 — OPTION
 require [tune_framework]   // nolint:STYLE030,LINT019 — OPTIONAL: tune_manifest_path, the /exchange apply target, reached only inside the exchange arms
 require daslib/defer            // defer() { delete js } — free the parsed request JSON on every exit path
 require model_catalog           // the curated list + the /catalog download rail
+require serving_knobs public    // the serving spellings shared with dasllama-cli (quant / kv / metal / tts lane + file set / the --gpu pick)
 require daslib/jobque_boost
 require daslib/rtti             // this_context().last_exception inside ASR worker recovery
 require daslib/strings_boost    // join()
@@ -144,33 +146,6 @@ def same_model_path(a, b : string) : bool {
     return get_platform_name() == "windows" ? to_lower(ga) == to_lower(gb) : ga == gb
 }
 
-//! True when ``s`` is a quant spelling ``pick_quant`` maps deliberately (any case): the serving
-//! modes fp32/f32 | q8 | q4, plus the gguf FILE formats that serve under the kq tier —
-//! q8_0 / q4_0 / q4_k / q5_k / q6_k (_M/_S suffixes fine), mxfp4, f16 / bf16.
-def quant_spelling_known(s : string) : bool {
-    let l = to_lower(s)
-    return (l == "fp32" || l == "f32" || l == "q4" || l == "q8" || l == "q8_0" || l == "q4_0"
-        || l == "mxfp4" || l == "f16" || l == "bf16"
-        || starts_with(l, "q4_k") || starts_with(l, "q5_k") || starts_with(l, "q6_k"))
-}
-
-//! The serving modes are QuantMode fp32/q8/q4_0, CLI spellings "fp32" | "q8" | "q4" — "q4"
-//! selects the legacy q4_0 requant tier (per-row kernels only, no batched prefill), whose one
-//! use is squeezing an f16/f32 file down to 4 bits for RAM. The FILE formats the gguf loader
-//! reads are first-class spellings too — all of those serve under QuantMode.q8 (K-quant, mx4,
-//! and Q4_0 planes run NATIVELY on the kq tier). An unknown spelling warns and serves q8.
-def pick_quant(s : string) : QuantMode {
-    let l = to_lower(s)
-    if (l == "fp32" || l == "f32") {
-        return QuantMode.fp32
-    } elif (l == "q4") {
-        return QuantMode.q4_0
-    } elif (!empty(l) && !quant_spelling_known(s)) {
-        to_log(LOG_WARNING, "dasllama-server: unknown --quant '{s}', using q8 (valid: fp32 | q8 | q8_0 | q4_0 | q4_k | q5_k | q6_k | mxfp4 | f16 | bf16 | q4 = legacy requant)\n")
-    }
-    return QuantMode.q8
-}
-
 var g_has_asr = false
 var g_asr_path = ""
 var g_asr_mmproj = ""
@@ -179,7 +154,6 @@ var g_asr_team_dispatch = false
 var g_has_tts = false
 var g_tts_path = ""
 var g_tts_id = ""
-let TTS_LANE_DEFAULT = "q8"
 var g_tts_lane = TTS_LANE_DEFAULT   // the weight lane the worker is ASKED for; its ready event echoes the pin it took
 var g_tts_voices_dir = ""   // clips a cloning model adds to its voices at boot, each under its file's stem
 let TTS_VOICE_CLIP_EXTENSIONS : array<string> <- [".wav", ".flac", ".mp3", ".ogg"]   // what the decode rail reads
@@ -551,50 +525,6 @@ def configure_asr_workers(path, mmproj : string; workers : int = 1) {
     g_asr_mmproj = mmproj
     g_asr_worker_count = clamp(workers, 1, 8)
     g_has_asr = !empty(path)
-}
-
-//! The first file of a TTS model's set that is absent — the GGUF at `path`, then, for a phoneme
-//! family, each front-end pack (``tts_g2p.bin``, ``tts_postag.bin``) beside it (a Pocket TTS GGUF
-//! reads text and needs none). "" when the set is complete, and for an empty `path` (no TTS
-//! configured). This is the file ``configure_tts`` drops the route over.
-def tts_missing_file(path : string) : string {
-    if (empty(path)) {
-        return ""
-    }
-    if (!stat(path).is_valid) {
-        return path
-    }
-    if (!tts_needs_packs(path)) {
-        return ""
-    }
-    let dir = dir_name(path)
-    for (pack in TTS_FRONT_END_PACKS) {
-        let pack_path = path_join(dir, pack)
-        if (!stat(pack_path).is_valid) {
-            return pack_path
-        }
-    }
-    return ""
-}
-
-//! True when `path` names a TTS model with its front-end packs beside it — the outcome
-//! ``configure_tts`` will reach, answerable BEFORE the call (an empty path reads false: nothing
-//! to serve). A boot that decides setup mode ahead of ``configure_tts`` reads this.
-def tts_files_present(path : string) : bool {
-    return !empty(path) && empty(tts_missing_file(path))
-}
-
-//! The TTS weight lane a spelling selects: ``q8`` | ``f32``, anything else warned about and
-//! served as ``q8``.
-def pick_tts_lane(s : string) : string {
-    let l = to_lower(s)
-    if (l == "f32" || l == "q8") {
-        return l
-    }
-    if (!empty(l)) {
-        to_log(LOG_WARNING, "dasllama-server: unknown --tts-lane '{s}', using {TTS_LANE_DEFAULT} (valid: q8 | f32)\n")
-    }
-    return TTS_LANE_DEFAULT
 }
 
 //! The weight lane ``/v1/audio/speech`` requested for its model — what ``configure_tts`` kept
@@ -2701,7 +2631,8 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
                              tools_declared : bool = false; call_open : string = ""; call_close : string = "";
                              seed : int = 0; think : ThinkStream = ThinkStream();
                              tool_mode : ToolMode = ToolMode.none; reuse_id : int64 = 0l;
-                             media_is_audio : bool = false; media_grid : int2 = int2(0)) {
+                             media_is_audio : bool = false; media_grid : int2 = int2(0);
+                             var nothink : NothinkStopGuard = NothinkStopGuard()) {
     if (bench_hold_active()) {
         service_unavailable(srv, writer, ibench_hold_text())
         return
@@ -2720,6 +2651,7 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
                            media_grid = media_grid)   // qwen mrope grid; (0,0) on gemma families
     preq.prompt <- prompt
     preq.stop_ids <- stop_ids
+    preq.nothink <- nothink
     preq.close_toks <- close_toks
     preq.media_embd <- media
     if (!submit(cur_model(), cur_sched(), preq)) {
@@ -2754,6 +2686,7 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
 def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : array<string>;   // nolint:STYLE037,STYLE038 — one arm per message role, each accumulating into the same renderer state
                                max_new : int64; start : int; think_set, think_val, has_media, media_is_audio : bool;
                                var prompt, stop_ids, close : array<int64>&;
+                               var nothink_out : NothinkStopGuard&;
                                var call_open, call_close : string&; var think_out : ThinkStream&;
                                var tool_mode_out : ToolMode&; var media_at : int64&) : string {
     var chat <- create_chat_renderer(cur_model(), system, max_new)
@@ -2886,7 +2819,8 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
     }
     // out-params: the sole caller hands them in empty and deletes them before every re-render
     prompt <- rendered      // nolint:PERF030 — empty on entry
-    stop_ids <- effective_stop_ids(chat)   // nolint:PERF030 — empty on entry; + thinking-off extras
+    stop_ids <- turn_stop_ids(chat)   // nolint:PERF030 — empty on entry; the thinking-off extras ride the guard
+    nothink_out <- make_nothink_guard(chat)   // nolint:PERF030 — empty on entry, like stop_ids
     close <- render_close(cur_model(), chat)   // nolint:PERF030 — empty on entry
     call_open = chat.tmpl.tool_call_open
     call_close = chat.tmpl.tool_call_close
@@ -3110,6 +3044,8 @@ def private handle_chat_tail(srv : WebSocketServer; var writer : HttpResponseWri
     defer() { delete prompt }
     var stop_ids : array<int64>
     defer() { delete stop_ids }
+    var nothink = NothinkStopGuard()
+    defer() { delete nothink }
     var close : array<int64>
     defer() { delete close }
     var call_open = ""
@@ -3120,7 +3056,7 @@ def private handle_chat_tail(srv : WebSocketServer; var writer : HttpResponseWri
     var start = 0
     while (true) {
         let render_error = render_chat_suffix(msgs_v, system, tools, max_new, start, think_set, think_val,
-                                              n_media > 0l, media_is_audio, prompt, stop_ids, close, call_open, call_close,
+                                              n_media > 0l, media_is_audio, prompt, stop_ids, close, nothink, call_open, call_close,
                                               think_stream, wire_tool_mode, media_at)
         if (!empty(render_error)) {
             bad_request(srv, writer, render_error)
@@ -3140,12 +3076,13 @@ def private handle_chat_tail(srv : WebSocketServer; var writer : HttpResponseWri
         start = next
         delete prompt
         delete stop_ids
+        delete nothink
         delete close
     }
     register_request(srv, writer, prompt, stop_ids, close, media, media_at, n_media, params, max_new,
                      streaming, true, "chatcmpl",
                      has_tools, call_open, call_close, seed, think_stream, wire_tool_mode, resume_rid,
-                     media_is_audio, media_grid)
+                     media_is_audio, media_grid, nothink)
 }
 
 def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
@@ -4031,7 +3968,7 @@ def private handle_config_save(var req : HttpRequest?; var resp : HttpResponse?)
     if (!empty(werr)) {
         return resp |> JSON(error_body("config not TOML-representable: {werr}", "invalid_request_error"), http_status.BAD_REQUEST)
     }
-    if (!fwrite(g_config_save_path, toml)) {
+    if (!write_config(g_config_save_path, toml)) {
         return resp |> JSON(error_body("could not write '{g_config_save_path}'", "server_error"), http_status.INTERNAL_SERVER_ERROR)
     }
     to_log(LOG_INFO, "dasllama-server: authoritative config saved to {g_config_save_path} ({length(toml)} bytes)\n")
