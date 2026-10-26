@@ -181,11 +181,11 @@ def document_module_builtin(_root : string) {
 find_for_edit|find_if_exists|find_index|find_index_if|has_value|key_exists|keys|values|get_key|lock|each_enum|each_ref|
 find_for_edit_if_exists|lock_forever|next|nothing|pop|push|push_from|push_clone|push_clone_from|back|sort|stable_sort|to_array|to_table|to_array_move|
 to_table_move|empty|subarray|insert|move_to_ref|copy_to_local|move_to_local|get|remove_value|erase_if|resize_and_init|
-get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_default|modify|long_length|long_capacity|long_find_index)$%%),
+get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_default|modify|long_length|long_capacity|long_find_index|ensure_capacity|set_scratch|is_scratch|scratch_reserve|scratch_ensure_capacity|scratch_resize)$%%),
         group_by_regex("Character set groups", mod, %regex~(is_alpha|is_number|is_white_space|is_char_in_set)$%%),
         group_by_regex("das::string manipulation", mod, %regex~(peek|set)$%%),
         group_by_regex("String builder", mod, %regex~(build_string|write|write_char|write_chars|write_escape_string)$%%),
-        group_by_regex("Heap reporting", mod, %regex~(heap|string_heap|memory_report|tag_array|tag_table)%%),
+        group_by_regex("Heap reporting", mod, %regex~(heap|string_heap|memory_report|tag_array|tag_table|max_unreserved_size|set_max_unreserved_size|frame_position)%%),
         group_by_regex("Vector and matrix math", mod, %regex~(float3x4|float4x4|identity|inverse|rotate|translation|transpose)$%%),
         group_by_regex("16/8-bit lattice converts", mod, %regex~(short2_sat|short3_sat|short4_sat|ushort2_sat|ushort3_sat|ushort4_sat|byte2_sat|byte3_sat|byte4_sat|byte8_sat|ubyte2_sat|ubyte3_sat|ubyte4_sat|ubyte8_sat|half8_lo|half8_hi)$%%),
         group_by_regex("16/8-bit lattice integer dots", mod, %regex~(idot|idot4|shuffle)$%%),
@@ -193,7 +193,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Smart ptr infrastructure", mod, %regex~(add_ptr_ref|smart_ptr|get_const_ptr|move|move_new|get_ptr$)%%),
         group_by_regex("Macro infrastructure", mod, %regex~(is_folding|is_compiling|is_in_completion|is_in_lint_check|is_building_documentation|is_reporting_compilation_errors)%%),
         group_by_regex("Profiler", mod, %regex~(profile|reset_profiler|dump_profile_info|collect_profile_info)$%%),
-        group_by_regex("System infrastructure", mod, %regex~(panic|print|feint|sprint|sprint_json|sscan_json|to_log|to_compiler_log|error|terminate|breakpoint|stackwalk|get_stackwalk|get_das_root|get_das_version|is_in_aot|aot_enabled|is_intern_strings|is_safe_hash|eval_main_loop|shared_module_extension)$%%),
+        group_by_regex("System infrastructure", mod, %regex~(panic|print|feint|sprint|sprint_json|sscan_json|to_log|to_compiler_log|diagnostics_to_stderr|diagnostics_to_file|error|terminate|breakpoint|stackwalk|get_stackwalk|get_das_root|get_das_version|is_in_aot|aot_enabled|is_intern_strings|is_safe_hash|eval_main_loop|shared_module_extension)$%%),
         group_by_regex("Memory manipulation", mod, %regex~(intptr|memcmp|variant_index|set_variant_index|hash|hash_combine64|memcpy|lock_data|map_to_array|map_to_ro_array)$%%),
         group_by_regex("Binary serializer", mod, %regex~(binary_load|binary_save)$%%),
         group_by_regex("Path and command line", mod, %regex~(get_command_line_arguments|with_argv)$%%),
@@ -221,7 +221,7 @@ def document_module_fio(_root : string) {
     var groups <- array<DocGroup>(
         hide_group(group_by_regex("Internal builtin functions", mod, %regex~builtin%%)),
         group_by_regex("Direct IO and mapping advice", mod, %regex~(dwrite_open|dwrite_append|dwrite_band|dwrite_commit|dwrite_stat|dwrite_close|prefetch_map)$%%),
-        group_by_regex("File manipulation", mod, %regex~(f|long_f|stat$|getchar|remove|rename|copy_file|file_size|equivalent|is_symlink|set_mtime)%%),
+        group_by_regex("File manipulation", mod, %regex~(f|long_f|stat$|getchar|remove|rename|copy_file|file_size|equivalent|is_symlink|is_reparse_point|set_mtime)%%),
         group_by_regex("Path manipulation", mod, %regex~(base_name|dir_name|get_full_file_name|extension|stem|replace_extension|path_join|normalize|to_generic_path|is_absolute|relative|relative_result|parent)$%%),
         group_by_regex("Directory manipulation", mod, %regex~(dir|dir_rec|mkdir|mkdir_rec|mkdir_result|rmdir|rmdir_rec|rmdir_rec_result|rmdir_result|chdir|getcwd)$%%),
         group_by_regex("Glob and pattern matching", mod, %regex~(match_glob|glob|glob_filtered|is_glob_pattern|expand_glob|parse_file_list)$%%),
@@ -323,10 +323,11 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_kv_pool|release_kv_pages|create_batch_workspace|setup_dasllama_jobque|caps)$%%),
         group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_release|prefix_held_groups|prefix_chain_list)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
-        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_batch|sample|set_seed|stats)$%%),
+        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_embd_span|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
-        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_assistant|render_turn|render_assistant|render_close|respond|set_thinking)$%%),
+        group_by_regex("Vision", mod, %regex~(encode_image)$%%),
+        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_assistant|render_turn|render_turn_image|render_assistant|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
         group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids)$%%)
     )
@@ -367,6 +368,12 @@ def document_module_dasllama(_root : string) {
             "One parsed tool call: the function ``name``, its ``args`` normalized to JSON object text, and the wire ``id`` where the family carries one (mistral; empty elsewhere).")
         dasllama_type_stanza(f, "struct-dasllama_audio-AudioTower", "AudioTower",
             "A loaded audio encoder: Whisper-family encoder weights plus the model-specific projector tail, as produced by ``load_audio_tower`` from an mmproj GGUF. Pass it to ``create_chat`` to enable ``add_user_audio`` turns.")
+        dasllama_type_stanza(f, "struct-dasllama_vision-VisionImage", "VisionImage",
+            "A decoded RGB8 image: ``width``, ``height``, and the pixel bytes in ``rgb``. Produced by ``load_image_rgb`` (the optional ``dasllama_vision_io`` companion) or built directly; ``add_user_image`` / ``encode_image`` letterbox and normalize it to the model's geometry.")
+        dasllama_type_stanza(f, "struct-dasllama_gemma4uv-Gemma4uvEmbedder", "Gemma4uvEmbedder",
+            "A loaded gemma vision embedder: the mmproj GGUF's projection weights plus the family's geometry, as produced by ``load_gemma4uv_embedder``. Pass it to ``create_chat`` to enable ``add_user_image`` turns; ``proj_dim`` must match the decoder's embedding width (checked at create).")
+        dasllama_type_stanza(f, "struct-dasllama_gemma4uv-Gemma4uvState", "Gemma4uvState",
+            "Caller-owned scratch for the embedder forward: the im2col and GEMM buffers ``encode_image`` reuses across calls. One per embedder user; holds no image state between calls.")
     }
     document("dasLLAMA LLM inference: models, sessions, generation, chat", mod, "dasllama.rst", groups, hook)
 }
@@ -1336,7 +1343,9 @@ def document_module_lint_config(_root : string) {
     var mod = find_module("lint_config")
     var groups <- array<DocGroup>(
         group_by_regex("Configuration", mod, %regex~(load_lint_config|load_lint_config_from_path|load_env_disabled|seed_default_disabled|build_lint_macro_disabled|lint_config_forces_on)$%%),
+        group_by_regex("Path excludes", mod, %regex~(load_path_excludes_from_path|matches_path_excludes|is_lint_path_excluded)$%%),
         group_by_regex("Path-based rule defaults", mod, %regex~(is_daslib_source|is_shipped_library_source|is_core_library_source)$%%),
+        group_by_regex("Lint-surface predicates", mod, %regex~(is_user_authored_body|is_lint_fixture_name|lint_file_skip_reason)$%%),
         group_by_regex("Structured findings", mod, %regex~(make_lint_issue)$%%)
     )
     document("Repo-level lint configuration", mod, "lint_config.rst", groups)
@@ -1356,7 +1365,7 @@ def document_module_logger(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Setup", mod, %regex~.*(logger_init|logger_init_tee|logger_set_name|logger_set_path|logger_get_path|logger_get_name)$%%),
         group_by_regex("Level filters", mod, %regex~.*(logger_set_min_level|logger_get_min_level|logger_set_category_level|logger_clear_category_levels)$%%),
-        group_by_regex("Output control", mod, %regex~.*(logger_set_stderr_fallback|logger_set_tee|logger_flush|logger_close)$%%),
+        group_by_regex("Output control", mod, %regex~.*(logger_set_stderr_fallback|logger_set_tee|logger_flush|logger_close|logger_capture_diagnostics)$%%),
         group_by_regex("Log calls", mod, %regex~.*(logger_log|logger_trace|logger_debug|logger_info|logger_warning|logger_error|logger_critical)$%%),
         group_by_regex("Stdout hook", mod, %regex~.*(logger_install_hook)$%%)
     )
@@ -1698,6 +1707,7 @@ def document_module_strudel_scheduler(_root : string) {
     var mod = find_module("strudel_scheduler")
     var groups <- array<DocGroup>(
         group_by_regex("Orbit effects", mod, %regex~(init_reverb|init_delay|get_orbit_reverb|get_orbit_delay|get_orbit_chorus)$%%),
+        group_by_regex("Scratch marking", mod, %regex~(mark_pools_scratch|mark_orbit_scratch)$%%),
         group_by_regex("Orbit levels", mod, %regex~(fade_orbit|set_orbit_gain|orbit_gain|advance_orbit_gains)$%%),
         group_by_regex("Reverb quality override", mod, %regex~(set_force_reverb_quality|set_force_reverb_stages)$%%),
         group_by_regex("Scheduler lifecycle", mod, %regex~(tick|shutdown_scheduler|finalize)$%%)

@@ -71,7 +71,7 @@ every derived-truth compare its own poison. A kernel with `@workgroup` state nee
 missing tgmem reads garbage silently.
 The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic
 carrier, model-free, runs in CI) `smol metal tower whisper voxtral parakeet qwen3a canary
-canary-dec gemma4a`; the voxtral arm re-saves a
+canary-dec gemma4a gemma4uv`; the voxtral arm re-saves a
 5.4 GB image from cold every run by design (it IS the >2 GiB-plane IO coverage); the `metal`
 arm mints/maps the blob-only metal flavor (SmolLM2) incl. the CPU-tripwire and a
 teacher-forced logits-tolerance parity cell (greedy token equality is NOT a valid bar on a
@@ -87,7 +87,7 @@ GPU-less boxes), and the flavor image round-trips the plan verbatim.
 The `coverage` suite (test_kernel_coverage, arm `coverage`; arm `coverage-vk` = the vulkan
 SERVING census — needs a vulkan device + `DASLLAMA_GPU=1` + `DASLLAMA_MODELS_DIR`, MoE rows
 under `DASLLAMA_PARITY_FULL=1`) is the KERNEL COVERAGE census
-(CODEREVIEW: "A new GPU kernel ships with a small model in the kernel coverage suite"): the small-model zoo swept across format/graph/batch/KV axes, then a
+(REVIEW: "A new GPU kernel ships with a small model in the kernel coverage suite"): the small-model zoo swept across format/graph/batch/KV axes, then a
 report of per-kernel dispatch counts with LOUD WARNINGS for compiled-but-never-dispatched
 kernels — never an auto-dead verdict. A zero means "nothing THIS zoo runs dispatched it",
 never "unreachable": the deletion gate is a reachability AUDIT of the kernel's dispatch
@@ -102,8 +102,9 @@ the device-free rail unit; the serving vulkan census runs on the PC box.
 ## Model-free / no-arm tests
 
 Suite-less files run under plain dastest (still `-jit`) — no arm, no family tag, no runner.
-New suite-less files register on this note (CODEREVIEW: "A new file under `tests/` registers
-in `tests/CLAUDE.md`"); suite members register in their suite's arm list via `run.das` instead.
+New suite-less files register on this note (REVIEW: "A suite-less file's `CLAUDE.md` entry is
+accurate in the same change"); suite members register in their suite's arm list via `run.das`
+instead.
 Current note: `test_think_split.das` — the reply-side reasoning matcher, model-free: every
 thinking family's wire shape, whole-string and per-chunk down to 1 byte.
 `test_tool_formats.das` — the per-ToolMode wire codecs (dasllama_tools), model-free: defs
@@ -121,8 +122,29 @@ wins, end of file closes an unterminated final line, doubled marker yields one l
 synthetic log files from a per-process temp dir. Requires `run` by bare same-dir name.
 `test_tok_seed.das` — model-free: `lcpp_bench.das`'s `tok_read_seed` corpus-header walk, required
 by relative path (`../benchmarks/lcpp_bench.das`), so it pays the bench's full engine compile.
+`test_sizing_helpers.das` — model-free: the sizing helpers (`reserve_resize` exact capacity,
+`grow_resize` geometric reuse, `overwrite_resize` grow-only no-init) fed directly, including
+grows past the `max_unreserved_size` guard that must not panic.
+`test_vision.das` — model-free: the vision preprocessing rail (geometry, letterbox, normalize)
+bit-exact against pinned mtmd oracle hashes (dumps + mint.sh in the models dir's
+`gemma4-vision-oracle/`), plus the stbimage decode/dump round-trips in a per-process temp dir.
+`test_gemma4uv.das` — the gemma4uv embedder tier-1 parity vs the `-p encode` oracle dumps
+(f32-mmproj-minted — the bf16 oracle carries ggml's bf16-dot activation noise); gates per-token
+mean/v0..v3 at 2e-4 with the measured maxdiff logged; skips honestly without the mmproj or dumps.
+`test_attn_span.das` — the non-causal image span (`eval_embd_ non_causal`): mask direction by
+perturbation (causal row 0 blind to the last row, span row 0 sees it), classic/blocked/flash
+agreement, and the flag-reset bit-exactness; stories15M fixture (test_flash's), skips without it.
+`test_cpu_prefill_tripwire.das` — the CPU-prefill guard vs the span: the non-causal span is
+EXEMPT (CPU is its only correct arm) while an undeclared causal prefill still panics; same
+stories15M fixture, deliberately never calls `allow_cpu_prefill()` (which is why it cannot
+live in test_attn_span — that file arms it in `[init]`). Metal-capable builds only; no suite arm.
+`test_vision_chat.das` — the image chat turn end to end (12B + mmproj + the cats fixture, so
+`DASLLAMA_PARITY_FULL=1`): the prompt stream shape around the splice (marker ids, media-first,
+span length from the geometry) and the greedy caption, logged in full. NOT token-parity with
+llama-mtmd-cli — the oracle renders its jinja template in thinking mode while dasLLAMA's gemma-4
+arm defaults to instruct, and freeform token-parity cells are banned (see below).
 
-## Model loads — never the image rail (CODEREVIEW: "A test suite loads models with load_model_")
+## Model loads — never the image rail (REVIEW: "A suite loads decoders with `load_model_`, never the image rail")
 
 Suites load models with `load_model_` (the direct gguf load) — never `load_model` /
 `load_model_cached` (the `.dlim` image rail). The rail stamps every mint with the box
@@ -176,7 +198,7 @@ Always capture COMPLETE logs (the runner does this); grep afterwards, never at c
 a capture-time filter once hid the exact proof line a verification run existed to produce.
 When a fixture claims a size/depth property ("2030 tokens", "crosses 2048"), assert the
 actual number in the test; a resize cap is not evidence.
-THE EYEBALL RAIL (CODEREVIEW: "Every test that compares logits also logs decoded text"): every token-for-token generate cell logs both decoded
+THE EYEBALL RAIL (REVIEW: "Every test that compares logits also logs decoded text"): every token-for-token generate cell logs both decoded
 streams (`log_gen_texts` in `_model_tier.das`), and every logits-tolerance cell logs a decoded
 text form (forced stream + the GPU's greedy would-be picks, or both next-token pieces) — read
 the text before trusting a red or a suspicious green; a near-tie synonym flip and real garbage
@@ -205,3 +227,17 @@ exist for it. Counting cells stay token-exact.
 and `test_exchange_schema.das` (the exchange validator: sweeps the ENTIRE in-tree
 records/sidecar corpus, so a writer-schema change reds here first) run directly under dastest
 with `-jit` — no runner, no arms, no models.
+
+## Out-of-folder test files (the checklist's placement ledger)
+
+Every `[test]` file requiring a `dasllama/*` module outside this folder, each with its reason:
+- `utils/dasllama-server/test_openai_server*.das` — require the server by bare same-dir name
+  (the hyphenated directory is unreachable by path require).
+- `utils/dasllama-server/test_exchange_client.das` — requires its subject by relative path,
+  but coordinates its fixed test port with the serving-leg suites' ports in that directory
+  (see its `TEST_PORT` note).
+- `modules/dasLLAMA/benchmarks/matmul/test_matmul_par.das` — the bench self-check, requiring
+  `matmul_variants` by bare same-dir name.
+
+The ladder tests (`utils/dasllama-ladder/test_*.das`) require no engine module and answer to
+that folder's own `REVIEW.md` — not dasLLAMA tests, not ledger entries.

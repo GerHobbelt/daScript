@@ -261,7 +261,7 @@ Three behavioral layers + enforcement gates:
 
 ## Cross-backend parity — the kernel-model asymmetry ledger
 
-The mirror rule (CODEREVIEW.md, both emitters) records deliberate or pending kernel-model
+The mirror rule (REVIEW.md, both emitters) records deliberate or pending kernel-model
 asymmetries HERE — one ledger for both backends (dasSpirv's MASTERPLAN points at this
 section). The primary correctness oracle remains the CPU-reference run of the same das body,
 cheaper and stricter than a second GPU; cross-GPU parity of one source is a nice-to-have now
@@ -921,7 +921,7 @@ gates green. Attribution rail: g_skip modes keep logits OFF so knockout deltas s
 "alloc 5ms" was forward_prefill_alloc's batched-scratch GROWTH cost on the first prefill at a
 new npos (~70 MB across 10 arrays at 512 rows): das `resize` zero-fills the grown span AND the
 realloc copies the old block. Both are pure waste here — the scratch is stage output, fully
-written before any read. Fix = `scratch_resize` (dasllama_common): grow-only, contents-
+written before any read. Fix = `overwrite_resize` (dasllama_common): grow-only, contents-
 DISCARDING (`delete` on grow skips the realloc's old-block copy), `resize_no_init` (skips the
 zero-fill). Measured (3B pp512, per-bucket profile): alloc 4969us -> 55us; embed +0.2ms
 (absorbs the first-touch page faults); framing TOTAL 5728 -> 1075us. A new `alloc` prof bucket

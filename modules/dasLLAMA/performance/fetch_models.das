@@ -75,7 +75,7 @@ def models_provenance() : array<ProvEntry> {   // nolint:STYLE038 — flat prove
         ProvEntry(name = "Llama-3.2-1B-Instruct-Q8_0.gguf", root = "llm",
             url = "{HF}/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf",
             bytes = 1321083008l, sha256 = "432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3"),
-        // the tool-format live-leg carriers (CODEREVIEW recognition-test rule): each family's
+        // the tool-format live-leg carriers (REVIEW recognition-test rule): each family's
         // smallest catalogued GGUF, exercised by utils/dasllama-server/test_openai_server_think.das
         ProvEntry(name = "Llama-3.2-3B-Instruct-Q4_K_M.gguf", root = "llm",
             url = "{HF}/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
@@ -89,6 +89,13 @@ def models_provenance() : array<ProvEntry> {   // nolint:STYLE038 — flat prove
         ProvEntry(name = "gemma-4-12B-it-Q4_K_M.gguf", root = "llm",
             url = "{HF}/lmstudio-community/gemma-4-12B-it-GGUF/resolve/main/gemma-4-12B-it-Q4_K_M.gguf",
             bytes = 7381382944l, sha256 = "95d83ba36642b1f385fb906b5962a71763361be3bac930a709945f72d97473f8"),
+        ProvEntry(name = "mmproj-gemma-4-12B-it-BF16.gguf", root = "llm",
+            url = "{HF}/ggml-org/gemma-4-12B-it-GGUF/resolve/main/mmproj-gemma-4-12B-it-BF16.gguf",
+            bytes = 175115616l, sha256 = "9b1edfa05b634728ca4bfd60b4e6b278e95166c078fa54ae4fa83e680112fd1d"),
+        ProvEntry(name = "coco-val2017-000000039769.jpg", root = "llm",
+            // path-style S3 spelling: the images.cocodataset.org website endpoint is http-only
+            url = "https://s3.amazonaws.com/images.cocodataset.org/val2017/000000039769.jpg",
+            bytes = 173131l, sha256 = "dea9e7ef97386345f7cff32f9055da4982da5471c48d575146c796ab4563b04e"),
         ProvEntry(name = "gemma-4-E4B-it-Q8_0.gguf", root = "llm",
             url = "{HF}/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf",
             bytes = 8031242688l, sha256 = "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a"),

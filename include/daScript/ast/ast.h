@@ -1004,6 +1004,7 @@ namespace das
                 bool    localFunction : 1;           // @@{} local function body - generated, but the block is verbatim user code
                 bool    tempStringResult : 1;        // [temp_string_result] - result is always a fresh string allocation (or null), never a passthrough of an input, never retained by the callee
                 bool    mayQueueTempString : 1;      // executing the BODY may hit a temp-string queue site (builder or wrappable call, transitively) - a caller must not hold a parked temp across a call to this
+                bool    needCallerStackFrame : 1;    // may reach a collect point - its caller must keep a real stack frame, so carriers are denied fastcall (closure: ast_unused.cpp)
             };
             uint32_t moreFlags2 = 0;
         };
@@ -1517,16 +1518,26 @@ namespace das
         VarInfo * makeVariableDebugInfo ( const Variable & var );
         VarInfo * makeVariableDebugInfo ( const Structure & st, const Structure::FieldDeclaration & var );
         StructInfo * makeStructureDebugInfo ( const Structure & st );
-        FuncInfo * makeFunctionDebugInfo ( const Function & fn );
+        // unique=true builds a fresh, uncached info - block frames under gc/debugger carry
+        // per-instance locals and intervals, so same-typed blocks must not share one
+        FuncInfo * makeFunctionDebugInfo ( const Function & fn, bool unique = false );
         EnumInfo * makeEnumDebugInfo ( const Enumeration & en );
-        FuncInfo * makeInvokeableTypeDebugInfo ( const TypeDeclPtr & blk, const LineInfo & at );
+        FuncInfo * makeInvokeableTypeDebugInfo ( const TypeDeclPtr & blk, const LineInfo & at, bool unique = false );
         AnnotationArgumentInfo * makeAnnotationArguments ( const AnnotationArgumentList & list, uint32_t & count );
         AnnotationInfo * makeAnnotationList ( const AnnotationList & list, uint32_t & count );
         void appendLocalVariables ( FuncInfo * info, ExpressionPtr body );
         void appendGlobalVariables ( FuncInfo * info, const FunctionPtr & body );
+        void stampFramePositions ( ExpressionPtr body, uint32_t spaceId );
+        // no-op for unrecorded expressions or outside a stamped function's simulate.
+        // the AST's `at` is never written - it outlives simulate (macro modules, lint, LSP)
+        void stampSimNode ( const Expression * expr, LineInfo & nodeAt );
         void logMemInfo ( TextWriter & tw );
     public:
         shared_ptr<DebugInfoAllocator>  debugInfo;
+        das_hash_map<Variable *, FramePosInterval> varFramePos;    // filled by stampFramePositions, read by appendLocalVariables
+        das_hash_map<const Expression *, uint32_t> exprFramePos;   // filled by stampFramePositions, read by stampSimNode
+        bool framePosStamping = false;  // on from stampFramePositions until the last function's sim nodes are built
+        uint32_t currentSpaceId = 0;    // owner of the function being simulated; block frames inherit it
     public:
         das_hash_map<string,StructInfo *>        smn2s;
         das_hash_map<string,TypeInfo *>          tmn2t;
@@ -1603,6 +1614,7 @@ namespace das
         uint64_t    max_static_variables_size = 0x100000000;   // 4GB
         /*option*/ uint64_t    max_heap_allocated = 0;
         /*option*/ uint64_t    max_string_heap_allocated = 0;
+        /*option*/ uint64_t    max_unreserved_size = 64ull<<20;    // a growing array resize past this byte size without a prior reserve panics
         /*option*/ bool        track_allocations = false;          // track where heap allocations came from (line info + comment)
     // rtti
         /*option*/ bool rtti = false;                              // create extended RTTI

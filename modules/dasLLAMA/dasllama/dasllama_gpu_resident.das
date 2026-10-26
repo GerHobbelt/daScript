@@ -186,8 +186,8 @@ def private vk_bake_slice(t : Model; fmt : int; woff, n, rows : int64;
     // int-indexed destinations: a >2GB plane would resize truncated and then memcpy past it
     assert(e.wq_bytes <= 2_147_483_647l && e.ws_bytes <= 2_147_483_647l,
         "vulkan image: a baked plane exceeds the int-indexed array cap")
-    wq |> resize(e.wq_bytes)
-    ws |> resize(e.ws_bytes)
+    wq |> grow_resize(e.wq_bytes)
+    ws |> grow_resize(e.ws_bytes)
     unsafe {
         // int64 blob indexing — wq_off crosses INT32_MAX on multi-GB bakes
         if (e.wq_bytes > 0l) {
@@ -722,9 +722,10 @@ def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int6
 // the "vulkan" whole-prefill override — host KV hydrates back on demand, so the CPU rails always take over from a valid authority
 [hot_path]   // per prefill call
 def private vulkan_resident_prefill(t : Model; var s : Session; npos, start_pos : int64) : bool {
-    // armed + embedder-allowed + a flat cache in the ARMED mirror codec (mismatch falls to the CPU rails)
+    // armed + embedder-allowed + flat cache in the ARMED mirror codec + causal (this path encodes the causal mask)
     if (!g_rdec_active || !g_resident_prefill_allowed
-            || s.kv_dtype_k != g_rdec_kvdt || s.kv_dtype_v != g_rdec_kvdt || s.kv_pool != null) {
+            || s.kv_dtype_k != g_rdec_kvdt || s.kv_dtype_v != g_rdec_kvdt || s.kv_pool != null
+            || s.attn_uniform_end != 0l) {
         return false
     }
     if (start_pos != 0l) {

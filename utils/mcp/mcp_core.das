@@ -376,9 +376,7 @@ def emit_progress_from_file() {
 // Run an external command, streaming progress when the current call set one up.
 // A worker runs the blocking capture; the main thread polls the progress file
 // every PROGRESS_POLL_MS, emitting a tick each interval, then takes the worker's
-// result. Popping that single result is the whole teardown — the worker's
-// notify_and_release already balanced its channel ref, so an extra release here
-// would under-count and abort the run.
+// result and joins it before the channel scope closes.
 def run_with_progress(argv : array<string>; timeout_sec : float; var output : string&) : int {
     if (empty(current_progress_file) || empty(current_progress_token)) {
         return run_and_capture(argv, output, timeout_sec)
@@ -408,13 +406,17 @@ def run_with_progress(argv : array<string>; timeout_sec : float; var output : st
                 emit_progress_from_file()
             }
         }
+        // The worker releases its channel reference after the push, so the pop
+        // that takes the result can return while that reference is still out —
+        // and a scope closing on a channel in use panics the process mid-call.
+        ch |> join()
     }
     output = captured
     remove(current_progress_file, err)
     return code
 }
 
-def handle_tools_call(server : McpServer; reg : array<ToolDef>; id_json : string; params : JsonValue?) : string {
+def handle_tools_call(server : McpServer; reg : array<ToolDef>; id_json : string; params : JsonValue?) : string {   // nolint:STYLE037 - flat tool-call validation and argument extraction, no seam to split
     let tool_name_val = params?.name
     let args = params?.arguments
     if (tool_name_val == null || !(tool_name_val.value is _string)) return jsonrpc::error(id_json, -32602, "missing or non-string tool name")
@@ -454,10 +456,7 @@ def handle_tools_call(server : McpServer; reg : array<ToolDef>; id_json : string
     let ns = length(server.str_extra_args)
     let extra1 = ns > 0 ? get_string_arg(args, server.str_extra_args[0]) : ""
     let extra2 = ns > 1 ? get_string_arg(args, server.str_extra_args[1]) : ""
-    var extra_list : array<string>
-    if (!empty(server.arr_extra_arg)) {
-        extra_list <- get_string_array_arg(args, server.arr_extra_arg)
-    }
+    var extra_list <- get_string_array_arg(args, server.arr_extra_arg)
     // Universal progress: armed only when the tool opts in, the server names a
     // progress dir, and the client supplied a scalar _meta.progressToken. The
     // handler reads these back through mcp_progress_path / run_with_progress.
@@ -545,6 +544,12 @@ def dispatch_jsonrpc(server : McpServer; reg : array<ToolDef>; body : string) : 
 // owns logger_init + ast-grep detection + registry assembly, then calls this.
 
 def serve_stdio(server : McpServer; reg : array<ToolDef>) {
+    // From here stdout carries frames and nothing else: a leak dump or a fatal
+    // landing between them is read as a frame, and the client drops the
+    // connection mid-call rather than showing the text.  It goes to the log's
+    // own directory rather than to stderr because a client keeps no record of
+    // that stream, which leaves a death rattle nowhere.
+    logger_capture_diagnostics()
     let sin = fstdin()
     let sout = fstdout()
     while (!feof(sin)) {

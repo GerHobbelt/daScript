@@ -454,7 +454,6 @@ namespace das
         __forceinline void restart( ) {
             DAS_ASSERTF(insideContext==0,"can't reset locked context");
             stopFlags = 0;
-            fastCallDepth = 0;
             exception = nullptr;
             last_exception = nullptr;
         }
@@ -604,16 +603,11 @@ namespace das
 
         DAS_EVAL_ABI __forceinline vec4f callOrFastcall(const SimFunction * fn, vec4f * args, LineInfo * line) {
             if ( fn->fastcall ) {
-                if ( fastCallDepth * sizeof(Prologue) > stack.free_size() ) { // this is to catch stack overflow
-                    throw_error_at(line, "stack overflow, fast call depth limit exceeded while calling %s", fn->mangledName);
-                }
-                fastCallDepth ++;
                 auto aa = abiArg;
                 abiArg = args;
                 result = fn->code->eval(*this);
                 stopFlags = 0;
                 abiArg = aa;
-                fastCallDepth --;
                 return result;
             } else {
                 // PUSH
@@ -826,7 +820,6 @@ namespace das
         char *                          globals = nullptr;
         char *                          shared = nullptr;
         StackAllocator                  stack;
-        uint32_t                        fastCallDepth = 0;
         uint32_t                        insideContext = 0;
         bool                            persistent = false;
         bool                            ownStack = false;
@@ -840,7 +833,8 @@ namespace das
         bool                            gcEnabled = false;
         bool                            gcLogTime = false;          // log per-phase heap GC timing
         bool                            failed = false;
-        bool                            verySafeContext = false;    // when true, array and table reserves don't free memory
+        bool                            verySafeContext = false;    // when true, array and table reserves don't free memory (unless the container's scratch flag or a scratch_* one-shot opts out)
+        uint64_t                        maxUnreservedSize = 64ull<<20;  // mirrors CodeOfPolicies::max_unreserved_size (assigned in setup/simulate; this initializer covers raw contexts)
         bool                            sharedPtrContext = false;   // there is a shared ptr to this context
         bool                            skipInitShutdownScript = false; // this (cloned) context skipped global init, so skip shutdown too
         // atomic (relaxed): a job's post-notify cleanup reads these on a worker while the main

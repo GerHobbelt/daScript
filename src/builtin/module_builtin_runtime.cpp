@@ -1056,6 +1056,14 @@ namespace das
         return context->heap->totalAlignedMemoryAllocated();
     }
 
+    uint64_t max_unreserved_size ( Context * context ) {
+        return context->maxUnreservedSize;
+    }
+
+    void set_max_unreserved_size ( uint64_t bytes, Context * context ) {
+        context->maxUnreservedSize = bytes;
+    }
+
     int32_t heap_depth ( Context * context ) {
         return (int32_t) context->heap->depth();
     }
@@ -1131,6 +1139,12 @@ namespace das
         }
     }
 
+    int32_t builtin_frame_position ( Context *, LineInfoArg * info ) {
+        // the call site's frame position (see LINEINFO_FRAME_POS_TAG); 0 when the program
+        // carries no positions (no gc/debugger)
+        return ( info && (info->last_line & LINEINFO_FRAME_POS_TAG) ) ? int32_t(info->last_column) : 0;
+    }
+
     void heap_collect ( bool sheap, bool validate, Context * context, LineInfoArg * info ) {
         if ( !context->persistent ) {
             context->throw_error_at(info, "heap collection is not allowed in this context, needs 'options persistent'");
@@ -1172,6 +1186,14 @@ namespace das
 
     void builtin_table_clear_lock ( const Table & arr, Context * ) {
         const_cast<Table&>(arr).hopeless = 0;
+    }
+
+    void builtin_table_set_scratch ( Table & tab, bool value, Context * ) {
+        tab.scratch = value;
+    }
+
+    bool builtin_table_is_scratch ( const Table & tab ) {
+        return tab.scratch;
     }
 
     void builtin_table_tag ( Table & tab, const char * name, Context * context ) {
@@ -1422,6 +1444,10 @@ namespace das
             } else {
                 memset ( &dim, 0, sizeof(Array) );
             }
+        } else {
+            // no backing store to free, but delete still resets the scratch mark - the one
+            // flag settable on a dataless container; lock state must survive untouched
+            dim.scratch = false;
         }
     }
 
@@ -1439,6 +1465,8 @@ namespace das
             } else {
                 memset ( &tab, 0, sizeof(Table) );
             }
+        } else {
+            tab.scratch = false;
         }
     }
 
@@ -1816,6 +1844,20 @@ namespace das
 
     void toLog ( int level, const char * text, Context * context, LineInfoArg * at ) {
         context->to_out(at, level, text);
+    }
+
+    void diagnosticsToStderr() {
+        // For a program whose stdout is a protocol rather than its own output:
+        // a leak dump or a fatal landing there is read as a frame, and the
+        // reader is gone before anyone sees the text.
+        textPrinterToStderr();
+    }
+
+    bool diagnosticsToFile ( const char * path ) {
+        // The same, for a program whose stderr nobody keeps: a launcher that
+        // records neither stream leaves the death rattle nowhere at all, so it
+        // goes to a file the program names and its owner reads.
+        return path ? textPrinterToFile(path) : false;
     }
 
     void toCompilerLog ( const char * text, Context * context, LineInfoArg * at ) {
@@ -2427,6 +2469,12 @@ namespace das
         addExtern<DAS_BIND_FUN(heap_total_allocated)>(*this, lib, "heap_total_allocated",
             SideEffects::modifyExternal, "heap_total_allocated")
                 ->arg("context");
+        addExtern<DAS_BIND_FUN(max_unreserved_size)>(*this, lib, "max_unreserved_size",
+            SideEffects::modifyExternal, "max_unreserved_size")
+                ->arg("context");
+        addExtern<DAS_BIND_FUN(set_max_unreserved_size)>(*this, lib, "set_max_unreserved_size",
+            SideEffects::modifyExternal, "set_max_unreserved_size")
+                ->args({"bytes","context"});
         addExtern<DAS_BIND_FUN(heap_depth)>(*this, lib, "heap_depth",
             SideEffects::modifyExternal, "heap_depth")
                 ->arg("context");
@@ -2443,8 +2491,13 @@ namespace das
                 SideEffects::modifyExternal, "heap_collect")
                     ->args({"string_heap","validate","context","at"});
         hcol->unsafeOperation = true;
+        // the collector walks caller frames and a fastcall caller has none - this is the seed
+        hcol->needCallerStackFrame = true;
         hcol->arguments[0]->init = new ExprConstBool(true);
         hcol->arguments[1]->init = new ExprConstBool(false);
+        addExtern<DAS_BIND_FUN(builtin_frame_position)>(*this, lib, "frame_position",
+            SideEffects::accessExternal, "builtin_frame_position")
+                ->args({"context","at"});
         addExtern<DAS_BIND_FUN(string_heap_report)>(*this, lib, "string_heap_report",
             SideEffects::modifyExternal, "string_heap_report")
                 ->args({"context","line"});
@@ -2525,6 +2578,13 @@ namespace das
         addExtern<DAS_BIND_FUN(builtin_table_tag)>(*this, lib, "tag_table",
             SideEffects::modifyExternal, "builtin_table_tag")
                 ->args({"table","name","context"});
+        // scratch: same contract as the array flag; the bit lives in the shared Array flags word
+        addExtern<DAS_BIND_FUN(builtin_table_set_scratch)>(*this, lib, "set_scratch",
+            SideEffects::modifyArgument, "builtin_table_set_scratch")
+                ->args({"table","value","context"})->unsafeOperation = true;
+        addExtern<DAS_BIND_FUN(builtin_table_is_scratch)>(*this, lib, "is_scratch",
+            SideEffects::none, "builtin_table_is_scratch")
+                ->arg("table");
         addExtern<DAS_BIND_FUN(builtin_table_keys)>(*this, lib, "__builtin_table_keys",
             SideEffects::modifyArgumentAndExternal, "builtin_table_keys")
                 ->args({"iterator","table","stride","context","at"});
@@ -2788,6 +2848,10 @@ namespace das
         // logger
         addExtern<DAS_BIND_FUN(toLog)>(*this, lib, "to_log",
             SideEffects::modifyExternal, "toLog")->args({"level", "text", "context", "at"});
+        addExtern<DAS_BIND_FUN(diagnosticsToStderr)>(*this, lib, "diagnostics_to_stderr",
+            SideEffects::modifyExternal, "diagnosticsToStderr");
+        addExtern<DAS_BIND_FUN(diagnosticsToFile)>(*this, lib, "diagnostics_to_file",
+            SideEffects::modifyExternal, "diagnosticsToFile")->args({"path"});
         addExtern<DAS_BIND_FUN(toCompilerLog)>(*this, lib, "to_compiler_log",
             SideEffects::modifyExternal, "toCompilerLog")->args({"text","context","at"});
         // log levels

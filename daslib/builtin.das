@@ -198,6 +198,74 @@ def reserve(var Arr : array<auto(numT)>; newSize : int64) {
     __builtin_array_reserve_i64(Arr, newSize, typeinfo sizeof(Arr[0]))
 }
 
+//! Grows capacity to at least `newSize`, at least doubling on each growth once non-empty,
+//! so an append-by-resize loop stays amortized O(1). This is the deliberate-unbounded-append
+//! spelling: a following `resize` never grows, so it cannot trip `max_unreserved_size`.
+def ensure_capacity(var Arr : array<auto(numT)>; newSize : int) {
+    ensure_capacity(Arr, int64(newSize))
+}
+
+//! Int64 form of `ensure_capacity`.
+def ensure_capacity(var Arr : array<auto(numT)>; newSize : int64) {
+    if (newSize > long_capacity(Arr)) {
+        var want = long_capacity(Arr) * 2l
+        if (newSize > want) {
+            want = newSize
+        }
+        Arr |> reserve(want)
+    }
+}
+
+//! `reserve` through the eager path: the old buffer is freed immediately even under
+//! `options very_safe_context` — the caller promises no interior alias survives the grow.
+//! Capacity is exact (reserve never rounds); a one-shot, no state left on the container.
+[unsafe_operation]
+def scratch_reserve(var Arr : array<auto(numT)>; newSize : int) {
+    unsafe(__builtin_array_scratch_reserve(Arr, newSize, typeinfo sizeof(Arr[0])))
+}
+
+//! Int64 form of `scratch_reserve`.
+[unsafe_operation]
+def scratch_reserve(var Arr : array<auto(numT)>; newSize : int64) {
+    unsafe(__builtin_array_scratch_reserve_i64(Arr, newSize, typeinfo sizeof(Arr[0])))
+}
+
+//! `ensure_capacity` through the eager path — same doubling policy, but old buffers are
+//! freed immediately even under `options very_safe_context`.
+[unsafe_operation]
+def scratch_ensure_capacity(var Arr : array<auto(numT)>; newSize : int) {
+    unsafe(scratch_ensure_capacity(Arr, int64(newSize)))
+}
+
+//! Int64 form of `scratch_ensure_capacity`.
+[unsafe_operation]
+def scratch_ensure_capacity(var Arr : array<auto(numT)>; newSize : int64) {
+    if (newSize > long_capacity(Arr)) {
+        var want = long_capacity(Arr) * 2l
+        if (newSize > want) {
+            want = newSize
+        }
+        unsafe(Arr |> scratch_reserve(want))
+    }
+}
+
+//! `resize` through the eager path: reserves the exact final size first (never pow2-rounds),
+//! so a grow frees the old buffer immediately even under `options very_safe_context`;
+//! a shrink never reallocates.
+[unsafe_operation]
+def scratch_resize(var Arr : array<auto(numT)>; newSize : int) {
+    unsafe(Arr |> scratch_resize(int64(newSize)))
+}
+
+//! Int64 form of `scratch_resize`.
+[unsafe_operation]
+def scratch_resize(var Arr : array<auto(numT)>; newSize : int64) {
+    if (newSize > long_capacity(Arr)) {
+        unsafe(Arr |> scratch_reserve(newSize))
+    }
+    Arr |> resize(newSize)
+}
+
 def pop(var Arr : array<auto(numT)>) {
     unsafe(resize(Arr, length(Arr) - 1))// resize will throw if negative
 }
@@ -1062,7 +1130,7 @@ def insert_default(var tab : table<auto(keyT), auto(valT)>, key : keyT | #, valu
 def insert_default(var tab : table<auto(keyT), auto(valT)>, key : keyT | #) : void {
     //! Inserts a default value into the table if the key does not exist. Does not overwrite existing keys.
     if (!key_exists(tab, key)) {
-        var val : valT -const
+        let val : valT -const // nolint:LINT003,LINT019 - a `var` spelling would steer some instantiations to insert's mutable overload; keep the let + contract
         insert(tab, key, val)
     }
 }
@@ -1196,6 +1264,7 @@ def clone_dim(var a; b : auto | #) {
 
 def clone(var a : array<auto(TT)>; b : array<TT> ==const | #) {
     let ln = length(b)
+    reserve(a, ln)   // clone knows the final size: exact reserve, and the resize never grows
     unsafe(resize(a, ln))// note: is this safe? do we actaully need to init first???
     return if (ln == 0)
     static_if (typeinfo is_pod(type<TT>)) {
@@ -1211,6 +1280,7 @@ def clone(var a : array<auto(TT)>; b : array<TT> ==const | #) {
 
 def clone(var a : array<auto(TT)>; var b : array<TT> ==const | #) {
     let ln = length(b)
+    reserve(a, ln)   // clone knows the final size: exact reserve, and the resize never grows
     unsafe(resize(a, ln))// note: is this safe? do we actaully need to init first???
     return if (ln == 0)
     static_if (typeinfo is_pod(type<TT>)) {

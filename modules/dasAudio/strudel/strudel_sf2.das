@@ -553,6 +553,7 @@ def private decode_ogg_block(data : array<uint8>; byte_offset, byte_len : int; v
     if (total > 0) {
         // decode straight into out_pcm's tail — no temp buffer
         let base = length(out_pcm)
+        out_pcm |> ensure_capacity(base + total)
         out_pcm |> resize(base + total)
         ma_decoder_read_pcm_frames(decoder, unsafe(addr(out_pcm[base])), uint64(total))
     }
@@ -564,6 +565,9 @@ def private decode_ogg_block(data : array<uint8>; byte_offset, byte_len : int; v
 def private sf3_decode_samples(data : array<uint8>; smpl_offset, smpl_size : int; var sf2 : SF2File) : bool {
     if (smpl_offset < 0 || smpl_size <= 0) return false
     var pcm : array<int16>
+    // the whole decoded soundfont accumulates here (tens of MB) - eager grow under
+    // very_safe_context; the bit is cleared before the move-out below
+    unsafe(pcm |> set_scratch(true))
     for (s in sf2.samples) {
         let base = length(pcm)
         var frames = 0
@@ -590,6 +594,7 @@ def private sf3_decode_samples(data : array<uint8>; smpl_offset, smpl_size : int
         s.loop_start = uint(base + clamp(loop_lo, 0, frames))
         s.loop_end = uint(base + clamp(loop_hi, 0, frames))
     }
+    unsafe(pcm |> set_scratch(false))   // sample_data is aliased by playing voices - hand off an ordinary array
     sf2.sample_data <- pcm
     return !empty(sf2.sample_data)
 }
@@ -603,6 +608,7 @@ def public sf2_load(path : string) : SF2File? {
         if (f != null) {
             let st = fstat(f)
             if (st.is_valid) {
+                data |> reserve(int64(st.size))     // soundfonts run past max_unreserved_size
                 data |> resize(int64(st.size))
                 fread(f, data)
             }
@@ -683,10 +689,15 @@ def public sf2_parse(data : array<uint8>) : SF2File? {  // nolint:STYLE037,STYLE
                         smpl_offset = cursor
                         smpl_size = sub_size
                         let num_samples = sub_size / 2
-                        result.sample_data |> resize(num_samples)
-                        // bulk copy — data is little-endian int16, same as native on x86/x64
-                        unsafe {
-                            memcpy(addr(result.sample_data[0]), addr(data[cursor]), sub_size)
+                        // a truncated file's sub_size can run past the data; skip the copy rather than
+                        // read out of bounds (length - cursor form: cursor + sub_size could wrap int)
+                        if (num_samples > 0 && sub_size <= length(data) - cursor) {
+                            result.sample_data |> reserve(num_samples)     // whole-soundfont PCM outgrows max_unreserved_size
+                            result.sample_data |> resize(num_samples)
+                            // bulk copy — data is little-endian int16, same as native on x86/x64
+                            unsafe {
+                                memcpy(addr(result.sample_data[0]), addr(data[cursor]), sub_size)
+                            }
                         }
                         cursor += sub_size
                     } else {

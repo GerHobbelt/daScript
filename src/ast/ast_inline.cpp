@@ -526,6 +526,29 @@ namespace das {
             }
         };
 
+        // attribution only: stack traces and at-keyed macros read the splice as the call
+        // site; liveness gating uses frame positions (LocalVariableInfo::openPos). runs
+        // BEFORE InlineBodyRewriter so substituted caller expressions keep their own at
+        class SpliceAtStamp : public Visitor {
+        public:
+            SpliceAtStamp ( const LineInfo & at ) : callAt(at) {}
+            LineInfo callAt;
+            bool markGenerated = true;
+        protected:
+            virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
+            virtual void preVisitExpression ( Expression * expr ) override {
+                Visitor::preVisitExpression(expr);
+                expr->at = callAt;
+                // a spliced clone is compiler-inserted: the original body is linted at its
+                // definition, and at-keyed macros must not re-analyze the copy (the stamp
+                // makes it look host-authored, defeating their foreign-file heuristics).
+                // temp INITS are exempt - they are caller-authored argument/prefix
+                // expressions merely relocated, and marking them would hide lint findings
+                // on user code
+                if ( markGenerated ) expr->generated = true;
+            }
+        };
+
         // replace one specific node (by identity) inside a statement
         class ReplaceNode : public Visitor {
         public:
@@ -1123,6 +1146,7 @@ namespace das {
             var->init_via_clone = viaClone;
             auto let = new ExprLet();
             let->at = at;
+            // visibility stays closed until the init ran
             let->atInit = init ? init->at : at;
             let->variables.push_back(var);
             return let;
@@ -2244,7 +2268,12 @@ namespace das {
             auto ret = static_cast<ExprReturn *>(in.body->list.back());
             ExpressionPtr callReplacement = nullptr;
             if ( ret->subexpr ) {
-                callReplacement = ret->subexpr->clone()->visit(rewriter);
+                auto cloned = ret->subexpr->clone();
+                if ( subj.fn ) {    // callee-origin lines; a literal's body is already caller code
+                    SpliceAtStamp stamp(callLike->at);
+                    cloned = cloned->visit(stamp);
+                }
+                callReplacement = cloned->visit(rewriter);
             }
             if ( site.stmt==callLike ) {
                 auto & list = site.anchor.block->list;
@@ -2498,18 +2527,30 @@ namespace das {
                 }
             }
             vector<ExpressionPtr> splice;
+            // stamping is gated on calleeFn throughout - an invoke-block literal is
+            // caller code with honest lines already
+            SpliceAtStamp stamp(callLike->at);
             int preIdx = 0;
             for ( auto pe : prefix ) {
                 string tname = INLINE_TEMP_PREFIX + to_string(inlineId) + "_pre" + to_string(preIdx++);
+                auto peAt = pe->at;                 // the host-side read keeps the real position
+                ExprLet * tl = nullptr;
                 // non-const throughout: a const temp read would stop matching var pointer params downstream
                 if ( pe->type && pe->type->ref ) {
                     // lvalue: bind a reference - identity survives, writes land in the original place
                     pe->alwaysSafe = true;          // generated binding to real storage
-                    splice.push_back(makeTemp(pe->at, tname, pe, pe->type->constant, true, false));
+                    // callLike->at, not pe->at: the temp must be in scope at the splice's park point
+                    tl = makeTemp(callLike->at, tname, pe, pe->type->constant, true, false);
                 } else {
-                    splice.push_back(makeTemp(pe->at, tname, pe, false, false, pe->type && !pe->type->canCopy()));
+                    tl = makeTemp(callLike->at, tname, pe, false, false, pe->type && !pe->type->canCopy());
                 }
-                ReplaceNode rn(pe, new ExprVar(pe->at, tname));
+                if ( calleeFn ) {
+                    stamp.markGenerated = false;    // caller-authored init, only relocated
+                    tl->visit(stamp);
+                    stamp.markGenerated = true;
+                }
+                splice.push_back(tl);
+                ReplaceNode rn(pe, new ExprVar(peAt, tname));
                 auto & slot = site.anchor.block->list[anchorIndex];
                 slot = slot->visit(rn);
                 if ( !rn.done ) {
@@ -2519,14 +2560,22 @@ namespace das {
             }
             InlineBodyRewriter rewriter(plan.paramSub, rename, callLike->at, calleeFn != nullptr);
             ExpressionPtr callReplacement = nullptr;
+            if ( calleeFn ) {
+                stamp.markGenerated = false;    // caller-authored arg inits, only relocated
+                for ( auto & t : temps ) t->visit(stamp);   // arg temps read as the call site too
+                stamp.markGenerated = true;
+            }
             if ( exprBody ) {
                 auto ret = static_cast<ExprReturn *>(in.body->list.back());
                 if ( ret->subexpr ) {
-                    callReplacement = ret->subexpr->clone()->visit(rewriter);
+                    auto cloned = ret->subexpr->clone();
+                    if ( calleeFn ) cloned = cloned->visit(stamp);
+                    callReplacement = cloned->visit(rewriter);
                 }
                 for ( auto & t : temps ) splice.push_back(t);
             } else {
                 auto bodyClone = static_cast<ExprBlock *>(in.body->clone());
+                if ( calleeFn ) bodyClone->visit(stamp);
                 if ( site.kind==SiteKind::InvokeBlock ) {
                     // parameters became substitutions, the result becomes the result temp - a plain scope block remains
                     bodyClone->arguments.clear();
@@ -2540,7 +2589,12 @@ namespace das {
                 }
                 ReturnStoreRewrite rsr(in.result ? INLINE_TEMP_PREFIX + to_string(inlineId) + "_res" : string(),
                     INLINE_TEMP_PREFIX + to_string(inlineId) + "_ret");
-                if ( in.result ) splice.push_back(makeUninitDecl(callLike->at, rsr.resName, in.result));
+                // _res goes FIRST: a no-init decl zero-fills its slot, so the walk reads
+                // zeros until a return-store writes it
+                if ( in.result ) {
+                    auto resLet = makeUninitDecl(callLike->at, rsr.resName, in.result);
+                    splice.insert(splice.begin(), resLet);
+                }
                 rsr.apply(bodyClone);
                 if ( in.result ) {
                     callReplacement = new ExprVar(callLike->at, rsr.resName);
@@ -2824,7 +2878,8 @@ namespace das {
             return false;
         }
         bool mustEnabled = !options.getBoolOption("disable_inline", policies.disable_inline);
-        bool autoEnabled = getOptimize()
+        // the debugger needs true frames and true lines - same reason it disables fastcall
+        bool autoEnabled = getOptimize() && !getDebugger()
             && !options.getBoolOption("disable_auto_inline", policies.disable_auto_inline);
         // under `options no_aliasing` call-result aliasing is an ERROR; splicing calls away
         // would change which programs compile - diagnostics must not depend on a perf knob

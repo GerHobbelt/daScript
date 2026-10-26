@@ -122,7 +122,7 @@
    half remains in the new shape: both stages' rope encoders are lens-generated now, but
    prefill's `MetalRope` instance names `g_pf_pso_rope` compiled from the same
    `metal_rope_msl` source decode compiles into its own PSO. The ownership rule is written
-   (CODEREVIEW.md: the class-owning file compiles/releases; instances may share a pso handle —
+   (REVIEW.md: the class-owning file compiles/releases; instances may share a pso handle —
    the MetalRmsNorm ×3 / tensor-twin precedent), so Done = prefill's rope instance either
    names decode's pso global the shared-handle way or a comment says why stage-local is
    intended.
@@ -213,12 +213,12 @@
     errors on an opaque dispatch unless the function carries an explicit opt-out annotation, which
     turns an invisible class of bug into an enumerated, reviewable list. Note this is ADVISORY — it
     flags "this function hand-binds", not "this function is wrong". Until it exists the rule is
-    structural: nothing dispatches a kernel except its `enc_*` builder (CODEREVIEW: "Nothing dispatches a kernel except its enc_* builder").
+    structural: nothing dispatches a kernel except its `enc_*` builder (REVIEW: "Nothing dispatches a kernel except its enc_* builder").
 
 14. **`dasllama_blocks` / `dasllama_moe` / `dasllama_ple` have no direct tests.** All three
    are pointer-dispatched forward-loop internals moved out of `dasllama_common` during the reorg;
    today their only coverage is the forward/family matrix — exactly the "the model still runs"
-   posture CODEREVIEW's Tests section calls out. Their siblings from the same wave have direct
+   posture REVIEW's Tests section calls out. Their siblings from the same wave have direct
    suites (`test_batch_decode`/`test_batch_grid`, `test_prefill`/`test_flash`, `test_sampling`).
    Done = each of the three gets a feed-the-function suite (a block kernel against a reference
    forward step; `moe_ffn_core` routing against a hand-checked top-k case; the PLE pre-step
@@ -248,22 +248,16 @@
    (verified in emitted IR), the double-count chore resolved by construction, and the census +
    report surface preserved.
 
-17. **Vision stills — when, not if (Boris 2026-08-05).** Image-in/text-out on the existing
-   mmproj carriers (the `v.*` towers the audio work already ships past unread). Explicitly
-   SEQUENCED: after the vulkan side comes together AND dasllama.io serves sidecars + hosts
-   ladders — not before. Scope expectation from the audio comparison: first family ≈ a
-   gemma4a-sized arc (vanilla ViT / MobileNet blocks, no DSP frontend, no realtime bar; the
-   soft-token splice, q8 tower rail, .dlim lane, and mtmd oracle harness all transfer;
-   qwen3vl's M-RoPE + deepstack are pre-registered and merely activate). One-time plumbing:
-   image decode (dasStbImage) + per-family resize/patchify conventions. VIDEO stays out:
-   not reasonable without GPU — "maybe hybrid mode, maybe one day"; its real dependency is
-   the deep-prefill context wall (50k-token splices), not new kernels.
-
+17. **Vision stills — DELIVERED for the first family (the vision arc, 2026-08-14).** gemma-4
+    dense via `gemma4uv` shipped end to end: preprocessing, non-causal span, chat/scheduler/
+    server splice, the `.dlim` rail, `ask --image`, and the `lcpp_bench --image` cell. What
+    remains of this item folded into #23 (uniform-bound GPU prefill kernels) and the v2 ledger
+    in `vision_plan.md` (the E-series `gemma4v` ViT, multi-image, remote fetch, video).
 18. **Tutorials + documentation resync sweep (Boris 2026-08-05).** The ASR/audio tutorials and
    module documentation have desynced from the API as the q8/KV/lever work landed — a full
    pass over `tutorials/` (`.das` and `.rst`) and the dasLLAMA doc pages against the current
    facade surface (`set_asr_kv`, `--kv`, `--fp32-tower`, exec_fmt spellings, the q8 defaults).
-   Going forward the new Documentation section in CODEREVIEW.md makes this a per-change check;
+   Going forward the new Documentation section in REVIEW.md makes this a per-change check;
    this item is the one-time catch-up.
 
 19. **Oracle-suite hardening round 2 (PR #3653's review round, deferred by ruling).** The
@@ -290,3 +284,47 @@
     The offline plan cannot see the cap (followup_vulkan item 19) and `vk_moe_would_accept`
     answers only format/geometry — a would-accept probe that consults device caps would let
     schedulers plan without a live ensure_ round-trip.
+
+21. **`harness/tq4_probe.das` helpers have no tests.** `rotate_row` / `unrotate_row` /
+    `row_dot` were rewritten to zip loops in the lint sweep (PR #3733) with no coverage
+    before or after - feed each a known row, check the bytes. Note the zip form stops at
+    the shorter operand where the old indexed form panicked on mismatched lengths;
+    current callers pass equal lengths, so the test should pin the equal-length results,
+    not the mismatch behavior.
+
+22. **Tune-sidecar rejection under `--gpu metal` — RESOLVED (2026-08-15): the staleness rail
+    working correctly behind an uninformative message.** Forensics: the refused
+    `main.tune.json` was an Aug-10 mint whose mtime predated the Aug-13 rebuilt binary
+    (stale reads as absent), while `ask.tune.json` was minted fresh by that binary — and
+    `--gpu metal` was a pure confound: the demand set is arm-invariant (one compiled
+    program; verified by an identical per-kernel stamp-line diff across cpu/metal server
+    arms). Neither reading (a) nor (b) held. Fixed in llvm_tune: every untuned refusal now
+    names its reason (stale-binary with both dates / foreign-box / version / missing
+    entries / absent / unreadable), `DAS_TUNE_MANIFEST` at an untuned-reading file warns
+    loudly instead of silently stamping fallbacks, and `[tune_scope] version_of=` pins the
+    scope to `DASLLAMA_VERSION` so a copy-restored old sidecar (fresh mtime, old winners —
+    the trap the forensics surfaced) refuses by name. Metal-arm measurement is unblocked;
+    bringup owes the standing fresh quiet-box mint, which also refreshes
+    `performance/last_known_good_sidecar.json` and the `performance/<box>.tune.json` rig
+    sidecars — the checked-in and on-box copies predate the version pin, so until then they
+    serve fallbacks with the named warning.
+
+23. **Uniform-bound non-causal prefill kernels for Metal and Vulkan.** The image span
+    currently serves on the CPU loop by decline: `attn_gpu_prefill_ready`,
+    `prefill_decline` (`MetalPrefillDecline.non_causal_span`) and `vulkan_resident_prefill`
+    all refuse `s.attn_uniform_end != 0`, and metal-blob models refuse a vision arm outright
+    at create (no CPU weights to fall back on). Done = the GPU prefill chains take the
+    uniform bound, the three declines and the blob refusals are deleted, and the kernel
+    coverage suite dispatches the non-causal arm. Scheduled for the Metal arc's tail —
+    pulled forward only if CPU-fallback vision proves a blocker (Boris 2026-08-14).
+
+24. **Stream the over-line audio-carrier mints (the 1 GiB staging rule, 2026-08-14).**
+    `REVIEW.md` caps `cache_via_image_staged` at a 1 GiB source file; six carriers on the
+    fleet stage over it today — mmproj-omni-3b-f32 (5.0 GB), canary-qwen-2.5b-encoder-f32
+    (3.1 GB), mmproj-ultravox-1b-f32 (2.6 GB), voxtral-mini-mmproj-f32 (2.5 GB),
+    qwen2audio-mmproj-f32 (2.4 GB), mmproj-Qwen3-Omni-30B bf16 (2.1 GB) — each paying a
+    staged peak of roughly source + built image. Done = the audio-family mints size the
+    image up front and write planes as produced (the decoder rail's shape), the staged
+    entry points refuse a source over the line, and the mint-form-differs conversions
+    restructure into per-plane producers. The vision carriers stay staged (gemma-4 12B
+    mmproj 0.2 GB, E2B 0.9 GB).

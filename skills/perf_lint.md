@@ -173,7 +173,7 @@ After compilation, `Expression._type` is resolved. Check `expr._type.baseType ==
 | PERF027 | environment lookup on a hot path (`[hot_path]` / `[no_env]`) | High | `get_env_variable` calls `getenv` AND allocates the result in the context heap on every call; resolve at `[init]` or behind a `[cold_path]` loader and cache |
 | PERF028 | console / file I/O on a hot path (`[hot_path]` / `[no_io]`) | Medium | the debug line that never got removed; this is the rule to reach for `DAS_LINT_DISABLE=PERF028` on |
 | PERF029 | `for (i in range(length(X)))` where `i` also subscripts bare sibling array vars in lockstep (`ys[i] = xs[i]`); routed from the PERF018 candidate when ≥1 sibling qualifies, same range/length spellings as PERF018 | Medium | zip them: `for (x, y in xs, ys)` — lockstep by construction, no length-coupling OOB risk |
-| PERF030 | move-assign `<-` onto a live heap-carrying variable (needs-release type) — drops the old contents without release, a leak on a persistent heap. Skips the `return <- r` CMRES lowering, generated vars, and moves already healed by `force_inscope_pod` (`move_flags.podDelete`) | High | live target: `delete` it first (fixes the leak) + `// nolint:PERF030 — released on the line above` (the syntactic check cannot see the delete); fresh target: fold into the declaration or suppress with the proof; or enable `force_inscope_pod` so the compiler collects it |
+| PERF030 | move-assign `<-` onto a live heap-carrying variable (needs-release type) — drops the old contents without release, a leak on a persistent heap. Skips the `return <- r` CMRES lowering, generated vars, and moves already healed by `force_inscope_pod` (`move_flags.podDelete`) | High | live target: `delete` it first — the check credits array/table, struct, and fixed-array deletes (lowered `builtin`finalize``/`_::finalize`/`builtin`finalize_dim`` calls, all matched), single-arg user `finalize(x)` calls, and a field-chain delete rooted at the var (`delete a.xs` — hand-rolled teardown counts); credit is per-function and inline block args count, deferred bodies (lambdas) do not. Fresh target: fold into the declaration (a `cond ? a : b` init covers conditional fills); or enable `force_inscope_pod`. Nolint remains only for releases the walker genuinely can't attribute (release through a helper call) |
 
 ## Hot-path contracts (PERF026-028)
 
@@ -223,7 +223,7 @@ struct Session {
 
 // a helper that sizes a caller's buffer marks the PARAMETER — the call site cannot see
 // which field arrived, because the destination comes in by reference
-def scratch_resize(@scratch var a : array<numT>; need : int64) { ... }
+def overwrite_resize(@scratch var a : array<numT>; need : int64) { ... }
 ```
 
 A sizing call whose destination reaches a `@scratch` declaration is not descended into — a
@@ -240,8 +240,8 @@ tells the linter "this buffer is reused". The same statement is exactly the prec
   up-size becomes a no-op instead of a realloc.
 - **Skip the zero-fill.** `resize` init-fills new elements; a scratch buffer is fully rewritten by
   the step that sizes it, so `@scratch` licenses `resize_no_init` implicitly. dasLLAMA already
-  hand-rolls exactly this in `scratch_resize` (delete-on-shrink, then `resize_no_init`) — the
-  annotation could make that the default rather than a hand-written idiom.
+  hand-rolls exactly this in `overwrite_resize` (delete-on-grow, exact `reserve`, then
+  `resize_no_init`) — the annotation could make that the default rather than a hand-written idiom.
 - **Hoist the sizing.** With the reuse promise, a `resize(n)` whose `n` is loop-invariant can be
   lifted out of the step loop entirely.
 

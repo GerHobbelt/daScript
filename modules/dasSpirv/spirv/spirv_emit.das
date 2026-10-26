@@ -843,19 +843,21 @@ def private const_int_by_name(name : string) : tuple<found : bool; value : int> 
     program_for_each_module(compiling_program()) $(mod) {
         for_each_global(mod) $(gv) {
             if (!got && gv.name == name && gv._type != null && gv._type.flags.constant && gv.init != null) {
-                let ci = gv.init ?as ExprConstInt
+                // under lint the initializer is unfolded, so what it is worth is the compiler's answer
+                let ce = get_const_expr(compiling_program(), gv.init)
+                let ci = ce ?as ExprConstInt
                 if (ci != null) {
                     result = ci.value
                     got = true
                 } else {
-                    let cu = gv.init ?as ExprConstUInt
+                    let cu = ce ?as ExprConstUInt
                     if (cu != null) {
                         result = int(cu.value)
                         got = true
                     } else {
                         // A bool const folds to 0/1 -- lets a named boolean `let` (a config flag
                         // in its das form) resolve where an int constant is expected.
-                        let cb = gv.init ?as ExprConstBool
+                        let cb = ce ?as ExprConstBool
                         if (cb != null) {
                             result = cb.value ? 1 : 0
                             got = true
@@ -1117,10 +1119,17 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         // for those. Floats default to perspective-correct smooth interpolation; honour an explicit
         // @flat annotation when the user wants flat-shaded floats (low-poly stylised look, provoking-
         // vertex picks per primitive). Reflection bit not added — Flat is purely a SPIR-V decoration,
-        // it doesn't change the descriptor or pipeline layout. A @pervertex input is never Flat.
+        // it doesn't change the descriptor or pipeline layout. A @pervertex input is never Flat, and
+        // neither is either END of the pipe: a VERTEX @in is a vertex attribute the buffer feeds
+        // whole, a FRAGMENT @out is written straight to an attachment, and nothing interpolates
+        // either, so an interpolation decoration there is forbidden rather than mandated
+        // (VUID-StandaloneSpirv-Flat-06202 and -06201).
         let bt = v._type.baseType
         let is_int_kind = scalar_class(bt) >= 0 && scalar_class(bt) <= 1
-        let want_flat = (is_int_kind || (v.annotation |> find_arg("flat") is tBool)) && !is_pervertex
+        let no_interp = ((is_in && stage == ShaderStage.Vertex)
+            || (is_out && stage == ShaderStage.Fragment))
+        let want_flat = ((is_int_kind || (v.annotation |> find_arg("flat") is tBool))
+            && !is_pervertex && !no_interp)
         if (want_flat) {
             emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.Flat))
         }
@@ -2697,7 +2706,19 @@ def private emit_const_enum(var m : SpirvModule; cen : ExprConstEnumeration?; va
 // Produces a deduped OpConstant / OpConstantComposite for a fully-constant expression. Used for
 // array literals (which must be constant initializers for now) and their constituents. ok=false =>
 // not a compile-time constant (the caller emits a clean error).
+// Lint compiles with folding off, so a const spelled as arithmetic or as another const's name
+// arrives here whole and the compiler owns what it is worth. Asking only where the shapes below
+// match nothing leaves a normal compile, handed an already-folded node, on the path it takes now.
 def private emit_const(var m : SpirvModule; e : ExpressionPtr; var errors : array<string>) : tuple<ok : bool; id : uint> {
+    let r = emit_const_node(m, e, errors)
+    // the ask is a hard error on a null expression, where the shapes below simply do not match
+    if (r.ok || e == null) return r
+    let ce = get_const_expr(compiling_program(), e)
+    if (ce == null) return r
+    return emit_const_node(m, ce, errors)
+}
+
+def private emit_const_node(var m : SpirvModule; e : ExpressionPtr; var errors : array<string>) : tuple<ok : bool; id : uint> {
     let r2v = e ?as ExprRef2Value
     if (r2v != null) return emit_const(m, r2v.subexpr, errors)
     let cu = e ?as ExprConstUInt

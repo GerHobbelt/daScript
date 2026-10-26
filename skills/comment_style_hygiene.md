@@ -39,20 +39,26 @@ some (noted), C++/JS lints are follow-up work.
 
 ## Comments
 
-**Short or absent.** 1–2 lines preferred, 3 the cap (das: STYLE014 fires at 4+)
-*(lintable)*. A comment that doesn't fit is the signal to interrogate it: why does
-this need prose at all, and does the detail belong at the use site — or nowhere?
+**Short or absent.** 1–2 lines preferred, 3 the cap — das lint STYLE014 enforces it under
+`daslib/` and wherever `options _comment_hygiene = true`; everywhere else the cap is the
+reviewer's. Inside a `def private` body the cap is ONE line (STYLE015, same gating), and that cap is
+body-only: a comment *attached to* a private symbol takes the ordinary 3-line cap plus the
+bar in *Private symbols don't get public-style docs* below. The cap covers per-symbol
+and in-body comments; the file header — the block before the first declaration,
+STYLE014's boundary — is governed by the map rule below. A comment that doesn't fit is
+the signal to interrogate it: why does this need prose at all, and does the detail
+belong at the use site, in the file-header map (shared contract moves up, the symbol
+keeps what is specific to it) — or nowhere?
 
 **No banners, no preambles.** No `// ===== name — desc =====` block above a function
-that already carries its own doc-comment, and no multi-paragraph architectural essay
-at the head of a section. Code reads well; design docs and tutorials carry the WHY.
-Terse section dividers stay.
+that already carries its own doc-comment, and no section-head essay restating what the
+code, the doc-comments, or the file-header map already carry — architectural WHY with
+no home in the file goes to a design doc. Terse section dividers stay.
 
-**A file header is a map, not an essay.** A pass or subsystem file may open with a
-numbered overview — one line per fact — stating the whole contract: when it runs, what
-it consumes and produces, the kinds and tiers it deals in. A map legitimately repeats
-what per-symbol comments say; a reader entering cold needs the shape before any
-symbol. What stays banned is prose — paragraphs argue, maps enumerate.
+**A file header is a map, not an essay.** At or under the comment cap a header may stay
+prose; past it, it either becomes a map — one line per fact of the file's contract — or
+gets trimmed. A map may repeat per-symbol comments (a cold reader needs the shape before
+any symbol), never text the code already prints.
 
 **Private symbols don't get public-style docs.** Doc-comment syntax (`//!` and kin) is
 for tooling-visible public API. On a private symbol a docstring restates the name to a
@@ -61,7 +67,9 @@ The bar for any comment on a private symbol: a maintainer reading the symbol alo
 would be surprised without it.
 
 **Field comments ride the declaration line** *(lintable)*, never a line above — fewer
-lines, and the struct scans as a table.
+lines, and the struct scans as a table. A note that cannot fit the line belongs at the use
+site; one that explains a GROUP of fields rather than any single one may sit above the
+group, within the cap.
 
 **Branch hints ride the branch line.** A few words on the `if` identifying what lands
 in the branch (`// retries exhausted upstream, not here`). A WHY the line can't hold
@@ -70,20 +78,26 @@ never right. A self-describing predicate — a named helper, a compare against a
 constant — gets nothing: restating `fn.neverInline` as "explicit opt-out" is
 narration. The comment must say something the identifiers don't.
 
-**No incident citations.** The banned form is a citation only a reviewer can check —
-a PR or issue number, a date, "proven: <module> lost <bug>". The required form is the
+**No incident citations.** The banned form is a citation that can only be verified
+outside the code — a PR or issue number, a date, "proven: <module> lost <bug>". The required form is the
 failure mode named in present tense at the code that guards it: "a defaulted operand
 no call site can supply crashes simulation", not "used to crash". A mechanism note
 stays when a maintainer needs it to change the code without breaking the guard (why
 an encoding stays injective); it goes when it only argues the guard was right.
 
-**The message is the comment.** A branch whose error/decline/log string already states
-the fact gets no comment on top. This makes good diagnostics double as documentation —
-one more reason to write them well.
+**The message is the comment.** Any site that already carries a human-readable failure
+string — a branch's error/decline/log, an assertion or panic message, a test
+expectation — gets no comment restating it; put the fact the reader needs *into* the
+string instead. This makes good diagnostics double as documentation — one more reason
+to write them well.
 
 **Counterpart pointers earn their line.** When a condition handles one half of a split
 responsibility, a few words naming where the other half lives is a good same-line
 comment: `if (isLiteral(a)) return true;   // variables resolve in BindingScan`.
+The discriminator against the consequence-note ban below: a pointer names WHERE the other
+half lives, so a maintainer changing this line knows what else to open
+(`// consumed by control.html's chat panel`); a note describing WHAT the effect looks like
+downstream (`// the page shows its attach button on this`) is the banned kind.
 
 **Define a term once, on the signature that coins it.** A predicate family's first
 member carries the tail comment defining the term; siblings say `// same, for X`. When
@@ -124,6 +138,12 @@ rename first, then see what's left to say.
 synonyms for one idea ("timeout" / "deadline" / "budget") are three chances to
 misread; pick the accurate one and sweep the rest.
 
+**One mechanism, one family word.** When one mechanism surfaces as several public
+names — a verb and its variants, a flag and the helpers that set it for one call —
+one word runs through every member (`push` / `push_clone` / `push_from`). A member
+named out of a second vocabulary makes the reader hunt for a difference that isn't
+there.
+
 **Diagnostics name the concrete thing.** If the code knows which one — which operator,
 which type, which file — the message says which one; a category without an instance
 reads as "trust us". User-facing messages carry no vocabulary that exists only inside
@@ -131,8 +151,8 @@ the implementation.
 
 ## Shape
 
-**A flag set-then-returned is a return in disguise** *(lintable — specced for the
-style lint)*. A bool initialized false, set on failure paths, then immediately
+**A flag set-then-returned is a return in disguise** *(lintable — STYLE041)*.
+A bool initialized false, set on failure paths, then immediately
 consumed by a single `if (flag) return/error` — collapse to a direct return at each
 set site. The flag form often keeps looping after the answer is known and reports
 repeatedly. When the set site is inside a callback or visitor that cannot return
@@ -140,8 +160,9 @@ through its caller, the collapse is a walk-abort instead: guard the callback's f
 line on the flag.
 
 **One guard style per function.** Message-setting early-outs are one-liners:
-`if (cond) { why = "..."; return false; }` — never a mix of one-liners and expanded
-blocks in the same function.
+`if (cond) { why = "..."; return false; }` — never a *gratuitous* mix of one-liners
+and expanded blocks in the same function. A guard whose message needs a local to
+build it stays expanded, and that's not a mix.
 
 **Declarations don't promise.** Declare at first use, not in an up-front batch — a
 block of aliases computed long before their consumers is a list of promises the

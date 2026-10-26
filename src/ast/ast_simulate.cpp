@@ -145,6 +145,8 @@ namespace das
 
         void setE ( const Expression * e, SimNode * n ) {
             e2v[e] = n;
+            // the GC locals gate and LineInfoArg externs read the position via &node->debugInfo
+            if ( n && context.thisHelper ) context.thisHelper->stampSimNode(e, n->debugInfo);
         }
 
         SimNode * getE ( const Expression * e ) {
@@ -1373,8 +1375,11 @@ namespace das
         auto blk = static_cast<ExprBlock*>(expr->block);
         uint32_t argSp = blk->stackTop;
         auto bt = blk->makeBlockType();
-        auto info = context.thisHelper->makeInvokeableTypeDebugInfo(bt, blk->at);
-        if ( context.gcEnabled || context.debugger  ) {
+        auto debuggerOrGC = context.gcEnabled || context.debugger;
+        // unique: the info cache is keyed by block TYPE, and this info carries per-instance locals
+        auto info = context.thisHelper->makeInvokeableTypeDebugInfo(bt, blk->at, debuggerOrGC);
+        if ( debuggerOrGC ) {
+            info->spaceId = context.thisHelper->currentSpaceId;
             context.thisHelper->appendLocalVariables(info, (Expression *)expr);
         }
         setE(expr, context.code->makeNode<SimNode_MakeBlock>(at, getE(expr->block), argSp, expr->stackTop, info));
@@ -1452,6 +1457,8 @@ namespace das
             }
         }
         pInvoke->debugInfo = at;
+        // the invoked frame reads &pInvoke->debugInfo, not the keep-alive wrapper setE gets
+        if ( context.thisHelper ) context.thisHelper->stampSimNode(expr, pInvoke->debugInfo);
         int nArg = (int) expr->arguments.size();
         if ( expr->isInvokeMethod ) nArg --;
         if ( nArg ) {
@@ -2506,28 +2513,30 @@ namespace das
         const auto &at = expr->at;
         if ( expr->block ) {
         } else if ( expr->local ) {
+            // extraLocalOffset is part of where the variable itself sits (a fake make-local var
+            // carries its slot inside the literal there), so it belongs to the variable and is
+            // added here alone - the chain of fields and indices above it never carries it
+            uint32_t varOffset = extraOffset + expr->variable->extraLocalOffset;
             if ( expr->variable->type->ref ) {
                 if ( r2vType->baseType!=Type::none ) {
                     return context.code->makeValueNode<SimNode_GetLocalRefOffR2V>(r2vType->getR2VType(), at,
-                                                    expr->variable->stackTop, extraOffset + expr->variable->extraLocalOffset);
+                                                    expr->variable->stackTop, varOffset);
                 } else {
                     return context.code->makeNode<SimNode_GetLocalRefOff>(at,
-                                                    expr->variable->stackTop, extraOffset + expr->variable->extraLocalOffset);
+                                                    expr->variable->stackTop, varOffset);
                 }
             } else if ( expr->variable->aliasCMRES ) {
-                // extraOffset already includes the var's extraLocalOffset (passed by the caller),
-                // which for fake CMRES-alias vars carries the make-struct element slot offset.
                 if ( r2vType->baseType!=Type::none ) {
-                    return context.code->makeValueNode<SimNode_GetCMResOfsR2V>(r2vType->getR2VType(), at, extraOffset);
+                    return context.code->makeValueNode<SimNode_GetCMResOfsR2V>(r2vType->getR2VType(), at, varOffset);
                 } else {
-                    return context.code->makeNode<SimNode_GetCMResOfs>(at, extraOffset);
+                    return context.code->makeNode<SimNode_GetCMResOfs>(at, varOffset);
                 }
             } else {
                 if ( r2vType->baseType!=Type::none ) {
                     return context.code->makeValueNode<SimNode_GetLocalR2V>(r2vType->getR2VType(), at,
-                                                                            expr->variable->stackTop + extraOffset);
+                                                                            expr->variable->stackTop + varOffset);
                 } else {
-                    return context.code->makeNode<SimNode_GetLocal>(at, expr->variable->stackTop + extraOffset);
+                    return context.code->makeNode<SimNode_GetLocal>(at, expr->variable->stackTop + varOffset);
                 }
             }
         } else if ( expr->argument ) {
@@ -2587,10 +2596,10 @@ namespace das
             }
         } else if ( expr->local ) {
             if ( expr->r2v ) {
-                setE(expr, sv_trySimulate(expr, expr->variable->extraLocalOffset, expr->type));
+                setE(expr, sv_trySimulate(expr, 0, expr->type));
             } else {
                 gc_local<TypeDecl> noneType = new TypeDecl(Type::none);
-                setE(expr, sv_trySimulate(expr, expr->variable->extraLocalOffset, noneType));
+                setE(expr, sv_trySimulate(expr, 0, noneType));
             }
         } else if ( expr->argument) {
             if (expr->variable->type->isRef()) {
@@ -3452,6 +3461,9 @@ namespace das
                 needTypeInfo = true;
         }
         pCall->debugInfo = expr->at;
+        // stamp here as well as setE: a wrapped call (keep-alive, NewArray) hands the
+        // WRAPPER to setE, but &pCall->debugInfo is what reaches the callee's prologue
+        if ( context.thisHelper ) context.thisHelper->stampSimNode(expr, pCall->debugInfo);
         if ( func->builtIn) {
             pCall->fnPtr = nullptr;
         } else if ( func->index>=0 ) {
@@ -3699,6 +3711,7 @@ namespace das
         isSimulating = true;
         context.failed = true;
         context.verySafeContext = options.getBoolOption("very_safe_context",policies.very_safe_context);
+        context.maxUnreservedSize = options.getUInt64Option("max_unreserved_size", policies.max_unreserved_size);
         astTypeInfo.clear();    // this is to be filled via typeinfo(ast_typedecl and such)
         auto disableInit = options.getBoolOption("no_init", policies.no_init);
         context.thisProgram = this;
@@ -3811,6 +3824,12 @@ namespace das
                         gfun.debugInfo->flags &= ~ (FuncInfo::flag_init | FuncInfo::flag_shutdown);
                     }
                     if ( debuggerOrGC ) {
+                        // number the body BEFORE building sim nodes and locals info: the
+                        // positions stamp each expression's sim node as it is built (see
+                        // SimulateVisitor::setE), and the intervals feed the locals gate
+                        // (see LocalVariableInfo::openPos)
+                        gfun.debugInfo->spaceId = frameSpaceId(pfun->index);
+                        helper.stampFramePositions(pfun->body, gfun.debugInfo->spaceId);
                         helper.appendLocalVariables(gfun.debugInfo, pfun->body);
                         helper.appendGlobalVariables(gfun.debugInfo, pfun);
                     }
@@ -3835,6 +3854,9 @@ namespace das
                     lookupFunctionTable.push_back(pfun);
                 });
             }
+            // global inits and annotation simulate build nodes outside any position space
+            helper.exprFramePos.clear();
+            helper.framePosStamping = false;
         }
         if ( totalVariables ) {
             for (auto & pm : library.modules ) {
@@ -4189,6 +4211,5 @@ namespace das
                 }
             }
         }
-        if ( isLlvmAot ) runLlvmAotGlobInits(context);
     }
 }

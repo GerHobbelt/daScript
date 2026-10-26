@@ -293,11 +293,11 @@ def whisper_dec_quantize(var st : WhisperStaging) {
     }
     let qlayer = 16l * d * d
     let qtotal = st.e.n_text_layer * qlayer + st.e.n_vocab * d
-    st.dqblob |> resize(qtotal)
-    st.dqscales |> resize(qtotal / 32l)
+    st.dqblob |> reserve_resize(qtotal)
+    st.dqscales |> reserve_resize(qtotal / 32l)
     // the fp32 remainder keeps pe + the full te (row lookups) + vectors + final ln
     var nf : array<float>
-    nf |> resize(long_length(st.dblob) - st.e.n_text_layer * qlayer)
+    nf |> reserve_resize(long_length(st.dblob) - st.e.n_text_layer * qlayer)
     var og = 0l
     var of = 0l
     st.e.d_pe_off = tq_keep(nf, st.dblob, of, st.e.d_pe_off, st.e.n_text_ctx * d)
@@ -435,7 +435,7 @@ def private wt_read(recs : table<string; WTensorRec>; b : array<uint8> | #; name
 def private wt_read_conv_permuted(recs : table<string; WTensorRec>; b : array<uint8> | #; name : string;
                                   var blob : array<float>; off : int64; c_out, c_in : int64) {
     var raw : array<float>
-    raw |> resize(int(c_out * c_in * 3l))
+    raw |> reserve_resize(int(c_out * c_in * 3l))
     wt_read(recs, b, name, raw, 0l, c_out * c_in * 3l)
     for (o in range64(c_out)) {
         for (c in range64(c_in)) {
@@ -472,8 +472,9 @@ def load_whisper_model(path : string; q8 : bool = false) : WhisperModel {
             return <- t
         }
         var built = WhisperModel()
-        stream_whisper_model(path, q8, img, tag, built)
-        dlim_gc_stale(path, tag)   // the fresh bake proves ITS LANE's siblings dead
+        if (stream_whisper_model(path, q8, img, tag, built)) {
+            dlim_gc_stale(path, tag)   // the fresh bake ON DISK proves its lane's siblings dead; an in-memory build reaps nothing
+        }
         return <- built
     }
     // no persisted image: stream one into memory and serve THAT — a served model is always
@@ -531,14 +532,14 @@ def stage_whisper_model(path : string; q8 : bool = false) : WhisperStaging {
         var encJobs : array<WFillJob>
         var decJobs : array<WFillJob>
         let sz = whisper_index(bytes, int64(stat(path).size), st, recs, encJobs, decJobs)
-        st.enc.fblob |> resize(sz.enc_len)
+        st.enc.fblob |> reserve_resize(sz.enc_len)
         for (j in encJobs) {
             wjob_read(recs, bytes, j, st.enc.fblob, 0l)
         }
         if (q8) {
             tower_quantize(st.e.enc, st.enc)
         }
-        st.dblob |> resize(sz.dec_len)
+        st.dblob |> reserve_resize(sz.dec_len)
         for (j in decJobs) {
             wjob_read(recs, bytes, j, st.dblob, 0l)
         }
@@ -598,7 +599,7 @@ def private wstream_plane(recs : table<string; WTensorRec>; b : array<uint8> | #
             continue if (!qz)
         }
         if (long_length(scratch) < j.n) {
-            scratch |> resize(int(j.n))
+            scratch |> grow_resize(int(j.n))
         }
         wjob_read(recs, b, j, scratch, -j.off)   // land the tensor at scratch[0]
         if (kind == 0) {
@@ -608,8 +609,8 @@ def private wstream_plane(recs : table<string; WTensorRec>; b : array<uint8> | #
             continue
         }
         if (long_length(q8s) < j.n) {
-            q8s |> resize(int(j.n))
-            qss |> resize(int(j.n / 32l))
+            q8s |> grow_resize(int(j.n))
+            qss |> grow_resize(int(j.n / 32l))
         }
         quantize_q8_0_into(scratch, j.n, q8s, qss, 0l, 0l)
         if (rep) {
@@ -653,11 +654,12 @@ def private whisper_dec_compact_offsets(var e : WhisperModel) {
 //! The STREAMED whisper mint — Phase 3 of the audio rail: the big planes transcode from the
 //! source mapping straight into the writer and never materialize. The staging carrier holds
 //! only scalars, the vocab, and the filterbank; peak drops from whole-model to one tensor.
-def private stream_whisper_model(path : string; q8 : bool; img, tag : string; var out : WhisperModel) {
+def private stream_whisper_model(path : string; q8 : bool; img, tag : string; var out : WhisperModel) : bool {
     let f = fopen(path, "rb")
     if (f == null) {
         panic("dasLLAMA whisper: cannot open model '{path}'")
     }
+    var wrote = false
     fmap(f) $(var bytes : array<uint8>#) {
         var st = WhisperStaging()
         var recs : table<string; WTensorRec>
@@ -676,8 +678,8 @@ def private stream_whisper_model(path : string; q8 : bool; img, tag : string; va
             extra += uint64((sz.enc_len / 32l + sz.dec_len / 32l) * 4l) // scale planes
             extra += 4ul * uint64(IMAGE_PAGE)
         }
-        cache_via_image_staged_(st, out, img, extra, tag, "q8") $(name : string;
-                                                                  var w : ImgWriter; var sections : array<ImgSection>) {
+        wrote = cache_via_image_staged_(st, out, img, extra, tag, "q8") $(name : string;
+                                                                          var w : ImgWriter; var sections : array<ImgSection>) {
             if (name == "dblob") {
                 return wstream_plane(recs, bytes, decJobs, 0, q8, rep, w, sections, name)
             }
@@ -703,6 +705,7 @@ def private stream_whisper_model(path : string; q8 : bool; img, tag : string; va
         delete decJobs
     }
     fclose(f)
+    return wrote
 }
 
 // Parse everything EXCEPT tensor data: hparams, filterbank, vocab, token ids, both blob
@@ -965,10 +968,10 @@ def make_decoder_state(w : WhisperModel) : DecoderState {
     let ta = w.enc.n_ctx
     let ncap = tmax
     var ds = DecoderState()
-    ds.kcache |> resize(w.n_text_layer * d * tmax)
-    ds.vcache |> resize(w.n_text_layer * d * tmax)
-    ds.kx |> resize(w.n_text_layer * d * ta)
-    ds.vx |> resize(w.n_text_layer * d * ta)
+    ds.kcache |> reserve_resize(w.n_text_layer * d * tmax)
+    ds.vcache |> reserve_resize(w.n_text_layer * d * tmax)
+    ds.kx |> reserve_resize(w.n_text_layer * d * ta)
+    ds.vx |> reserve_resize(w.n_text_layer * d * ta)
     ds.ckv_tmp |> resize(ta * d)
     ds.x |> resize(ncap * d)
     ds.xb |> resize(ncap * d)

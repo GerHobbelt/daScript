@@ -18,6 +18,7 @@ Lint Tools
 .. das-doc: given struct Session { pos : int64 }
 .. das-doc: given struct SomeStruct { value : int64 }
 .. das-doc: given struct Foo { x : int }
+.. das-doc: given struct State { mark : int; claimed : array<int> }
 .. das-doc: given def compute() : int { return 0 }
 .. das-doc: given def report(ok : bool) { }
 .. das-doc: given def process(v : int) { }
@@ -105,6 +106,8 @@ Options:
 - ``--style-only`` — only run style lint
 - ``--enable CODE[,CODE...]`` — force-enable specific rules (bypasses ``.lint_config`` defaults)
 - ``--disable CODE[,CODE...]`` — disable specific rules; on overlap with ``--enable``, ``--disable`` wins
+- ``--lint-fixtures`` — also lint fixture-named files (underscore-led names containing ``fixture``)
+- ``--lint-excluded-paths`` — report findings the ``.lint_config`` ``[paths]`` exclude policy would drop
 
 Examples::
 
@@ -137,6 +140,15 @@ Add a ``// nolint:CODE`` comment on the same line as the flagged expression::
 The suppression is exact: ``// nolint:PERF003`` only suppresses PERF003, not other
 rules. An optional explanation after the code is recommended but not required.
 
+A file whose *subject* conflicts with the lint pipeline's compile policies can opt
+out entirely with a ``// lint-skip-file: <reason>`` comment in the file header (the
+first 16 lines — deeper occurrences are treated as prose, so quoting the directive
+in a doc comment cannot silently unlint a file). Canonical user:
+``tests/language/static_if.das``, which tests the infer-time
+folding the pipeline's ``no_infer_time_folding`` policy disables — it cannot even
+compile under lint. The runner reports the file as skipped with the reason, so
+coverage accounting still sees it.
+
 ---------------------------
 Repo-level ``.lint_config``
 ---------------------------
@@ -167,6 +179,22 @@ Defaults (applied before the file is read):
 The file is optional. When missing, unreadable, or syntactically
 malformed the defaults stand — bad TOML is a silent no-op, not a
 compile error. Non-boolean entries under ``[rules]`` are ignored.
+
+A ``[paths]`` table declares repo-root-relative globs whose findings are
+dropped at REPORT time::
+
+    [paths]
+    exclude = ["tests/interfaces/test_interfaces.das"]
+
+Excluded files still compile through the lint pipeline — their compiles
+instantiate generics and consume ``nolint`` directives, so cross-file
+findings they expose in non-excluded files stay visible; only findings
+*in* the matching files are hidden, and the summary counts what the
+policy hid. The intended use is a shrinking debt ratchet: narrow or
+remove entries as paths reach zero. ``--lint-excluded-paths`` on the
+standalone runner shows the hidden findings; the MCP ``lint`` tool
+always shows raw findings (the same deliberate split as
+``--lint-fixtures``).
 
 CLI ``--enable`` on the standalone runner bypasses the defaults (the
 explicit whitelist wins), so ``daslang utils/lint/main.das -- --enable
@@ -736,7 +764,12 @@ LINT019 — stale ``nolint`` directive
 A ``// nolint:CODE`` directive that suppressed no diagnostic during the run is dead
 weight: it buries the next real finding on that line and does not survive the code
 moving. The lint runner records every suppression the passes consume and reports the
-leftovers after all passes complete.
+leftovers after all passes complete. In the standalone runner's serial mode
+(``-j 1``) the stale scan runs once at the END of the run over every file, so a
+directive in a generic body is credited by ANY compile in the run that instantiates
+it — including files that sort after it. Parallel workers still scan per file
+(each worker sees only its own consumption), so serial mode is the authoritative
+staleness determination.
 
 Two escape hatches for directives that are live only outside the current compile:
 add ``LINT019`` to the code list (``// nolint:PERF020,LINT019``) when the rule fires
@@ -1365,6 +1398,15 @@ fresh-slot inserts where nothing leaks. Compiler temps, the ``return <- r``
 lowering, and generated moves are excluded — in particular the early-out
 relocation that splits ``var inscope x <- init`` into a hoisted declaration
 plus a generated move (the target is fresh and the ``finally`` releases it).
+
+The release credit: a ``delete`` of the variable — or of a field chain rooted at
+it, the hand-rolled-teardown shape — before the move silences the warning, as
+does the lowered form of any of those (``_::finalize``, ``builtin`finalize```,
+``builtin`finalize_dim``` for fixed arrays, or a call named ``finalize``).
+Credit is per function and per site: it does not cross into or out of deferred
+bodies (a lambda's ``delete`` runs later and never credits; an inline block
+argument's counts, though the block may never run — the rule errs silent), and
+a conditional fill is best folded into the declaration as ``var a <- c ? x : y``.
 
 .. das-doc: fragment
 .. code-block:: das
@@ -2767,6 +2809,36 @@ disables the rule for the module — the right escape for a legitimately dense
 file such as a code emitter or a ported kernel. Suppress a single deliberate
 keep with ``// nolint:STYLE038`` on the ``def`` line.
 
+STYLE039 — non-ASCII byte in a string literal
+==============================================
+
+Emitted strings and error messages flow into logs and consoles that are not
+UTF-8 aware, where an em-dash or a multiplication sign turns into mojibake.
+The rule reports the first byte at or above ``0x80`` in a string literal —
+interpolation chunks included — unless the source spells it with ASCII escapes
+(``"\xEF\xBB\xBF"`` is already log-safe). Lambda, local-function, and generator
+bodies are checked like any other user code.
+
+.. code-block:: das
+
+    // Bad — typography in an emitted string
+    def report_bad() : string {
+        return "shader failed — see log"     // STYLE039 (em-dash)
+    }
+
+    // Good — plain ASCII
+    def report_good() : string {
+        return "shader failed - see log"
+    }
+
+The gate is tri-state: a module-local ``options _ascii_strings`` wins in either
+direction; else ``STYLE039 = true`` in ``.lint_config`` turns it on everywhere;
+else the default — on only for sources under ``daslib/`` or ``modules/``, the
+shipped-library trees whose strings reach every consumer's logs. Suppress an
+intended character (box drawing, localized text, a unicode demo) with
+``// nolint:STYLE039`` on the line, or ``options _ascii_strings = false`` for a
+whole intentionally non-ASCII module.
+
 STYLE040 — duplicated statement region a helper could absorb
 =============================================================
 
@@ -2829,6 +2901,50 @@ modules in this tree. Tune the thresholds per module with ``options _dupe_min_no
 (default 20 AST nodes) and ``options _dupe_min_statements = N`` (default 2);
 ``0`` on either leaves the default in place. Suppress a deliberate repetition
 with ``// nolint:STYLE040``.
+
+STYLE041 — a bool flag set-then-returned is a return value in disguise
+=======================================================================
+
+A ``var flag = false`` set ``true`` on some paths, then consumed by a single
+``if (flag) return X`` right after the statement that set it, is a return
+value with extra steps — and the loop often keeps running after the answer is
+known. Return directly at each set site and drop the flag.
+
+.. code-block:: das
+
+    // Bad — the flag carries the answer to the next statement
+    def first_bad(xs : array<int>) : int {
+        var found = false                    // STYLE041 (reported here)
+        for (x in xs) {
+            if (x < 0) {
+                found = true
+                break
+            }
+        }
+        if (found) return -1
+        return 0
+    }
+
+    // Good — return the answer where it is known
+    def first_good(xs : array<int>) : int {
+        for (x in xs) {
+            if (x < 0) return -1
+        }
+        return 0
+    }
+
+Extra reads are allowed only as ``if (flag) break`` / ``continue`` plumbing
+inside the setting statement — those die with the flag. Everything else is
+exempt by design, and the check fails closed: a set inside a ``$(...)``
+callback (the walk-abort idiom — a flag is the only way to get a value out of
+a block-callback walk; guard the callback's first line on it instead), negative
+polarity (``if (!found)`` search-miss, whose fix is extraction), a set that is
+not the last action on its path, a consuming statement that does not
+immediately follow the setter, a return payload not provably identical at the
+set site, and any reference the analysis cannot classify — a capture, a
+``flag && other`` read, an argument pass — all keep the rule silent.
+Init-``true`` separator flags never match. Suppress a deliberate keep with
+``// nolint:STYLE041`` on the declaration line.
 
 -----
 Tests

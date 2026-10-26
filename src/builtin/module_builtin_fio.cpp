@@ -216,8 +216,8 @@ namespace das {
     bool builtin_spawn_argv ( const Array & args_arr, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int builtin_system ( const char * cmd, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * get_full_file_name ( const char * path, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
-    bool has_env_variable ( const char * var, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
-    char * get_env_variable ( const char * var, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    bool has_env_variable ( const char *, Context *, LineInfoArg * ) { return false; }
+    char * get_env_variable ( const char *, Context *, LineInfoArg * ) { return nullptr; }
     void set_env_variable ( const char * var, const char * value, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * sanitize_command_line ( const char * cmd, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * builtin_describe_pending_dynamic_modules ( Context * context, LineInfoArg * at ) GENERATE_IO_STUB
@@ -245,6 +245,7 @@ namespace das {
     int64_t builtin_fs_file_size ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
     bool builtin_fs_equivalent ( const char * a, const char * b, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
     bool builtin_fs_is_symlink ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_fs_is_reparse_point ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
     bool builtin_fs_copy_file ( const char * src, const char * dst, bool overwrite, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
     bool builtin_fs_set_mtime ( const char * path, Time time, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
     bool builtin_fs_disk_space ( const char * path, DiskSpaceInfo & info, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
@@ -2215,6 +2216,27 @@ namespace das {
         return result;
     }
 
+    bool builtin_fs_is_reparse_point ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) {
+        error = nullptr;
+        if ( !path || !path[0] ) { error = empty_path_error(ctx, at); return false; }
+#if _WIN32
+        // is_symlink misses junctions (MSVC reports them as plain directories); the
+        // attribute catches every reparse flavor - junction, symlink, mount point
+        DWORD attrs = GetFileAttributesW(das_to_path(path).c_str());
+        if ( attrs == INVALID_FILE_ATTRIBUTES ) {
+            std::error_code ec((int)GetLastError(), std::system_category());
+            error = ec_to_string(ec, ctx, at);
+            return false;
+        }
+        return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+        std::error_code ec;
+        bool result = std::filesystem::is_symlink(das_to_path(path), ec);
+        if ( ec ) { error = ec_to_string(ec, ctx, at); return false; }
+        return result;
+#endif
+    }
+
     // file operations
 
     bool builtin_fs_copy_file ( const char * src, const char * dst, bool overwrite, char * & error, Context * ctx, LineInfoArg * at ) {
@@ -2719,6 +2741,9 @@ namespace das {
                     ->args({"a","b","error","context","at"});
             addExtern<DAS_BIND_FUN(builtin_fs_is_symlink)>(*this, lib, "is_symlink",
                 SideEffects::modifyArgumentAndExternal, "builtin_fs_is_symlink")
+                    ->args({"path","error","context","at"});
+            addExtern<DAS_BIND_FUN(builtin_fs_is_reparse_point)>(*this, lib, "is_reparse_point",
+                SideEffects::modifyArgumentAndExternal, "builtin_fs_is_reparse_point")
                     ->args({"path","error","context","at"});
             // file operations
             addExtern<DAS_BIND_FUN(builtin_fs_copy_file)>(*this, lib, "copy_file",

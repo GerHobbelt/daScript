@@ -176,9 +176,40 @@ struct Scheduler {
         //! Stereo output scratch (right-channel HRTF result); interleaved L/R per frame.
 }
 
+//! The scheduler's pools and buffers are player-internal - no interior alias survives a
+//! grow - so growth may free the old buffer eagerly even under `options very_safe_context`.
+[unsafe_operation]
+def mark_pools_scratch(var sched : Scheduler) {
+    unsafe {
+        sched.voices |> set_scratch(true)
+        sched.osc_voices |> set_scratch(true)
+        sched.output |> set_scratch(true)
+        sched.sf2_voices |> set_scratch(true)
+        sched.sf2_meta |> set_scratch(true)
+        sched.orbit_buses |> set_scratch(true)
+        sched.voice_fx_buf |> set_scratch(true)
+        sched.hrtf_mono_buf |> set_scratch(true)
+        sched.hrtf_stereo_buf |> set_scratch(true)
+        sched.hrtf_stereo_buf_r |> set_scratch(true)
+    }
+}
+
 // Convert wall-clock time to cycle position.
 def private current_cycle(sched : Scheduler; wall_time : double) : double {
     return (wall_time - sched.startTime) * sched.cps
+}
+
+//! Same contract as `mark_pools_scratch`, for one orbit bus's send/return buffers.
+[unsafe_operation]
+def mark_orbit_scratch(var bus : OrbitBus) {
+    unsafe {
+        bus.reverb_send_buf |> set_scratch(true)
+        bus.reverb_out_buf |> set_scratch(true)
+        bus.delay_send_buf |> set_scratch(true)
+        bus.delay_out_buf |> set_scratch(true)
+        bus.chorus_send_buf |> set_scratch(true)
+        bus.chorus_out_buf |> set_scratch(true)
+    }
 }
 
 // Ensure orbit bus exists at given index, creating it if needed.
@@ -187,7 +218,9 @@ def private ensure_orbit(var sched : Scheduler; orbit : int) {
         sched.orbit_buses |> push(null)
     }
     if (sched.orbit_buses[orbit] == null) {
-        sched.orbit_buses[orbit] = new OrbitBus()
+        var bus = new OrbitBus()
+        unsafe(mark_orbit_scratch(*bus))
+        sched.orbit_buses[orbit] = bus
     }
 }
 
@@ -483,6 +516,20 @@ def private prepare_hrtf_scratch(var sched : Scheduler; chunkFrames : int) {
     }
 }
 
+// ma_hrtf owns miniaudio-side state: uninit before delete.
+def private release_hrtf_pair(var hrtf_l : ma_hrtf?&; var hrtf_r : ma_hrtf?&) {
+    if (hrtf_l != null) {
+        ma_hrtf_uninit(hrtf_l)
+        unsafe { delete hrtf_l; }
+        hrtf_l = null
+    }
+    if (hrtf_r != null) {
+        ma_hrtf_uninit(hrtf_r)
+        unsafe { delete hrtf_r; }
+        hrtf_r = null
+    }
+}
+
 // Render a stereo voice contribution through the binaural-stereo HRTF.
 // Treats the L input channel as a virtual source at (azimuth - 30°) and the R input channel
 // as a virtual source at (azimuth + 30°), runs each through its own HRTF instance, and sums
@@ -595,7 +642,7 @@ def private osc_render_chunk_routed(
 // Render all active SF2 voices into the output buffer. Handles note-off scheduling,
 // reverb/chorus/delay send, and voice cleanup.
 // Reverb, delay, and chorus sends all accumulate into per-orbit bus buffers.
-def private sf2_render_voices(var sched : Scheduler; var output : array<float>; chunkFrames : int) {
+def private sf2_render_voices(var sched : Scheduler; var output : array<float>; chunkFrames : int) {   // nolint:STYLE037,STYLE038 - per-voice render kernel; one arm per HRTF/FX/send routing, all sharing the saved attenuation, meta and chunk cursor
     if (empty(sched.sf2_voices) || sched.sf2 == null) return
     var si = length(sched.sf2_voices) - 1
     while (si >= 0) {
@@ -786,16 +833,7 @@ def private sf2_render_voices(var sched : Scheduler; var output : array<float>; 
             sched.sf2_meta[si].samples_elapsed += chunkFrames
         }
         if (sched.sf2_voices[si].finished != 0) {
-            if (sched.sf2_meta[si].hrtf_l != null) {
-                ma_hrtf_uninit(sched.sf2_meta[si].hrtf_l)
-                unsafe { delete sched.sf2_meta[si].hrtf_l; }
-                sched.sf2_meta[si].hrtf_l = null
-            }
-            if (sched.sf2_meta[si].hrtf_r != null) {
-                ma_hrtf_uninit(sched.sf2_meta[si].hrtf_r)
-                unsafe { delete sched.sf2_meta[si].hrtf_r; }
-                sched.sf2_meta[si].hrtf_r = null
-            }
+            release_hrtf_pair(sched.sf2_meta[si].hrtf_l, sched.sf2_meta[si].hrtf_r)
             sched.sf2_voices |> erase(si)
             sched.sf2_meta |> erase(si)
         }
@@ -807,7 +845,7 @@ def private sf2_render_voices(var sched : Scheduler; var output : array<float>; 
 // Sends (reverb / delay / chorus) accumulate into per-orbit bus buffers based on each voice's orbit.
 // When a voice has active FX, render dry (no sends) into voice_fx_buf,
 // apply effects, then mix post-FX into output + sends.
-def private osc_render_voices(var sched : Scheduler; var output : array<float>; chunkFrames : int) {
+def private osc_render_voices(var sched : Scheduler; var output : array<float>; chunkFrames : int) {   // nolint:STYLE037,STYLE038 - per-voice render kernel; one arm per HRTF/FX/send routing, all sharing the saved gain and chunk cursor
     let chunkSamples = chunkFrames * 2
     var i = length(sched.osc_voices) - 1
     while (i >= 0) {
@@ -900,16 +938,7 @@ def private osc_render_voices(var sched : Scheduler; var output : array<float>; 
         }
         sched.osc_voices[i].gain = saved_osc_gain
         if (sched.osc_voices[i].finished) {
-            if (sched.osc_voices[i].hrtf_l != null) {
-                ma_hrtf_uninit(sched.osc_voices[i].hrtf_l)
-                unsafe { delete sched.osc_voices[i].hrtf_l; }
-                sched.osc_voices[i].hrtf_l = null
-            }
-            if (sched.osc_voices[i].hrtf_r != null) {
-                ma_hrtf_uninit(sched.osc_voices[i].hrtf_r)
-                unsafe { delete sched.osc_voices[i].hrtf_r; }
-                sched.osc_voices[i].hrtf_r = null
-            }
+            release_hrtf_pair(sched.osc_voices[i].hrtf_l, sched.osc_voices[i].hrtf_r)
             sched.osc_voices |> erase(i)
         }
         i --
@@ -1004,7 +1033,7 @@ def private process_orbit_buses(var sched : Scheduler; var output : array<float>
     }
 }
 
-def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time : double; chunk_seconds : float = 0.05; lookAhead : float = 0.1) : void {
+def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time : double; chunk_seconds : float = 0.05; lookAhead : float = 0.1) : void {   // nolint:STYLE037,STYLE038 - per-block mixing kernel; the voice arms share the chunk cursor, the orbit send buffers and the gain save/restore
     //! Advance one audio block: query the pattern for new events, spawn voices, mix all voices through the per-orbit reverb/delay/chorus buses into sched.output.
     //! chunk_seconds controls how much audio is produced this tick; lookAhead is how far ahead in time to query for new events.
     let cycleNow = current_cycle(sched, wall_time)
@@ -1028,16 +1057,7 @@ def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time 
                     var k = length(sched.voices) - 1
                     while (k >= 0) {
                         if (sched.voices[k].cut == cutGroup) {
-                            if (sched.voices[k].hrtf_l != null) {
-                                ma_hrtf_uninit(sched.voices[k].hrtf_l)
-                                unsafe { delete sched.voices[k].hrtf_l; }
-                                sched.voices[k].hrtf_l = null
-                            }
-                            if (sched.voices[k].hrtf_r != null) {
-                                ma_hrtf_uninit(sched.voices[k].hrtf_r)
-                                unsafe { delete sched.voices[k].hrtf_r; }
-                                sched.voices[k].hrtf_r = null
-                            }
+                            release_hrtf_pair(sched.voices[k].hrtf_l, sched.voices[k].hrtf_r)
                             unsafe { delete sched.voices[k]; }
                             sched.voices |> erase(k)
                         }
@@ -1046,16 +1066,7 @@ def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time 
                     var ko = length(sched.osc_voices) - 1
                     while (ko >= 0) {
                         if (sched.osc_voices[ko].cut == cutGroup) {
-                            if (sched.osc_voices[ko].hrtf_l != null) {
-                                ma_hrtf_uninit(sched.osc_voices[ko].hrtf_l)
-                                unsafe { delete sched.osc_voices[ko].hrtf_l; }
-                                sched.osc_voices[ko].hrtf_l = null
-                            }
-                            if (sched.osc_voices[ko].hrtf_r != null) {
-                                ma_hrtf_uninit(sched.osc_voices[ko].hrtf_r)
-                                unsafe { delete sched.osc_voices[ko].hrtf_r; }
-                                sched.osc_voices[ko].hrtf_r = null
-                            }
+                            release_hrtf_pair(sched.osc_voices[ko].hrtf_l, sched.osc_voices[ko].hrtf_r)
                             sched.osc_voices |> erase(ko)
                         }
                         ko --
@@ -1267,16 +1278,7 @@ def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time 
         voice.gain = saved_voice_gain
         voice.position += chunkSamples
         if (voice.position >= voiceLen) {
-            if (sched.voices[i].hrtf_l != null) {
-                ma_hrtf_uninit(sched.voices[i].hrtf_l)
-                unsafe { delete sched.voices[i].hrtf_l; }
-                sched.voices[i].hrtf_l = null
-            }
-            if (sched.voices[i].hrtf_r != null) {
-                ma_hrtf_uninit(sched.voices[i].hrtf_r)
-                unsafe { delete sched.voices[i].hrtf_r; }
-                sched.voices[i].hrtf_r = null
-            }
+            release_hrtf_pair(sched.voices[i].hrtf_l, sched.voices[i].hrtf_r)
             unsafe {
                 delete sched.voices[i]
             }
@@ -1328,16 +1330,7 @@ def finalize(var sched : Scheduler) {
     // pre-rendered sample voices — their `samples` arrays are the biggest leaked allocations
     for (i in range(length(sched.voices))) {
         if (sched.voices[i] != null) {
-            if (sched.voices[i].hrtf_l != null) {
-                ma_hrtf_uninit(sched.voices[i].hrtf_l)
-                unsafe { delete sched.voices[i].hrtf_l; }
-                sched.voices[i].hrtf_l = null
-            }
-            if (sched.voices[i].hrtf_r != null) {
-                ma_hrtf_uninit(sched.voices[i].hrtf_r)
-                unsafe { delete sched.voices[i].hrtf_r; }
-                sched.voices[i].hrtf_r = null
-            }
+            release_hrtf_pair(sched.voices[i].hrtf_l, sched.voices[i].hrtf_r)
             unsafe { delete sched.voices[i]; }
             sched.voices[i] = null
         }
@@ -1346,33 +1339,15 @@ def finalize(var sched : Scheduler) {
         delete sched.voices
     }
     // streaming oscillator voices — release any HRTF state
-    for (i in range(length(sched.osc_voices))) {
-        if (sched.osc_voices[i].hrtf_l != null) {
-            ma_hrtf_uninit(sched.osc_voices[i].hrtf_l)
-            unsafe { delete sched.osc_voices[i].hrtf_l; }
-            sched.osc_voices[i].hrtf_l = null
-        }
-        if (sched.osc_voices[i].hrtf_r != null) {
-            ma_hrtf_uninit(sched.osc_voices[i].hrtf_r)
-            unsafe { delete sched.osc_voices[i].hrtf_r; }
-            sched.osc_voices[i].hrtf_r = null
-        }
+    for (v in sched.osc_voices) {
+        release_hrtf_pair(v.hrtf_l, v.hrtf_r)
     }
     unsafe {
         delete sched.osc_voices
     }
     // SF2 voices — release HRTF state from parallel meta
-    for (i in range(length(sched.sf2_meta))) {
-        if (sched.sf2_meta[i].hrtf_l != null) {
-            ma_hrtf_uninit(sched.sf2_meta[i].hrtf_l)
-            unsafe { delete sched.sf2_meta[i].hrtf_l; }
-            sched.sf2_meta[i].hrtf_l = null
-        }
-        if (sched.sf2_meta[i].hrtf_r != null) {
-            ma_hrtf_uninit(sched.sf2_meta[i].hrtf_r)
-            unsafe { delete sched.sf2_meta[i].hrtf_r; }
-            sched.sf2_meta[i].hrtf_r = null
-        }
+    for (m in sched.sf2_meta) {
+        release_hrtf_pair(m.hrtf_l, m.hrtf_r)
     }
     unsafe {
         delete sched.sf2_voices

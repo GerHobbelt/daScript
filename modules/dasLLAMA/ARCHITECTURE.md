@@ -12,10 +12,10 @@ in two of them will drift:
 |---|---|---|
 | `README.md` | users | what each file *is*, one line, plus how to run things |
 | `ARCHITECTURE.md` | me | what *belongs* in each file and why the system is shaped this way |
-| `CODEREVIEW.md` | `/code-review`, and us while writing | criteria checkable against a diff |
+| `REVIEW.md` | `/code-review`, and us while writing | criteria checkable against a diff |
 
-**References flow one way: CODEREVIEW cites ARCHITECTURE, never the reverse.** Sections here are
-numbered so they can be cited (`ARCHITECTURE §2.2`). Nothing here may cite a CODEREVIEW rule —
+**References flow one way: REVIEW cites ARCHITECTURE, never the reverse.** Sections here are
+numbered so they can be cited (`ARCHITECTURE §2.2`). Nothing here may cite a REVIEW rule —
 those are unnumbered review criteria by design, and a citation to one is a dangling pointer the
 moment the checklist is reordered.
 
@@ -41,7 +41,7 @@ never hand-edit the tables).
   in the module that owns the concern, and the facade re-exports it.
 - **`dasllama_version.das`** — `DASLLAMA_VERSION`, the module's own release counter, and nothing
   else. Decoupled from the daslang version and from `LLVM_JIT_CODEGEN_VERSION`; ANY kernel work
-  bumps it (CODEREVIEW.md), so equal versions mean an equal kernel roster — the sidecar exchange
+  bumps it (REVIEW.md), so equal versions mean an equal kernel roster — the sidecar exchange
   keys validity on (version, box). A zero-require leaf so the tuner's noise half, the benches,
   and the facade chain (`dasllama_common` re-exports it) all reach it without weight.
 - **`dasllama_common.das`** — the engine: `Model`/`Session`/`Config`, the forward loops, the
@@ -129,7 +129,10 @@ often gotten wrong, so each says explicitly where the neighbouring half goes.
   merges over vocab pieces, `<0xXX>` byte fallback.
 - **`dasllama_bpe.das`** — the byte-level BPE backend (Llama-3 / tiktoken family): vocab load, the
   GPT-2 byte alphabet, ranked merges, encode/decode. Split from SPM because the two algorithms
-  share no state; a third merge algorithm gets a fourth file.
+  share no state; a third merge algorithm gets a fourth file. Two sanctioned family-name tests
+  live here rather than in `dasllama_pretok`: the `pre`-name selector inside `bpe_encode`, and the
+  gemma-4 newline-run split in `bpe_encode_spm_space`; `load_bpe_tokenizer_gguf`'s per-family
+  metadata defaults are the third and last.
 - **`dasllama_pretok.das`** — the pre-tokenizer: one hand-compiled split function per family
   (llama3/qwen2/qwen35, gpt-2, gpt-4o, tekken), selected by the BPE `pre` name. Regex-port growth
   lands here, never in the merge engine — the two change for different reasons (new model family
@@ -203,6 +206,12 @@ that a question answered for one backend has an obvious address in the other. Th
   generates `enc_*` builders and MSL globals into the module the class COMPILES in, so co-location
   follows the class — "the builder needs the driver module" is never a placement reason. Prefill's
   prefill-only classes are convergence debt, not precedent.
+- **Ledgered kernel-binding asymmetries** — a REVIEW rule firing on one of these is expected, and
+  this entry is the sanction: the moe mul_mm TENSOR twins (`MetalMoeMulMmQ8T` /
+  `MetalMoeMulMmMx4T`) keep the pre-family compact kargs slots while their base classes bind the
+  family numbers, so no shared bind path may span the two layouts; and the in-engine moe mul_mm
+  A/B race harnesses (`dasllama_metal_prefill.das`) encode through `kn_moe_mm_family_tail`
+  rather than a per-class `enc_*` builder.
 - **`dasllama_gpu_tier.das`** — the device-cooperation SPI: hook types, install/unset slots,
   route/mark/want/status state, engine-facing forwarders. Vulkan implements it (per-op offload plus
   resident plumbing); Metal deliberately does not, because UMA makes residency moot there and Metal
@@ -299,6 +308,27 @@ on a shared path is the anti-pattern. Only a genuinely new dataflow earns its ow
   sideways between families.
 - **`dasllama_vad.das`** — Silero-VAD weights and per-stream state.
 
+### 1.7b Vision
+
+- **`dasllama_vision.das`** — the image preprocessing rail: dynamic-resolution geometry, the
+  letterbox resize (aspect-preserving bilinear onto a centered black canvas), u8→f32 normalize,
+  and the `DASLLAMA_VISION_DUMP` PPM writer. The only preprocessing home.
+- **`dasllama_vision_io.das`** — image decode to RGB8, from a file or a byte blob. The only file
+  that talks to stbimage; optional, like `dasllama_audio_io` — the facade takes decoded pixels.
+- **`dasllama_gemma4uv.das`** — the gemma4uv embedder (gemma-4 dense): mmproj load and the
+  im2col → LayerNorm → GEMM → position-table → projection forward. One file per vision
+  projector family, following the audio tower pattern; shared pieces move up, never sideways.
+  A shipped mmproj mixes element types per tensor — gemma-4's "BF16" file stores the patch
+  embedder as F32 and only the projection as BF16 — which is why a weight plane's element type
+  follows its source tensor, per tensor, never a per-file verdict.
+
+Vision oracle provenance (the convention `REVIEW.md`'s fixture rule points at): real image
+fixtures and mmproj files live in the models dir with `.sha` pins, fetched never generated
+(their `performance/fetch_models.das` entries are the checkable pins); the mtmd reference dumps
+live beside them in `gemma4-vision-oracle/`, whose `mint.sh` records the exact
+`llama-mtmd-debug` / `llama-mtmd-cli` invocation that minted each dump, so regeneration is a
+command, not archaeology.
+
 ### 1.8 Instrumentation and support
 
 - **`dasllama_parity.das`** — CPU-reference caches for the parity instruments. Test-facing, but
@@ -306,7 +336,8 @@ on a shared path is the anti-pattern. Only a genuinely new dataflow earns its ow
 - **`dasllama_prefix.das`** — the prefix/page cache for evaluated token history.
 - **`performance/fetch_models.das`** — the committed model-provenance manifest: per catalog
   file, the exact HF repo + revision pin + sha256, or the on-box conversion recipe. Verify by
-  default, `--fetch` downloads; it never converts, never benches. BRINGUP.md §2 is the runbook.
+  default, `--fetch` downloads; it never converts, never benches, and it touches no tune
+  state (`tune_policy(missing="fallback")`). BRINGUP.md §2 is the runbook.
 - **`performance/exchange_schema.das`** — engine-free validation for exchange submissions
   (record stores + tune sidecars); the dasllama.io ladder service builds on it.
 - **`performance/exchange_client.das`** — the sidecar-exchange client: the boot-time
@@ -331,7 +362,7 @@ on a shared path is the anti-pattern. Only a genuinely new dataflow earns its ow
 
 ## 2. Mechanisms
 
-The "why" behind criteria that CODEREVIEW states in one line each.
+The "why" behind criteria that REVIEW states in one line each.
 
 ### 2.1 There is ONE way to load a model
 
@@ -464,17 +495,22 @@ manifest and check its winners against the stored rows' `tune` stamps before tru
 release shipped beside it; a `DAS_TUNE_MANIFEST` run checks that file; a plain script checks
 that every `[tune]` row stamps a manifest winner. An invocation no arm covers refuses — or
 worse, measures on fallback kernels — which is why every measuring entry point calls the gate
-before its first timed rep.
+before its first timed rep. Two rig shapes fall outside "measuring entry point" by the
+property itself, ledgered here: a kernel A/B lab dispatches its variants through its own arms
+(never the `[tune]` selection), and `lcpp_bench.das`'s `--tok` cell dispatches no kernels at
+all — neither can measure a fallback silently.
 
 **The retune re-exec bites scaffolding, and the pin for it is checked in.** Any bare `daslang`
 run that requires the engine — a probe, a one-off script, a REPL experiment — re-execs into a
 full retune when no manifest is armed. `performance/last_known_good_sidecar.json` exists for
 exactly that: a frozen copy of a complete, noise-gated mint, tracked in git (the `*.tune.json`
 ignore rule deliberately does not match it). Point `DAS_TUNE_MANIFEST` at it and the framework
-never retunes; on a different box the identity mismatch just serves fallbacks. That is the whole
+never retunes; on a different box the identity mismatch just serves fallbacks, and a copy minted
+before the current `DASLLAMA_VERSION` serves fallbacks on any box — the compile says which with
+one `WARNING DAS_TUNE_MANIFEST` line per scope. That is the whole
 contract — it suppresses the re-exec, it does not tune the box, and a number measured under it
 is not a benchmark. Benches and the rig keep minting their own; refresh the copy when a
-paranoid re-mint moves the crowns.
+paranoid re-mint moves the crowns or `DASLLAMA_VERSION` bumps.
 
 ### 2.6 Capability questions and readiness questions are different questions
 
@@ -507,7 +543,7 @@ Three consequences the code is shaped around:
   quantized x; gate/up share another. Resident arming classifies each member's consumer form
   and DECLINES a mixed group rather than serving one member wrong scales.
 
-### 2.8 Every program root declares the same stack budget
+### 2.8 Every program root declares its stack budget and its prefill intent
 
 `options stack` is main-module-only: it does not unify up from required modules, so no library in
 the forward chain can declare the depth it needs. Every program that drives the engine — each test,
@@ -521,6 +557,14 @@ the limit is discovered by crashing — and the program that crashes is whicheve
 rarest. A measurement rig sized below a test suite is the worst case of this, because the suite
 stays green while the rig dies. The cost of the uniform number is reserved address space per
 context; the cost of per-root numbers is a runtime crash found by the least-covered program.
+
+The second declaration is prefill intent. A model-loading root declares `allow_cpu_prefill()`
+on the arms that hit the CPU-prefill guard — `set_metal_mode` with a runtime value declares
+nothing, since `MetalMode.off` leaves the guard armed — and logs, once, which configuration it
+ended on. The guard panics, and a panic takes every live stream down, so an undeclared root is
+a serving outage waiting on its first long prompt. Both halves of root discipline are enforced
+by `tests/test_program_roots.das`; weakening that test is a review defect
+(`tests/REVIEW.md`).
 
 ### 2.9 Environment knobs
 

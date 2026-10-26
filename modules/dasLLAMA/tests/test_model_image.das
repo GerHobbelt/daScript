@@ -11,6 +11,7 @@ require dasllama/dasllama_image
 require dasllama/dasllama_plane   // PlaneF — the served side of the round-trip comparisons
 require dasllama/dasllama_canary  // CanaryStaging/stage_canary_encoder — the off-rail truth read
 require dasllama/dasllama_gemma4a // Gemma4aStaging/stage_gemma4a_encoder — same, for the gemma4a arm
+require dasllama/dasllama_gemma4uv // Gemma4uvStaging/stage_gemma4uv_embedder — same, for the vision arm
 require dasllama/dasllama_parakeet // ParakeetStaging/stage_parakeet_model — same, for the parakeet arm
 require dasllama/dasllama_config     // DlimConfiguration — the peek/round-trip mechanics arms
 require dasllama/dasllama_math   // pin_kernel_backend — the metal-flavor arm's donor contract
@@ -55,6 +56,19 @@ def private count_mismatch(a : array<float>; b : PlaneF) : int64 {
 }
 
 def private count_mismatch_i8(a : array<int8>; b : PlaneI8) : int64 {
+    if (long_length(a) != length(b)) {
+        return -1l
+    }
+    var bad = 0l
+    for (i in range64(long_length(a))) {
+        if (a[i] != b[i]) {
+            bad++
+        }
+    }
+    return bad
+}
+
+def private count_mismatch_u16(a : array<uint16>; b : PlaneU16) : int64 {
     if (long_length(a) != length(b)) {
         return -1l
     }
@@ -464,10 +478,7 @@ def private text_image_roundtrip(t : T?; path : string; n_gen : int) {
 [test]
 def test_model_image_roundtrip(t : T?) {
     t |> run("SmolLM2-135M q8: gguf load vs mapped image, token-for-token") @(t : T?) {
-        if (!family_on(t, "llama")) return
-        if (!arm_on(t, "smol")) {
-            return
-        }
+        if (!family_on(t, "llama") || !arm_on(t, "smol")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -539,10 +550,7 @@ def private forced_logits_maxd(tc, tg : Model; prompt, teach : array<int64>; tag
 def test_metal_flavor_image(tst : T?) {
     tst |> run("SmolLM2 q8: metal flavor - blob mint + map + GPU serve + CPU tripwire") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!family_on(t, "llama")) return
-            if (!arm_on(t, "metal")) {
-                return
-            }
+            if (!family_on(t, "llama") || !arm_on(t, "metal")) return
             if (!jit_enabled()) {
                 t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
                 return
@@ -572,7 +580,7 @@ def test_metal_flavor_image(tst : T?) {
             t |> success(tm.metal_blob, "metal-mode load is blob-form")
             t |> success(tm.image_map != null, "cold metal load serves the image it built")
             t |> success(stat(img_m).is_valid, "cold metal load saved the metal-flavor image")
-            t |> success(length(tm.qblob) == 0, "planar q8 planes are gone")
+            t |> success(empty(tm.qblob), "planar q8 planes are gone")
             var g_mint <- gen_ids(tm, prompt, 16)   // a blob model CANNOT silently CPU-serve —
                                                     // completing at all proves the GPU served
             // teacher-forced parity vs a fresh planar CPU control (engine entry, no image
@@ -626,10 +634,7 @@ def test_metal_flavor_image(tst : T?) {
 def test_metal_flavor_derive(tst : T?) {
     tst |> run("SmolLM2 q8: the derived blob plane equals the in-RAM transform's") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!family_on(t, "llama")) return
-            if (!arm_on(t, "metal")) {
-                return
-            }
+            if (!family_on(t, "llama") || !arm_on(t, "metal")) return
             if (!jit_enabled()) {
                 t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
                 return
@@ -667,10 +672,7 @@ def test_metal_flavor_derive(tst : T?) {
 [test]
 def test_voxtral_mini_image(t : T?) {
     t |> run("voxtral-mini q8: the >2 GiB-plane image round trip") @(t : T?) {
-        if (!family_on(t, "voxtral")) return
-        if (!arm_on(t, "voxtral")) {
-            return
-        }
+        if (!family_on(t, "voxtral") || !arm_on(t, "voxtral")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -688,13 +690,10 @@ def test_voxtral_mini_image(t : T?) {
 [test]
 def test_gemma4_image_roundtrip(t : T?) {
     t |> run("gemma-4-E2B q8: arch-configure fallbacks must not clobber mapped config") @(t : T?) {
-        if (!family_on(t, "gemma")) return
         // gemma4's configure sets gguf-overridable fallbacks (sliding_window, swa_pattern);
         // re-running it on an image load stomped the serialized overrides (caught 2026-07-16:
         // token drift on the mapped E2B while every llama-arch carrier round-tripped clean)
-        if (!arm_on(t, "gemma")) {
-            return
-        }
+        if (!family_on(t, "gemma") || !arm_on(t, "gemma")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -710,10 +709,7 @@ def test_gemma4_image_roundtrip(t : T?) {
 [test]
 def test_tower_image_roundtrip(t : T?) {
     t |> run("ultravox-1b tower: mapped image planes are element-exact vs gguf") @(t : T?) {
-        if (!family_on(t, "ultravox")) return
-        if (!arm_on(t, "tower")) {
-            return
-        }
+        if (!family_on(t, "ultravox") || !arm_on(t, "tower")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -804,10 +800,7 @@ def private whisper_transcribe_text(path : string; samples : array<float>; cache
 [test]
 def test_whisper_image_roundtrip(t : T?) {
     t |> run("whisper tiny: gguf load vs mapped image, transcript-exact") @(t : T?) {
-        if (!family_on(t, "whisper")) return
-        if (!arm_on(t, "whisper")) {
-            return
-        }
+        if (!family_on(t, "whisper") || !arm_on(t, "whisper")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -883,8 +876,7 @@ def private parakeet_transcribe_text(path : string; samples : array<float>; cach
 [test]
 def test_parakeet_image_roundtrip(t : T?) {
     t |> run("parakeet v3: bin load vs mapped image, transcript-exact") @(t : T?) {
-        if (!family_on(t, "parakeet")) return
-        if (!arm_on(t, "parakeet")) return
+        if (!family_on(t, "parakeet") || !arm_on(t, "parakeet")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -920,8 +912,7 @@ def test_parakeet_image_roundtrip(t : T?) {
 [test]
 def test_qwen3a_tower_image_roundtrip(t : T?) {
     t |> run("qwen3a 0.6B tower: mapped image planes are element-exact vs gguf") @(t : T?) {
-        if (!family_on(t, "qwen3a")) return
-        if (!arm_on(t, "qwen3a")) return
+        if (!family_on(t, "qwen3a") || !arm_on(t, "qwen3a")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -968,10 +959,67 @@ def test_qwen3a_tower_image_roundtrip(t : T?) {
 }
 
 [test]
+def test_gemma4uv_embedder_image_roundtrip(t : T?) {
+    t |> run("gemma4uv embedder: mapped image planes are element-exact vs mmproj, bf16 lane") @(t : T?) {
+        if (!family_on(t, "gemma") || !arm_on(t, "gemma4uv")) return
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "mmproj-gemma-4-12B-it-BF16.gguf")
+        if (!model_available(t, path)) {
+            return
+        }
+        let img = image_path_for(path, "gemma4uv")
+        remove(img)
+        // off-rail truth: the staged read — both cached loads are image-backed and cannot check
+        // each other. A served embedder has no array-owning shape at all.
+        var inscope a <- stage_gemma4uv_embedder(path)
+        var inscope cold <- load_gemma4uv_embedder(path)
+        t |> success(cold.image_map != null, "cold load serves the image it built")
+        t |> success(stat(img).is_valid, "cold load saved an image")
+        // gemma-4's shipped "BF16" mmproj is MIXED: the patch embedder is F32 on disk, only the
+        // projection is BF16. The plane choice follows each tensor, so exactly one rides wblob.
+        t |> success(!cold.patch_bf16, "the F32 patch embedder stays on the fp32 plane")
+        t |> success(cold.proj_bf16, "the BF16 projection rides the bf16 plane")
+        t |> equal(count_mismatch(a.blob, cold.blob), 0l, "cold-built blob element-exact")
+        var inscope b <- load_gemma4uv_embedder(path)
+        t |> success(b.image_map != null, "warm load is image-backed")
+        t |> success(b.patch_bf16 == cold.patch_bf16 && b.proj_bf16 == cold.proj_bf16,
+                     "warm load keeps both plane choices")
+        t |> equal(b.n_embd, a.e.n_embd)
+        t |> equal(b.proj_dim, a.e.proj_dim)
+        t |> equal(b.patch, a.e.patch)
+        t |> equal(b.patch_dim, a.e.patch_dim)
+        t |> equal(b.pos_entries, a.e.pos_entries)
+        t |> equal(b.patch_w, a.e.patch_w)
+        t |> equal(b.proj_w, a.e.proj_w)
+        t |> equal(b.pos_w, a.e.pos_w)
+        t |> equal(count_mismatch(a.blob, b.blob), 0l, "blob element-exact")
+        t |> equal(count_mismatch_u16(a.wblob, b.wblob), 0l, "wblob (the bf16 GEMM) element-exact")
+        // the bf16 plane holds the file's OWN halfwords: exactly the projection, nothing rounded
+        t |> equal(long_length(a.wblob), a.e.n_embd * a.e.proj_dim,
+                   "the bf16 plane is exactly the projection ({length(a.wblob)} halfwords)")
+        // an F32 mmproj is a DIFFERENT lane and a different image — rounding it down to bf16
+        // would be a real precision loss, so the flavor follows the file
+        let f32path = path_join(models_dir(), "mmproj-gemma-4-12B-it-F32.gguf")
+        if (stat(f32path).is_valid) {
+            let img32 = image_path_for(f32path, "gemma4uv")
+            remove(img32)
+            var inscope a32 <- stage_gemma4uv_embedder(f32path)
+            var inscope c32 <- load_gemma4uv_embedder(f32path)
+            t |> success(!c32.patch_bf16 && !c32.proj_bf16, "an all-F32 mmproj mints no bf16 plane")
+            t |> equal(long_length(a32.wblob), 0l, "the all-fp32 source leaves wblob empty")
+            t |> equal(count_mismatch(a32.blob, c32.blob), 0l, "f32 blob element-exact")
+            t |> success(img32 != img, "a different source keys a different image")
+        }
+    }
+}
+
+[test]
 def test_canary_encoder_image_roundtrip(t : T?) {
     t |> run("canary encoder: mapped image planes are element-exact vs bin") @(t : T?) {
-        if (!family_on(t, "canary")) return
-        if (!arm_on(t, "canary")) return
+        if (!family_on(t, "canary") || !arm_on(t, "canary")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -1005,8 +1053,7 @@ def test_canary_encoder_image_roundtrip(t : T?) {
 [test]
 def test_canary_encoder_q8_image_roundtrip(t : T?) {
     t |> run("canary encoder q8: mapped image planes are element-exact vs bin transcode") @(t : T?) {
-        if (!family_on(t, "canary")) return
-        if (!arm_on(t, "canary")) return
+        if (!family_on(t, "canary") || !arm_on(t, "canary")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -1049,8 +1096,7 @@ def test_canary_encoder_q8_image_roundtrip(t : T?) {
 [test]
 def test_gemma4a_encoder_image_roundtrip(t : T?) {
     t |> run("gemma4a encoder q8: mapped image planes are element-exact vs gguf transcode") @(t : T?) {
-        if (!family_on(t, "gemma4a")) return
-        if (!arm_on(t, "gemma4a")) return
+        if (!family_on(t, "gemma4a") || !arm_on(t, "gemma4a")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -1099,16 +1145,14 @@ def test_gemma4a_encoder_image_roundtrip(t : T?) {
 [test]
 def test_gemma4a_transcribe_q8_ab(t : T?) {
     t |> run("gemma4a transcribe: the q8 tower vs the f32 rail on jfk, same text") @(t : T?) {
-        if (!family_on(t, "gemma4a")) return
-        if (!arm_on(t, "gemma4a")) return
+        if (!family_on(t, "gemma4a") || !arm_on(t, "gemma4a")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let dec_path = path_join(models_dir(), "gemma-4-E2B-it-Q8_0.gguf")
         let mmp_path = path_join(models_dir(), "mmproj-gemma-4-E2B-it-bf16.gguf")
-        if (!model_available(t, dec_path)) return
-        if (!model_available(t, mmp_path)) return
+        if (!model_available(t, dec_path) || !model_available(t, mmp_path)) return
         var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
         if (empty(samples)) {
             t |> skip("jfk.wav not present beside the models")
@@ -1119,7 +1163,7 @@ def test_gemma4a_transcribe_q8_ab(t : T?) {
         var lang = ""
         with_job_que() {
             setup_dasllama_jobque_()
-            // decoder off-rail (CODEREVIEW: suites load decoders with load_model_) — loaded ONCE; only the tower flips rails
+            // decoder off-rail (REVIEW: suites load decoders with load_model_) — loaded ONCE; only the tower flips rails
             var dec <- load_model_(dec_path, QuantMode.q8)
             var inscope enc <- load_gemma4a_encoder(mmp_path)
             var inscope s <- create_gemma4a_asr_session(dec)
@@ -1147,8 +1191,7 @@ def test_gemma4a_transcribe_q8_ab(t : T?) {
 [test]
 def test_qwen3a_tower_q8_ab(t : T?) {
     t |> run("qwen3a tower: the q8 core tracks the f32 rail on jfk window 0") @(t : T?) {
-        if (!family_on(t, "qwen3a")) return
-        if (!arm_on(t, "qwen3a")) return
+        if (!family_on(t, "qwen3a") || !arm_on(t, "qwen3a")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
@@ -1201,16 +1244,14 @@ def test_qwen3a_tower_q8_ab(t : T?) {
 [test]
 def test_qwen3a_transcribe_q8_ab(t : T?) {
     t |> run("qwen3a transcribe: the q8 tower core vs the f32 rail on jfk, same text") @(t : T?) {
-        if (!family_on(t, "qwen3a")) return
-        if (!arm_on(t, "qwen3a")) return
+        if (!family_on(t, "qwen3a") || !arm_on(t, "qwen3a")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let dec_path = path_join(models_dir(), "Qwen3-ASR-0.6B-Q8_0.gguf")
         let mmp_path = path_join(models_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
-        if (!model_available(t, dec_path)) return
-        if (!model_available(t, mmp_path)) return
+        if (!model_available(t, dec_path) || !model_available(t, mmp_path)) return
         var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
         if (empty(samples)) {
             t |> skip("jfk.wav not present beside the models")
@@ -1221,7 +1262,7 @@ def test_qwen3a_transcribe_q8_ab(t : T?) {
         var lang = ""
         with_job_que() {
             setup_dasllama_jobque_()
-            // decoder off-rail (CODEREVIEW: suites load decoders with load_model_) — loaded ONCE; only the tower flips rails
+            // decoder off-rail (REVIEW: suites load decoders with load_model_) — loaded ONCE; only the tower flips rails
             var dec <- load_model_(dec_path, QuantMode.q8)
             dec.config.seq_len = min(dec.config.seq_len, 8192l)
             var inscope tw <- load_qwen3a_tower(mmp_path)
@@ -1250,8 +1291,7 @@ def test_qwen3a_transcribe_q8_ab(t : T?) {
 [test]
 def test_fp32_decoder_image_roundtrip(t : T?) {
     t |> run("canary decoder fp32: gguf load vs mapped image, token-for-token") @(t : T?) {
-        if (!family_on(t, "canary")) return
-        if (!arm_on(t, "canary-dec")) return
+        if (!family_on(t, "canary") || !arm_on(t, "canary-dec")) return
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return

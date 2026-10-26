@@ -347,8 +347,11 @@ jobs:
           exit 0
         fi
         echo "linting: ${CHANGED[*]}"
-        $BIN/daslang ./utils/lint/main.das -- "${CHANGED[@]}" --quiet
-        $BIN/das-lint.exe "${CHANGED[@]}" --quiet
+        # LINT019 (stale nolint) is OFF here: a changed-set ledger cannot see consumers
+        # outside the PR, and >=16 files parallelize into per-file ledgers - both produce
+        # false stales. The nightly whole-tree -j 1 pass owns staleness.
+        $BIN/daslang ./utils/lint/main.das -- "${CHANGED[@]}" --quiet --disable LINT019
+        $BIN/das-lint.exe "${CHANGED[@]}" --quiet --disable LINT019
 
     - name: "Run ast-verify on changed .das files"
       if: matrix.target == 'linux'
@@ -429,23 +432,36 @@ jobs:
         set -eux
         python3 utils/lsp/test_crosstree_guard.py
 
-    - name: "Test dasllama-server"
-      # OpenAI-compatible server conformance test. Model-gated + JIT-only, so it
-      # skips cleanly here (no GGUF, no -jit) — the value is the compile guard:
-      # it exercises the dasHV + dasAudio + dasllama facade surface the server
-      # reaches, catching any API/module breakage in CI. The exchange-client
-      # suite is model-free and runs fully (fake exchange on 127.0.0.1:18131).
+    - name: "Test review-md discovery"
       if: matrix.target == 'linux'
       run: |
         set -eux
-        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/dasllama-server/test_openai_server.das
-        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/dasllama-server/test_openai_server_think.das
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/review-md/test_scan.das
+
+    - name: "Test pr-babysit verdict core"
+      if: matrix.target == 'linux'
+      run: |
+        set -eux
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/pr-babysit/test_watch_verdict.das
+
+    - name: "Test dasllama-server"
+      # The model-gated server suites run --compile-only: this lane has no GGUF
+      # and no -jit, so the value is the explicit compile guard — it exercises
+      # the dasHV + dasAudio + dasllama facade surface the server reaches,
+      # catching any API/module breakage in CI. The exchange-client suite is
+      # model-free and runs fully (fake exchange on 127.0.0.1:18131).
+      if: matrix.target == 'linux'
+      run: |
+        set -eux
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --compile-only --color --failures-only --test ./utils/dasllama-server/test_openai_server.das
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --compile-only --color --failures-only --test ./utils/dasllama-server/test_openai_server_think.das
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --compile-only --color --failures-only --test ./utils/dasllama-server/test_openai_server_vision.das
         $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/dasllama-server/test_exchange_client.das
 
     - name: "Test env-knob registries"
       # The [EnvConfig] enforcement tests (daslib/env_registry scanners): raw-read
       # ban, declaration coverage, generated-ENVIRONMENT.md drift. Model-free,
-      # sub-second — this lane is what makes each CODEREVIEW's "the registry test
+      # sub-second — this lane is what makes each REVIEW's "the registry test
       # enforces it" sentence true.
       if: matrix.target == 'linux'
       run: |

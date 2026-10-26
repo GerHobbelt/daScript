@@ -279,6 +279,49 @@ def test_lockfile_roundtrip(t : T?) {
 }
 
 [test]
+def test_copy_dir_rec_skips_links_and_build_residue(t : T?) {
+    t |> run("junction/symlink, .git, and build dirs stay out of the copy") @(t : T?) {
+        let tmp = "{get_das_root()}/_daspkg_test_copyskip"
+        let src = "{tmp}/src"
+        mkdir(tmp)
+        mkdir(src)
+        mkdir("{src}/real")
+        fopen("{src}/real/a.txt", "wb") $(f) {
+            fprint(f, "content")
+        }
+        mkdir("{src}/_build")
+        fopen("{src}/_build/CMakeCache.txt", "wb") $(f) {
+            fprint(f, "stale")
+        }
+        mkdir("{src}/build")
+        mkdir("{src}/.git")
+        // a link pointing at src itself - copying it recurses forever unless copy_dir_rec skips links
+        let link = "{src}/loop"
+        var out : string
+        var link_cmd = "ln -s \"{src}\" \"{link}\""
+        if (get_platform_name() == "windows") {
+            link_cmd = "cmd /c mklink /J \"{replace(link, "/", "\\")}\" \"{replace(src, "/", "\\")}\""
+        }
+        let linked = run_cmd(link_cmd, out) == 0
+        let dst = "{tmp}/dst"
+        t |> success(copy_dir_rec(src, dst), "copy_dir_rec({src} -> {dst}) returned false")
+        t |> success(fexist("{dst}/real/a.txt"), "real content missing from the copy")
+        t |> success(!fexist("{dst}/_build"), "_build was copied")
+        t |> success(!fexist("{dst}/build"), "build was copied")
+        t |> success(!fexist("{dst}/.git"), ".git was copied")
+        if (linked) {
+            var link_err : string
+            t |> success(is_reparse_point(link, link_err), "is_reparse_point does not see the link")
+            t |> success(!is_reparse_point(src, link_err), "is_reparse_point flags a plain dir")
+            t |> success(!fexist("{dst}/loop"), "the link was followed into the copy")
+        } else {
+            to_log(LOG_INFO, "test_copy_dir_rec_skips_links_and_build_residue: could not create a junction/symlink here; skipping the link half\n")
+        }
+        force_rmdir(tmp)
+    }
+}
+
+[test]
 def test_in_tree_module_satisfies_install(t : T?) {
     t |> run("explicit install of an in-tree module is a no-op") @(t : T?) {
         // dasGlfw is a tracked in-tree module: present at <das_root>/modules/
@@ -2170,8 +2213,7 @@ def test_cmd_release_portable_on_macos(t : T?) { // nolint:STYLE038
         var real_dylib = ""
         var dylib_count = 0
         dir(glfw_dir) $(filename) {
-            if (filename == "." || filename == "..") return
-            if (!ends_with(filename, ".dylib")) return
+            if (filename == "." || filename == ".." || !ends_with(filename, ".dylib")) return
             let p = path_join(glfw_dir, filename)
             var sym_err : string
             if (is_symlink(p, sym_err)) return
@@ -2185,8 +2227,7 @@ def test_cmd_release_portable_on_macos(t : T?) { // nolint:STYLE038
         var install_name = ""
         for (line in split(id_out, "\n")) {
             let s = strip(line)
-            if (empty(s)) continue
-            if (ends_with(s, ":")) continue
+            if (empty(s) || ends_with(s, ":")) continue
             install_name = s
         }
         tt |> success(starts_with(install_name, "@rpath/"),

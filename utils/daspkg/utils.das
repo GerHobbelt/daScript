@@ -7,6 +7,8 @@ module utils shared public
 require daslib/fio
 require strings
 
+let COPY_WINDOW_BYTES = 1024 * 1024
+
 // ── Logging ──────────────────────────────────────────────────────────
 
 var log_file_path : string
@@ -365,46 +367,76 @@ def gitignore_remove(root, pattern : string) {
     }
 }
 
+// a package is its files, not its history or its build residue: .git costs more than
+// the rest of the tree, and a copied build dir (_build or build) carries a CMakeCache
+// pointing at the source path, which aborts the installed package's own configure
+def private is_package_content(name : string) : bool {
+    return name != "." && name != ".." && name != ".git" && name != "_build" && name != "build"
+}
+
+// streamed through a fixed window: sizing a buffer by the file costs that file in
+// memory, and panics outright on one past max_unreserved_size
+def private copy_file_bytes(src, dst : string) : bool {
+    var ok = true
+    fopen(src, "rb") $(fin) {
+        if (fin == null) {
+            ok = false
+            return
+        }
+        fopen(dst, "wb") $(fout) {
+            if (fout == null) {
+                ok = false
+                return
+            }
+            var buf : array<uint8>
+            buf |> resize(COPY_WINDOW_BYTES)
+            while (true) {
+                let n = fread(fin, buf)
+                break if (n <= 0)
+                if (n < length(buf)) {
+                    buf |> resize(n)
+                }
+                if (fwrite(fout, buf) != length(buf)) {
+                    ok = false
+                    break
+                }
+                break if (n < COPY_WINDOW_BYTES)
+            }
+            // a mid-file read error returns a short count exactly like EOF - feof is the tiebreaker
+            if (ok && !feof(fin)) {
+                ok = false
+            }
+            delete buf
+        }
+    }
+    return ok
+}
+
 def copy_dir_rec(src, dst : string) : bool {
     mkdir(dst)
     var ok = true
     dir(src) $(name) {
-        if (name == "." || name == "..") return
+        return if (!is_package_content(name))
         let src_child = "{src}/{name}"
         let dst_child = "{dst}/{name}"
+        // never follow a junction/symlink: one into the tree recurses forever, and one
+        // out of it copies content that is not the package's
+        var link_err : string
+        return if (is_reparse_point(src_child, link_err))
         let st = stat(src_child)
         if (st.is_dir) {
             if (!copy_dir_rec(src_child, dst_child)) {
                 ok = false
             }
         } elif (st.is_reg) {
-            fopen(src_child, "rb") $(fin) {
-                if (fin != null) {
-                    let fs = fstat(fin)
-                    let sz = int(fs.size)
-                    if (sz == 0) {
-                        // empty file — just create it
-                        fopen(dst_child, "wb") $(fout) {
-                            if (fout == null) {
-                                ok = false
-                            }
-                        }
-                    } else {
-                        var buf : array<uint8>
-                        buf |> resize(sz)
-                        fread(fin, buf)
-                        fopen(dst_child, "wb") $(fout) {
-                            if (fout != null) {
-                                fwrite(fout, buf)
-                            } else {
-                                ok = false
-                            }
-                        }
-                    }
-                } else {
-                    ok = false
-                }
+            if (!copy_file_bytes(src_child, dst_child)) {
+                ok = false
             }
+        } else {
+            // stat failed, or the entry is neither file nor dir - a copy that silently
+            // dropped an entry must not report itself complete
+            to_log(LOG_ERROR, "Error: cannot stat {src_child} (or unsupported entry kind)\n")
+            ok = false
         }
     }
     return ok

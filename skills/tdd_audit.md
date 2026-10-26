@@ -87,6 +87,9 @@ For each, run the **reverse control**: the OLD test against the NEW code.
   written from what the author hopes is documentation, not a test.
 - **Never mutate a test to change a verdict.** The mutation goes in the code under test;
   the test is the instrument.
+- **A test is named for the invariant it pins, never the ticket.** `test_issue_NNNN`
+  says nothing without leaving the code; `test_stackwalk_tail_split` states what must
+  hold. Same for fixture files and test-case labels.
 
 ## Reporting
 
@@ -115,10 +118,10 @@ branches and tests is a real result; "tests pass" is not an audit.
 
 ## Where this runs in the daslang repo (repo-only)
 
-- The rule is constitutional: every `CODEREVIEW.md` carries it verbatim in its opening
-  (template: `skills/codereview_md.md`).
+- The rule is constitutional: every `REVIEW.md` carries it verbatim in its opening
+  (template: `skills/review_md.md`).
 - The per-PR audit is the `tdd-auditor` agent (`.claude/agents/tdd-auditor.md`), launched
-  in `skills/make_pr.md` step 0a beside the CODEREVIEW.md auditors — one instance for the
+  in `skills/make_pr.md` step 0a beside the REVIEW.md auditors — one instance for the
   whole diff, so folders with no checklist (`daslib/`, `src/`, `utils/`) are covered too.
 - Repo test placement (AOT registration, the `tests/.das_test` gate) is
   `skills/tests_in_repo.md`.

@@ -22,6 +22,7 @@ let ENGINE_FILES = [
     "modules/dasLLAMA/dasllama/dasllama_sampling.das",  // sample_ / generate_ / generate_embd_ / stats_ / set_seed_
     "modules/dasLLAMA/dasllama/dasllama_prefix.das",
     "modules/dasLLAMA/dasllama/dasllama_chat.das",
+    "modules/dasLLAMA/dasllama/dasllama_gemma4uv.das",   // encode_image_ (the vision splice's encode half)
     "modules/dasLLAMA/dasllama/dasllama_math.das"   // setup_dasllama_jobque_ (jobque setup lives with the runtime knobs)
 ]
 let EXAMPLES = ["examples/dasLLAMA/run.das", "examples/dasLLAMA/chat.das"]
@@ -73,7 +74,7 @@ def test_facade_docstrings_inside_body(t : T?) {
         let lines <- read_lines(FACADE)
         for (i in range(length(lines) - 1)) {
             let inert = starts_with(strip(lines[i]), "//!") && starts_with(lines[i + 1], "def ")
-            t |> success(!inert, "line {i + 1}: //! directly above a def is invisible to the doc extractor — move it inside the body")
+            t |> success(!inert, "line {i + 1}: //! directly above a def is invisible to the doc extractor - move it inside the body")
         }
     }
 }
