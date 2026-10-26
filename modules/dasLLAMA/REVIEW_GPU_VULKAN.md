@@ -4,7 +4,8 @@
 docs: `ARCHITECTURE_GPU_VULKAN.md`, `ARCHITECTURE_GPU_VULKAN_ATTN.md`,
 `ARCHITECTURE_GPU_VULKAN_DECODE.md`, `ARCHITECTURE_GPU_VULKAN_GEMM.md`,
 `ARCHITECTURE_GPU_VULKAN_MOE.md`, `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`,
-`ARCHITECTURE_GPU_VULKAN_NROW.md`, `ARCHITECTURE_GPU.md`. Planned work: `followup_vulkan.md`.
+`ARCHITECTURE_GPU_VULKAN_NROW.md`, `ARCHITECTURE_GPU_VULKAN_MTP.md`, `ARCHITECTURE_GPU.md`.
+Planned work: `followup_vulkan.md`.
 
 **A diff that adds a Vulkan dispatch family - a `[vk_dispatch]` class and the `ensure_<family>` /
 `set_<family>` pair generated from it - or that caches a descriptor set or a host address (a
@@ -22,10 +23,10 @@ the stamps of one `[vk_dispatch]` class template, picked by a shape argument - t
 `dasllama/dasllama_vulkan_classes.das` adds that family's stamp glob to the kernel-home row's
 stamp list in `ARCHITECTURE_GPU.md#gpu-backends`, in the same change.**
 
-**Never size a buffer bound as one SSBO (shader storage buffer) range above
-`vk_max_storage_range()` - compare it where its size is computed: at the site that computes that
-buffer's size, or once at the function that starts the encode chain binding it, against a size no
-buffer of that chain can exceed.** The bind site cannot shrink a buffer that was sized wrong.
+**Never size a buffer bound as one SSBO (shader storage buffer) range above the device limit
+`vk_max_storage_range()` - check the size with `vk_range_ok` at the site that computes it, or
+once at the function that starts the encode chain binding the buffer, against a size no buffer of
+that chain can exceed.** The bind site cannot shrink a buffer that was sized wrong.
 
 **Never take a quant byte out of an `unpack8` select in a cm2 decode body - the `decode` method
 of a format's `<Fmt>Cm2T` class in `dasllama/dasllama_vulkan_classes.das` - or its four-wide twin
@@ -54,11 +55,16 @@ routed off and why.** A silent decline is a fallback a user finds only by profil
 to a slower form inside the same path (a host upload in place of a device-to-device copy) -
 that does not log the concrete reason it declined, once per reason per armed model, is a defect.**
 
+**A `*_decline_words` return that a diff adds or changes, for a reason a `VK_DECLINE_WORDS_*`
+constant in `dasllama/dasllama_vulkan_tower.das` already states, returns that constant or starts
+its text with it - never a second wording of that reason.**
+
 **A diff that adds or changes a function under `dasllama/` outside the tier's arm probe
 `vulkan_moe_gpu_arm` that calls `vk_moe_init()` makes it test `gpu_want_arms_tier()` first, and
-decline without calling it when the want is off; a serving hook that keeps a decline counter
-counts that decline under its no-device reason.** `vk_moe_init` reads no knob, so a caller that
-skips the test serves on a box whose `DASLLAMA_GPU` says no.
+decline without calling it when the want is off; a serving hook - a hook slot the CPU chain calls
+to hand work to the GPU - that keeps a `VkDeclineCounter` counts that decline under its decline
+enum's `device` member, the reason `VK_DECLINE_WORDS_DEVICE` words.** `vk_moe_init` reads no
+knob, so a caller that skips the test serves on a box whose `DASLLAMA_GPU` says no.
 
 **A diff that changes what a device limit or extension decides for the tier - which path
 serves, how much it arms, whether it declines - adds that limit or extension to `vk_ext_roster`
@@ -155,9 +161,10 @@ beats its `=0` row; or `override DECV4 = false` and `override DECVEC = false` to
 the format back on the scalar callback.** With `DECV4 = true` the class never reads `DECVEC`, so
 `override DECVEC = false` alone leaves the hand-written twin running.
 
-**A GPU timestamp the resident decode's token command records goes through `rd_ts` with the name
-its interval is reported under - never a bare `pfq_ts` - in `dasllama/dasllama_vulkan_decode.das`;
-the command's first stamp is the anchor and takes the empty name.** The profiler (`rdq_sample`)
+**A GPU timestamp in `dasllama/dasllama_vulkan_decode.das` recorded by a command whose stamps
+`rdq_sample` reads goes through `rd_ts` with the name its interval is reported under - never a
+bare `pfq_ts`; the command's first stamp is the anchor and takes the empty name.** The profiler
+(`rdq_sample`)
 sums intervals by the recorder's own names, so a bare stamp records more stamps than the recorder
 has names and the token's roles are not summed; a name's prefix (`a:` `d:` `m:` `p:` `t:`) picks
 its table, and a name shared by two stamps sums them on purpose.
@@ -214,9 +221,10 @@ no error.
 byte literal.** A literal stops matching when `TokMeta` gains a field, and every row past the first
 then reads its fields outside the binding, with no error.
 
-**A diff that adds a recorded form - a recorder that builds the resident token command into its
-own command buffer (`dasllama/dasllama_vulkan_decode.das`) - gives that form its own stamp-name
-list and stamp count.** The profiler sums intervals by the recorder's own names.
+**A diff that adds a recorded form - a recorder that builds, into its own command buffer, a
+command whose stamps `rdq_sample` reads (`dasllama/dasllama_vulkan_decode.das`) - gives that
+form its own stamp-name list and stamp count.** The profiler sums intervals by the recorder's
+own names.
 
 **A diff that adds or changes a recorder that installs its own stamp names in
 `g_rdq_stamp_names` (`dasllama/dasllama_vulkan_decode.das`) puts the one-row command's list back
@@ -228,22 +236,21 @@ profile to another form's role names.
 returned before it submits any command that writes the buffer that copy reads.** The host's wait
 is the only order between the copy's read and that write.
 
-**An integer division or modulo in `dasllama/dasllama_vulkan_classes.das` kernel code - a kernel
-body or any method it reaches through calls, `dasllama/dasllama_gpu_math.das`'s helpers included -
-whose divisor is not a literal or a template constant (a push-constant field, bare or computed
-from one) either clamps the divisor to at least one (`max(1u, ...)`) before it divides, or sits
-inside an `if` whose condition tests the divisor expression as the division reads it and is false
-when that expression is zero; a test on any other field, one the divisor is computed from
-included, is no guard, and a `?:` select is neither.** Some drivers evaluate both arms of a
-select, and an integer division by zero is undefined in SPIR-V, so the selected arm can carry the
-undefined result.
+**A diff that adds an integer division or modulo to `dasllama/dasllama_vulkan_classes.das` kernel
+code - a kernel body or any method it reaches through calls, `dasllama/dasllama_gpu_math.das`'s
+helpers included - or changes one's divisor, the values that feed it, or the clamp or `if` that
+guards it, where the divisor is not a literal or a template constant, clamps the divisor to at
+least one (`max(1u, ...)`) before the division, or places the division inside an `if` whose
+condition tests that same divisor expression and is false when it is zero.** An integer division
+by zero is undefined in SPIR-V, and some drivers evaluate both arms of a `?:` select, so neither
+a select nor a test on a field the divisor is computed from guards it.
 
 **A diff that adds or changes a path under `dasllama/` that re-records the one-row token
 command's split form - the chain recorded with the attention at `RD_SPLIT_PIECES` key pieces - or
-replaces a descriptor set it dispatches, makes it clear that region's wide-twin recorded flag
-(`RDec.tok_wide_recorded`) in the same path.** The wide twin (the same chain at
-`RD_SPLIT_WIDE_PIECES` pieces) dispatches the same sets, so a twin left marked recorded runs sets
-the new record replaced.
+replaces a descriptor set it dispatches, makes it clear `RDec.tok_wide_recorded` for the region
+whose split form it re-recorded or whose set it replaced, in the same path.** The wide twin (the
+same chain at `RD_SPLIT_WIDE_PIECES` pieces) dispatches the same sets, so a twin left marked
+recorded runs sets the new record replaced.
 
 **A twin's availability flag (`RDec.unsplit_on`, `RDec.wide_on`) is written where the twin's
 command buffers are allocated, in `vk_rdec_prepare`, and nowhere else.** A path that writes

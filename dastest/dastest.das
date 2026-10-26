@@ -577,6 +577,12 @@ def main() : int {  // nolint:STYLE037,STYLE038 - CLI dispatch, one arm per mode
         }
         files |> erase_if() $(f) => !(keep |> key_exists(f |> replace("\\", "/")))
     }
+    if (!empty(test_args.test_only)) {
+        files |> erase_if() $(f) {
+            let one = f |> replace("\\", "/")
+            return (find_index_if(test_args.test_only) $(p) => p |> replace("\\", "/") == one) < 0
+        }
+    }
     if (!empty(test_args.exclude_files)) {
         files |> erase_if() $(f) {
             let base = base_name(f)
@@ -683,8 +689,18 @@ def main() : int {  // nolint:STYLE037,STYLE038 - CLI dispatch, one arm per mode
         // source instead of streaming them all through the captured pipe.
         let failuresOnlyFlag = test_args.failures_only ? " --failures-only" : ""
         let useAotFlag = test_args.use_aot ? " --use-aot" : ""
-        let cmdPrefix = "{launchPrefix} {jitstr} {aotstr} --"
-        let cmdSuffix = " {benchstr}{log::useTtyColors ? " --color" : ""}{headlessFlag}{stackExcFlag}{failuresOnlyFlag}{useAotFlag}"
+        let persistentHeapFlag = test_args.persistent_heap ? " --persistent-heap" : ""
+        //! the JIT reads its --jit-* flags off the worker's own command line, so each one crosses to the worker
+        let jitFlags = build_string() $(var w) {
+            for (i in range(dashdash + 1, length(raw_args))) {
+                if (dashdash >= 0 && raw_args[i] |> starts_with("--jit-")) {
+                    w |> write(" ")
+                    w |> write(raw_args[i])
+                }
+            }
+        }
+        let cmdPrefix = "{launchPrefix} {jitstr} {aotstr} --{persistentHeapFlag}"
+        let cmdSuffix = " {benchstr}{log::useTtyColors ? " --color" : ""}{headlessFlag}{stackExcFlag}{failuresOnlyFlag}{useAotFlag}{jitFlags}"
         let batchSize = max(1, test_args.batch)
         // Group files into batches of batchSize. Each batch is run by one worker
         // subprocess (batchCmd); per-file singleCmds are kept so a crash can be

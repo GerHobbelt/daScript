@@ -236,14 +236,14 @@ serves the loaded model the pool carries only the sampler's argmax between steps
 still spinning when the step's command is submitted starves the driver's submission thread - on
 the pod (48 vCPUs, `-jit`, `benchmarks/lcpp_bench.das --npl 4`; `PERF_LEDGER.md`'s 2026-09-19
 section) Llama-3.2-1B at four streams read 707 tok/s summed under the 30 ms window and 1053 under
-500 us, the knee at the step's own length. So the driver's arm and drop (`rdec_set_active`) report
-to `set_dispatch_gpu_served`, which pushes the GPU window (`g_jobque_spin_gpu_us`, 500 us) to the
-live queue at once, and `setup_dasllama_jobque` reads whichever window is in force
-(`get_jobque_spin_in_force`) for a queue made after the load. The pool is one per process, so the
-window is process-wide: on a GPU-served slot the CPU audio and speech routes park after the 500 us
-window too, and a box profile's `runtime.jobque_spin_gpu_us` or `set_jobque_spin_gpu_us` widens
-it. An embedder's own `set_jobque_worker_spin` value is replaced whenever a resident model arms or
-drops; the facade's window setters are the way to choose it. The pool's size
+500 us, the knee at the step's own length. So the Vulkan driver's arm and drop (`rdec_set_active`)
+and a Metal driver's served forward (`metal_note_served`, until the next weights load) report to
+`set_dispatch_gpu_served`, which pushes the GPU window (`g_jobque_spin_gpu_us`, 500 us) to the live
+queue; `setup_dasllama_jobque` reads the window in force for a queue made later. Under the CPU
+window the pool's workers spin through a Metal prefill, and its windows slow within seconds.
+The pool is one per process: on a GPU-served slot the CPU audio and speech routes park after
+500 us too, and a box profile's `runtime.jobque_spin_gpu_us` or `set_jobque_spin_gpu_us` widens it.
+An embedder's own `set_jobque_worker_spin` value is replaced at each report. The pool's size
 is the runtime's (`src/misc/job_que.cpp`): the browser's reported cores, capped and floored by
 `DAS_MAX_HW_JOBS` and `DAS_MIN_WEB_JOBS` (eight and four unless the build overrides them), minus
 one for the computing main thread - seven workers on a real box, the pool
@@ -258,7 +258,8 @@ skewed routing draw becomes one unit the barrier waits on - measured 620 against
 Zipf k4 draw (`harness/moe_kq_probe.das`). The CPU arms therefore split a region into sub-regions
 of at most 32 rows: sub-regions of one expert share its weight offset, and the per-expert bias
 lists repeat once per sub-region. The GPU arms keep whole regions - their kernels chunk by work
-already.
+already. The list runs biggest bucket first (`lpt_order`): the dispatcher hands out units in list
+order, so the heavy spans start first; in expert order a late heavy expert left the other lanes idle.
 
 ### The engine dispatches only on a configured job queue {#jobque-policy}
 

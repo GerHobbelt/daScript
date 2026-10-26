@@ -110,16 +110,23 @@ Ordered roughly by user-visible value; re-rank against zen2 measurements before 
    cell, both against the sequential CPU rule; (e) DONE 9/5 - the prefill hands each slot to the
    session (valid, dirty, owned) instead of flushing it home and re-uploading, and window 0 zeroes
    the slots with fills inside the window command: 48 host round trips gone per prefill.
-3. **KV codecs on device** - Vulkan's mirror serves f16 (the armed default) and f32 through
-   the codec-templated kernel stamps; Metal additionally carries q8_0/tq4. Port the quant
-   codecs next (the CPU truth is `dasllama_convert`'s KV codec functions; the Metal quant
-   kernels are the device reference).
+3. **KV codecs on device.** Vulkan's mirror serves f16 (the armed default) and f32 through the
+   codec-templated kernel stamps; Metal additionally carries q8_0 / tq4, and the CPU cache all four,
+   so a server's `--kv q8_0` or `tq4` under Vulkan passes every session back to the CPU rails as a codec
+   mismatch. The mirror's bytes are what a 16 GB card's context and its resident experts compete for:
+   Qwen3.6-35B-A3B UD-IQ2_XXS held 46203 f16 positions at one stream, 11510 at four, on a user's RTX 5080
+   16 GB (the server's control page, `external`); a context asked whole (131072) moves ten of forty routed
+   layers' experts to the host on the reference card (`test_gpu_resident_moe_ctx_strict`'s load log), and on
+   Qwen3-30B-A3B Q4_K_M the 32768-position f16 mirror costs eight resident layers against the per-op rails
+   (`PERF_LEDGER.md`'s host-layers entry: tg128 41.8 against 64.0, `debug-jit`). A q8_0 mirror halves those
+   bytes, tq4 quarters them: the same context with 8-12 more layers resident, or 92k / 180k positions
+   where 46k fit. Done = the Vulkan decode and flash-attention arms read q8_0 and tq4 mirror rows
+   (`dasllama_convert`'s KV codec functions the truth, the Metal `sq_attn` codec arms the device
+   reference), `resident_mirror_dtype` arms the session's codec, the hc cell's `DASLLAMA_VK_KV32` skip
+   turns into a served codec arm, and the two files above re-measured at the asked context.
 4. **Real batched decode** - the resident mirror is single-sequence; batch rows round-trip
    their KV per step (`rdec_sync_kv` in, `rdec_read_kv` out). Metal has a true batched driver
    (P4). Options: multi-sequence mirror slabs, or per-row device KV like Metal's `KVMirror`.
-5. **MTP / speculative decode** - Metal-only today (`metal_mtp_spec_eval`, same-slab verify).
-   Register the vulkan `mtp_spec`/`mtp_seam` overrides once batch (4) exists - the verify step
-   is a B=2 batch.
 6. **mx4 / q51 device kernels** - absent on Vulkan (CPU+Metal only). Needed before gpt-oss
    (mx4 experts) or gemma-4-26B (q51 stacks) can go resident on PC.
 7. **Tune-race parity** - Metal races tensor-op twins per box (`metal_tensor_race*`); Vulkan
@@ -1679,8 +1686,10 @@ module) is independent and can land any time - it is pure structure.
     two setters are `mtp_walk_sampled` and `rdec_land_pick`, and `mtp_round_begin` panics on
     either latch left set. The work: one `pre_drawn` / `pre_tok` pair, both setters writing it,
     the six `test_mtp_sampled_walk.das` assertions reading the one name - after saying in one
-    line that a speculative round and a device pick are never live on one session in one step
-    (the scheduler's speculative arm never asks a pick).
+    line that the two latches are never both set on one session: the sampled walk parks a draw
+    and rides no pick ask, a round under the scheduler's per-tick pick ask publishes the committed
+    row's pick through `land_pick` and parks no draw, and `mtp_round_begin` panics on either
+    latch left set.
 87. **The mistral3 family has no batched evidence.** Mistral-Small-3.1-24B-Instruct-2503 Q4_K_M
     (`performance/model_specs.das`, 14 GB) serves through the N-row command like the other dense
     K-quant carriers, but no box of ours stocks it beside its models, so no regions file pins its
@@ -1750,7 +1759,7 @@ module) is independent and can land any time - it is pure structure.
     the compensated sums they protect can fold. Done = the arm sets the knob where the user has not,
     and the source kernels' cells run green on the Mac.
 112. **`tts_div`'s Newton step relies on `mad` being fused.** The source kernels divide as the
-    CPU's IEEE division rounds through `tts_div` (`dasllama_gpu_math.das`): a reciprocal
+    CPU's IEEE division rounds through `tts_div` (`dasllama_vulkan_classes.das`): a reciprocal
     refined once and the quotient corrected by its exact remainder, each correction a `mad` whose
     exactness needs one rounding. `mad` lowers to `Fma`, which the `precise` mark does not decorate
     and which Vulkan lets a driver evaluate as a multiply then an add
@@ -1832,16 +1841,15 @@ module) is independent and can land any time - it is pure structure.
     minted at that width, or a kernel-cell pair); the GPU ledger (`vt_pt`, `vt_prof_report`, the
     `vk_prof()` reports) under `DASLLAMA_GPU_PROF=1` - one cell reading the report text; the
     bench's `--asr-clips` override and the served-clip stamping, and the `DASLLAMA_VK_WDEC` knob
-    read; the lower-side guards of `TowerDwConv5` (`t + kk >= 4u`), `TowerCnDw` (`src >= kpad`) and
-    `TowerDwConv` (`iy >= 0`, `ix >= 0`) - a wrapped index lands gigabytes past any buffer and
+    read; the lower-side guards of `TowerDwConv5` and `TowerCnDw` (`st >= 0` in
+    `conv_src_fwd_row`, which their `DwConvRowsT.src_row` calls) and `TowerDwConv` (`iy >= 0`,
+    `ix >= 0`) - a wrapped index lands gigabytes past any buffer and
     robust buffer access reads zero, so the fixtures cannot reach them without a source base offset
     in the args that lets a garbage prefix sit before the block (the upper-side guards are
     covered); the `sdot4` arm of every audio twin (the cm2-off feeds: `vt_tile`'s q8 variant, the
     requant steps, the decoder's non-cm2 buffers) as a standing run, not the one p22 leg.
 103. **The tower dedup pass's leftovers.** The folds the pass ruled out or left, each with its
-    reason. `TowerDwConv5` against `TowerCnDw` (one template over the pad placement, causal or
-    centered, with a gated BatchNorm + silu epilogue): the epilogues compute different things, the
-    weakest fold of the census - deferred. `TowerRms` against `ClsArAddRms` at `add_on = 0`: the
+    reason. `TowerRms` against `ClsArAddRms` at `add_on = 0`: the
     residual class reads a zero add partner, rewrites the row in place and stashes it in a 32 KB
     workgroup array where the tower class reads the row once, so the fold adds two plane passes and
     a workgroup array to a role that reads 1% of the gemma4a chain (176 us over 36 stamps at
@@ -1945,3 +1953,238 @@ module) is independent and can land any time - it is pure structure.
     the ncol cell dispatches the one-column class before the N class, so a grid N leaf that skipped
     `stage_grid` would read the grid the previous dispatch left in workgroup memory (a poisoning
     dispatch between them, or the N class first, pins the call).
+93. **MoltenVK reds in the model-free suite.** On a Mac with the dasVulkan module built, MoltenVK
+    is a live Vulkan device and three model-free files red on it - `test_vulkan_dec_tail` and
+    `test_vulkan_tier` on the class-rail asserts ("the class rails must engage on a live device":
+    a decode span, FFN tail and add+rms class fails its SPIR-V to MSL conversion), and
+    `test_vulkan_tower_kernels` on `[mvk-error] SPIR-V to MSL conversion error: Currently no block
+    to insert opcode`. The sdot4 GEMV cells and the cm2 gates (skipped, no coopmat) read right.
+    Done = the tier declines a device whose pipeline build fails (`device` decline, the cells
+    skip on it as they do on a missing device) or the offending opcode is spelled the way
+    MoltenVK's converter accepts, and the three files read green under MoltenVK.
+
+115. **Nineteen TTS kernels are one algorithm under two class shells.** `TtsSrcCumsumT`, `TtsStftT`,
+    `TtsIstft`, `TtsSrcSinesT`, `TtsSrcLowT`, `TtsAdainT`, `TtsConcat`, `TtsPkAttn`, `TtsPkGemvT`,
+    `TtsPoolDw`, `TtsIm2colT`, `TtsElemT`, `TtsAddScale`, `TtsPkRowScale`, `TtsRowGather`,
+    `TtsPkRowsT` (the reflect pad's two copies included), `TtsSigSum`, `TtsAxpy` and
+    `TtsSrcNoise` each have a `MetalSt2*` / `MetalPk*` twin whose body is the same arithmetic; the dedup pass moved that
+    arithmetic into `dasllama_gpu_math.das`, and what stays twice is the shell - the binding
+    declarations (`@push_constant pa` against `@uniform ka`), the entry, the workgroup count. No
+    `class template` is stamped by both the SPIR-V and the Metal emitter today
+    (`modules/dasMetal/ARCHITECTURE.md` section 5: uniform against push-constant bindings, method
+    splicing against calls), so the shells wait on an emitter feature: one template with a
+    per-emitter binding form, about 500 lines across the two homes. The seat chains the two
+    drivers write per backend are the other half of the same picture and a separate arc after
+    the 0.6.5 release (Boris's ruling): the host flow of every TTS seat - the stage ping-pong,
+    the concat when the width differs, the head-block loop - is identical and could run once over
+    an encoder interface, about 450 lines.
+
+116. **The speculative round has no Vulkan round seat.** The round's four backend seats
+    (`register_mtp_spec_override`, `_spec_batch_`, `_round_`, `_seam_` in `dasllama_common.das`)
+    are filled by the Metal decode driver and the Metal gemma drafter alone. The resident driver
+    homes the NextN draft head and serves the round's draft through its own seat
+    (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`), under the Vulkan owner
+    (`register_mtp_seat_owner`, "the resident driver is armed on t"), serves the round's
+    two-row verify as same-slab rows of the N-row command with the head's re-warm in the same
+    command - the k-head store alone, no q GEMV - landing the rows' picks and hidden and, under a
+    bare-argmax caller's pick ask, no logits, the committed row's pick published for `sample_`
+    as a plain step's is (`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`), the draft's pick
+    answered from the device and the round's head rows staying on the device until a pass
+    hydrates them (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`), and warms the head's
+    slab over a prompt it serves as the window chain's extra layer, the prompt's rows read back
+    to the host (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-head-prompt-warm`; the CPU warm stands
+    down behind a driver that landed the logits, so it never reads the host `x_b` rows such a
+    driver leaves unwritten); the resident overrides land the
+    post-norm hidden carry (`ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#logits-transfer-queue`), so with
+    `set_mtp_spec` or the server's `--mtp` the round's cold gate passes and the CPU round runs
+    around the device draft and verify, and a reject of a verify the seat served rolls the region
+    back on the device from the copies the verify command took - no snapshot, no replayed step
+    (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`, the rollback seat). A verify the
+    seat declines runs the CPU two-row prefill over the snapshot the round then takes, inside the
+    verify window the resident prefill declines by name
+    (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-window`): a hybrid's passes to the CPU rails,
+    and a routed-head carrier (GLM-4.5-Air's shape - no recurrent layer, a head the driver
+    declines) is served by the CPU verify under the window with its trunk resident.
+    `test_mtp.das`'s sessions carry f32 K/V, so they reach the driver only under
+    `DASLLAMA_VK_KV32=1`. What is still owed, in Metal's shape (`ARCHITECTURE_GPU_MTP.md`) on the
+    resident driver: the Vulkan round seat (`register_mtp_round_override("vulkan", ...)`) - a
+    round at depth k > 1 (the verify's per-row planes and the rollback scratch already hold the
+    box knob's depth plus one, eight rows at most, and the scratch's rows serve a reject to any
+    `a < k`) and the joint verify across streams - then the gemma assistant drafter. Carriers: Qwen3.5-0.8B-MTP first,
+    Qwen3.8-27B with its split Q8_0 head for the rate (Metal reads 1.23x at depth 1, 1.31x at
+    depth 3 on the M5 Max), gemma-4-26B with the assistant drafter as the second round kind; the
+    invariance cells of `tests/test_mtp.das` and the scheduler arm are the parity, `lcpp_bench
+    --mtp-ab` on the pod the rate, a CUDA reference row per carrier beside it.
+117. **The Vulkan MTP arc's declined folds are one dedup pass.** The arc's dupe audit folded the
+    seat lookup, the draft and verify decline ladders, the head prologue, the host timing block and
+    the test helpers it named duplicates; four sibling sets stayed by ruling, each a fold whose
+    evidence is the kernel cells and the hybrid file on the pod, in the shape of the TTS dedup pass:
+    (a) the head's K/V row seats as one more layer - `vk_rdec_head_sync_rows` and
+    `vk_rdec_head_read_rows` beside `vk_rdec_sync_kv` and the tier's forwarders differ on the head
+    (`l == n_layers`) alone, and the fold changes the seat signatures the Metal twin shares; (b) the
+    hybrid file's bar-and-control helpers `carries_within` and `head_rows_within` beside
+    `_resident_feed.das`'s `rows_within_control` - one form over a row list with the bar and the
+    control's rows passed in; (c) the hybrid file's feed collectors (`feed_under_spec` and the
+    per-cell copies of a session's logits and carry rows) - one collector over a step list; (d) the
+    reject cells' helpers (the rolled-back state read-back, the fresh-session control) shared with
+    `test_mtp.das`'s `reject_round_ids`. The vulkan-lane mint arc's audit added its sibling sets to the
+    same pass: (e) the two streaming saves' plane hooks (`save_model_image_streaming`,
+    `image_from_model_streaming` - the mint, devwf16 and streamed-plane arms twice, on the sink and
+    the log wording alone); (f) the two aligned plan appends (`vk_mint_sink_append`, `vk_bake_append`
+    - the RAM blob as one more `VkMintSinkFn`); (g) the trim's dropped-family set spelled twice
+    (`trim_plane_dropped` by section name, `trim_model_planes` by field delete - one table walked by
+    both once a field walks by name); (h) the plan's decline chain (`resident_would_serve` beside
+    `resident_upload`'s gates - one pure `resident_decline_reason`); (i) the tests' cached-load
+    block (`load_cached_q8` in `test_vulkan_mint.das` and `test_model_image_vulkan.das`). A kernel
+    fold's identity gate is `harness/vk_spv_diff.das`
+    over `DASLLAMA_VK_SPV_DUMP` at the base and the tip; a test fold's is the file's cell count and
+    skip count unchanged on the pod under both mirrors.
+118. **Two vulkan-lane arms still bake from RAM with the planar families kept.** The streaming mint
+    (`ARCHITECTURE_IMAGE_VULKAN.md#image-vulkan-mint`) serves the cold load; a planar image already
+    mapped (a CPU-mode load's lane found under an armed tier) and the eager rail (a gguf that would
+    not open for streaming, a chunk that would not allocate) still bake the lane through
+    `vulkan_bake_flavor` off the mapping or the loaded planes - one file, but the families ride it,
+    the eager rail writes the CPU lane beside it and serves that, and under `DASLLAMA_TRIM` the
+    lane's identity says trimmed while its meta says not (the image serves, with the extra planes;
+    the arm warns). The untrimmed lane is the default, so the mint's lane carries the planar families
+    unless the lever is on, and an fp32 token table rides `fblob` whole under the trim (nothing packs
+    it). `vulkan_bake_begin` on those arms collects the twin into RAM even under
+    `DASLLAMA_IMAGE_SAVE=0`, where `vulkan_bake_flavor` deletes it unsaved. Done = both arms re-read
+    the gguf through the streaming mint, the collect skipped where nothing saves, and the trimmed
+    lane means the same thing on every arm.
+119. **The converter's trim and the runtime's trim admit different models under one identity bit.**
+    `dasllama-convert -f vulkan --trim` (`trim_model_planes`) refuses a NextN head, while the cold
+    load's trimmed mint (`resident_would_serve`) admits one the driver's draft seat serves - the
+    0.8B-MTP trims at runtime and is refused offline - and both write the lane under the same
+    trim-folded tag; the converter's streamed `-f vulkan` rail still refuses with a text that
+    predates the mint ("collects whole planes"). Done = one admission predicate on both rails
+    (`resident_would_serve` with `planes_trimmed` set before the converter's save), the refusal text
+    naming what still holds, and `dasllama-convert --trim` proven on a q8, a K-quant and a
+    third-format model.
+120. **The served one-stream round on a Vulkan device is unmeasured.** `dasllama-server` arms the
+    speculative round by default on a one-stream slot whose whole model is resident
+    (`mtp_auto_arms`, `utils/dasllama-server/openai_server.das`), and an armed slot serves
+    host-cached sessions where a plain one serves device-home ones (`slot_wants_device_kv`); the
+    rates that rule rests on are `benchmarks/lcpp_bench.das --mtp-ab` rows (`PERF_LEDGER.md`, the
+    resident driver's NextN entries), which time no served slot. Done = the server's in-process
+    bench (`/bench`) on a one-stream Vulkan slot, the round armed against the round off with
+    device-home sessions, on the 0.8B-MTP and one larger NextN carrier, in `PERF_LEDGER.md`.
+121. **A roster slot keeps the self-speculation answer of its load.** `init_one_scheduler`
+    (`utils/dasllama-server/openai_server.das`) reads `backend_effective` once, when the slot's
+    scheduler is built, and the GPU owner moves between roster slots afterwards
+    (`bind_gpu_slot`): a slot that armed the round as the owner goes on drafting on the CPU
+    after it hands the device over, where the round is slower than plain decode
+    (`PERF_LEDGER.md`, the CPU self-speculation entry), and a slot loaded off the device never
+    arms after it takes it. Done = the unset default re-read at every owner switch, with a cell
+    that switches the owner between two NextN slots and reads `mtp_drafted` on each.
+122. **The hyper-connection chain takes one form of the token command and one window form.**
+    `ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command` serves a hyper-connection MoE's decode as the split
+    token command and `#hc-window-chain` its prompt, but the split command records the split attention
+    form alone (no unsplit twin under `RD_UNSPLIT_POS`, no wide twin past `RD_WIDE_POS`), one mirror
+    region, no N-row rows and no same-slab verify; the window chain runs no chunked overlap and stamps
+    no profile roles. Done = the attention twins recorded per segment, the regions and rows forms as the
+    serving shapes ask for them, and the window's `--prof` roles.
+123. **A window's pool hits ride the batch arm's chain, with a host round trip and one tile column.**
+    `ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool` runs a window's hits through `vk_moe_ffn_batch_xf_begin`:
+    the window's rows go up (5 MB at 512 rows), the combined rows come back (5 MB) and the host adds
+    them, and each plane's regions take one cm2 column (`batch_tile_edges`) where the resident block's
+    own schedule takes the e and s columns per bucket (`ARCHITECTURE_GPU_VULKAN_MOE.md#vk-prefill-moe-block`).
+    The chain is bounded by its one chunk (`moe_gpu_ffn_xf_async_rows`), so a wider window would fall
+    back to the host. Done = the window's segment schedules the hits on the device (the sched, gather,
+    ladder and combine kernels over the pool's planes, the combine accumulating onto the host's sums),
+    no rows cross the link, and the prompt's row is re-measured.
+125. **Placing an expert in a pool slot copies it twice.** The gather writes the expert's device layout
+    into host scratch (0.57 ms) and the upload copies the scratch into the slot (0.27 ms; both
+    `DASLLAMA_GPU_PROF=1`'s pool line, debug-jit), so a pool of 32 x 48 slots fills in 1.3 s at the
+    first window and a decode that starts with no prompt reads 14-21 tok/s over its first 128 tokens
+    (debug-jit; no board row carries this model on Vulkan). Done = the gather writes the slot's mapped bytes where the
+    device buffer is host-visible, and the fill's cost is re-measured.
+126. **The resident plan's reserve beside a desktop is 1 GiB, and this box pages inside it.** With the
+    OS's room answered, the plan fills the card to the per-process budget less the other processes'
+    bytes less `RDEC_OS_RESERVE`; on the zen2 (RTX 5060 Ti, a desktop holding 3.9-4.3 GB) a plan 681 MB
+    under that room read tg128 2.93 tok/s under the driver's paging warning, one 1.3 GB under it read
+    30.0, and one 550 MB under it read the prompt's row 5% low at four times the spread (debug-jit,
+    the `lcpp_bench` rows of `PERF_LEDGER.md`'s hot-pool entry). Done = the
+    reserve measured on a box with a live desktop (the plan's slack against the rows, three slacks or
+    more), and the constant or the rule set from the reading.
+127. **A pool placement rides the token's path.** The gather of an expert's device layout (0.57 ms) and
+    its upload (0.27) run inside the host's routed step, so the pool swaps one expert a layer a step and
+    holds 31-45% of real text's picks (`PERF_LEDGER.md`'s NextN entry, the profile). The trace sim
+    (`harness/hot_pool_sim.das` over the same entry's eight-prompt trace, the token modeled from the
+    profile's costs - the device 22.0 ms, a miss 72 us, a placement 570 us of host gather + 270 us of
+    upload; the calibration row is on the ledger) at 32 slots a layer, the zen2's trace, debug-jit:
+
+    | policy | decode hits | placements a token | modeled token | tok/s |
+    | :--- | ---: | ---: | ---: | ---: |
+    | heat, the shipped one (decay 256, hysteresis 2x+1, 1 swap) | 37.5% | 2.38 | 45.7 ms = 22.0 + misses 21.7 + placements 2.0 | 21.9 |
+    | lru, 1 swap a step | 58.2% | 50.1 | 78.6 = 22.0 + 14.5 + 42.1 | 12.7 |
+    | lru, 2 swaps | 70.9% | 92.2 | 109.5 = 22.0 + 10.1 + 77.4 | 9.1 |
+    | lru, 4 swaps | 87.3% | 154.6 | 156.3 = 22.0 + 4.4 + 129.9 | 6.4 |
+    | lru, 64 slots, 2 swaps | 82.4% | 82.6 | 97.5 = 22.0 + 6.1 + 69.4 | 10.3 |
+    | lru 4, async placements, the gather on the path (`--async`) | 87.3% | 154.6 | 114.6 = max(22.0 + 4.4 + host 88.1, link 26.6) | 8.7 |
+    | lru 1, async, no host gather (`--place-host-us 0`) | 58.2% | 50.1 | 36.5 = max(22.0 + 14.5, link 8.6) | 27.4 |
+    | lru 2, async, no host gather | 70.9% | 92.2 | 32.1 = max(22.0 + 10.1, link 15.9) | 31.1 |
+    | lru 4, async, no host gather | 87.3% | 154.6 | 26.6 = max(22.0 + 4.4, link 26.6) | 37.6 |
+
+    The picks have recency: LRU at four swaps a step holds 87% of them in the same 32 slots, but a
+    placement's 0.84 ms on the token's path (row 125) turns 155 placements into 130 ms, and even with
+    the upload off the path the host's layout gather (570 us) binds. With the gather gone - the experts
+    mirrored in their device layout in host memory (55 GB beside the 94 of the file; the zen2 holds 256)
+    and the placements on the transfer queue behind the segments - the token is the longer of the
+    compute path and the link, and LRU-4 models 37.6 tok/s link-bound (a placement 172 us of a 13 GB/s
+    link: 127 experts a token free under the 22 ms device floor), 1.67x the ledger's 22.5 (debug-jit,
+    no board row carries this model). Done = the routed experts mirrored in their device layout in pinned host
+    memory at load (55 GB beside the file's 94; the plan declines the mirror where the host's room does
+    not hold it), a placement one transfer-queue copy off the mirror behind the segments, LRU at four
+    swaps a step as the mechanism's first policy (row 128 refines it, the sim kept as the offline
+    bench), and the live profile's hits and token wall against the sim's row.
+128. **The pool's policy is a decaying count.** With row 127 landed the placements are free to the link's
+    budget (row 127's table: 127 experts a token at 13 GB/s under the 22 ms device floor) and the policy
+    decides the hits: LRU-N first (the same table's 58-87% at one to four swaps), then a predictor - the previous layer's picks
+    over a co-occurrence table, or the next token's picks prefetched during this token's segments -
+    placing fewer experts for the same hits. Done = each policy tried in the sim against the trace
+    before its live run, the winner's hits and token wall on the ledger.
+129. **The rows' side panel commits at depth 1 alone.** `PleCommit` lands every verify row's normed gated
+    row in the ring's slot of its position after the conv read them, and a rejected row's slot is
+    rewritten by the next token before any conv reads it - true at depth 1, where one row past the
+    accepted prefix is at stake, so `rd_ensure_hc_v_rail` declines every other row count and the CPU
+    verify serves a deeper draft. Done = a depth past 1 commits the accepted rows alone, or the rollback
+    restores the slots it rewrote, and the rail admits the depth.
+130. **The device draft accepts 14 points under the CPU draft.** The device's draft and the verify rows
+    route their near-ties apart (65.8% against the CPU rail's 79.9% on the same eight prompts,
+    `PERF_LEDGER.md`'s NextN entry, the `--mtp-ab` rows), and every
+    point of acceptance is a share of the round's second token. Done = the gap read on the pick tape
+    (the draft's picks against the verify row's on the same token) and the arm that flips named.
+131. **The NextN-on-the-chain arc's instruments have no cell of their own.** The MOET trace writer
+    (`DASLLAMA_MOE_TRACE`: the header, the prompt mark, the flush at `RDEC_TRACE_FLUSH_RECORDS`, the
+    flush at the drop), `harness/hot_pool_sim.das`'s reader and policies, `gpu_resident_experts_host`
+    after a load and after the drop, the `hot_submit_rows` seat's unset panic and restore, and the
+    declines of `rd_ensure_hc_v_rail` are reached only by the serving cells or by no cell. Done = a
+    cell in `test_gpu_resident_hc.das` writes a trace to a temp file, drops the model and reads it back
+    (the magic, the header's three counts, one mark, a window record a layer, a one-row record a layer
+    a step); a model-free cell replays a hand-made trace through `heat`, `lru` and `lfu` asserting the
+    hits and placements; `test_gpu_tier.das` gains the unset rows seat; the facade predicate is asserted
+    true then false around the drop; the rail's declines run under a fixture that lacks a leaf.
+132. **The stocked resident cells written for the pod read red on a 16 GB card beside a desktop.** On
+    the zen2 (RTX 5060 Ti, 2.6-2.7 GB held by other processes) `test_gpu_resident_regions_gemma4`
+    (the 12B: needs 17667 MB of 11649), `_gemma4moe` (needs 20166 of 11647) and `_gptoss` (2 regions
+    of 4667 positions where the cell asks 3) fail on the room the plan finds, and
+    `test_gpu_resident_moe`'s census floor misses by three planes (`_hybrid` 117 of 120, `_no_shexp`
+    134 of 144) on this box on master (934fe7b2e, run through this tree's binary against a detached
+    worktree) as on the arc's tip; `test_gpu_resident_hybrid_kq_q8out` is `followup_general.md` row
+    183. Done = the regions cells skip, naming the room, where the plan cannot arm the regions they
+    ask, and the census floor's miss on this card named (the pieces one layer routes off the cm2e
+    column) or the floor keyed to the card.
+
+133. **The host-layer form's declined folds join the Vulkan dedup pass.** The arc's dupe audit found six
+   templatable sets and left them for the pass that closes the Vulkan arc (row 117's shape): the prefill
+   host cut in `pf_run` against `pf_run_hc`'s, with the `rdec_host_rows` tier seat that exists to feed it
+   (one helper taking the callback, the way `rdec_prefill_hc` passes `experts`); the decode host cut in
+   `rd_encode_token` against `rd_record_hc_segments_n`'s and `rd_record_hc_draft`'s (router, landing, end,
+   re-open, routed sum - one helper taking the row count and the next buffer); the host and device combine
+   binding lists in `rd_moe_sets` and `pf_moe_layer_sets` (four bindings differ of ten); the ramp and
+   constant device buffers `ones_dev`, `pf_ident_dev`, `pf_ones_dev`, `moe_ident_dev`, `hot_ident1_dev`
+   (`make_ramp_buf` / `make_fill_buf` over `staged_upload`); the `g_rdec_hx_t` / `g_rdec_hx_s` set-call-clear
+   at five sites (a block helper); and the prefill host-sum landings allocated alike in `pf_moe_setup` and
+   `pf_hc_setup`. Each fold is behavior-neutral and the MoE cells on the hc carrier and the two host-layer
+   fixtures are its proof.

@@ -143,6 +143,21 @@ def test_chat_qwen(t : T?) {
         want |> push(ims)
         want |> push_from(bpe_encode(raw, "assistant\n"))
         t |> success(ids_equal(engine_prefill(m, SYS, USR), want), "qwen chatml prefill token-for-token")
+        // the marked render: a first turn's opening is its system turn, a later turn has none
+        var c = create_chat(m, SYS)
+        add_user(c, USR)
+        var marked <- render_turn_marked(m, c)
+        var inscope sys_toks <- bpe_encode(raw, "system\n{SYS}")
+        var inscope nl_toks <- bpe_encode(raw, "\n")
+        t |> equal(marked.opening, 2l + long_length(sys_toks) + long_length(nl_toks), "the opening is the system turn, marker to newline")
+        t |> success(marked.opening > 0l && marked.opening < long_length(marked.toks), "and stops short of the user turn ({marked.opening} of {long_length(marked.toks)})")
+        t |> success(ids_equal(marked.toks, want), "the marked render's tokens are render_turn's")
+        c.first = false
+        var later <- render_turn_marked(m, c)
+        t |> equal(later.opening, 0l, "a later turn has no opening")
+        delete later
+        delete marked
+        delete c
         delete raw
         delete m
     }
@@ -180,10 +195,7 @@ def test_chat_llama3(t : T?) {
 [test]
 def test_chat_end_to_end(t : T?) {
     t |> run("respond() streams a reply, stops on a stop token, records stats + transcript") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
+        return if (!jit_only(t))
         let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> skip("{path} not present")
@@ -193,8 +205,7 @@ def test_chat_end_to_end(t : T?) {
         m.config.seq_len = min(m.config.seq_len, 512l)
         var reply = ""
         var ntok = 0l
-        with_job_que() {
-            setup_dasllama_jobque()
+        with_dasllama_jobque() {
             var c = create_chat(m, "", 24l)   // no system prompt, short budget
             add_user(c, "Say hello in one short sentence.")
             reply = respond(m, c, SamplingParams()) $(piece) {   // greedy
@@ -410,8 +421,7 @@ def test_chat_gemma4_instruct_text_turn(t : T?) {
         }
         var m <- load_capped(path)
         allow_cpu_prefill()
-        with_job_que() {
-            setup_dasllama_jobque()
+        with_dasllama_jobque() {
             var c = create_chat(m, "", 64l)
             set_thinking(c, false)
             add_user(c, "What is 2+2? Answer with just the number.")
@@ -896,8 +906,7 @@ def test_chat_pending_cleared_on_consume(t : T?) {
             t |> skip("{path} not present")
             return
         }
-        with_job_que() {
-            setup_dasllama_jobque()
+        with_dasllama_jobque() {
             var m <- load_capped(path)
             var c = create_chat(m, "", 4l)   // max_new=4 — the state machine is under test, not the reply
             add_user(c, "Count to three.")
@@ -930,17 +939,13 @@ def test_chat_pending_cleared_on_consume(t : T?) {
 [test]
 def test_chat_render_seam(t : T?) {
     t |> run("render_assistant == add_assistant evals; renderer chat holds no KV (needs SmolLM2-135M)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
+        return if (!jit_only(t))
         let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> skip("{path} not present")
             return
         }
-        with_job_que() {
-            setup_dasllama_jobque()
+        with_dasllama_jobque() {
             var m <- load_capped(path)
             moe_gpu_drop_model()   // one lane: under DASLLAMA_GPU=1 the two paths would split between the device prefill and the CPU continuation
             // classic prefill is bit-exact under ANY chunking (test_prefill's contract), so a

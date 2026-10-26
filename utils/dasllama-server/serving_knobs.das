@@ -12,6 +12,25 @@ require model_catalog           // gpu_env_master_off — the env rail's GPU mas
 require daslib/fio
 require strings
 
+//! The rope-scaling override both programs spell alike: an empty kind and zero numbers leave the env-seeded
+//! override alone, else each set flag replaces its field (the betas stay the env's); the loader checks the kind
+def apply_rope_scaling(kind : string; scale : float; orig_ctx : int64) {
+    if (empty(kind) && scale <= 0.0 && orig_ctx <= 0l) {
+        return
+    }
+    var o = rope_scaling_override()
+    if (!empty(kind)) {
+        o.kind = kind
+    }
+    if (scale > 0.0) {
+        o.scale = scale
+    }
+    if (orig_ctx > 0l) {
+        o.orig_ctx = orig_ctx
+    }
+    set_rope_scaling_override(o)
+}
+
 //! True when ``s`` is a quant spelling ``pick_quant`` maps deliberately (any case): the serving
 //! modes fp32/f32 | q8 | q4, plus the gguf FILE formats that serve under the kq tier —
 //! q8_0 / q4_0 / q4_k / q5_k / q6_k (_M/_S suffixes fine), mxfp4, f16 / bf16.
@@ -53,16 +72,27 @@ def pick_kv_dtype(s : string; tool : string = "dasllama-server") : KVDtype {
     return KVDtype.f16
 }
 
-def pick_metal_mode(s : string; tool : string = "dasllama-server") : MetalMode {
+//! The Metal mode a `--metal` spelling names; `known` is false on a spelling that names none, and the mode is then off.
+def metal_mode_of(s : string) : tuple<mode : MetalMode; known : bool> {
     let l = to_lower(s)
-    if (l == "required") {
-        return MetalMode.required
-    } elif (l == "auto" || l == "when_available") {
-        return MetalMode.when_available
-    } elif (!empty(l) && l != "off") {
+    return (mode = MetalMode.required, known = true) if (l == "required")
+    return (mode = MetalMode.when_available, known = true) if (l == "auto" || l == "when_available")
+    return (mode = MetalMode.off, known = empty(l) || l == "off")
+}
+
+def pick_metal_mode(s : string; tool : string = "dasllama-server") : MetalMode {
+    let picked = metal_mode_of(s)
+    if (!picked.known) {
         to_log(LOG_WARNING, "{tool}: unknown --metal '{s}', using off (valid: off | auto | required)\n")
     }
-    return MetalMode.off
+    return picked.mode
+}
+
+//! The Metal mode a run serves under: a `--gpu` pick (`effective_gpu`'s answer) wins, and only an empty one leaves the legacy `--metal` mode standing.
+def resolved_metal_mode(legacy : MetalMode; gpu : string) : MetalMode {
+    return MetalMode.when_available if (gpu == "metal")
+    return MetalMode.required if (gpu == "metal-required")
+    return empty(gpu) ? legacy : MetalMode.off
 }
 
 let TTS_LANE_DEFAULT = "q8"
@@ -192,6 +222,10 @@ def gpu_detail_dn(k : GpuKnobs) : bool
 def gpu_detail_attn(k : GpuKnobs) : bool
     => k.attn_set ? k.attn : true
 
+//! an explicit context - the server's --ctx, a load body's ctx, the CLI's --ctx - is asked whole of the whole-model driver; none leaves the plan to shorten the model's own
+[arch(at = "README.md#gpu-key")]
+def gpu_ctx_asked_whole(ctx : int64) : bool => ctx > 0l
+
 [arch(at = "README.md#gpu-key")]
 def vulkan_serving_want(k : GpuKnobs) : GpuTierWant
     => GpuTierWant(resident = true,
@@ -204,14 +238,7 @@ def vulkan_serving_want(k : GpuKnobs) : GpuTierWant
 //! uploads stacks. `gpu` is ``effective_gpu``'s answer; returns whether the Vulkan tier armed
 //! (false under every other pick).
 def apply_gpu_backend(k : GpuKnobs; gpu : string; tool : string = "dasllama-server") : bool {
-    var metal_mode = pick_metal_mode(k.metal, tool)
-    if (gpu == "metal") {
-        metal_mode = MetalMode.when_available
-    } elif (gpu == "metal-required") {
-        metal_mode = MetalMode.required
-    } elif (!empty(gpu)) {
-        metal_mode = MetalMode.off   // gpu = off | vulkan both keep metal out
-    }
+    let metal_mode = resolved_metal_mode(pick_metal_mode(k.metal, tool), gpu)
     set_metal_mode(metal_mode)
     if (metal_mode == MetalMode.off) {
         // the Metal-build CPU-prefill guard is a profiling tripwire; its panic would drop every

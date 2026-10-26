@@ -47,8 +47,26 @@ struct public EngineEnv {
     @clarg_doc = "Split NextN/MTP head GGUF to attach to the trunk being loaded (the split mtp-<model>.gguf form: its blk.<n_layers>.* tensors become the draft block; its copies of the trunk's tables are ignored). Default: the mtp-<trunk basename> sibling beside the trunk when present. The head rides the split-shard walk, so one prepared image carries trunk and head."
     mtp_head : string = ""
 
+    @clarg_doc = "RoPE scaling override for the load: yarn | linear | none; unset keeps the file's rope.scaling keys, none drops them (a file's per-pair factor tensors and attn_factor stay, as llama.cpp keeps them). yarn folds the NTK-by-parts frequency ramp and the 1 + 0.1 ln(s) magnitude into the rope tables (llama.cpp --rope-scaling yarn). The Qwen families publish the recipe (Qwen2.5-Instruct 7B and up, Qwen3, Qwen3-Next / 3.5 / 3.8: factor 4 over the trained context) and ship no scaling keys because static YaRN costs a little on short texts - arm it when a conversation needs the length; no other vendor validates it, and a non-Qwen file logs a warning. The override is baked into the prepared image, under its own lane."
+    rope_scaling : string = ""
+
+    @clarg_doc = "The RoPE scaling factor s (the context multiplier) for the override; 0 = the file's rope.scaling.factor, and yarn needs one."
+    rope_scale : float = 0.0
+
+    @clarg_doc = "YaRN: the original training context the factor extends; 0 = the file's original_context_length, else its context_length (llama.cpp --yarn-orig-ctx)."
+    yarn_orig_ctx : int64 = 0l
+
+    @clarg_doc = "YaRN: the low correction dim beta_fast; 0 = the file's, else 32."
+    yarn_beta_fast : float = 0.0
+
+    @clarg_doc = "YaRN: the high correction dim beta_slow; 0 = the file's, else 1."
+    yarn_beta_slow : float = 0.0
+
     @clarg_doc = "Pin the matmul backend by name, bypassing the measured auto-selection."
     pin_backend : string = ""
+
+    @clarg_doc = "How an IQ3_S weight is served: grid = the disk form (the 3.44-bit grid planes, decoded by a gather), lut = the iq3s4 form (a 4-bit codebook index a superblock, decoded by the LUT kernels - exact, 17% more bytes, the CPU decode several times faster), auto = lut wherever the serving rails decode it (the CPU rails and the Vulkan tier), grid under the Metal tier (it gathers the grid and carries no iq3s4 kernel)."
+    iq3s_serve : string = "auto"
 
     @clarg_doc = "Pin the batched (prefill) matmul backend independently of the decode one."
     pin_batch_backend : string = ""
@@ -80,6 +98,9 @@ struct public EngineEnv {
 
     @clarg_doc = "Advisory source-mapping readahead at gguf load (cold-conversion fix); =0 restores on-demand faulting."
     prefetch : bool = true
+
+    @clarg_doc = "Readahead of the prepared image at its map (madvise WILLNEED, synchronous on macOS): a purged page cache then reads the whole image at the SSD's rate before the first token - 103 GB in 15 s on the M5 - instead of paying 2.5x on the routed expert stacks over the first 128 tokens, and a WARM map pays ~2.5 s for the page walk in place of 65 ms. A serving process that runs for hours wants it; a bench, a test or a short session does not."
+    prefetch_image : bool = false
 }
 
 // Tri-state on purpose: the tier's effective defaults are computed from set_gpu_tier_want state
@@ -109,6 +130,9 @@ struct public GpuTierEnv {
     @clarg_default_doc = "the model's context"
     @clarg_doc = "Cap the resident driver's KV mirror at this many positions (the card's room and the 4 GiB binding cap still bound it); a cap under the arming floor lowers the floor to the cap (never under 256), since the cap is the shape the caller serves; 0 follows the model's context; a server keeps the model's."
     gpu_ctx_max : int64 = 0l
+
+    @clarg_doc = "The context pin (DASLLAMA_GPU_CTX_MAX, set_gpu_ctx_max) is the context asked, not a cap: a K/V mirror the card cannot hold at it declines the resident driver instead of shortening, and the per-op rails serve the asked context; the load log names the room."
+    gpu_ctx_strict : bool = false
 
     @clarg_doc = "The whole-model resident driver for a model that fits the card, MoE included; 0 keeps the per-op rails (the A/B lever)."
     gpu_resident : bool = true
@@ -160,11 +184,14 @@ struct public GpuTierEnv {
     gpu_dec_span : bool = true
 
     @clarg_default_doc = "0"
-    @clarg_doc = "Expert heat threshold: hold the N hottest experts resident regardless of layer placement."
+    @clarg_doc = "Hot expert slots a layer. On the per-op tier: hold the N hottest experts of a streamed layer resident (unset = none). On the whole-model driver with the routed experts on the host (a hyper-connection MoE): the slots of the hot expert pool - unset = 64 where the card has the room past the weights and the mirror, else up to 32 out of the mirror's context; a count asks that many; 0 keeps every routed expert on the host."
     gpu_heat : Option<int64>
 
     @clarg_doc = "Report lifetime GPU queue submissions (real commands plus staging round-trips)."
     gpu_prof : bool = false
+
+    @clarg_doc = "Record the routed picks of every layer's host expert step under the whole-model driver - a layer, its rows, k expert ids and weights a row, in serving order - and write them to this file when the model drops: the hot expert pool's policy experiments replay the trace offline (harness/hot_pool_sim.das). Unset: no trace."
+    moe_trace : string = ""
 }
 
 // ===== Vision =====
@@ -202,7 +229,7 @@ struct public MetalEnv {
     @clarg_doc = "Serve tower/embedder encodes on the Metal tower driver - the gemma4uv chain, the gemma4v ViT and gemma3v SigLIP block loops (their exact-plane lanes), the whisper-class block loops, the gemma4a Conformer and the canary / parakeet FastConformer block loops (their f32 lanes), the whole StyleTTS2 (kitten / kokoro) synthesis - PL-BERT, the text and duration encoders, the duration head, prosody, the decoder, the harmonic source, the generator and the inverse STFT - on both weight lanes, the Pocket TTS codec and frame loop, and the conv frontends (whisper im2col + the qwen3a conv2d, which serves the q8 default); 0 pins the CPU tower."
     tower : bool = true
 
-    @clarg_doc = "Serve the qwen3v tower's block/merger GEMMs from the image's baked f16 twin plane on the crowned tensor mul_mm twins (the mint bakes the twin only for f16-sourced GEMMs, so it holds the file's own values; needs a tensor crown - a box without one, or an image without the plane, keeps the f32 route); 0 pins the f32 GEMM route - the A/B rail."
+    @clarg_doc = "Serve a tower's weighted GEMMs from a halfword twin of its weights on the crowned tensor mul_mm twins: the image's baked f16 twin plane where the mint bakes one (only for f16-sourced GEMMs, so it holds the file's own values), and the FastConformer chain's device twin of parakeet's f32 blob. Needs a tensor crown - a box without one, or an image without the plane, keeps the f32 route; 0 pins the f32 GEMM route - the A/B rail."
     tower_f16 : bool = true
 
     @clarg_doc = "Serve head-72 tower attention at %64 canvases on the lifted flash kernel (no score slab, no rowstat pass, no head restrides - the gemma3v-geometry ViTs); 0 pins the three-pass slab - the A/B rail."
@@ -363,7 +390,7 @@ struct public VulkanEnv {
     @clarg_doc = "Stream mirrors import the mapped .dlim (VK_EXT_external_memory_host) instead of pinned copies; =0 restores the copy path."
     vk_import : bool = true
 
-    @clarg_doc = "Serve from P3-trimmed vulkan images (big CPU weight families dropped; folded into the flavor identity)."
+    @clarg_doc = "Mint the TRIMMED vulkan lane: the device twin plus the packed emb region the CPU embed reads, the planar weight families dropped. A model the whole-model driver would not take whole keeps its families, and the load says so; a call the driver passes to the CPU rails panics by name. Folded into the lane's identity, so a flip re-bakes the lane; `set_vulkan_trim` is the in-process lever."
     trim : bool = false
 
     @clarg_doc = "Tag every device allocation priority 1.0 (VK_EXT_memory_priority). Off by default: on the NVIDIA WDDM driver the tag makes the tagged weights the pageable set, and a resident model then decodes at PCIe speed once anything is demoted."

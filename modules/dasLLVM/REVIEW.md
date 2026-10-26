@@ -2,7 +2,8 @@
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture docs:
 `ARCHITECTURE.md`, `ARCHITECTURE_TARGET_FEATURES.md`, `ARCHITECTURE_DEBUG_INFO.md`,
-`ARCHITECTURE_JIT_ENTRY.md`, `ARCHITECTURE_EXE.md`, `ARCHITECTURE_LIB.md`. Planned work: `LEDGER.md`.
+`ARCHITECTURE_JIT_ENTRY.md`, `ARCHITECTURE_EXE.md`, `ARCHITECTURE_LIB.md`,
+`ARCHITECTURE_CODEGEN_IDENTITY.md`, `ARCHITECTURE_VECTOR_MATH.md`. Planned work: `LEDGER.md`.
 
 **A `[test]` file under this module that carries a `require dasllama/...` line of its own answers
 to `modules/dasLLAMA/tests/REVIEW.md` (repo root) as well** - its out-of-folder ledger row lives
@@ -32,9 +33,13 @@ there.
 
 - **A diff that changes which arm of a branch keyed on the target triple a non-host triple
   selects - a key added, changed or removed - or changes code only a cross target's arm reaches,
-  records in its PR body the `-exe --jit-target=<triple>` build for that target that exercised
-  the behavior; the host's own triple is discharged by the module-owned suite.** The suite runs
-  on the host, so any other target's arm is checked only by the artifact built for it.
+  records in its PR body the `--jit-target=<triple>` command for that target that reached the
+  changed arm: an `-exe` build, or a `--jit-compile-only` run when the arm is one only
+  compile-only takes (it keeps the `[tune]` grid where an exe build stamps reference bodies) -
+  and beside a compile-only run, the run of that code on a box of the target, or the statement
+  that no such box ran it; the host's own triple is discharged by the module-owned suite.** The
+  suite runs on the host, so any other target's arm is checked only by a command built for it,
+  and a compile-only run shows the code emits, never that it runs.
 
 - **A diff that adds work to, or moves work within, what `run_jit`
   (`daslib/llvm_jit_run.das`) or `run_jit_linked` (`daslib/llvm_jit_link.das`) executes - its
@@ -45,16 +50,23 @@ there.
   `ARCHITECTURE.md` sec.1). Only work on the path that reaches the report is timed: option
   resolution before the first timer, log lines, and failure-path teardown are not.
 
-- **A change that can alter the machine code the JIT's DLL or split-obj cache serves back for
-  identical inputs - IR generation, target-machine setup, a `[llvm_code]` generator body, or the
-  call ABI the generated code binds: function signatures, the name scheme, the prologue, the
-  externs the install phase binds - bumps `LLVM_JIT_CODEGEN_VERSION`**
-  (`daslib/llvm_jit_plan.das`). Both keys fold each function's AST hash, the hint inputs they
-  carry - loop-hint names, `[llvm_code]` arguments, function hints - and this constant, so a
-  change none of those covers serves the old machine code back (`ARCHITECTURE.md` sec.1.2).
+- **A change that alters the machine code emitted for a function without changing any input the
+  JIT cache keys fold bumps `LLVM_JIT_CODEGEN_VERSION` (`daslib/llvm_jit_plan.das`)** - IR
+  generation, target-machine setup, the body of a `[llvm_code]` generator under this module, or
+  the call ABI the generated code binds: function signatures, the name scheme, the prologue, the
+  externs the install phase binds. The folded inputs are what `jit_dll_basename`
+  (`daslib/llvm_jit_plan.das`) and the split-partition key in `run_jit` (`daslib/llvm_jit_run.das`) fold; a key that does not change
+  serves the old machine code back.
+
+- **A diff that adds an input only the backend reads - an annotation, or an annotation argument,
+  that changes emitted code and leaves the function's AOT hash unchanged - folds it, after the
+  carrying function's mangled name, into the DLL key and the split-obj key through a
+  `fold_*_hints` function in `daslib/llvm_jit_plan.das`, in the same change** (`ARCHITECTURE_JIT_ENTRY.md#hint-folds`). A
+  `LLVM_JIT_CODEGEN_VERSION` bump re-keys once, so adding or removing the input on a function
+  afterwards still serves the old machine code back.
 
 - **A diff that adds a `require` line naming a `[llvm_code]` generator module outside this
-  module - a package's, dasLLAMA's - to `daslib/llvm_user_modules.das` is a defect; the package
+  module to `daslib/llvm_user_modules.das` is a defect; that module's package
   joins the `llvm_code_generator` group from its own descriptor instead.** The wiring module
   names no package, so a build that does not carry the package registers nothing and compiles
   unchanged; the generators this module ships stay named.
@@ -66,11 +78,14 @@ there.
   code, so a jittable function on its path joins every jitted program's DLL (the block-passing
   helpers cannot be lowered: `ARCHITECTURE_JIT_ENTRY.md` sec.4).
 
-- **A diff that adds an environment or config input to a JIT cache key folds it inside
-  `jit_env_salt` (`daslib/llvm_jit_plan.das`), never directly into either JIT key - the DLL
-  key or the split-obj key (`ARCHITECTURE.md` sec.2)** - salt feeds both keys, and a config
-  folded into one but not the other links stale objects. Inputs that vary per function set
-  (AOT hashes) fold into the key directly, not through the salt.
+- **A diff that adds to a JIT cache key an input that is the same for every function of one
+  compile - the environment, the configuration, the host, or anything read from the running
+  binary such as its type layouts, among others - folds it inside `jit_env_salt`
+  (`daslib/llvm_jit_plan.das`), never directly into either JIT key - the DLL key or the
+  split-obj key (`ARCHITECTURE_CODEGEN_IDENTITY.md#split-obj-cache`)** - salt feeds both keys,
+  and an input folded into one but not the other links stale objects. An input that differs
+  between functions of one compile (a per-function AOT hash) folds into each key directly, not
+  through the salt.
 
 - **A macro under this module's `daslib/` that reads a file at compile time registers it with
   `add_module_cache_dependency` before any early return, in the same change**
@@ -111,11 +126,11 @@ there.
   sidecar at submission, and the checked-in corpus the test sweeps cannot show it. A new key
   inside an existing section passes the validator as it stands.
 
-- **A diff introducing an override knob adds it to `ARCHITECTURE.md` sec.3's inventory in the
-  same change.** An override knob is supplied at run time - an environment variable, a
-  command-line flag, or an exported runtime setter - and changes what a run compiles, tunes,
-  or emits beyond its defaults. Anything written in source - `[tune]`-family and `[hint]`
-  annotation arguments - is a declaration, not an override.
+- **A diff that adds an override knob, or gives one a new effect, adds the knob or the effect
+  to `ARCHITECTURE.md` sec.3's inventory in the same change.** An override knob is supplied at
+  run time - an environment variable, a command-line flag, or an exported runtime setter - and
+  changes what a run compiles, tunes, or emits beyond its defaults. Anything written in source
+  - `[tune]`-family and `[hint]` annotation arguments - is a declaration, not an override.
 
 - **A diff that adds an override knob, or gives one a new effect, also logs at least one line
   naming the knob where it takes effect.** A diff that only exposes the knob puts the line at
@@ -167,17 +182,16 @@ there.
 
 - **A diff that adds or changes a `build_vector_*` emitter (`daslib/llvm_jit_intrin.das`) emits
   each Horner step unfused, through `vmath_poly_step`, and calls `vmath_fma` only for the steps
-  vecmath itself writes fused** (`ARCHITECTURE.md#vector-poly-fusion`). One fused step in a
+  vecmath itself writes fused** (`ARCHITECTURE_VECTOR_MATH.md#vector-poly-fusion`). One fused step in a
   sign-alternating chain moves the last few bits of the result, and the interpreter and AOT
   answers do not move with it.
 
 - **A diff that changes the machine code an emitter the interpreter has a twin for produces -
   a das body, or the builtin the interpreter calls: every `build_vector_*` in
-  `daslib/llvm_jit_intrin.das`, every `[llvm_code]` generator - its body, which of its arms a
-  call selects, or the feature set its output is lowered under - ships a cell comparing the
-  emitted result with the interpreted result
-  over the operand range that emitter serves (every vector width for a vector emitter, the full
-  int8 lattice for a dot), added in the same change when no cell covers that range.** An IR-shape
+  `daslib/llvm_jit_intrin.das`, every `[llvm_code]` generator under this module - its body,
+  which of its arms a call selects, or the feature set its output is lowered under - ships a cell
+  comparing the emitted result with the interpreted result over the operand range that emitter
+  serves (every vector width for a vector emitter, the full int8 lattice for a dot), added in the same change when no cell covers that range.** An IR-shape
   test names the instruction and never a number.
 
 - **A cell comparing a float emitter's emitted and interpreted results also asserts both answer

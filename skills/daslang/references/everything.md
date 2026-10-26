@@ -37,6 +37,7 @@ One section per module: what the module is for, then its public symbols grouped 
 - [coroutines](#coroutines) - The COROUTINES module provides coroutine infrastructure including the `[coroutine]` function annotation, `yield_from` for delegating to sub-coroutines, and `co_await` for composing asynchronous generators.
 - [cpp_bind](#cpp_bind) - The CPP_BIND module provides utilities for generating daslang bindings to C++ code.
 - [cross_context](#cross_context) - The CROSS_CONTEXT module requires a `shared` module after the prerequisite walk - from a macro, a simulate macro or an `[init]`, never from a running script, which has no compile for the module to join - and calls into its macro context by function name, so a module that is expensive to bring up and only sometimes needed comes in at the point that decides it needs it.
+- [crypto](#crypto) - Native OpenSSL cryptographic primitives.
 - [cuckoo_hash_table](#cuckoo_hash_table) - The CUCKOO_HASH_TABLE module implements a cuckoo hash table data structure.
 - [dap](#dap) - The DAP module implements the Debug Adapter Protocol (DAP) for integrating daslang with external debuggers.
 - [das_source_formatter](#das_source_formatter) - The DAS_SOURCE_FORMATTER module implements source code formatting for daslang.
@@ -215,6 +216,7 @@ The BUILTIN module contains core runtime functions available in all daslang prog
 - `no_alloc` - Declares that the function, and everything it calls, must not touch the heap — no array or table growth, no `new` or `delete`, no string interpolation, no lambda capture frame.
 - `expect_ref` - Contract annotation requiring a function argument to be passed by reference.
 - `unsafe_operation` - Marks a function as an unsafe operation, requiring callers to wrap the call in an `unsafe` block.
+- `unsafe_heap_collect` - Declares that a heap collection reached through this function or lambda is safe even though the compile-time proof cannot show it - for example a thread body the host starts on an empty stack.
 - `type_function` - Marks a function as a type function, meaning it operates on types at compile time and does not generate runtime code.
 - `nodiscard` - Enforces that the return value of the function must be used by the caller; discarding the result produces a compilation error.
 - `never_inline` - Keeps the function out of best-effort (automatic) inlining: block-literal call-site splicing and the heuristic plain-call tier (options auto_inline_functions) both skip it.
@@ -225,6 +227,7 @@ The BUILTIN module contains core runtime functions available in all daslang prog
 - `_macro` - Marks a function to be executed during the macro compilation pass, similar to `[init]` but running at macro time.
 - `unsafe_when_not_clone_array` - Marks a function as unsafe to call outside of an array `clone` operation, restricting its usage context.
 - `unsafe_deref` - Optimization annotation that removes null-pointer checks, bounds checks on array and string indexing, and similar safety validations.
+- `never_fast_math` - Keeps the function's floating-point arithmetic, and that of the block literals written in its body, exact under options fast_math: the LLVM tiers (JIT, LLVM-AOT, -exe) emit it without the reassoc, nsz and contract flags every other function gets.
 - `expect_any_vector` - Contract annotation restricting a function argument to accept only `das::vector` template types.
 - `builtin_array_sort` - Internal function annotation that provides the sorting implementation used by the built-in `sort` function.
 - `alias_cmres` - Declares that the function always aliases cmres (copy-or-move result), disabling cmres return optimizations for it.
@@ -858,6 +861,7 @@ The FIO module implements file input/output and filesystem operations. It provid
 - `set_mtime` - Sets the last modification time of a file or directory.
 - `set_mtime_result`
 - `stat` - Returns the file status (size, modification time, etc.) for a file at the given path.
+- `try_fflush` - Flushes a non-null open file and returns whether fflush succeeded.
 
 ### Path manipulation
 
@@ -1053,6 +1057,30 @@ The NETWORK module implements networking facilities including HTTP client/server
 - `make_client` - Creates the native client behind a `Client` class instance: stores it in the instance's `_client` field and wires the instance's `onConnect`, `onDisconnect`, `onData`, `onError` and `onLog` methods as the socket's callbacks.
 - `probe_local_port` - Binds a throwaway TCP socket to `port` on every interface, as a listener would, and returns the port it got: the same port when it is free, the one the system picked when `port` is 0, and -1 when the port is taken or `host` (an IPv4 address, or `localhost`) does not resolve.
 
+## crypto
+
+Native OpenSSL cryptographic primitives. Enable dasCrypto with OpenSSL 3 or newer; this module is unavailable in Emscripten. Byte inputs are bounded to 16 MiB unless a narrower limit is stated. Output-producing functions clear their output on failure and allow output/input aliasing. Callers own key storage and protocol validation.
+
+
+### Randomness and comparison
+
+- `crypto_equal` - Compares equal-length byte arrays in constant time.
+- `crypto_random_bytes` - Fills output with count cryptographically secure random bytes.
+
+### Message authentication
+
+- `crypto_hmac_sha1` - Computes a 20-byte HMAC-SHA1 for protocols requiring it, such as TOTP.
+- `crypto_hmac_sha256` - Computes a 32-byte HMAC-SHA256 from key and message.
+
+### Authenticated encryption
+
+- `crypto_aes256_gcm_open` - Authenticates and decrypts ciphertext followed by its 16-byte AES-256-GCM tag.
+- `crypto_aes256_gcm_seal` - Encrypts and authenticates plain with AES-256-GCM.
+
+### Signature verification
+
+- `crypto_verify_rsa_sha256` - Verifies an RSA PKCS#1 v1.5 SHA-256 signature.
+
 ## dashv
 
 The DASHV module provides HTTP and WebSocket networking built on top of the `libhv`_ library. It exposes WebSocket client/server types, HTTP request/response handling, route registration, cookie and form-data helpers, and an HTTP client for making outbound requests.
@@ -1067,17 +1095,18 @@ The DASHV module provides HTTP and WebSocket networking built on top of the `lib
 
 ### Handled structures
 
-- `HttpRequest` - HTTP request with URL, method, headers, body, and parameters.
-- `HttpContext` - HTTP request/response context passed to route handlers.
 - `HttpMessage` - Base type for HTTP messages, providing header access.
 - `HttpResponse` - HTTP response with status code, headers, and body.
 - `HttpResponseWriter` - HTTP response writer for streaming responses.
+- `HttpRequest` - HTTP request with URL, method, headers, body, and parameters.
+- `HttpContext` - HTTP request/response context passed to route handlers.
 
 ### Handled types
 
 - `WebSocketClient` - Opaque handle to an outbound WebSocket connection.
-- `WebSocketChannel` - Opaque handle to a server-side WebSocket client connection.
 - `WebSocketServer` - Opaque handle to a running HTTP/WebSocket server.
+- `WebSocketAdmission` - Generation-checked ticket for a pending WebSocket upgrade.
+- `WebSocketChannel` - Opaque handle to a server-side WebSocket client connection.
 
 ### WebSocket client
 
@@ -1100,13 +1129,15 @@ The DASHV module provides HTTP and WebSocket networking built on top of the `lib
 
 ### Handle operations
 
+- `WebSocketAdmission!=` - Compares WebSocket admission ticket identity and generation for inequality.
+- `WebSocketAdmission==` - Compares WebSocket admission ticket identity and generation.
 - `WebSocketChannel!=` - Handle inequality: returns true if the two handles refer to different channels (or at least one is null).
 - `WebSocketChannel==` - Handle equality: returns true if both refer to the same channel.
 - `WebSocketClient!=` - Handle inequality: returns true if the two handles refer to different clients (or at least one is null).
 - `WebSocketClient==` - Handle equality: returns true if both refer to the same client.
 - `WebSocketServer!=` - Handle inequality: returns true if the two handles refer to different servers (or at least one is null).
 - `WebSocketServer==` - Handle equality: returns true if both refer to the same live server.
-- `is_alive` - Returns true if the channel handle still refers to a live peer connection.
+- `is_alive` - Returns whether this WebSocket admission ticket is still registered.
 
 ### HTTP route registration
 
@@ -1123,11 +1154,16 @@ The DASHV module provides HTTP and WebSocket networking built on top of the `lib
 ### HTTP server configuration
 
 - `STATIC` - Registers a static-file route: serves files under dir at the URL prefix path.
+- `WEBSOCKET_UPGRADE` - Registers a deferred WebSocket admission callback before server start.
+- `accept_websocket` - Submits acceptance of a live, undecided WebSocket ticket.
 - `allow_cors` - Enables cross-origin resource sharing (CORS) on all server responses.
+- `reject_websocket` - Submits rejection of a live, undecided WebSocket ticket with HTTP status 400–599.
+- `set_access_log` - Enables or disables libhv request access logging before server start.
 - `set_document_root` - Sets the root directory used for serving static files.
 - `set_error_page` - Sets the file served when the server returns an error response.
 - `set_home_page` - Sets the file served when a request maps to a directory (e.g.
 - `set_index_of` - Enables directory listing for the given directory path.
+- `set_limits` - Sets positive HTTP-body, complete WebSocket-message, pending-event count and queued-payload byte limits before start.
 
 ### HTTP response helpers
 
@@ -1143,6 +1179,7 @@ The DASHV module provides HTTP and WebSocket networking built on top of the `lib
 
 - `request` - Sends an HTTP request configured via an `HttpRequest` object and invokes the block with the response.
 - `request_cb` - Sends an HTTP request and invokes `on_body` with each body chunk as a string as it arrives, then calls `on_complete` with the final response.
+- `request_checked` - Performs synchronous verified HTTPS with a response-body limit of 1–16777216 bytes.
 - `status_message` - Returns the status message string for the given HTTP response.
 
 ### Message and header access
@@ -3126,14 +3163,16 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `load_model` - Load a model AND its tokenizer from a GGUF file — architecture and tokenizer backend are auto-selected from metadata; `mode` picks the weight quantization.
 - `release_kv_pages` - Return `session`'s KV pages to its pool (no-op on flat sessions).
 - `setup_dasllama_jobque` - Configure the job queue for dasLLAMA's fork/join matmul dispatch: pooled fork contexts, batched dispatch, the worker spin-before-park window (`jobque_spin_us`; 0 disables).
+- `with_dasllama_jobque` - Run `blk` inside a fresh `with_job_que()` that `setup_dasllama_jobque()` has configured — the one-call form of the pair.
 
 ### Prefix cache
 
-- `create_prefix_cache` - Create a prefix cache for the paged sessions of one `create_kv_pool` pool: finished streams donate KV pages (`prefix_insert`), later requests with the same prefix attach them (`prefix_attach`) instead of re-prefilling.
+- `create_prefix_cache` - Create a prefix cache for the paged sessions of one `create_kv_pool` pool: streams donate KV pages (`prefix_insert`), later requests with the same prefix attach them (`prefix_attach`).
 - `prefix_attach` - Attach the longest cached prefix of `prompt` to a FRESH paged `session` of `pool`: matched pages join the session's block table and `n_past` advances past them, so the caller prefills only the tail.
 - `prefix_chain_list` - Snapshot of the cache's donated chains for dashboards: per donation — page-covered token count, live pages, hit count, born/last-hit ticks, and the caller-provided preview.
+- `prefix_checkpoint_at` - Where a recurrent `session`'s prefill of `prompt` should stop for a `prefix_insert`, after `prefix_attach` matched `matched` tokens: `stable_at` (`render_turn_marked`'s opening) when the caller knows it, else the longest opening an earlier checkpoint shares.
 - `prefix_held_groups` - Pages the cache currently holds (== pool groups retained for reuse).
-- `prefix_insert` - Donate a finished session's KV pages to the cache.
+- `prefix_insert` - Donate a session's KV pages to the cache.
 - `prefix_release` - Release every cached page back to `pool` and clear the cache (pages still used by live sessions stay alive until those sessions release them).
 
 ### Tokenizer
@@ -3182,6 +3221,7 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `render_turn` - Render the next turn's prefill token ids — BOS + system on the first turn, then the user turn and the generation prompt — WITHOUT running the model.
 - `render_turn_audio` - `render_turn`'s AUDIO twin: the same two-span contract around the audio soft-token splice (the template's audio span markers).
 - `render_turn_image` - `render_turn`'s IMAGE twin: the turn's prefill as the two token spans that bracket the image soft-token splice — `head` before the rows, `tail` after.
+- `render_turn_marked` - `render_turn` with its opening marked: `opening` leading tokens - BOS, prelude and the system turn of a conversation's first turn - are the same for any user text, so a prefix cache can checkpoint there.
 - `respond` - Generate the assistant's reply to the queued user message, streaming pieces through the trailing block (return `false` to stop early).
 - `set_thinking` - Toggle reasoning for a hybrid thinking model (Qwen3 family): `false` appends the template's empty think block so the model answers directly.
 
@@ -3206,8 +3246,8 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 
 ### Operations: prepared images and dispatch
 
-- `dlim_clean` - Garbage-collect `STALE` and `OTHER` images beside `gguf_path` (`FOREIGN`, another flavor's, are always left alone): `apply = false` only reports, `true` removes; `keep_other` spares `OTHER`.
-- `dlim_inventory` - List the prepared images (`.dlim`) minted beside `gguf_path` — per image: file, bytes, image version, identity, and a verdict (`CURRENT` loads; `STALE vN` is an older image version; `OTHER` a different bake configuration or box; `FOREIGN` a different flavor).
+- `dlim_clean` - Garbage-collect `STALE` images beside `gguf_path` and hash-named legacy images of another identity; a lane-named `OTHER` and every `FOREIGN` image stay (their own loads re-bake them in place).
+- `dlim_inventory` - List the prepared images (`.dlim`) minted beside `gguf_path` — per image: file, lane (the file name's `metal` / `cpu-<class>` / `vulkan` / family segment, "" for a hash-named legacy image), bytes, version, identity, verdict (`CURRENT` loads; `STALE vN` an older version; `OTHER` another bake config or box; `FOREIGN` another flavor).
 - `get_dispatch_worker_limit` - The dispatch worker cap in force (0 = no limit) — `set_dispatch_worker_limit`'s read half.
 - `get_jobque_spin_gpu_us` - The GPU-served spin window — `set_jobque_spin_gpu_us`'s read half.
 - `get_jobque_spin_in_force` - The spin window the pool runs right now: the GPU window while the whole-model driver serves the loaded model, the CPU window otherwise.
@@ -3239,6 +3279,7 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 
 - `create_device_session` - Create a DEVICE-HOME session: its K/V cache lives only in the armed GPU driver's region - no host cache, nothing over the bus per token.
 - `gpu_cpu_passes` - Calls the armed GPU path handed back to the CPU rails since the model armed, one row per reason that fired: its name, the same in words a status page prints, the count.
+- `gpu_ctx_pins` - The in-process context pins as set (`set_gpu_ctx_max`, `set_gpu_ctx_strict`), apart from the environment's knobs: a fixture reads them before it pins and puts them back after its load.
 - `gpu_device_kv_adopt` - Hand the first `npos` rows a kept `claim` holds to the fresh device-home `session`, whose `n_past` becomes `npos`.
 - `gpu_device_kv_park` - A FINISHED device-home session lets go of its K/V region and answers the claim its rows stay under (0 = none) - call it before every such session's `delete`.
 - `gpu_device_prefill_continues` - A device-home session of `model` prefills from a position past zero - a prompt in chunks, a turn over the turns before it.
@@ -3248,7 +3289,9 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `gpu_device_sessions` - How many DEVICE-HOME sessions (`create_device_session`) the installed model serves at once: the armed driver's region count, 0 when the model is not served whole from the device.
 - `gpu_dn_room` - Tell the GPU driver how many sessions' recurrent state it keeps device-resident at once: a scheduler names its stream count before the first prefill, so no stream's deltanet state evicts under the batched step it rides.
 - `gpu_resident_decline` - Why the whole-model GPU driver does not serve the model loaded last: its decline reason (with the remedy where one exists), or why it was never attempted.
+- `gpu_resident_experts_host` - Whether the whole-model driver serving the model loaded last sums some routed layers' experts on the host (a hyper-connection MoE, or a plain MoE the card does not hold whole) - the form whose speculative round does not pay, so a server slot leaves the round off unless asked.
 - `set_gpu_ctx_max` - Cap the whole-model GPU driver's K/V context at `n` positions per region for the models loaded next (0 lifts it): a server's `ctx`.
+- `set_gpu_ctx_strict` - The `set_gpu_ctx_max` pin is the context asked, not a cap, for the models loaded next: a K/V mirror the card cannot hold at it declines the whole-model GPU driver instead of shortening the context, and the per-op rails serve the asked context (DASLLAMA_GPU_CTX_STRICT in the environment).
 - `set_gpu_resident_regions` - Ask the whole-model GPU driver for `n` K/V regions on the models loaded next, so `n` sessions keep their K/V on the device at once - a server's stream count.
 
 ## dasllama_tts
@@ -3282,6 +3325,7 @@ Text to speech in pure daslang: load a converted StyleTTS2-lineage GGUF (KittenT
 - `finalize` - Free the model's planes, the carrier and both packs; `delete m` runs it.
 - `g2p_pack_path`
 - `load_tts_model` - Load a TTS model: a converted GGUF (KittenTTS, Kokoro or Pocket TTS, picked from its architecture) or its prepared `.dlim` image; the phoneme families read `tts_g2p.bin` and `tts_postag.bin` from the same directory (Pocket needs neither).
+- `tts_finish_styletts2` - A StyleTTS2 carrier in `m.model`, loaded or minted from `path`, made a facade: its family's kind, the phoneme packs its front end reads from the same directory, the voices it cannot speak said once.
 - `tts_has_phonemes` - Whether `tts_phonemize` has an answer for this model: the phoneme families yes, a Pocket model no - it reads text, and its chunks carry no phoneme string.
 - `tts_needs_packs` - Whether the model at `path` reads the front-end packs (`tts_g2p.bin`, `tts_postag.bin`) from its directory: the phoneme families do, a Pocket TTS GGUF reads text and needs neither - decided before any load, by the architecture test `load_tts_model` makes (a `.dlim` is a phoneme family).
 - `tts_voice_lang` - The language the front end reads `voice` in - a canonical name from `caps` or a family alias, resolved the way `synthesize` resolves it.
@@ -3862,6 +3906,7 @@ The AST module provides access to the abstract syntax tree representation of das
 - `TypeDecl.canWrite` - Returns whether the given type can be written to.
 - `TypeDecl.isAotAlias` - Returns whether the type definition contains an AOT alias type.
 - `TypeDecl.isShareable` - Returns whether the given type is shareable across contexts.
+- `TypeDecl.gcFlags` - Returns the type's garbage-collection flags: non-zero when a value of the type holds something the collector walks - a heap pointer, a string, or a container or structure holding one.
 - `TypeDecl.isIndex` - Returns whether the given type is an index type.
 - `TypeDecl.isBool` - Returns whether the given type is a boolean type.
 - `TypeDecl.isInteger` - Returns whether the given type is an integer type.
@@ -4444,7 +4489,7 @@ The STRINGS module implements string formatting, conversion, searching, and modi
 ### String modifications
 
 - `chop` - Returns a substring of `str` beginning at index `start` with the specified `length`.
-- `escape` - Returns a new string with special characters replaced by their printable escape sequences (e.g.
+- `escape` - Returns a new string with the special characters of the das_string replaced by their printable escape sequences; unlike the string overload it reads every byte, so a null byte comes out as \\u0000.
 - `ltrim` - Returns a new string with leading whitespace characters removed from `str`.
 - `repeat` - Returns a new string formed by concatenating `str` repeated `count` times.
 - `replace` - Returns a new string with all occurrences of substring `toSearch` in `str` replaced by the substring `replace`.
@@ -4500,7 +4545,7 @@ The STRINGS module implements string formatting, conversion, searching, and modi
 
 - `modify_data` - Maps the raw bytes of string `str` into a temporary uint8 array, passes it to `block` for in-place reading and writing, and returns the modified string.
 - `peek_data` - Maps the raw bytes of string `str` into a temporary read-only uint8 array and passes it to `block` for inspection.
-- `to_bytes` - Returns a new uint8 byte array holding a copy of the bytes of string `str`, with no terminator appended.
+- `to_bytes` - Returns a new uint8 byte array holding a copy of every byte of the das_string `str`, null bytes included, with no terminator appended.
 
 ### Low level memory allocation
 
@@ -4948,6 +4993,10 @@ The AST_BOOST module provides high-level utilities for working with the AST. It 
 - `describe` - Returns a human-readable textual representation of an AST object (`AnnotationArgumentList`, `AnnotationDeclaration`, `AnnotationList`, `Variable`, or `Expression`).
 - `describe_bitfield` - Returns a textual representation of the set bits in a bitfield value, listing the names of all active flags joined by the specified `merger` string.
 - `describe_function_short` - Returns a short human-readable description of the given function, including its name and signature.
+
+### Collect carriers
+
+- `collect_carrier_violation` - Returns an empty string when `fn` cannot reach a heap collection, or when its frame provably holds nothing the collector must walk: no argument or named local of a collectable type, no reference local, no block reaching a collect, and every call to a carrier a statement of its own; `[unsafe_heap_collect]` skips the proof.
 
 ### Queries
 
@@ -5407,7 +5456,7 @@ The CPP_BIND module provides utilities for generating daslang bindings to C++ co
 
 ### Generation of bindings
 
-- `log_cpp_class_adapter` - Generates C++ class adapter for the Daslang class.
+- `log_cpp_class_adapter` - Generates a C++ adapter for abstract methods and explicitly selected default methods.
 
 ## cuckoo_hash_table
 
@@ -5517,6 +5566,8 @@ The DASHV_BOOST module provides high-level daScript wrapper classes for the low-
 - `HvWebServer.set_bind_host` - Selects the interface to bind before `start` (for example, `127.0.0.1`).
 - `HvWebServer.stop` - Stops the server.
 - `HvWebServer.tick` - Processes pending HTTP and WebSocket events; must be called periodically.
+- `HvWebServer.onWsMessageFrame` - Complete message with authoritative byte count and opcode, including embedded zero bytes.
+- `HvWebServer.set_limits` - Sets positive parser and queue budgets before start.
 - `HvWebServer.onInit`
 - `HvWebServer.GET` - Registers a handler for HTTP GET requests matching `uri`.
 - `HvWebServer.POST` - Registers a handler for HTTP POST requests matching `uri`.
@@ -5532,6 +5583,7 @@ The DASHV_BOOST module provides high-level daScript wrapper classes for the low-
 - `HvWebServer.set_index_of` - Enables directory listing for the specified directory.
 - `HvWebServer.set_error_page` - Sets a custom error page file.
 - `HvWebServer.SSE` - Registers an SSE (Server-Sent Events) handler for `uri`.
+- `HvWebServer.WEBSOCKET_UPGRADE` - Registers admission before HTTP 101; the request is borrowed for the callback.
 - `HvWebServer.STREAM` - Registers a streaming (incremental) handler for `uri` (any HTTP method, like `ANY`).
 
 ### HTTP request helpers
@@ -6187,6 +6239,7 @@ The JSON module implements JSON parsing and serialization. It provides `read_jso
 
 - `JsonValue` - JSON value, wraps any JSON element.
 - `TokenAt` - JSON parsing token.
+- `JsonReadLimits` - Bounds for strict, scalar-safe reads.
 
 ### Value conversion
 
@@ -6196,6 +6249,7 @@ The JSON module implements JSON parsing and serialization. It provides `read_jso
 ### Read and write
 
 - `read_json` - reads JSON from the `text` array of uint8.
+- `read_json_bounded` - Strict read with preflight budgets before recursive tree construction.
 - `write_json` - Overload accepting temporary type
 - `write_json_compact` - `write_json` on one line: no newlines or indentation, `", "` / `": "` separators — the python `json.dumps` / jinja `tojson` shape chat templates and wire protocols carry.
 
@@ -6646,6 +6700,7 @@ The logger module provides a structured, file-backed logging facility for daslan
 - `logger_info` - Informational record.
 - `logger_log` - Generic log entry.
 - `logger_trace` - Verbose trace-level record.
+- `logger_try_log` - True only when the complete JSONL record was written and flushed to the file.
 - `logger_warning` - Warning record.
 
 ### Stdout hook
@@ -6818,6 +6873,10 @@ The MATH_BOOST module adds geometric types (`AABB`, `AABR`, `Ray`), intersection
 - `RGBA_TO_UCOLOR` - conversion from RGBA to ucolor.
 - `UCOLOR_TO_RGB` - conversion from ucolor to RGB.
 - `UCOLOR_TO_RGBA` - conversion from ucolor to RGBA.
+
+### Integer rounding
+
+- `round_up` - `n` rounded up to a multiple of `m` (`m` > 0), in `m`'s integer type
 
 ## option
 

@@ -99,6 +99,39 @@ Every materialized cos/sin table is the same fill; the position source is what d
 
 `Model.kq : KqPlanes[KQ_FMT_COUNT]` is the one `dim` field a `Model` carries, so every `apply` walk over it - the finalizer, the image build, the image parse, the layout describe - spells its plane-table arm as the `typeinfo is_dim(field)` branch and reaches each element's arrays from there. The table's interleaves serialize in enum order, so an appended `KqFmt` member lands last and no earlier slot moves.
 
+### The per-32 rail is one kernel body over a format tag {#per-32-rail}
+
+The per-32 formats (`q51`, `iq4nl32`) sit off the superblock lattice: 32-weight blocks, Q8_0-form
+activations, dedicated `Model` plane pairs (`ARCHITECTURE_IMAGE.md#image-kq-table-sb-only`), and in
+`dasllama_math.das` one body per kernel shape (`b32_batch_kernel`, `b32_groupn_kernel`,
+`b32_batch_groupn_kernel`) generic over the `KqTag_<fmt>` it takes last - the tag picks the
+strides, the row expand, the grp scale gather and the expanded-row dot. `iq4nl32` is the IQ4_NL
+disk block served per-32: `kq_fmt_expert_ok` chooses it for an expert stack whose rows are off
+the 256 lattice and on the 32 lattice (the superblock member `iq4nl` serves a `% 256` row), and a
+dense plane off the lattice still demotes to q8. The codebook levels are int8, so the q8 rail's
+requant of an IQ4_NL block is value-exact and the per-32 form's gain is bytes - 18 a block
+against 34 - not precision.
+
+### A served form is a second member over the same disk type {#served-form}
+
+`iq3s4` is IQ3_S served as a 16-entry codebook plane: every IQ3_S weight is a signed odd
+magnitude 1..15 times its block scale, so the grid entry, the `qh` ninth bit and the sign fold
+at transcode into one nibble index (`iq3s4_lut`, `-15, -13, .., 15`) laid in the k4 tiling, and
+the scale row is iq3s's own. The dequant is value-exact against the grid form; the planes cost
+17% more bytes (128 against 104 a superblock) and decode through the iq4xs codebook kernels -
+one table lookup a nibble in place of the grid gather, which is where the IQ3_S CPU decode spent
+its time. The member's descriptor row names the source type (`GGML_TYPE_IQ3_S`, 110 disk bytes)
+with its own schema and stream ids, so the image and the stream rail carry it like any lattice
+member. The choice is `kq_fmt_of`'s at the load (`iq3s_serve_lut`, the `DASLLAMA_IQ3S_SERVE`
+knob: `grid`, `lut`, `auto` = lut wherever the serving rails decode it), and it is an image
+identity bit (`DlimCpuConfig.iq3s_lut`), because it changes plane bytes. The Vulkan tier decodes
+it on every ladder: the device row is iq4xs's quant plane under iq3s's scale word, the codebook is
+arithmetic (`2q - 15`, no table bound), and the stamps are the iq4xs kernels with the odd
+codebook and the grid scale switched in. So a host that sums routed experts beside a Vulkan
+device reads the fast planes, and the device reads the same bytes. The Metal tier keeps the grid
+form: its gather is a device read and no Metal kernel decodes `iq3s4`, so the member sits off the
+Metal roster and a load the Metal tier targets serves `iq3s`.
+
 ### The load and image rail {#the-load-and-image-rail}
 
 **`dasllama_load.das`** is the GGUF load walk: metadata to `Config`, the plane layout, disk-format
@@ -129,7 +162,7 @@ classifier and final norm are dead by construction (tensor lookup is first-match
 is last). The prepared image folds the head's name and size into its path hash, so the
 trunk-only and trunk+head images never collide and one image file serves both trunk and head.
 
-### CPU kernel tiers
+### CPU kernel tiers {#cpu-kernel-tiers}
 
 - **`dasllama_math.das`** - the numeric ABSTRACTION: typedefs, active backend pointers, public
   wrappers, dispatch shaping, and the array-sizing helpers every tier and the engine share
@@ -152,6 +185,15 @@ trunk-only and trunk+head images never collide and one image file serves both tr
   **`dasllama_gemm_register.das`** - the generated GEMM tier: the runtime registration, the tile
   generator, the layout/perm schema shared by generator and runtime, and the `[tune]` family
   registration. A hand-written tile that the generator could emit belongs in the generator.
+  The bf16 tile's operand builders - the activation widen (`xbf16_build`, its `bf16_bits`
+  narrow) and the row-dequant reference panel (`kq_panel_rows_bf16`) - sit in
+  `dasllama_math_gen.das` beside the walk that runs them once per batch call, in its JIT
+  partition (`ARCHITECTURE_CPU_KERNELS.md#jit-partition-inlining`). The JIT cache keys a
+  generated kernel by its stub's hash and its perm's arguments, never by the generator's text,
+  so `REVIEW.das`'s `check_gemm_gen_stamp` pins one hash over `dasllama_gemm_gen.das` and
+  `dasllama_gemm_schema.das` with their comments and blank lines cut: a code edit to either is red until the stamp
+  moves, and the finding asks for the `LLVM_JIT_CODEGEN_VERSION` bump that re-keys the cached
+  kernels. The check licenses no names.
 - **`dasllama_tune.das`** - the per-box loop-hint tuner (`[tuned]` / `[dasllama_grid]`) and the
   perm-less clone `[from_template]` (a template body into an empty stub, placeholder calls
   renamed to the annotation's targets - the kernel shapes' stamp). Tuning

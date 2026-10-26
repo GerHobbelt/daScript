@@ -3569,10 +3569,13 @@ def metal_decode_init : bool {   // nolint:STYLE038 — a flat compile_pso per k
     g_pso_swiglu_oai = compile_stamp(MetalSwigluOai_metal_swiglu_oai_msl, ok)
     g_pso_moe_gemv_mx4 = compile_stamp(metal_moe_gemv_mx4_msl, ok)
     g_pso_moe_gemv_q51 = compile_stamp(metal_moe_gemv_q51_msl, ok)
+    g_pso_moe_gemv_iq4nl32 = compile_stamp(metal_moe_gemv_iq4nl32_msl, ok)
     g_pso_dn_conv = compile_stamp(metal_dn_conv_msl, ok)
     g_pso_dn_hist = compile_stamp(metal_dn_conv_hist_msl, ok)
     g_pso_dn_l2 = compile_stamp(metal_dn_l2norm_msl, ok)
-    g_pso_dn_scan = compile_stamp(metal_dn_scan_msl, ok)
+    g_pso_dn_scan = compile_stamp(MetalDnScan_metal_dn_scan_msl, ok)
+    g_pso_dn_scan_h = compile_stamp(MetalDnScanH_metal_dn_scan_msl, ok)
+    g_pso_dn_prep = compile_stamp(metal_dn_prep_msl, ok)
     g_pso_st2_im2col = compile_stamp(metal_st2_im2col_msl, ok)
     g_pso_st2_im2col_tr = compile_stamp(metal_st2_im2col_tr_msl, ok)
     g_pso_st2_im2col_cm = compile_stamp(metal_st2_im2col_cm_msl, ok)
@@ -3619,7 +3622,15 @@ def metal_decode_init : bool {   // nolint:STYLE038 — a flat compile_pso per k
     g_pso_st2_axpy = compile_stamp(metal_st2_axpy_msl, ok)
     g_pso_st2_add = compile_stamp(MetalSt2Add_metal_ew2_msl, ok)
     g_pso_st2_reflect1 = compile_stamp(metal_st2_reflect1_msl, ok)
-    g_pso_dn_gate = compile_stamp(metal_dn_gate_msl, ok)
+    g_pso_dn_gate = compile_stamp(MetalDnGate_metal_dn_gate_msl, ok)
+    g_pso_dn_gate_sig = compile_stamp(MetalDnGateSig_metal_dn_gate_msl, ok)
+    g_pso_hc_norm = compile_stamp(metal_hc_norm_msl, ok)
+    g_pso_hc_lo = compile_stamp(MetalHcLo_metal_ew1_msl, ok)
+    g_pso_hc_init = compile_stamp(metal_hc_init_msl, ok)
+    g_pso_hc_mix = compile_stamp(metal_hc_mix_msl, ok)
+    g_pso_hc_combine = compile_stamp(metal_hc_combine_msl, ok)
+    g_pso_ple_gate = compile_stamp(metal_ple_gate_msl, ok)
+    g_pso_ple_conv = compile_stamp(metal_ple_conv_msl, ok)
     g_pso_dn_deint = compile_stamp(metal_dn_deint_msl, ok)
     g_pso_sigmul = compile_stamp(MetalSigmul_metal_ew2_msl, ok)
     g_pso_axpy_sig = compile_stamp(metal_axpy_sig_msl, ok)
@@ -4162,6 +4173,9 @@ def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, 
     } elif (fmt == KqFmt.q51) {
         let qp = q51_planes_of(g_dev, t, stack_off)
         enc_moe_gemv_q51_c(enc, qp.qbuf, qp.qoff, qp.sbuf, qp.soff, bx, by, yoff, ka, bsel, rows, k, nst)
+    } elif (fmt == KqFmt.iq4nl32) {
+        let qp = iq4nl32_planes_of(g_dev, t, stack_off)
+        enc_moe_gemv_iq4nl32_c(enc, qp.qbuf, qp.qoff, qp.sbuf, qp.soff, bx, by, yoff, ka, bsel, rows, k, nst)
     } else {
         let bq = kq_quants_of(g_dev, t, fmt, stack_off)
         let bs = kq_scales_of(g_dev, t, fmt, stack_off)
@@ -4294,8 +4308,14 @@ def enc_rows_tiles(nrows, n, ys : int64; tile : block<(four : bool; live : int64
 [arch(at="../ARCHITECTURE_GPU_MTP_DECODE.md#verify-row-pad")]
 def enc_gemv_rows(enc : MetalComputeEncoder?; nrows : int64; bw : MetalBuffer?; boff : uint64;
                   bx, by, bn, bd, bys : MetalBuffer?; n, d, ys : int64; yoff : uint64 = 0ul) {
-    enc_rows_tiles(nrows, n, ys) $(four; _live; xo, yo) {
-        enc_gemv_b(enc, four, bw, boff, bx, by, bn, bd, bys, d, yoff + yo, xo)
+    var base = 0l
+    while (base < nrows) {   // the tile ladder repeats every twelve rows, each pass offset by its first row
+        let xb = uint64(base * n * 4l)
+        let yb = uint64(base * ys * 4l)
+        enc_rows_tiles(min(nrows - base, 12l), n, ys) $(four; _live; xo, yo) {
+            enc_gemv_b(enc, four, bw, boff, bx, by, bn, bd, bys, d, yoff + yb + yo, xb + xo)
+        }
+        base += 12l
     }
 }
 
@@ -4499,8 +4519,10 @@ def metal_kernels_release {
     release_handles(g_pso_moe_router, g_pso_moe_select, g_pso_moe_select_512, g_pso_moe_gemv_q8, g_pso_moe_kq_k4, g_pso_moe_kq_k3)
     release_handles(g_pso_moe_kq_iq3s, g_pso_moe_kq_iq3xxs, g_pso_moe_kq_iq2s, g_pso_moe_kq_iq2xs, g_pso_moe_kq_iq2xxs, g_pso_moe_kq_iq4xs)
     release_handles(g_pso_moe_kq_q40, g_pso_moe_kq_k5, g_pso_moe_kq_k6, g_pso_moe_combine, g_pso_g4rnorm, g_pso_moe_wscale)
-    release_handles(g_pso_swiglu_oai, g_pso_moe_gemv_mx4, g_pso_moe_gemv_q51, g_pso_dn_conv, g_pso_dn_hist, g_pso_dn_l2)
+    release_handles(g_pso_swiglu_oai, g_pso_moe_gemv_mx4, g_pso_moe_gemv_q51, g_pso_moe_gemv_iq4nl32, g_pso_dn_conv, g_pso_dn_hist, g_pso_dn_l2)
     release_handles(g_pso_dn_scan, g_pso_dn_gate, g_pso_dn_deint, g_pso_sigmul, g_pso_axpy_sig, g_mx4_vtab)
+    release_handles(g_pso_dn_scan_h, g_pso_dn_prep)
+    release_handles(g_pso_dn_gate_sig, g_pso_hc_norm, g_pso_hc_lo, g_pso_hc_init, g_pso_hc_mix, g_pso_hc_combine, g_pso_ple_gate, g_pso_ple_conv)
     release_handles(g_pso_st2_attn)
     release_handles(g_pso_pk_rows, g_pso_pk_rows_elu, g_pso_pk_row_scale, g_pso_pk_attn)
     release_handles(g_pso_pk_add_ln, g_pso_pk_gemv_f32, g_pso_pk_gemv_f32_ln_silu, g_pso_pk_gemv_f32_gate, g_pso_pk_gemv_f32_add_silu)
@@ -5428,7 +5450,7 @@ def st2_conv_b_src_fwd(rr, kk, rows, k, cin, r0, pad_l, dil, stride, t_in, xs : 
     if (rr >= rows || kk >= k * cin) {
         return 0xFFFFFFFF
     }
-    let st = st2_conv_src_fwd_row(rr, kk / cin, r0, pad_l, dil, stride, t_in)
+    let st = conv_src_fwd_row(rr, kk / cin, r0, pad_l, dil, stride, t_in)
     return st >= 0 ? (uint(st) * xs + kk % cin) / 4u : 0xFFFFFFFF
 }
 
@@ -5437,7 +5459,7 @@ def st2_conv_b_src_tr(rr, kk, rows, k, cin, r0, pad_l, dil, stride, t_in, xs : u
     if (rr >= rows || kk >= k * cin) {
         return 0xFFFFFFFF
     }
-    let st = st2_conv_src_tr_row(rr, kk / cin, r0, pad_l, dil, stride, t_in)
+    let st = conv_src_tr_row(rr, kk / cin, r0, pad_l, dil, stride, t_in)
     return st >= 0 ? (uint(st) * xs + kk % cin) / 4u : 0xFFFFFFFF
 }
 
@@ -5831,13 +5853,13 @@ class template MetalKqMulMmK45T : MetalMmTileBase {
                 let dsc1 = dsc * 0.00390625
                 let dsc2 = dsc * 0.0000152587890625
                 let dsc3 = dsc * 0.000000059604644775390625
-                let qb = blk * 48u + half6 * 16u + (gg & 1u) * 8u + il0 * 4u
-                let hb = blk * 48u + 32u + half6 * 8u + il0 * 4u
+                let qp = unsafe(addr(kqu[blk * 48u + half6 * 16u + (gg & 1u) * 8u + il0 * 4u]))
+                let hp = unsafe(addr(kqu[blk * 48u + 32u + half6 * 8u + il0 * 4u]))
                 let nsh = (gg / 2u) * 4u
                 let hsh = gg * 2u
                 for [unroll_full] (k in range(4)) {
-                    let u = kqu[qb + uint(k)]
-                    let hu = kqu[hb + uint(k)]
+                    let u = unsafe(qp[k])
+                    let hu = unsafe(hp[k])
                     // all 4 bytes composed at once — cross-byte bleed of the uint-wide shifts is
                     // masked off; per element only mask+fma remain (shift folded into dsc1..3)
                     let qv = ((u >> nsh) & 0x0F0F0F0F) | (((hu >> hsh) & 0x03030303) << 4u)
@@ -5862,13 +5884,13 @@ class template MetalKqMulMmK45T : MetalMmTileBase {
                     let dsc1 = dsc * 0.00390625
                     let dsc2 = dsc * 0.0000152587890625
                     let dsc3 = dsc * 0.000000059604644775390625
-                    let qb = blk * 24u + hf3 * 8u + il0 * 4u
-                    let hb = blk * 24u + 16u + il0 * 4u
+                    let qp = unsafe(addr(kqu[blk * 24u + hf3 * 8u + il0 * 4u]))
+                    let hp = unsafe(addr(kqu[blk * 24u + 16u + il0 * 4u]))
                     let nsh = gg3 * 2u
                     let hsh = hf3 * 4u + gg3
                     for [unroll_full] (k in range(4)) {
-                        let u = kqu[qb + uint(k)]
-                        let hu = kqu[hb + uint(k)]
+                        let u = unsafe(qp[k])
+                        let hu = unsafe(hp[k])
                         let qv = ((u >> nsh) & 0x03030303) | (((hu >> hsh) & 0x01010101) << 2u)
                         va[k * 4] = float16(dsc * float(qv & 255u) - dmn)
                         va[k * 4 + 1] = float16(dsc1 * float(qv & 65280u) - dmn)
@@ -5984,10 +6006,10 @@ class template MetalKqMulMmK45T : MetalMmTileBase {
                                     let scw = js < 4u ? sv.x : sv.y
                                     dsc = float(ksh[blk]) * float(((int(scw >> ((js & 3u) * 8u)) & 255) ^ 128) - 128)
                                 }
-                                let qb = blk * 32u + js * 4u
+                                let qp = unsafe(addr(kqu[blk * 32u + js * 4u]))
                                 let nsh = il0 * 4u
                                 for [unroll_full] (k in range(4)) {
-                                    let u = kqu[qb + uint(k)]
+                                    let u = unsafe(qp[k])
                                     for [unroll_full] (c in range(4)) {
                                         va[k * 4 + c] = float16(dsc * iq4lut[(u >> (8u * uint(c) + nsh)) & 15u])
                                     }
@@ -6006,10 +6028,10 @@ class template MetalKqMulMmK45T : MetalMmTileBase {
                                     let dsc1 = dsc * 0.00390625
                                     let dsc2 = dsc * 0.0000152587890625
                                     let dsc3 = dsc * 0.000000059604644775390625
-                                    let qb = blk * 16u + hf3 * 8u + il0 * 4u
+                                    let qp = unsafe(addr(kqu[blk * 16u + hf3 * 8u + il0 * 4u]))
                                     let nsh = gg3 * 2u
                                     for [unroll_full] (k in range(4)) {
-                                        let u = kqu[qb + uint(k)]
+                                        let u = unsafe(qp[k])
                                         let qv = (u >> nsh) & 0x03030303
                                         va[k * 4] = float16(dsc * float(qv & 255u) - dmn)
                                         va[k * 4 + 1] = float16(dsc1 * float(qv & 65280u) - dmn)
@@ -6023,13 +6045,13 @@ class template MetalKqMulMmK45T : MetalMmTileBase {
                                 kmask_scmn(sv, js, sc, mn)
                                 let dsc = float(ksh[blk * 8u]) * float(sc)
                                 let dmn = float(ksh[blk * 8u + 1u]) * float(mn)
-                                let qb = blk * SB_UINTS + (js / 2u) * 8u + il0 * 4u
+                                let qp = unsafe(addr(kqu[blk * SB_UINTS + (js / 2u) * 8u + il0 * 4u]))
                                 static_if (QH) {
-                                    let hb = blk * SB_UINTS + 32u + il0 * 4u
+                                    let hp = unsafe(addr(kqu[blk * SB_UINTS + 32u + il0 * 4u]))
                                     let nsh = (js & 1u) * 4u
                                     for [unroll_full] (k in range(4)) {
-                                        let u = kqu[qb + uint(k)]
-                                        let hu = kqu[hb + uint(k)]
+                                        let u = unsafe(qp[k])
+                                        let hu = unsafe(hp[k])
                                         for [unroll_full] (c in range(4)) {
                                             let q = ((u >> (8u * uint(c) + nsh)) & 15u) | (((hu >> (8u * uint(c) + js)) & 1u) << 4u)
                                             va[k * 4 + c] = float16(dsc * float(q) - dmn)
@@ -6038,7 +6060,7 @@ class template MetalKqMulMmK45T : MetalMmTileBase {
                                 } else {
                                     let nsh = (js & 1u) * 4u
                                     for [unroll_full] (k in range(4)) {
-                                        let u = kqu[qb + uint(k)]
+                                        let u = unsafe(qp[k])
                                         for [unroll_full] (c in range(4)) {
                                             let q = (u >> (8u * uint(c) + nsh)) & 15u
                                             va[k * 4 + c] = float16(dsc * float(q) - dmn)
@@ -6495,12 +6517,13 @@ class MetalMoeGemvMx4 {
             }
             ib += 16u
         }
+        let bp = unsafe(addr(wb[e * ddim + first_row]))
         for [unroll_full] (r in range(2)) {
             let sr = simd_sum(sumf[r])
             if (lane == 0u && first_row + uint(r) < ddim) {
                 var outv = sr
                 if (hasb != 0u) {
-                    outv += wb[e * ddim + first_row + uint(r)]
+                    outv += unsafe(bp[r])
                 }
                 y[y0 + first_row + uint(r)] = outv
             }
@@ -6563,6 +6586,68 @@ class MetalMoeGemvQ51 {
                 hx += (qh & 4u) != 0u ? xv.z : 0.0
                 hx += (qh & 8u) != 0u ? xv.w : 0.0
                 sumf[r] += float(wsh[blk * 2u]) * (qx + 16.0 * hx) + float(wsh[blk * 2u + 1u]) * sx
+            }
+            ib += 4u
+        }
+        for [unroll_full] (r in range(2)) {
+            let sr = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[y0 + first_row + uint(r)] = sr
+            }
+        }
+    }
+}
+
+// Expert-indexed IQ4_NL per-32 GEMV — the q51 shape over 16B/2B planes (a block = 4 uints of nibbles
+// in the k/k+16 split-half pairing; the scale = one f16 d). value = d*LUT[q], the codebook staged
+// in threadgroup floats as the kq iq4 GEMVs do (f32 activations).
+[metal_dispatch(name = "enc_moe_gemv_iq4nl32_c", pso = "g_pso_moe_gemv_iq4nl32", tgmem = "metal_moe_gemv_iq4nl32_msl_tgmem", tg = 64, grid = "rows/4, k, nst", params = "rows : int64, k : int64, nst : int64")]
+class MetalMoeGemvIq4nl32 {
+    @ssbo @binding = 0 @role = "weight" @off = "qoff" wqu : array<uint>    // nibble plane, uint view (block at 4*blk)
+    @ssbo @binding = 1 @role = "weight" @off = "soff" wsh : array<float16> // d plane (block blk's d at blk)
+    @ssbo @binding = 2 @role = "read" xf : array<float4>   // activations, float4 view (xoff always % 4)
+    @ssbo @binding = 3 @role = "write" @off = "yoff" @span = "rows*k*nst*4" y : array<float>
+    @uniform @binding = 4 ka : MoeGemvArgs
+    @ssbo @binding = 6 @role = "read" sel : array<uint>    // [streams x 2k] selection rows (idx section read)
+    @workgroup lut : float[64]   // kvalues_iq4nl as floats, one slot per thread of the 64-wide group
+
+    [metal_kernel(name="metal_moe_gemv_iq4nl32_msl")]
+    def metal_moe_gemv_iq4nl32 {
+        let ndim = ka.ndim
+        let ddim = ka.ddim
+        let eblk = ka.eplane
+        let xs = ka.xs
+        let ss = ka.ss
+        let bxs = ka.bxs
+        let bys = ka.bys
+        let lid = gl_LocalInvocationID.x
+        lut[lid] = iq4_lut(lid & 15u)
+        barrier()
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u    // 4-way block stride
+        let it = lane % 8u    // 8 threads per block, one float4 (4 elems) each
+        let nb = ndim / 32u
+        let slot = gl_WorkGroupID.y
+        let st = gl_WorkGroupID.z
+        let eb = sel[st * ss + slot] * eblk
+        let xoff = st * bxs + slot * xs
+        let y0 = st * bys + slot * ddim
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        // this thread's 4 elems: half = it/4 selects the nibble half, ku = it%4 the quant uint
+        let nsh = (it / 4u) * 4u
+        let ku = it % 4u
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let xv = xf[(xoff + ib * 32u) / 4u + it]
+            for [unroll_full] (r in range(2)) {
+                let blk = eb + (first_row + uint(r)) * nb + ib
+                let u = wqu[blk * 4u + ku]
+                var qx = lut[(u >> nsh) & 15u] * xv.x
+                qx += lut[(u >> (8u + nsh)) & 15u] * xv.y
+                qx += lut[(u >> (16u + nsh)) & 15u] * xv.z
+                qx += lut[(u >> (24u + nsh)) & 15u] * xv.w
+                sumf[r] += float(wsh[blk]) * qx
             }
             ib += 4u
         }
@@ -7161,13 +7246,13 @@ class template MetalKqGemvK5T : MetalGemvSiteT {
             for [unroll_full] (r in range(2)) {
                 let blk = eb + (first_row + uint(r)) * nb + ib
                 let scs = kmask_scales(ks4[blk], iq)
-                let qs0 = blk * 160u + iq * 32u + l0
-                let qh0 = blk * 160u + 128u + l0
+                let qsp = unsafe(addr(kqb[blk * 160u + iq * 32u + l0]))
+                let qhp = unsafe(addr(kqb[blk * 160u + 128u + l0]))
                 var acc : float[4]
                 for [unroll_full] (l in range(8)) {
-                    let q1 = uint(kqb[qs0 + uint(l)])
-                    let q2 = uint(kqb[qs0 + 64u + uint(l)])
-                    let h = uint(kqb[qh0 + uint(l)]) >> hb0
+                    let q1 = uint(unsafe(qsp[l]))
+                    let q2 = uint(unsafe(qsp[64 + l]))
+                    let h = uint(unsafe(qhp[l])) >> hb0
                     acc[0] += yl[l] * float((q1 & 0x0F) | ((h & 1u) << 4u))
                     acc[1] += yl[l + 8] * float((q1 >> 4u) | ((h & 2u) << 3u))
                     acc[2] += yh[l] * float((q2 & 0x0F) | ((h & 16u) << 0u))
@@ -7244,28 +7329,28 @@ class MetalKqGemvK5C {
         var sumf = 0.0
         var ib = ix
         while (ib < nb) {
-            let yb = ib * 256u + iq * 64u + l0
+            let xp = unsafe(addr(x[ib * 256u + iq * 64u + l0]))
             var sumy : float[4]
             for [unroll_full] (l in range(8)) {
-                yl[l] = x[yb + uint(l)]
+                yl[l] = unsafe(xp[l])
                 sumy[0] += yl[l]
-                yl[l + 8] = x[yb + 32u + uint(l)]
+                yl[l + 8] = unsafe(xp[32 + l])
                 sumy[1] += yl[l + 8]
-                yh[l] = x[yb + 128u + uint(l)]
+                yh[l] = unsafe(xp[128 + l])
                 sumy[2] += yh[l]
-                yh[l + 8] = x[yb + 160u + uint(l)]
+                yh[l + 8] = unsafe(xp[160 + l])
                 sumy[3] += yh[l + 8]
             }
             let blk = first_row * nb + ib
             let scs = kmask_scales(ks4[blk], iq)
-            let qs0 = blk * 160u + iq * 32u + l0
-            let qh0 = blk * 160u + 128u + l0
+            let qsp = unsafe(addr(kqb[blk * 160u + iq * 32u + l0]))
+            let qhp = unsafe(addr(kqb[blk * 160u + 128u + l0]))
             var acc1 : float[4]
             var acc2 : float[4]
             for [unroll_full] (l in range(8)) {
-                let q1 = uint(kqb[qs0 + uint(l)])
-                let q2 = uint(kqb[qs0 + 64u + uint(l)])
-                let h = uint(kqb[qh0 + uint(l)])
+                let q1 = uint(unsafe(qsp[l]))
+                let q2 = uint(unsafe(qsp[64 + l]))
+                let h = uint(unsafe(qhp[l]))
                 acc1[0] += yl[l] * float(q1 & 0x0F)
                 acc1[1] += yl[l + 8] * float(q1 & 0xF0)
                 acc1[2] += yh[l] * float(q2 & 0x0F)
@@ -7334,14 +7419,14 @@ class template MetalKqGemvK6T : MetalGemvSiteT {
             }
             for [unroll_full] (r in range(2)) {
                 let blk = eb + (first_row + uint(r)) * nb + ib
-                let ql0 = blk * 192u + ip * 64u + l0
-                let qh0 = blk * 192u + 128u + ip * 32u + l0
+                let qlp = unsafe(addr(kqb[blk * 192u + ip * 64u + l0]))
+                let qhp = unsafe(addr(kqb[blk * 192u + 128u + ip * 32u + l0]))
                 let sb = blk * 16u + is0
                 var sums : float[4]
                 for [unroll_full] (l in range(4)) {
-                    let q1 = uint(kqb[ql0 + uint(l)])
-                    let q2 = uint(kqb[ql0 + 32u + uint(l)])
-                    let h = uint(kqb[qh0 + uint(l)])
+                    let q1 = uint(unsafe(qlp[l]))
+                    let q2 = uint(unsafe(qlp[32 + l]))
+                    let h = uint(unsafe(qhp[l]))
                     sums[0] += yl[4 * l] * (float((q1 & 0x0F) | ((h & 0x03) << 4u)) - 32.0)
                     sums[1] += yl[4 * l + 1] * (float((q2 & 0x0F) | ((h & 0x0C) << 2u)) - 32.0)
                     sums[2] += yl[4 * l + 2] * (float((q1 >> 4u) | (h & 0x30)) - 32.0)
@@ -7414,16 +7499,16 @@ class MetalKqGemvK2 {
         var sumf : float[4]
         var ib = ix
         while (ib < nb) {
-            let yb = ib * 256u + iq * 128u + ir * 8u
+            let xp = unsafe(addr(x[ib * 256u + iq * 128u + ir * 8u]))
             var sumy : float[4]
             for [unroll_full] (i in range(8)) {
-                yl[i] = x[yb + uint(i)]
+                yl[i] = unsafe(xp[i])
                 sumy[0] += yl[i]
-                yl[i + 8] = x[yb + 32u + uint(i)]
+                yl[i + 8] = unsafe(xp[32 + i])
                 sumy[1] += yl[i + 8]
-                yl[i + 16] = x[yb + 64u + uint(i)]
+                yl[i + 16] = unsafe(xp[64 + i])
                 sumy[2] += yl[i + 16]
-                yl[i + 24] = x[yb + 96u + uint(i)]
+                yl[i + 24] = unsafe(xp[96 + i])
                 sumy[3] += yl[i + 24]
             }
             for [unroll_full] (r in range(4)) {
@@ -7520,10 +7605,10 @@ class template MetalKqMvShellT : MetalKqLaneMapsT {
             static_if (TILED) {
                 rowb = colbase + uint(b)
             }
-            let xb4 = rowb * nb4 + cx4
+            let xp = unsafe(addr(x[rowb * nb4 + cx4]))
             var acc = 0.0
             for [unroll_full] (u in range(8)) {
-                let v = x[xb4 + uint(u)]
+                let v = unsafe(xp[u])
                 acc += v.x * w[u].x + v.y * w[u].y + v.z * w[u].z + v.w * w[u].w
             }
             sumf[b] += acc
@@ -7536,10 +7621,10 @@ class template MetalKqMvShellT : MetalKqLaneMapsT {
             static_if (TILED) {
                 rowb = colbase + uint(b)
             }
-            let xb4 = rowb * nb4 + cx4
+            let xp = unsafe(addr(x[rowb * nb4 + cx4]))
             var acc = 0.0
             for [unroll_full] (u in range(4)) {
-                let v = x[xb4 + uint(u)]
+                let v = unsafe(xp[u])
                 acc += v.x * w[4 * u] + v.y * w[4 * u + 1] + v.z * w[4 * u + 2] + v.w * w[4 * u + 3]
             }
             sumf[b] += acc
@@ -7609,14 +7694,14 @@ class template MetalKqMvK2T : MetalKqMvShellT {
         let dmn = float(kdh[blk * 2u + 1u])
         for [unroll_full] (ch in range(2)) {
             let ip = uint(ch)
-            let qb = blk * 16u + ip * 8u + o4
+            let qp = unsafe(addr(kqu[blk * 16u + ip * 8u + o4]))
             let g = ip * 8u + s * 2u + (tx % 2u)
             let pb = uint(kscb[blk * 16u + g])
             let dl = dd * float(pb & 15u)
             let ml = dmn * float(pb >> 4u)
             var w : float[16]
             for [unroll_full] (u in range(4)) {
-                let qu = kqu[qb + uint(u)]
+                let qu = unsafe(qp[u])
                 let qv = (qu >> shr) & 0x03030303
                 for [unroll_full] (e in range(4)) {
                     w[4 * u + e] = float((qv >> (8u * uint(e))) & 255u) * dl - ml
@@ -7724,14 +7809,14 @@ class MetalKqMvB8K2 : MetalKqMvB8ShellT {
         let dmn = float(kdh[blk * 2u + 1u])
         for [unroll_full] (ch in range(2)) {
             let ip = uint(ch)
-            let qb = blk * 16u + ip * 8u + o4
+            let qp = unsafe(addr(kqu[blk * 16u + ip * 8u + o4]))
             let g = ip * 8u + s * 2u + (tx % 2u)
             let pb = uint(kscb[blk * 16u + g])
             let dl = dd * float(pb & 15u)
             let ml = dmn * float(pb >> 4u)
             var w4 : float4[4]
             for [unroll_full] (u in range(4)) {
-                let qvc = (kqu[qb + uint(u)] >> shr) & 0x03030303
+                let qvc = (unsafe(qp[u]) >> shr) & 0x03030303
                 w4[u] = u8x4_f4(qvc) * dl - float4(ml)
             }
             accum_panel(ip * 32u + s * 8u + o4, w4, acc)
@@ -7783,13 +7868,13 @@ class template MetalKqGemvK3T : MetalGemvSiteT {
             }
             for [unroll_full] (r in range(2)) {
                 let blk = eb + (first_row + uint(r)) * nb + ib
-                let qs0 = blk * 96u + ip * 32u + l0
-                let hm0 = blk * 96u + 64u + l0
+                let qsp = unsafe(addr(kqb[blk * 96u + ip * 32u + l0]))
+                let hmp = unsafe(addr(kqb[blk * 96u + 64u + l0]))
                 let sb = blk * 16u + is0
                 var sums : float[4]
                 for [unroll_full] (l in range(4)) {
-                    let q = uint(kqb[qs0 + uint(l)])
-                    let h = uint(kqb[hm0 + uint(l)]) >> hb0
+                    let q = uint(unsafe(qsp[l]))
+                    let h = uint(unsafe(hmp[l])) >> hb0
                     sums[0] += yl[4 * l] * (float((q & 3u) | ((h & 1u) << 2u)) - 4.0)
                     sums[1] += yl[4 * l + 1] * (float(((q >> 2u) & 3u) | ((h & 2u) << 1u)) - 4.0)
                     sums[2] += yl[4 * l + 2] * (float(((q >> 4u) & 3u) | (h & 4u)) - 4.0)
@@ -7856,8 +7941,8 @@ class template MetalKqMvK3T : MetalKqMvShellT {
         let dd = float(kdh[blk])
         for [unroll_full] (ch in range(2)) {
             let ip = uint(ch)
-            let qb = blk * 24u + ip * 8u + o4
-            let hb = blk * 24u + 16u + o4
+            let qp = unsafe(addr(kqu[blk * 24u + ip * 8u + o4]))
+            let hp = unsafe(addr(kqu[blk * 24u + 16u + o4]))
             let hsh = ip * 4u + s
             let g = ip * 8u + s * 2u + (tx % 2u)
             let sc = float((int(kscb[blk * 16u + g]) ^ 128) - 128)
@@ -7865,8 +7950,8 @@ class template MetalKqMvK3T : MetalKqMvShellT {
             let ml = dl * 4.0
             var w : float[16]
             for [unroll_full] (u in range(4)) {
-                let qu = kqu[qb + uint(u)]
-                let hu = kqu[hb + uint(u)]
+                let qu = unsafe(qp[u])
+                let hu = unsafe(hp[u])
                 let qv = ((qu >> shr) & 0x03030303) | (((hu >> hsh) & 0x01010101) << 2u)
                 for [unroll_full] (e in range(4)) {
                     w[4 * u + e] = float((qv >> (8u * uint(e))) & 255u) * dl - ml
@@ -7915,14 +8000,14 @@ class MetalKqMvB8K3 : MetalKqMvB8ShellT {
         let dd = float(kdh[blk])
         for [unroll_full] (ch in range(2)) {
             let ip = uint(ch)
-            let qb = blk * 24u + ip * 8u + o4
-            let hb = blk * 24u + 16u + o4
+            let qp = unsafe(addr(kqu[blk * 24u + ip * 8u + o4]))
+            let hp = unsafe(addr(kqu[blk * 24u + 16u + o4]))
             let hsh = ip * 4u + s
             var qu : uint[4]
             var hu : uint[4]
             for [unroll_full] (u in range(4)) {
-                qu[u] = kqu[qb + uint(u)]
-                hu[u] = kqu[hb + uint(u)]
+                qu[u] = unsafe(qp[u])
+                hu[u] = unsafe(hp[u])
             }
             let g = ip * 8u + s * 2u + (tx % 2u)
             let sc = float((int(kscb[blk * 16u + g]) ^ 128) - 128)
@@ -8114,8 +8199,9 @@ class template MetalKqGemvIq3T : MetalGemvSiteT {
                 var accv = float4(0.0)
                 static_if (XXS) {
                     let aux = kqu[blk * 24u + 16u + it]
+                    let qsp = unsafe(addr(kqu[blk * 24u + it * 2u]))
                     for [unroll_full] (h in range(2)) {
-                        let qsw = kqu[blk * 24u + it * 2u + uint(h)]
+                        let qsw = unsafe(qsp[h])
                         for [unroll_full] (k in range(4)) {
                             let e8 = uint(h) * 2u + uint(k) / 2u
                             let sgb = ksign7((aux >> (7u * e8)) & 127u)
@@ -8128,8 +8214,9 @@ class template MetalKqGemvIq3T : MetalGemvSiteT {
                 } else {
                     let qh = (kqu[blk * 26u + 16u + it / 4u] >> ((it % 4u) * 8u)) & 255u
                     let sgw = kqu[blk * 26u + 18u + it]
+                    let qsp = unsafe(addr(kqu[blk * 26u + it * 2u]))
                     for [unroll_full] (h in range(2)) {
-                        let qsw = kqu[blk * 26u + it * 2u + uint(h)]
+                        let qsw = unsafe(qsp[h])
                         for [unroll_full] (k in range(4)) {
                             let b3 = uint(h) * 4u + uint(k)
                             let idx = ((qsw >> (8u * uint(k))) & 255u) | ((qh << (8u - b3)) & 256u)
@@ -8347,6 +8434,7 @@ class template MetalKqGemvIq2sT : MetalGemvSiteT {
                 let qwi = kqu[blk * 18u + it]
                 let sgw = kqu[blk * 18u + 8u + it]
                 let qh = (kqu[blk * 18u + 16u + it / 4u] >> ((it % 4u) * 8u)) & 255u
+                let scp = unsafe(addr(kscb[blk * 16u + it * 2u]))
                 var half_sum : float[2]
                 for [unroll_full] (h in range(2)) {
                     var accv = float4(0.0)
@@ -8365,7 +8453,7 @@ class template MetalKqGemvIq2sT : MetalGemvSiteT {
                         accv += yv[l * 2u] * f0
                         accv += yv[l * 2u + 1u] * f1
                     }
-                    half_sum[h] = float(kscb[blk * 16u + it * 2u + uint(h)]) * (accv.x + accv.y + accv.z + accv.w)
+                    half_sum[h] = float(unsafe(scp[h])) * (accv.x + accv.y + accv.z + accv.w)
                 }
                 sumf[r] += float(kdh[blk]) * (half_sum[0] + half_sum[1])
             }
@@ -8437,8 +8525,10 @@ class template MetalKqGemvIq2xsT : MetalGemvSiteT {
             for [unroll_full] (r in range(2)) {
                 let blk = eb + (first_row + uint(r)) * nb + ib
                 var half_sum : float[2]
+                let qwp = unsafe(addr(kqu[blk * 16u + it * 2u]))
+                let scp = unsafe(addr(kscb[blk * 16u + it * 2u]))
                 for [unroll_full] (h in range(2)) {
-                    let qw = kqu[blk * 16u + it * 2u + uint(h)]
+                    let qw = unsafe(qwp[h])
                     var accv = float4(0.0)
                     for [unroll_full] (wi in range(2)) {
                         let w16 = (qw >> (16u * uint(wi))) & 0xFFFFu
@@ -8455,7 +8545,7 @@ class template MetalKqGemvIq2xsT : MetalGemvSiteT {
                         accv += yv[h * 4 + wi * 2] * f0
                         accv += yv[h * 4 + wi * 2 + 1] * f1
                     }
-                    half_sum[h] = float(kscb[blk * 16u + it * 2u + uint(h)]) * (accv.x + accv.y + accv.z + accv.w)
+                    half_sum[h] = float(unsafe(scp[h])) * (accv.x + accv.y + accv.z + accv.w)
                 }
                 sumf[r] += float(kdh[blk]) * (half_sum[0] + half_sum[1])
             }
@@ -8625,8 +8715,9 @@ class template MetalKqMvIq3xxsT : MetalKqMvShellT {
         let dl = float(kdh[blk]) * float((int(kscb[blk * 16u + tx]) ^ 128) - 128)
         let aux = kqu[blk * 24u + 16u + tx]
         var w : float4[8]
+        let qsp = unsafe(addr(kqu[blk * 24u + tx * 2u]))
         for [unroll_full] (h in range(2)) {
-            let qsw = kqu[blk * 24u + tx * 2u + uint(h)]
+            let qsw = unsafe(qsp[h])
             for [unroll_full] (wi in range(4)) {
                 let q3 = uint(h) * 2u + uint(wi) / 2u
                 let sgb = ksign7((aux >> (7u * q3)) & 127u)
@@ -8671,8 +8762,9 @@ class MetalKqMvB8Iq3xxs : MetalKqMvB8ShellT {
         let dl = float(kdh[blk]) * float((int(kscb[blk * 16u + tx]) ^ 128) - 128)
         let aux = kqu[blk * 24u + 16u + tx]
         var w : float4[8]
+        let qsp = unsafe(addr(kqu[blk * 24u + tx * 2u]))
         for [unroll_full] (h in range(2)) {
-            let qsw = kqu[blk * 24u + tx * 2u + uint(h)]
+            let qsw = unsafe(qsp[h])
             for [unroll_full] (wi in range(4)) {
                 let q3 = uint(h) * 2u + uint(wi) / 2u
                 let sgb = ksign7((aux >> (7u * q3)) & 127u)
@@ -8704,8 +8796,9 @@ class template MetalKqMvIq3sT : MetalKqMvShellT {
         let qh = (kqu[blk * 26u + 16u + tx / 4u] >> ((tx % 4u) * 8u)) & 255u
         let sgw = kqu[blk * 26u + 18u + tx]
         var w : float4[8]
+        let qsp = unsafe(addr(kqu[blk * 26u + tx * 2u]))
         for [unroll_full] (h in range(2)) {
-            let qsw = kqu[blk * 26u + tx * 2u + uint(h)]
+            let qsw = unsafe(qsp[h])
             for [unroll_full] (wi in range(4)) {
                 let b = uint(h) * 4u + uint(wi)
                 let idx = ((qsw >> (8u * uint(wi))) & 255u) | ((qh << (8u - b)) & 256u)
@@ -8751,8 +8844,9 @@ class MetalKqMvB8Iq3s : MetalKqMvB8ShellT {
         let qh = (kqu[blk * 26u + 16u + tx / 4u] >> ((tx % 4u) * 8u)) & 255u
         let sgw = kqu[blk * 26u + 18u + tx]
         var w : float4[8]
+        let qsp = unsafe(addr(kqu[blk * 26u + tx * 2u]))
         for [unroll_full] (h in range(2)) {
-            let qsw = kqu[blk * 26u + tx * 2u + uint(h)]
+            let qsw = unsafe(qsp[h])
             for [unroll_full] (wi in range(4)) {
                 let b = uint(h) * 4u + uint(wi)
                 let idx = ((qsw >> (8u * uint(wi))) & 255u) | ((qh << (8u - b)) & 256u)
@@ -9051,11 +9145,11 @@ class template MetalKqMvIq4T : MetalKqMvShellT {
         } else {
             dl = float(kdh[blk]) * float((int(kscb[blk * 16u + tx]) ^ 128) - 128)
         }
-        let qb = blk * 32u + tx * 4u
+        let qp = unsafe(addr(kqu[blk * 32u + tx * 4u]))
         var wl : float4[4]
         var wh : float4[4]
         for [unroll_full] (u in range(4)) {
-            let qv = kqu[qb + uint(u)]
+            let qv = unsafe(qp[u])
             static_if (Q40) {
                 wl[u] = (float4(float(qv & 15u), float((qv >> 8u) & 15u), float((qv >> 16u) & 15u), float((qv >> 24u) & 15u)) - float4(8.0)) * dl
                 wh[u] = (float4(float((qv >> 4u) & 15u), float((qv >> 12u) & 15u), float((qv >> 20u) & 15u), float(qv >> 28u)) - float4(8.0)) * dl
@@ -9070,11 +9164,11 @@ class template MetalKqMvIq4T : MetalKqMvShellT {
             static_if (TILED) {
                 rowb = colbase + uint(b)
             }
-            let xb4 = rowb * nb4 + cx4
+            let xp = unsafe(addr(x[rowb * nb4 + cx4]))
             var acc = 0.0
             for [unroll_full] (u in range(4)) {
-                let v = x[xb4 + uint(u)]
-                let vh = x[xb4 + 4u + uint(u)]
+                let v = unsafe(xp[u])
+                let vh = unsafe(xp[4 + u])
                 acc += v.x * wl[u].x + v.y * wl[u].y + v.z * wl[u].z + v.w * wl[u].w
                 acc += vh.x * wh[u].x + vh.y * wh[u].y + vh.z * wh[u].z + vh.w * wh[u].w
             }
@@ -9152,11 +9246,11 @@ class template MetalKqMvB8Iq4T : MetalKqMvB8ShellT {
         } else {
             dl = float(kdh[blk]) * float((int(kscb[blk * 16u + tx]) ^ 128) - 128)
         }
-        let qb = blk * 32u + tx * 4u
+        let qp = unsafe(addr(kqu[blk * 32u + tx * 4u]))
         var wl : float4[4]
         var wh : float4[4]
         for [unroll_full] (u in range(4)) {
-            let qv = kqu[qb + uint(u)]
+            let qv = unsafe(qp[u])
             static_if (Q40) {
                 wl[u] = (float4(float(qv & 15u), float((qv >> 8u) & 15u), float((qv >> 16u) & 15u), float((qv >> 24u) & 15u)) - float4(8.0)) * dl
                 wh[u] = (float4(float((qv >> 4u) & 15u), float((qv >> 12u) & 15u), float((qv >> 20u) & 15u), float(qv >> 28u)) - float4(8.0)) * dl
@@ -9218,10 +9312,10 @@ class template MetalKqMvK4T : MetalKqMvShellT {
             kmask_sc_mn_ch(sv, jl, ch, sc, mn)
             let dl = dd * float(sc)
             let ml = dm * float(mn)
-            let qb = blk * 32u + (q4i + uint(ch) * 2u) * 8u + lo
+            let qp = unsafe(addr(kqu[blk * 32u + (q4i + uint(ch) * 2u) * 8u + lo]))
             var w : float[16]
             for [unroll_full] (u in range(4)) {
-                let qv = kqu[qb + uint(u)]
+                let qv = unsafe(qp[u])
                 for [unroll_full] (e in range(4)) {
                     let byv = (qv >> (8u * uint(e))) & 255u
                     w[4 * u + e] = float((byv >> nsh) & 0x0Fu) * dl - ml
@@ -9290,13 +9384,13 @@ class MetalKqMvB2K4R2 {
                 let dlB = ddB * float(scB)
                 let mlB = dmB * float(mnB)
                 let qoff = (q4i + uint(ch) * 2u) * 8u + lo
-                let qbA = blkA * 32u + qoff
-                let qbB = blkB * 32u + qoff
+                let qpA = unsafe(addr(kqu[blkA * 32u + qoff]))
+                let qpB = unsafe(addr(kqu[blkB * 32u + qoff]))
                 var wa : float[16]
                 var wb : float[16]
                 for [unroll_full] (u in range(4)) {
-                    let qvA = kqu[qbA + uint(u)]
-                    let qvB = kqu[qbB + uint(u)]
+                    let qvA = unsafe(qpA[u])
+                    let qvB = unsafe(qpB[u])
                     for [unroll_full] (e in range(4)) {
                         let byA = (qvA >> (8u * uint(e))) & 255u
                         let byB = (qvB >> (8u * uint(e))) & 255u
@@ -9306,11 +9400,11 @@ class MetalKqMvB2K4R2 {
                 }
                 let cx4 = sb * 64u + (q4i + uint(ch) * 2u) * 16u + (nib ? 0u : 8u) + lo
                 for [unroll_full] (b in range(2)) {
-                    let xb4 = uint(b) * nb4 + cx4
+                    let xp = unsafe(addr(x[uint(b) * nb4 + cx4]))
                     var accA = 0.0
                     var accB = 0.0
                     for [unroll_full] (u in range(4)) {
-                        let v = x[xb4 + uint(u)]
+                        let v = unsafe(xp[u])
                         accA += v.x * wa[4 * u] + v.y * wa[4 * u + 1] + v.z * wa[4 * u + 2] + v.w * wa[4 * u + 3]
                         accB += v.x * wb[4 * u] + v.y * wb[4 * u + 1] + v.z * wb[4 * u + 2] + v.w * wb[4 * u + 3]
                     }
@@ -9362,8 +9456,8 @@ class template MetalKqMvK6T : MetalKqMvShellT {
         let dd = float(kdh[blk])
         for [unroll_full] (ch in range(2)) {
             let ip = uint(ch)
-            let qb = blk * 48u + ip * 16u + qoff
-            let hb = blk * 48u + 32u + ip * 8u + o4
+            let qp = unsafe(addr(kqu[blk * 48u + ip * 16u + qoff]))
+            let hp = unsafe(addr(kqu[blk * 48u + 32u + ip * 8u + o4]))
             let g = ip * 8u + s * 2u + (tx % 2u)
             let sc = float((int(kscb[blk * 16u + g]) ^ 128) - 128)
             let dl = dd * sc
@@ -9372,8 +9466,8 @@ class template MetalKqMvK6T : MetalKqMvShellT {
             // 4+4 uint loads per chunk (the byte-view form was 32 scattered byte loads);
             // the slot's lsh/rsh dance is identically ((h >> 2s) & 3) << 4, vectorized
             for [unroll_full] (u in range(4)) {
-                let qu = kqu[qb + uint(u)]
-                let hu = kqu[hb + uint(u)]
+                let qu = unsafe(qp[u])
+                let hu = unsafe(hp[u])
                 let qv = ((qu >> shr) & 0x0F0F0F0F) | (((hu >> hsh) & 0x03030303) << 4u)
                 for [unroll_full] (e in range(4)) {
                     w[4 * u + e] = float((qv >> (8u * uint(e))) & 255u) * dl - ml
@@ -9428,8 +9522,9 @@ class template MetalKqMvK5T : MetalKqMvShellT {
         let dd = float(ksh[blk * 8u])
         let dm = float(ksh[blk * 8u + 1u])
         var hq : uint[4]
+        let hp = unsafe(addr(kqu[blk * 40u + 32u + lo]))
         for [unroll_full] (u in range(4)) {
-            hq[u] = kqu[blk * 40u + 32u + lo + uint(u)]
+            hq[u] = unsafe(hp[u])
         }
         for [unroll_full] (ch in range(2)) {
             var sc = 0u
@@ -9437,11 +9532,11 @@ class template MetalKqMvK5T : MetalKqMvShellT {
             kmask_sc_mn_ch(sv, jl, ch, sc, mn)
             let dl = dd * float(sc)
             let ml = dm * float(mn)
-            let qb = blk * 40u + (q4i + uint(ch) * 2u) * 8u + lo
+            let qp = unsafe(addr(kqu[blk * 40u + (q4i + uint(ch) * 2u) * 8u + lo]))
             let hsh = jl + 4u * uint(ch)
             var w : float[16]
             for [unroll_full] (u in range(4)) {
-                let qv = kqu[qb + uint(u)]
+                let qv = unsafe(qp[u])
                 for [unroll_full] (e in range(4)) {
                     let byv = (qv >> (8u * uint(e))) & 255u
                     let hb = (hq[u] >> (8u * uint(e) + hsh)) & 1u
@@ -9496,14 +9591,15 @@ class template MetalKqMvB8K45T : MetalKqMvB8ShellT {
         let sv = ks4[blk]
         let dd = float(ksh[blk * 8u])
         let dm = float(ksh[blk * 8u + 1u])
-        let qb = blk * SB_UINTS + q4i * 8u + lo
+        let qp = unsafe(addr(kqu[blk * SB_UINTS + q4i * 8u + lo]))
+        let hp = unsafe(addr(kqu[blk * SB_UINTS + 32u + lo]))
         var qv : uint[8]
         var hq : uint[4]   // nolint:LINT002 dead in the QH=false stamp — no init, no dataflow
         for [unroll_full] (u in range(4)) {
-            qv[u] = kqu[qb + uint(u)]
-            qv[4 + u] = kqu[qb + 16u + uint(u)]
+            qv[u] = unsafe(qp[u])
+            qv[4 + u] = unsafe(qp[16 + u])
             static_if (QH) {
-                hq[u] = kqu[blk * SB_UINTS + 32u + lo + uint(u)]
+                hq[u] = unsafe(hp[u])
             }
         }
         for [unroll_full] (ch in range(2)) {
@@ -9572,13 +9668,13 @@ class MetalKqMvB8K6 : MetalKqMvB8ShellT {
         let dd = float(kdh[blk])
         for [unroll_full] (ch in range(2)) {
             let ip = uint(ch)
-            let qb = blk * 48u + ip * 16u + qoff
-            let hb = blk * 48u + 32u + ip * 8u + o4
+            let qp = unsafe(addr(kqu[blk * 48u + ip * 16u + qoff]))
+            let hp = unsafe(addr(kqu[blk * 48u + 32u + ip * 8u + o4]))
             var qu : uint[4]
             var hu : uint[4]
             for [unroll_full] (u in range(4)) {
-                qu[u] = kqu[qb + uint(u)]
-                hu[u] = kqu[hb + uint(u)]
+                qu[u] = unsafe(qp[u])
+                hu[u] = unsafe(hp[u])
             }
             let g = ip * 8u + s * 2u + (tx % 2u)
             let sc = float((int(kscb[blk * 16u + g]) ^ 128) - 128)
@@ -9831,7 +9927,7 @@ class MetalDnConv {
             acc += xv * w[ch * dconv + k]
             k++
         }
-        y[(ka.row + p) * cd + ch] = tts_silu(acc)
+        y[(ka.row + p) * cd + ch] = silu_f32(acc)
     }
 }
 
@@ -9908,8 +10004,9 @@ class MetalDnL2Norm {
         let base = (ka.row + p) * cd + blk * ds + lane * 4u
         var v : float[4]
         var ss = 0.0
+        let yp = unsafe(addr(y[base]))
         for [unroll_full] (c in range(4)) {
-            v[c] = y[base + uint(c)]
+            v[c] = unsafe(yp[c])
             ss += v[c] * v[c]
         }
         ss = simd_sum(ss)
@@ -9920,12 +10017,10 @@ class MetalDnL2Norm {
     }
 }
 
-// The fused sequential gated delta-net rule: one simdgroup per
-// (state column j, v-head) holds S[:,j] in registers and walks ALL npos tokens in-kernel —
-// zero per-token state traffic; β/σ/softplus fold into the loop (redundant per column, trivial).
-[metal_dispatch(name = "enc_dn_scan", pso = "g_pso_dn_scan", tg = 128, grid = "ds/4, nvh", params = "ds : int64, nvh : int64")]
-class MetalDnScan {
-    @ssbo @binding = 0 cv : array<float>    // [npos x cd] conv rows: q at 0 / k at kd / v at 2kd
+[ |> template_struct_instance]
+class template MetalDnScanT {
+    @template_constant PREP : bool = false   //! braw / graw hold beta and the decay (MetalDnPrep wrote them), not the raw projections
+    @ssbo @binding = 0 cv : array<CT>       // [npos x cd] conv rows: q at 0 / k at kd / v at 2kd
     @ssbo @binding = 1 @off = "stoff" st : array<float>    // state layer slice [nvh x ds x ds] row-major (i·ds + j)
     @ssbo @binding = 2 braw : array<float>  // [npos x nvh] raw beta projections
     @ssbo @binding = 3 graw : array<float>  // [npos x nvh] raw alpha projections
@@ -9935,8 +10030,8 @@ class MetalDnScan {
     @ssbo @binding = 7 @role = "alias" @off = "stmoff" stm : array<float>  // dual-store: post-token-(npos-2) state (verify shadow region)
     @uniform @binding = 8 ka : DnArgs
 
-    [metal_kernel(name="metal_dn_scan_msl")]
-    def metal_dn_scan {
+    [metal_kernel, arch(at="../ARCHITECTURE_GPU_PREFILL_WINDOW.md#prefill-dn-scan")]
+    def metal_dn_scan {   // nolint:STYLE038 — MSL kernel body; the walk's state is register-resident across the whole loop
         let cd = ka.cd
         let kd = ka.kd
         let ds = ka.ds
@@ -9945,74 +10040,134 @@ class MetalDnScan {
         let di = ka.di
         let npos = ka.npos
         let mid = ka.mid
-        let j = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        let sg = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
         let h = gl_WorkGroupID.y
-        if (j >= ds) {
+        if (sg * 8u >= ds) {
             return
         }
         let lane = gl_SubgroupInvocationID
+        let j = sg * 8u + lane / 4u
+        let r = lane & 3u
         let kh = h % nkh
-        let qoff = kh * ds + lane * 4u
-        let koff = kd + kh * ds + lane * 4u
+        let qoff = kh * ds + r * 32u
+        let koff = kd + kh * ds + r * 32u
         let voff = 2u * kd + h * ds + j
         let a_h = aa[h]
         let dt_h = dtb[h]
-        let s0 = h * ds * ds + (lane * 4u) * ds + j
-        var ls : float[4]
-        for [unroll_full] (c in range(4)) {
-            ls[c] = st[s0 + uint(c) * ds]
+        let s0 = h * ds * ds + (r * 32u) * ds + j
+        var ls : float[32]
+        for [unroll_full] (e in range(32)) {
+            ls[e] = st[s0 + uint(e) * ds]
         }
         var p = 0u
         while (p < npos) {
-            let gr = graw[(ka.row + p) * nvh + h] + dt_h
-            let dec = exp(a_h * (gr > 20.0 ? gr : log(1.0 + exp(gr))))
-            let beta = tts_sigmoid(braw[(ka.row + p) * nvh + h])
+            var dec = graw[(ka.row + p) * nvh + h]
+            var beta = braw[(ka.row + p) * nvh + h]
+            static_if (!PREP) {
+                let gr = dec + dt_h
+                dec = exp(a_h * (gr > 20.0 ? gr : log(1.0 + exp(gr))))
+                beta = sigmoid_f32(beta)
+            }
             let cb = (ka.row + p) * cd
-            var kv4 : float[4]
-            var sk = 0.0
-            for [unroll_full] (c in range(4)) {
-                kv4[c] = cv[cb + koff + uint(c)]
-                ls[c] *= dec
-                sk += kv4[c] * ls[c]
+            let kp = unsafe(addr(cv[cb + koff]))
+            let qp = unsafe(addr(cv[cb + qoff]))
+            var part : float[8]
+            for [unroll_full] (pb in range(8)) {
+                var acc = 0.0
+                for [unroll_full] (c in range(4)) {
+                    ls[pb * 4 + c] *= dec
+                    acc += float(unsafe(kp[pb * 4 + c])) * ls[pb * 4 + c]   // nolint:PERF020 — the half stamp's row widens here; on the f32 stamp the cast is the identity
+                }
+                part[pb] = acc
             }
-            sk = simd_sum(sk)
-            let d = (cv[cb + voff] - sk) * beta
-            var yy = 0.0
-            for [unroll_full] (c in range(4)) {
-                ls[c] += kv4[c] * d
-                yy += cv[cb + qoff + uint(c)] * ls[c]
+            var sk = ((part[0] + part[1]) + (part[2] + part[3])) + ((part[4] + part[5]) + (part[6] + part[7]))
+            sk += simd_shuffle_xor(sk, 1u)
+            sk += simd_shuffle_xor(sk, 2u)
+            let d = (float(cv[cb + voff]) - sk) * beta   // nolint:PERF020 — same widening
+            for [unroll_full] (pb in range(8)) {
+                var acc = 0.0
+                for [unroll_full] (c in range(4)) {
+                    ls[pb * 4 + c] += float(unsafe(kp[pb * 4 + c])) * d   // nolint:PERF020 — same widening
+                    acc += float(unsafe(qp[pb * 4 + c])) * ls[pb * 4 + c]   // nolint:PERF020 — same widening
+                }
+                part[pb] = acc
             }
-            yy = simd_sum(yy)
-            if (lane == 0u) {
+            var yy = ((part[0] + part[1]) + (part[2] + part[3])) + ((part[4] + part[5]) + (part[6] + part[7]))
+            yy += simd_shuffle_xor(yy, 1u)
+            yy += simd_shuffle_xor(yy, 2u)
+            if (r == 0u) {
                 o[(ka.row + p) * di + h * ds + j] = yy
             }
             if (mid != 0u && p + 2u == npos) {
-                for [unroll_full] (c in range(4)) {
-                    stm[s0 + uint(c) * ds] = ls[c]
+                for [unroll_full] (e in range(32)) {
+                    stm[s0 + uint(e) * ds] = ls[e]
                 }
             }
             p++
         }
-        for [unroll_full] (c in range(4)) {
+        for [unroll_full] (e in range(32)) {
             if (ka.split != 0u) {
-                stm[s0 + uint(c) * ds] = ls[c]
+                stm[s0 + uint(e) * ds] = ls[e]
             } else {
-                st[s0 + uint(c) * ds] = ls[c]
+                st[s0 + uint(e) * ds] = ls[e]
             }
         }
     }
 }
 
+[metal_dispatch(name = "enc_dn_scan", pso = "g_pso_dn_scan", tg = 64, grid = "ds/16, nvh", params = "ds : int64, nvh : int64", requires = "ds % 32")]
+class MetalDnScan : MetalDnScanT {
+    typedef CT = float
+}
+
+//! the prefill window's stamp: half conv rows, the gates prepared
+[metal_dispatch(name = "enc_dn_scan_h", pso = "g_pso_dn_scan_h", tg = 64, grid = "ds/16, nvh", params = "ds : int64, nvh : int64", requires = "ds % 32")]
+class MetalDnScanH : MetalDnScanT {
+    typedef CT = float16
+    override PREP = true
+}
+
+[metal_dispatch(name = "enc_dn_prep", pso = "g_pso_dn_prep", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalDnPrep {
+    @ssbo @binding = 0 braw : array<float>  // [npos x nvh] raw beta in, beta out
+    @ssbo @binding = 1 graw : array<float>  // [npos x nvh] raw alpha in, the decay out
+    @ssbo @binding = 2 @role = "weight" aa : array<float>    // [nvh] ssm_a
+    @ssbo @binding = 3 @role = "weight" dtb : array<float>   // [nvh] dt_bias
+    @uniform @binding = 4 ka : DnArgs
+
+    [metal_kernel(name="metal_dn_prep_msl"), arch(at="../ARCHITECTURE_GPU_PREFILL_WINDOW.md#prefill-dn-scan")]
+    def metal_dn_prep {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= ka.npos * ka.nvh) {
+            return
+        }
+        let h = gid % ka.nvh
+        let i = ka.row * ka.nvh + gid
+        let gr = graw[i] + dtb[h]
+        graw[i] = exp(aa[h] * (gr > 20.0 ? gr : log(1.0 + exp(gr))))
+        braw[i] = sigmoid_f32(braw[i])
+    }
+}
+
 // Gated out-norm (dn_token_core's tail): per (v-head, position) RMSNorm over ds with the
 // SHARED ssm_norm row, then ⊙ SiLU(z) — in place on o, one simdgroup per (head, position).
-[metal_dispatch(name = "enc_dn_gate", pso = "g_pso_dn_gate", tg = 256, grid = "nvh/8, npos", params = "nvh : int64, npos : int64")]
-class MetalDnGate {
+[ |> template_struct_instance]
+class template MetalDnGateT {
     @ssbo @binding = 0 o : array<float>     // [npos x di] delta-rule output, gated in place
     @ssbo @binding = 1 z : array<float>     // [npos x di] raw gate projections
     @ssbo @binding = 2 @role = "weight" wn : array<float>    // [ds] shared norm weight (fblob row)
     @uniform @binding = 3 ka : DnArgs
+    @template_constant SIG : bool = false   //!< the z gate: silu(z) (qwen35), σ(z) (qwen4exp)
 
-    [metal_kernel(name="metal_dn_gate_msl")]
+    def zgate(zz : float) : float {
+        static_if (SIG) {
+            return 1.0 / (1.0 + exp(-zz))
+        } else {
+            return zz / (1.0 + exp(-zz))
+        }
+    }
+
+    [metal_kernel]
     def metal_dn_gate {
         let ds = ka.ds
         let di = ka.di
@@ -10026,17 +10181,29 @@ class MetalDnGate {
         let base = (ka.row + p) * di + h * ds + lane * 4u
         var v : float[4]
         var ss = 0.0
+        let op = unsafe(addr(o[base]))
         for [unroll_full] (c in range(4)) {
-            v[c] = o[base + uint(c)]
+            v[c] = unsafe(op[c])
             ss += v[c] * v[c]
         }
         ss = simd_sum(ss)
         let inv = rsqrt(ss / float(ds) + eps)
+        let zp = unsafe(addr(z[base]))
+        let wp = unsafe(addr(wn[lane * 4u]))
         for [unroll_full] (c in range(4)) {
-            let zz = z[base + uint(c)]
-            o[base + uint(c)] = (wn[lane * 4u + uint(c)] * (v[c] * inv)) * tts_silu(zz)
+            let zz = unsafe(zp[c])
+            o[base + uint(c)] = (unsafe(wp[c]) * (v[c] * inv)) * zgate(zz)
         }
     }
+}
+
+[metal_dispatch(name = "enc_dn_gate", pso = "g_pso_dn_gate", tg = 256, grid = "nvh/8, npos", params = "nvh : int64, npos : int64")]
+class MetalDnGate : MetalDnGateT {
+}
+
+[metal_dispatch(name = "enc_dn_gate_sig", pso = "g_pso_dn_gate_sig", tg = 256, grid = "nvh/8, npos", params = "nvh : int64, npos : int64")]
+class MetalDnGateSig : MetalDnGateT {
+    override SIG = true
 }
 
 // Deinterleave the 2x-wide gated-attention Q projection (head h's q at 2h·hs, its gate at
@@ -10085,6 +10252,257 @@ class MetalAxpySig {
     }
 }
 
+// ===== hyper-connections (qwen4exp): the wide residual's mixer and scatter =====
+
+// The mixer's pre-norm: one threadgroup per stream row - stream (row % hc) of a wide row
+// RMS-normalizes over dim and scales by its own gamma row (the converter folded (1 + w) into w);
+// rows = hc for the single row, npos x hc for a window of wide rows.
+[metal_dispatch(name = "enc_hc_norm", pso = "g_pso_hc_norm", tgmem = "metal_hc_norm_msl_tgmem", tg = 1024, grid = "rows", params = "rows : int64")]
+class MetalHcNorm : MetalTgReduceBase {
+    @ssbo @binding = 0 @role = "read" x : array<float>       // [rows x dim] the wide residual rows
+    @ssbo @binding = 1 @role = "weight" w : array<float>     // [hc x dim] per-stream gammas
+    @ssbo @binding = 2 @role = "write" y : array<float>      // [rows x dim] the normed streams
+    @uniform @binding = 3 dim : uint
+    @uniform @binding = 4 eps : float
+    @uniform @binding = 5 hc : uint
+
+    [metal_kernel(name="metal_hc_norm_msl")]
+    def metal_hc_norm {
+        let row = gl_WorkGroupID.x
+        let lid = gl_LocalInvocationID.x
+        let wb = (row % hc) * dim
+        var ss = 0.0
+        var k = lid
+        while (k < dim) {
+            let vv = x[row * dim + k]
+            ss += vv * vv
+            k += gl_WorkGroupSize.x
+        }
+        let inv = tg_rms_inv(ss, dim, eps)
+        k = lid
+        while (k < dim) {
+            y[row * dim + k] = w[wb + k] * (x[row * dim + k] * inv)
+            k += gl_WorkGroupSize.x
+        }
+    }
+}
+
+// the wide residual of nrows rows: every stream of row p starts as row p of x
+[metal_dispatch(name = "enc_hc_init", pso = "g_pso_hc_init", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalHcInit {
+    @ssbo @binding = 0 @role = "read" x : array<float>       // [nrows x dim]
+    @ssbo @binding = 1 @role = "write" res : array<float>    // [nrows x hc x dim]
+    @uniform @binding = 2 ndim : uint
+    @uniform @binding = 3 hc : uint
+    @uniform @binding = 4 total : uint   // nrows x hc x dim
+
+    [metal_kernel(name="metal_hc_init_msl")]
+    def metal_hc_init {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= total) {
+            return
+        }
+        let width = hc * ndim
+        let p = gid / width
+        res[gid] = x[p * ndim + (gid - p * width) % ndim]
+    }
+}
+
+// the mixer's gate input: lo = silu(lo / hc) in place, on the low-rank row
+[metal_dispatch(name = "enc_hc_lo", pso = "g_pso_hc_lo", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalHcLo : MetalEw1T {
+    @uniform @binding = 2 hc : uint
+
+    def override map(a : float) : float => (a / float(hc)) / (1.0 + exp(-(a / float(hc))))
+}
+
+// the mixer's collapse over nrows wide rows: y[p][i] = the stream mean of xn[p][c][i] * σ(gate[p][c][i]) - the block's input rows
+[metal_dispatch(name = "enc_hc_mix", pso = "g_pso_hc_mix", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalHcMix {
+    @ssbo @binding = 0 @role = "read" xn : array<float>      // [nrows x hc x dim] the normed streams
+    @ssbo @binding = 1 @role = "read" gate : array<float>    // [nrows x hc x dim] the up projection
+    @ssbo @binding = 2 @role = "write" y : array<float>      // [nrows x dim] the block input
+    @uniform @binding = 3 ndim : uint
+    @uniform @binding = 4 hc : uint
+    @uniform @binding = 5 nrows : uint
+
+    [metal_kernel(name="metal_hc_mix_msl")]
+    def metal_hc_mix {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= nrows * ndim) {
+            return
+        }
+        let p = gid / ndim
+        let i = gid - p * ndim
+        var acc = 0.0
+        var c = 0u
+        while (c < hc) {
+            let k = (p * hc + c) * ndim + i
+            acc += xn[k] / (1.0 + exp(-gate[k]))
+            c++
+        }
+        y[gid] = acc / float(hc)
+    }
+}
+
+// the scatter over nrows wide rows: stream c of row p += the block output row p x 2 σ(inject[p][c] / hc) -
+// a zero logit is a plain residual add
+[metal_dispatch(name = "enc_hc_combine", pso = "g_pso_hc_combine", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalHcCombine {
+    @ssbo @binding = 0 @role = "readwrite" res : array<float>   // [nrows x hc x dim] the wide residual
+    @ssbo @binding = 1 @role = "read" o : array<float>          // [nrows x dim] the block output
+    @ssbo @binding = 2 @role = "read" inj : array<float>        // [nrows x hc] the scatter logits
+    @uniform @binding = 3 ndim : uint
+    @uniform @binding = 4 hc : uint
+    @uniform @binding = 5 nrows : uint
+
+    [metal_kernel(name="metal_hc_combine_msl")]
+    def metal_hc_combine {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= nrows * hc * ndim) {
+            return
+        }
+        let pc = gid / ndim
+        let p = pc / hc
+        let w = 2.0 / (1.0 + exp(-inj[pc] / float(hc)))
+        res[gid] += o[p * ndim + (gid - pc * ndim)] * w
+    }
+}
+
+// ===== the n-gram PLE side input (qwen4exp) =====
+
+struct PleGateArgs {
+    dim : uint
+    hc : uint
+    eps : float
+    pos0 : uint     // the position of row 0
+    rows : uint     // ring rows
+    direct : uint   // 1: the conv input lands at row p of a window panel; 0: at ring slot (pos0 + p) % rows
+}
+
+struct PleConvArgs {
+    dim : uint
+    hc : uint
+    kern : uint     // conv taps
+    dil : uint      // tap spacing in positions (the n-gram size)
+    rows : uint     // ring rows
+    pos0 : uint     // the position of row 0
+    nrows : uint
+    direct : uint   // 1: a tap at or past pos0 reads the window panel row (src - pos0), older taps the ring; 0: every tap reads the ring
+}
+
+// One (row, stream) per threadgroup of the side input: the normed key . normed query dot over dim gives
+// the gate (signed sqrt, then σ); the value row scaled by it is the stream's gated row, and its
+// grouped norm is the conv input row - into the history ring at the position's slot, or row p of a window panel.
+[metal_dispatch(name = "enc_ple_gate", pso = "g_pso_ple_gate", tgmem = "metal_ple_gate_msl_tgmem", tg = 1024, grid = "wgs", params = "wgs : int64")]
+class MetalPleGate : MetalTgReduceBase {
+    @ssbo @binding = 0 @role = "read" @off = "rb" res : array<float>       // [nrows x hc x dim] the wide residual (the query); the offsets pick one stream's rows out of a joint verify
+    @ssbo @binding = 1 @role = "read" @off = "kb" key : array<float>       // [nrows x hc x dim] the key projection
+    @ssbo @binding = 2 @role = "read" @off = "vb" val : array<float>       // [nrows x dim] the value projection
+    @ssbo @binding = 3 @role = "weight" wk : array<float>      // [hc x dim] key norm gammas
+    @ssbo @binding = 4 @role = "weight" wq : array<float>      // [hc x dim] query norm gammas
+    @ssbo @binding = 5 @role = "weight" wc : array<float>      // [hc x dim] conv-input norm gammas
+    @ssbo @binding = 6 @role = "write" @off = "gb" gated : array<float>    // [nrows x hc x dim] value x gate, per stream
+    @ssbo @binding = 7 @role = "write" @off = "coff" cin : array<float>   // the conv input rows: the ring (rows x hc x dim) or the window panel
+    @uniform @binding = 8 ka : PleGateArgs
+
+    [metal_kernel(name="metal_ple_gate_msl")]
+    def metal_ple_gate {
+        let wg = gl_WorkGroupID.x
+        let c = wg % ka.hc
+        let p = wg / ka.hc
+        let lid = gl_LocalInvocationID.x
+        let dim = ka.dim
+        let eps = ka.eps
+        let b = (p * ka.hc + c) * dim
+        let vb = p * dim
+        let wb = c * dim
+        var sk = 0.0
+        var sq = 0.0
+        var k = lid
+        while (k < dim) {
+            let kv = key[b + k]
+            let qv = res[b + k]
+            sk += kv * kv
+            sq += qv * qv
+            k += gl_WorkGroupSize.x
+        }
+        let invk = tg_rms_inv(sk, dim, eps)
+        barrier()
+        let invq = tg_rms_inv(sq, dim, eps)
+        barrier()
+        var d = 0.0
+        k = lid
+        while (k < dim) {
+            d += (wk[wb + k] * (key[b + k] * invk)) * (wq[wb + k] * (res[b + k] * invq))
+            k += gl_WorkGroupSize.x
+        }
+        let s = tg_sum(d) / sqrt(float(dim))
+        barrier()
+        let mag = sqrt(max(abs(s), 1.0e-6))
+        let sg = s > 0.0 ? mag : (s < 0.0 ? -mag : 0.0)
+        let g = 1.0 / (1.0 + exp(-sg))
+        var sg2 = 0.0
+        k = lid
+        while (k < dim) {
+            let gv = val[vb + k] * g
+            gated[b + k] = gv
+            sg2 += gv * gv
+            k += gl_WorkGroupSize.x
+        }
+        let invg = tg_rms_inv(sg2, dim, eps)
+        let slot = ka.direct != 0u ? p : (ka.pos0 + p) % ka.rows
+        let rb = (slot * ka.hc + c) * dim
+        k = lid
+        while (k < dim) {
+            cin[rb + k] = wc[wb + k] * ((val[vb + k] * g) * invg)
+            k += gl_WorkGroupSize.x
+        }
+    }
+}
+
+// The dilated depthwise causal conv over the normed conv-input rows (tap k of row p reads position
+// pos0 + p - (kern - 1 - k) x dil: the window panel from pos0 on, the ring before it) and the side
+// input's residual add: res += gated + silu(conv). A position before the sequence reads zero.
+[metal_dispatch(name = "enc_ple_conv", pso = "g_pso_ple_conv", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalPleConv {
+    @ssbo @binding = 0 @role = "readwrite" @off = "rb" res : array<float>   // [nrows x hc x dim] the wide residual; the offsets pick one stream's rows out of a joint verify
+    @ssbo @binding = 1 @role = "read" @off = "gb" gated : array<float>      // [nrows x hc x dim]
+    @ssbo @binding = 2 @role = "read" @off = "coff" cin : array<float>    // the window panel (nrows x hc x dim); direct = 0 leaves it unread
+    @ssbo @binding = 3 @role = "read" @off = "roff" ring : array<float>   // the history ring (rows x hc x dim)
+    @ssbo @binding = 4 @role = "weight" w : array<float>        // [(hc x dim) x kern] taps, contiguous per channel
+    @uniform @binding = 5 ka : PleConvArgs
+
+    [metal_kernel(name="metal_ple_conv_msl")]
+    def metal_ple_conv {
+        let gid = gl_GlobalInvocationID.x
+        let width = ka.hc * ka.dim
+        if (gid >= ka.nrows * width) {
+            return
+        }
+        let p = gid / width
+        let chn = gid - p * width
+        let pos = int(ka.pos0) + int(p)
+        let kern = ka.kern
+        var acc = 0.0
+        var k = 0u
+        while (k < kern) {
+            let src = pos - int((kern - 1u - k) * ka.dil)
+            if (src >= 0) {
+                var v = 0.0
+                if (ka.direct != 0u && src >= int(ka.pos0)) {
+                    v = cin[uint(src - int(ka.pos0)) * width + chn]
+                } else {
+                    v = ring[uint(src % int(ka.rows)) * width + chn]
+                }
+                acc += w[chn * kern + k] * v
+            }
+            k++
+        }
+        res[gid] += gated[gid] + acc / (1.0 + exp(-acc))
+    }
+}
+
 //! The im2col of one chunk: the whole [mp x kdim] panel, zeros past the taps, in the pad columns
 //! and in the pad rows; the conv's direction and the source layout are the stamp's.
 [ |> template_struct_instance]
@@ -10118,9 +10536,9 @@ class template MetalSt2Im2colT {
             let ci = j % ka.cin
             var st = -1
             static_if (TRANSPOSED) {
-                st = st2_conv_src_tr_row(r, tap, ka.r0, ka.pad_l, ka.dil, ka.stride, ka.t_in)
+                st = conv_src_tr_row(r, tap, ka.r0, ka.pad_l, ka.dil, ka.stride, ka.t_in)
             } else {
-                st = st2_conv_src_fwd_row(r, tap, ka.r0, ka.pad_l, ka.dil, ka.stride, ka.t_in)
+                st = conv_src_fwd_row(r, tap, ka.r0, ka.pad_l, ka.dil, ka.stride, ka.t_in)
             }
             if (st >= 0) {
                 v = src_at(uint(st), ci)
@@ -10427,7 +10845,7 @@ class MetalSt2PoolDw {
         var acc = b[j]
         var kk = 0u
         while (kk < ka.k) {
-            let src = st2_conv_src_tr_row(p, kk, 0u, ka.pad_l, ka.dil, ka.stride, ka.t_in)
+            let src = conv_src_tr_row(p, kk, 0u, ka.pad_l, ka.dil, ka.stride, ka.t_in)
             if (src >= 0) {
                 acc += w[j * ka.k + kk] * x[uint(src) * ka.c + j]
             }
@@ -10488,9 +10906,9 @@ class MetalSt2Lstm {
                 let gf = xg[ti * ka.xgs + hd + j] + gsh[hd + j]
                 let gg = xg[ti * ka.xgs + 2u * hd + j] + gsh[2u * hd + j]
                 let go = xg[ti * ka.xgs + 3u * hd + j] + gsh[3u * hd + j]
-                let si = tts_sigmoid(gi)
-                let sf = tts_sigmoid(gf)
-                let so = tts_sigmoid(go)
+                let si = sigmoid_f32(gi)
+                let sf = sigmoid_f32(gf)
+                let so = sigmoid_f32(go)
                 cst = sf * cst + si * tts_tanh(gg)
                 let hn = so * tts_tanh(cst)
                 hsh[j] = hn
@@ -10601,7 +11019,7 @@ class MetalSt2SigSum {
         var acc = 0.0
         var j = 0u
         while (j < nb) {
-            acc += tts_sigmoid(logits[gid * ls + j])
+            acc += sigmoid_f32(logits[gid * ls + j])
             j++
         }
         raw[gid] = acc / speed   //! the CPU divides; a reciprocal multiply rounds a raw duration apart from it
@@ -11200,13 +11618,13 @@ class template MetalPkGemvT {
                 y[row] = d
             }
             static_if (EPI == 1) {
-                y[row] = tts_silu(d)
+                y[row] = silu_f32(d)
             }
             static_if (EPI == 2) {
                 y[row] += mod[2u * ka.nin + row] * d
             }
             static_if (EPI == 3) {
-                y[row] = tts_silu(d + aux[row])
+                y[row] = silu_f32(d + aux[row])
             }
             static_if (EPI == 4) {
                 let v = d + x0[row]

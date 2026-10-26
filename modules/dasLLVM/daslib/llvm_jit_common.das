@@ -417,6 +417,7 @@ var public g_target_x64_vnniint8 = false
 // amx-tile and amx-int8 cpuid bits, hyphen-spelled like the LLVM target features so the force env
 // and llc -mattr take the same names. The per-process XTILEDATA grant is the family's own witness.
 var public g_target_x64_amx = false
+var public g_target_x64_amx_bf16 = false
 
 // The JIT target OS is Linux: host platform on native runs, the triple's OS field on cross
 // targets. Gates emission that calls Linux-only externs (the amx witness's arch_prctl).
@@ -526,6 +527,29 @@ def public LLVMAddFunctionWithType(mod : LLVMModuleRef; name : string; typ : LLV
         rv |> LLVMAddAttributeToFunction(LLVMCreateEnumAttribute(g_ctx, LLVMGetEnumAttributeKindForName("uwtable"), 2ul))
     }
     return rv
+}
+
+//! the optimizer reads the MODULE triple and data layout - its library-call table, type sizes and alignments, an
+//! instrumentation pass's shadow mapping - while codegen reads the target machine's; a module built for the host
+//! carries neither, so the target machine's go on it before the passes. A cross target's module has its own already
+def public stamp_module_target(mod : LLVMOpaqueModule?; tm : LLVMTargetMachineRef) {
+    return if (!empty(LLVMGetTarget(mod)))
+    let triple = LLVMGetTargetMachineTriple(tm)
+    LLVMSetTarget(mod, triple)
+    LLVMDisposeMessage(triple)
+    let dl = LLVMCreateTargetDataLayout(tm)
+    LLVMSetModuleDataLayout(mod, dl)
+    LLVMDisposeTargetData(dl)
+}
+
+//! asan instruments only the functions that carry `sanitize_address`
+def public mark_sanitize_address(mod : LLVMOpaqueModule?) {
+    let attr = LLVMCreateEnumAttribute(LLVMGetModuleContext(mod), LLVMGetEnumAttributeKindForName("sanitize_address"), 0ul)
+    var fn = LLVMGetFirstFunction(mod)
+    while (fn != null) {
+        LLVMAddAttributeToFunction(fn, attr)
+        fn = LLVMGetNextFunction(fn)
+    }
 }
 
 // ===== extern-helper declaration =====
@@ -655,6 +679,8 @@ def public init_jit_target_flags(target_triple : string = ""; host_features_aske
     g_target_x64_avx512vbmi = g_target_x64_avx512bw && x64_tier_feature("avx512vbmi", forced_only)
     g_target_x64_vnniint8 = g_target_x64_avx2 && x64_tier_feature("avxvnniint8", forced_only)
     g_target_x64_amx = g_target_is_x64 && x64_tier_feature("amx-tile", forced_only) && x64_tier_feature("amx-int8", forced_only)
+    g_target_x64_amx_bf16 = (g_target_x64_avx512bw && x64_tier_feature("avx512bf16", forced_only)
+        && x64_tier_feature("amx-tile", forced_only) && x64_tier_feature("amx-bf16", forced_only))
     // target OS truth (native = host platform; cross = the triple's OS field)
     g_target_os_linux = (empty(target_triple)
         ? get_platform_name() == "linux"
@@ -685,6 +711,7 @@ def public with_class_target_gates(klass : string; blk : block<void>) {
     let s_avx512vbmi = g_target_x64_avx512vbmi
     let s_vnniint8 = g_target_x64_vnniint8
     let s_amx = g_target_x64_amx
+    let s_amx_bf16 = g_target_x64_amx_bf16
     let s_dotprod = g_target_arm64_dotprod
     let s_i8mm = g_target_arm64_i8mm
     let s_fullfp16 = g_target_arm64_fullfp16
@@ -698,6 +725,8 @@ def public with_class_target_gates(klass : string; blk : block<void>) {
     g_target_x64_avx512vbmi = g_target_x64_avx512bw && jit_class_has(klass, "avx512vbmi")
     g_target_x64_vnniint8 = g_target_x64_avx2 && jit_class_has(klass, "avxvnniint8")
     g_target_x64_amx = g_target_is_x64 && jit_class_has(klass, "amx-tile") && jit_class_has(klass, "amx-int8")
+    g_target_x64_amx_bf16 = (g_target_x64_avx512bw && jit_class_has(klass, "avx512bf16")
+        && jit_class_has(klass, "amx-tile") && jit_class_has(klass, "amx-bf16"))
     g_target_arm64_dotprod = g_target_is_aarch64 && jit_class_has(klass, "dotprod")
     g_target_arm64_i8mm = g_target_is_aarch64 && jit_class_has(klass, "i8mm")
     g_target_arm64_fullfp16 = g_target_is_aarch64 && jit_class_has(klass, "fullfp16")
@@ -711,6 +740,7 @@ def public with_class_target_gates(klass : string; blk : block<void>) {
     g_target_x64_avx512vbmi = s_avx512vbmi
     g_target_x64_vnniint8 = s_vnniint8
     g_target_x64_amx = s_amx
+    g_target_x64_amx_bf16 = s_amx_bf16
     g_target_arm64_dotprod = s_dotprod
     g_target_arm64_i8mm = s_i8mm
     g_target_arm64_fullfp16 = s_fullfp16
@@ -828,10 +858,16 @@ def public init_jit_state(cg_opt_level : uint; target_triple : string; host_feat
     // NO willreturn: this aborts (DAS_FATAL_ERROR) on any mismatch, so it may not return normally.
     jit_add_extern(FN_JIT_HANDLED_ABI_CHECK_REPORT, jit_fn_type($() : void {}),
         get_jit_handled_abi_check_report(), fixed_array(nounwind))
-    jit_add_extern(FN_JIT_ALLOC_HEAP, jit_fn_type($(size : int; ctx : void?) : void? {}),
+    var alloc_heap = jit_add_extern(FN_JIT_ALLOC_HEAP, jit_fn_type($(size : int; ctx : void?) : void? {}),
         get_jit_alloc_heap(), fixed_array(nounwind, willreturn, nofree, memory_inaccessible_rw), (nocapture, [1]))
-    jit_add_extern(FN_JIT_ALLOC_PERSISTENT, jit_fn_type($(size : int; ctx : void?) : void? {}),
+    var alloc_persistent = jit_add_extern(FN_JIT_ALLOC_PERSISTENT, jit_fn_type($(size : int; ctx : void?) : void? {}),
         get_jit_alloc_persistent(), fixed_array(nounwind, willreturn, nofree, memory_inaccessible_rw), (nocapture, [1]))
+    //! the object size LLVM's bounds checks read off the call; a vec3 load past a 12-byte object would be UB against it
+    if (!LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS) {
+        for (alloc in fixed_array(alloc_heap, alloc_persistent)) {
+            LLVMAddAttributeToFunction(alloc, LLVMCreateEnumAttribute(g_ctx, LLVMGetEnumAttributeKindForName("allocsize"), 0xFFFFFFFFul))
+        }
+    }
     jit_add_extern(FN_JIT_FREE_HEAP, jit_fn_type($(bytes : void?; size : int; ctx : void?) : void {}),
         get_jit_free_heap(), fixed_array(nounwind, willreturn, memory_arg_inaccessible_rw), (nocapture, [0, 2]))
     jit_add_extern(FN_JIT_FREE_PERSISTENT, jit_fn_type($(bytes, ctx : void?) : void {}),
@@ -963,14 +999,8 @@ def public create_default_target_machine(opt_level : uint; use_host_cpu : bool) 
     // default (clang-mingw64: prebuilt MSVC clang-cl LLVM.dll defaults to x86_64-pc-windows-msvc,
     // emitting MSVC-ABI .o that mingw's linker can't satisfy). Empty = use LLVM default.
     let host_triple = host_jit_triple()
-    var triple_msg : string
-    var triple_owned_by_llvm = false
-    if (empty(host_triple)) {
-        triple_msg = LLVMGetDefaultTargetTriple()
-        triple_owned_by_llvm = true
-    } else {
-        triple_msg = host_triple
-    }
+    let triple_owned_by_llvm = empty(host_triple)
+    let triple_msg = triple_owned_by_llvm ? LLVMGetDefaultTargetTriple() : host_triple
     let machine = default_target_cpu_features(use_host_cpu)
     let targetMachine = create_target_machine(triple_msg, machine.cpu, machine.features, opt_level)
 
@@ -1071,7 +1101,7 @@ def public emit_object_only(mod : LLVMOpaqueModule?; out_path : string; use_host
         LLVMDisposeMessage(mod_triple)
         LLVMDisposeTargetData(dl)
         let error : string?
-        let file = artifact_path(out_path, JitArtifact.object)
+        let file = get_platform_name() == "windows" ? "{out_path}.obj" : artifact_path(out_path, JitArtifact.object)
         let filetype = LLVMCodeGenFileType.LLVMObjectFile
         let failed = LLVMTargetMachineEmitToFile(targetMachine, mod, file, filetype, error)
         if (failed != 0) {
@@ -1240,7 +1270,12 @@ def public write_wasm(mod : LLVMOpaqueModule?; out_path : string; triple : strin
 
 def public build_string_constant(message : string) {
     if (g_str2v |> key_exists(message)) return g_str2v[message]
-    let msg_size = uint(length(message))
+    var str = build_string_constant(message, uint(length(message)))
+    g_str2v[message] = str
+    return str
+}
+
+def public build_string_constant(message : string implicit; msg_size : uint) {
     var strType = LLVMArrayType(g_prim_t.t_int8, msg_size + 1u)
     // Prefix all string variable names to not intersect with function names.
     var str = LLVMAddGlobal(g_mod, strType, ".str.{message}")
@@ -1249,7 +1284,6 @@ def public build_string_constant(message : string) {
     LLVMSetLinkage(str, LLVMLinkage.LLVMPrivateLinkage)
     LLVMSetUnnamedAddress(str, LLVMUnnamedAddr.LLVMGlobalUnnamedAddr)
     LLVMSetAlignment(str, 1u)
-    g_str2v[message] = str
     return str
 }
 
@@ -1273,6 +1307,15 @@ def public get_string_constant_ptr(builder : LLVMOpaqueBuilder?; message : strin
     if (empty(message)) return LLVMConstPointerNull(g_prim_t.get_type_string())
     var str = build_string_constant(message)
     return LLVMBuildPointerCast(builder, str, g_prim_t.get_type_string(), "string_constant {message}")
+}
+
+def public get_string_constant_ptr(builder : LLVMOpaqueBuilder?; value : das_string) {
+    if (empty(value)) return LLVMConstPointerNull(g_prim_t.get_type_string())
+    var str : LLVMOpaqueValue?
+    peek(value) $(text) {
+        str = build_string_constant(text, uint(length(value)))
+    }
+    return LLVMBuildPointerCast(builder, str, g_prim_t.get_type_string(), "string_constant {value}")
 }
 
 def public failed(msg : string) {

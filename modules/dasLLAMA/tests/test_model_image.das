@@ -29,6 +29,7 @@ require ?das_metal dasllama/dasllama_metal_prefill  // metal_prefill_shutdown �
 require ?das_metal dasllama/dasllama_metal_asr_dec  // set_metal_wdec/metal_wdec_stats — the cross-KV gate + the tower cell's pin
 require ?das_metal dasllama/dasllama_metal_decode   // metal_decode_shutdown — same
 require dasllama/dasllama_gemm_schema // Q8_BLOCK_ELEMS/Q8_QPB/Q8_SPB — the dev-W bake key arithmetic
+require dasllama/dasllama_gpu_tier    // moe_gpu_bake_tag — the lane a cold load under an armed tier mints
 require dasllama/dasllama_layout // convert_model_to_metal_blob — the derive cell's in-RAM control
 require daslib/jobque_boost
 require daslib/archive
@@ -237,6 +238,8 @@ struct ImgTableProbe {
     @safe_when_uninitialized kq : KqPlanes[KQ_FMT_COUNT]
     q51q : array<uint8>
     q51s : array<uint8>
+    iq4nl32q : array<uint8>
+    iq4nl32s : array<uint8>
     image_map : void?
     image_bytes : uint64
 }
@@ -298,11 +301,17 @@ def test_image_table_slot_names(t : T?) {
         fill_bytes(p.q51q, 2048, 3)
         fill_bytes(p.q51s, 256, 4)
         fill_bytes(p.kq[int(KqFmt.q51)].q, 777, 5)
+        fill_bytes(p.iq4nl32q, 1024, 6)
+        fill_bytes(p.iq4nl32s, 128, 7)
+        fill_bytes(p.kq[int(KqFmt.iq4nl32)].q, 555, 8)
         t |> success(save_image(p, path, "img-table"), "save")
         var m = ImgTableProbe()
         t |> success(load_image(path, m, "img-table"), "the image maps back (no two sections share a name)")
         t |> equal(count_mismatch(m.q51q, p.q51q), 0l, "q51q element-exact from the top-level pair")
         t |> equal(count_mismatch(m.q51s, p.q51s), 0l, "q51s element-exact")
+        t |> equal(count_mismatch(m.iq4nl32q, p.iq4nl32q), 0l, "iq4nl32q element-exact from the top-level pair")
+        t |> equal(count_mismatch(m.iq4nl32s, p.iq4nl32s), 0l, "iq4nl32s element-exact")
+        t |> equal(long_length(m.kq[int(KqFmt.iq4nl32)].q), 0l, "the iq4nl32 slot rode no section")
         t |> equal(count_mismatch(m.kq[int(KqFmt.k4)].q, p.kq[int(KqFmt.k4)].q), 0l, "the k4 slot's q plane element-exact")
         t |> equal(count_mismatch(m.kq[int(KqFmt.k4)].s, p.kq[int(KqFmt.k4)].s), 0l, "the k4 slot's s plane element-exact")
         t |> equal(long_length(m.kq[int(KqFmt.q51)].q), 0l, "the q51 slot rode no section")
@@ -490,6 +499,110 @@ def test_image_mechanics(t : T?) {
         var junk = DlimConfiguration()
         t |> success(!dlim_config_from_json("not a config", junk), "garbage declines")
     }
+    t |> run("lanes: the file name spells the lane, a legacy image is adopted, a save reaps its own lane only, a stale lane re-bakes in place") @(t : T?) {
+        if (!arm_on(t, "mechanics")) {
+            return
+        }
+        var terr : string
+        let tmp = temp_directory(terr)
+        let fake = path_join(empty(tmp) ? "." : tmp, "dasllama_lane_{ref_time_ticks()}.gguf")
+        let fk = fopen(fake, "wb")   // the inventory scans the siblings of an existing source file
+        t |> success(fk != null, "the fake source exists")
+        fclose(fk)
+        t |> equal(dlim_file_lane("m.gguf.metal.dlim"), "metal", "the last dot-segment is the lane")
+        t |> equal(dlim_file_lane("m.Q4_K_M.gguf.cpu-arm-i8mm-fp32.dlim"), "cpu-arm-i8mm-fp32", "the source's own dots stay out of the lane")
+        t |> equal(dlim_file_lane("m.gguf.0xc09d7ce0fafeac5c.dlim"), "", "a hash-named legacy image has no lane")
+        t |> equal(dlim_file_lane("m.gguf"), "", "a file that is no image has no lane")
+        t |> equal(dlim_file_lane("m.dlim"), "", "an image with no lane segment has none")
+        let prev_rope = rope_scaling_override()
+        set_rope_scaling_override(RopeScalingOverride())   // the cells below spell lanes with the override off; the env may have seeded one
+        t |> equal(image_lane_name("whisper-f32"), "whisper-f32", "a family tag is its own lane")
+        t |> equal(image_lane_name(METAL_IMAGE_TAG), "metal", "the blob flavor's lane")
+        t |> equal(image_lane_name("vulkan|m2n b8192 l4"), "vulkan", "the vulkan plan folds to one lane")
+        t |> equal(image_lane_name("a b|c/d"), "a-b-c-d", "a lane keeps letters, digits, _ and - alone")
+        t |> equal(image_lane_name("", "fp32"), "{image_lane_name()}-fp32", "an off-q8 quant suffixes the lane")
+        t |> equal(image_lane_name(METAL_IMAGE_TAG, "q8", true), "metal-mtp", "a split head riding the load suffixes the lane")
+        static_if (typeinfo builtin_module_exists(llvm)) {
+            t |> equal(image_lane_name(), "cpu-{tune_cpu_class()}", "the planar lane names the box's tune class")
+        } else {
+            t |> equal(image_lane_name(), "cpu-{get_architecture_name()}", "the planar lane names the architecture where no tune framework is built")
+        }
+        let eight = "v{IMAGE_VERSION}|q8|arm64-gen|s16|q8 mr8 b0 g4|kq 8/8/4/8|q51 mr4|nat 1101"
+        t |> equal(dlim_identity_lane(eight), eight, "an identity short of DLIM_IDENTITY_FIELDS is its own lane, never cross-matched")
+        // two images baked under the box-bound identity, then the tags registered config-free: the
+        // same lanes, another identity - OTHER, never FOREIGN
+        var p <- make_probe()
+        let stray = "{fake}.0xfeedfacecafebeef.dlim"
+        t |> success(save_image(p, stray, "img-lane"), "a legacy-named image of the lane's (quant, tag) off the hash path")
+        let lane2 = "{fake}.img-lane-2.dlim"
+        t |> success(save_image(p, lane2, "img-lane-2"), "a second lane's image")
+        register_image_family_tag("img-lane", true)
+        register_image_family_tag("img-lane-2", true)
+        t |> equal(dlim_identity_tag(image_identity("img-lane")), "img-lane", "the identity writes DLIM_IDENTITY_FIELDS fields before the tag")
+        // the image a pre-lane build minted: the identity hash names it, the lane adopts it
+        let legacy = "{fake}.{hash(image_identity("img-lane", "q8"))}.dlim"
+        t |> success(save_image(p, legacy, "img-lane"), "a legacy-named image at the identity-hash path")
+        let path = image_path_for(fake, "img-lane")
+        t |> equal(base_name(path), "{base_name(fake)}.img-lane.dlim", "the lane path")
+        t |> success(!stat(legacy).is_valid && stat(path).is_valid, "the image at the identity-hash path is adopted into the lane")
+        var inv <- dlim_inventory_(fake)
+        t |> equal(length(inv), 3, "three images beside the source")
+        for (im in inv) {
+            t |> equal(im.verdict, im.path == path ? "CURRENT" : "OTHER", "{im.file}: the box-bound identity against the config-free one")
+            t |> equal(im.lane, im.path == stray ? "" : (im.path == path ? "img-lane" : "img-lane-2"), "{im.file}: the lane the name spells")
+        }
+        delete inv
+        // the lane's own save: the image at the lane path is rewritten; its GC reaps the legacy-named other of
+        // its own (quant, tag) and leaves the other lane's OTHER alone
+        t |> success(save_image(p, path, "img-lane"), "re-bake in place")
+        dlim_gc_stale(fake, "img-lane")
+        t |> success(!stat(stray).is_valid, "a legacy-named image of this lane's (quant, tag) under another identity goes with the save")
+        t |> success(stat(lane2).is_valid, "another lane's OTHER image survives this lane's save")
+        var m = ImgProbe()
+        t |> success(load_image(path, m, "img-lane"), "the re-baked lane image maps")
+        delete m
+        // the explicit clean: a lane-named OTHER stays
+        let r = dlim_clean_(fake, true)
+        t |> equal(r.removed, 0, "the clean removes no lane-named image ({r.removed})")
+        t |> success(stat(path).is_valid && stat(lane2).is_valid, "both lanes stay")
+        // version-stale goes in any lane
+        patch_u32(t, lane2, 4l, 0xDEADu)
+        dlim_gc_stale(fake, "img-lane")
+        t |> success(!stat(lane2).is_valid, "a version-stale image of another lane goes")
+        delete p
+        remove(path)
+        remove(fake)
+        set_rope_scaling_override(prev_rope)
+    }
+    t |> run("lanes: the rope-scaling override is a lane suffix and an identity element") @(t : T?) {
+        if (!arm_on(t, "mechanics")) {
+            return
+        }
+        let prev = rope_scaling_override()
+        set_rope_scaling_override(RopeScalingOverride())   // the plain spellings, whatever DASLLAMA_ROPE_SCALING seeded ({prev.kind})
+        let plain_lane = image_lane_name()
+        let plain_id = image_identity()
+        set_rope_scaling_override(RopeScalingOverride(kind = "YARN", scale = 4.0, orig_ctx = 32768l))
+        t |> equal(rope_scaling_override().kind, "yarn", "the kind reads lower-case")
+        t |> equal(image_lane_name(), "{plain_lane}-yarn4", "the planar lane takes the yarn suffix")
+        t |> equal(image_lane_name(METAL_IMAGE_TAG), "metal-yarn4", "so does the blob lane")
+        register_image_family_tag("img-lane-free", true)
+        t |> equal(image_lane_name("img-lane-free"), "img-lane-free", "a config-free family's lane takes none - its identity carries no override")
+        t |> success(find(image_identity(), " rope yarn4/32768") >= 0, "the identity spells the factor and the original context ({image_identity()})")
+        t |> equal(dlim_identity_tag(image_identity("img-lane")), "img-lane", "the element rides inside the last fixed field - the tag still parses")
+        set_rope_scaling_override(RopeScalingOverride(kind = "yarn", scale = 4.0, orig_ctx = 32768l, beta_fast = 16.0, beta_slow = 2.0))
+        t |> success(find(image_identity(), " rope yarn4/32768/16/2") >= 0, "set betas ride the identity ({image_identity()})")
+        t |> equal(image_lane_name(), "{plain_lane}-yarn4", "and not the lane")
+        set_rope_scaling_override(RopeScalingOverride(kind = "linear", scale = 2.5))
+        t |> success(find(image_identity(), " rope linear2.5") >= 0, "a linear factor spells as it reads ({image_identity()})")
+        t |> equal(image_lane_name(), "{plain_lane}-linear2-5", "the linear lane - the dot yields to the file name's segment reader")
+        set_rope_scaling_override(RopeScalingOverride(kind = "none"))
+        t |> equal(image_lane_name(), "{plain_lane}-norope", "dropping a file's scaling is its own lane")
+        t |> success(find(image_identity(), " rope none") >= 0, "and its own identity ({image_identity()})")
+        set_rope_scaling_override(RopeScalingOverride())
+        t |> equal(image_identity(), plain_id, "the override off leaves the identity as it was")
+        set_rope_scaling_override(prev)
+    }
 }
 
 // ===== real carriers: gguf load vs mapped image load =====
@@ -498,8 +611,7 @@ def test_image_mechanics(t : T?) {
 // in this process with identical knobs, so determinism is per-run, not per-fixture)
 def private gen_ids(tr : Model; prompt : array<int64>; n_gen : int) : array<int64> {
     var out : array<int64>
-    with_job_que() {
-        setup_dasllama_jobque()
+    with_dasllama_jobque() {
         var s = make_run_state(tr.config)
         var ids <- generate(tr, s, prompt, length(prompt) + n_gen)
         out <- ids
@@ -532,7 +644,7 @@ def private config_diff_field(a, b : Config) : string {
 }
 
 def private text_image_roundtrip(t : T?; path : string; n_gen : int) {
-    let img = image_path_for(path)
+    let img = image_path_for(path, moe_gpu_bake_tag())   // each lane is its mode's: an armed tier's cold load mints the vulkan lane
     remove(img)   // cold start: the first facade load must build + save
     // the truth is the OFF-RAIL gguf read: cold and warm are both image-backed now, so a
     // cold-vs-warm compare alone would only prove the file matches the chunk it came from
@@ -590,36 +702,24 @@ def private text_image_roundtrip(t : T?; path : string; n_gen : int) {
 def test_model_image_roundtrip(t : T?) {
     t |> run("SmolLM2-135M q8: gguf load vs mapped image, token-for-token") @(t : T?) {
         if (!family_on(t, "llama") || !arm_on(t, "smol")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         text_image_roundtrip(t, path, 24)
     }
     // the untied twin: a separate output.weight, so the image carries the classifier plane AND
     // the embedding's own linear q8 copy (emb_q8) with no fp32 table - the smol arm never sees that layout
     t |> run("stories15M q8 (untied): gguf load vs mapped image, token-for-token") @(t : T?) {
         if (!family_on(t, "llama") || !arm_on(t, "untied")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "stories15M-Q8_0.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         text_image_roundtrip(t, path, 24)
         var m <- load_model(path, QuantMode.q8)
         t |> success(m.emb_q8 && !m.cls_q8 && m.tok_emb_off < 0l, "the mapped image serves the untied q8 table with no fp32 copy")
-        // the whole image is smaller than the f32 table alone (27 MB against 37 MB on stories15M): an
+        // the whole image less its device twin is smaller than the f32 table alone (27 MB against 37 MB on stories15M): an
         // image that still carried the table could not be, whatever else it packs
-        let img_bytes = int64(stat(image_path_for(path)).size)
+        let img_bytes = int64(stat(image_path_for(path, moe_gpu_bake_tag())).size) - long_length(m.vkblob)
         let table_f32 = m.config.vocab_size * m.config.dim * 4l
-        t |> success(img_bytes < table_f32, "the image ({img_bytes >> 20l} MB) is smaller than the f32 table it no longer carries ({table_f32 >> 20l} MB)")
+        t |> success(img_bytes < table_f32, "the image ({img_bytes >> 20l} MB past its twin) is smaller than the f32 table it no longer carries ({table_f32 >> 20l} MB)")
         delete m
     }
 }
@@ -637,21 +737,11 @@ def private counting_ids(tr : Model) : array<int64> {
 // breakage moves logits 15+; measured cross-backend noise here is ~0.75). With metal mode
 // on, the planar model CPU-serves (the gates decline `planar`) and the blob model GPU-serves
 // — no override juggling.
-def private top_id(lg : array<float>) : int64 {
-    var best = 0l
-    for (v in range64(1l, long_length(lg))) {
-        if (lg[v] > lg[best]) {
-            best = v
-        }
-    }
-    return best
-}
 
 def private forced_logits_maxd(tc, tg : Model; prompt, teach : array<int64>; tag : string) : float {
     var maxd = 0.0
     var picks : array<int64>   // the GPU's greedy would-be choice per teach position — eyeball rail
-    with_job_que() {
-        setup_dasllama_jobque()
+    with_dasllama_jobque() {
         var sa = make_run_state(tc.config)
         var sb = make_run_state(tg.config)
         eval_(tc, sa, prompt)
@@ -660,7 +750,7 @@ def private forced_logits_maxd(tc, tg : Model; prompt, teach : array<int64>; tag
             maxd = max(maxd, abs(a - b))
         }
         for (tok in teach) {
-            picks |> push(top_id(sb.logits))
+            picks |> push(argmax_of(sb.logits))
             var one : array<int64>
             one |> push(tok)
             eval_(tc, sa, one)
@@ -683,11 +773,7 @@ def private forced_logits_maxd(tc, tg : Model; prompt, teach : array<int64>; tag
 def test_metal_flavor_image(tst : T?) {
     tst |> run("SmolLM2 q8: metal flavor - blob mint + map + GPU serve + CPU tripwire") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!family_on(t, "llama") || !arm_on(t, "metal")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
+            return if (!family_on(t, "llama") || !arm_on(t, "metal") || !jit_only(t))
             if (!has_decode_override("metal")) {
                 t |> skip("metal overrides not registered")
                 return
@@ -764,11 +850,7 @@ def test_metal_flavor_image(tst : T?) {
     // mblob, and embed_row reads it there
     tst |> run("TinyLlama-1.1B q8 (untied): metal flavor - blob mint + map + GPU serve on the emb_q8 table") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!family_on(t, "llama") || !arm_on(t, "metal-untied")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
+            return if (!family_on(t, "llama") || !arm_on(t, "metal-untied") || !jit_only(t))
             if (!has_decode_override("metal")) {
                 t |> skip("metal overrides not registered")
                 return
@@ -822,11 +904,7 @@ def test_metal_flavor_image(tst : T?) {
 def test_gemma4e_flavor_image(tst : T?) {
     tst |> run("E2B q8: the metal-flavor image serves the PLE table (mint + map, the go-live tripwire seam)") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!family_on(t, "gemma4e") || !arm_on(t, "gemma4e")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
+            return if (!family_on(t, "gemma4e") || !arm_on(t, "gemma4e") || !jit_only(t))
             if (!has_decode_override("metal")) {
                 t |> skip("metal overrides not registered")
                 return
@@ -880,14 +958,8 @@ def test_metal_flavor_derive(tst : T?) {
     tst |> run("SmolLM2 q8: the derived blob plane equals the in-RAM transform's") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!family_on(t, "llama") || !arm_on(t, "metal")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
             let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
-            if (!model_available(t, path)) {
-                return
-            }
+            return if (!jit_model_available(t, path))
             let prior_backend = active_kernel_backend()
             pin_kernel_backend("portable")
             // the control: the in-RAM transform, which is what the writer must reproduce
@@ -997,16 +1069,8 @@ def private kitten_image_roundtrip(path : string; q8 : bool) : KittenRoundtrip {
 def test_kitten_image(t : T?) {
     let path = path_join(models_dir(), "kitten-nano.gguf")
     t |> run("kitten-nano: the staged read, the mapped image and the in-memory mint agree on both lanes") @(t : T?) {
-        if (!family_on(t, "kitten") || !arm_on(t, "kitten")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        if (!model_available(t, path)) {
-            return
-        }
-        with_job_que() {
-            setup_dasllama_jobque_()
+        return if (!family_on(t, "kitten") || !arm_on(t, "kitten") || !jit_model_available(t, path))
+        with_dasllama_jobque_() {
             for (q8 in [false, true]) {
                 let lane = q8 ? "q8" : "f32"
                 let r = kitten_image_roundtrip(path, q8)
@@ -1028,16 +1092,8 @@ def test_kitten_image(t : T?) {
         t |> success(f32_img != q8_img, "each lane is its own prepared image:\n  {f32_img}\n  {q8_img}")
     }
     t |> run("kitten-nano: the image loads by its own path, the family data riding its meta") @(t : T?) {
-        if (!family_on(t, "kitten") || !arm_on(t, "kitten")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        if (!model_available(t, path)) {
-            return
-        }
-        with_job_que() {
-            setup_dasllama_jobque_()
+        return if (!family_on(t, "kitten") || !arm_on(t, "kitten") || !jit_model_available(t, path))
+        with_dasllama_jobque_() {
             var inscope from_gguf <- load_styletts2(path)   // bakes the q8 sibling when it is not there yet
             let img = image_path_for(path, ST2_IMAGE_TAG_Q8)
             t |> success(stat(img).is_valid, "the q8 lane's image is on disk: {img}")
@@ -1068,14 +1124,8 @@ def test_kitten_image(t : T?) {
 def test_voxtral_mini_image(t : T?) {
     t |> run("voxtral-mini q8: the >2 GiB-plane image round trip") @(t : T?) {
         if (!family_on(t, "voxtral") || !arm_on(t, "voxtral")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "voxtral-mini-3b-q8_0.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         text_image_roundtrip(t, path, 12)
         // the arm exists for the 64-bit plane IO: the q8 image must actually cross 2 GiB
         t |> success(stat(image_path_for(path)).size > 0x80000000ul, "image crosses 2 GiB")
@@ -1089,14 +1139,8 @@ def test_gemma4_image_roundtrip(t : T?) {
         // re-running it on an image load stomped the serialized overrides (caught 2026-07-16:
         // token drift on the mapped E2B while every llama-arch carrier round-tripped clean)
         if (!family_on(t, "gemma") || !arm_on(t, "gemma")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "gemma-4-E2B-it-Q8_0.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         text_image_roundtrip(t, path, 16)
     }
 }
@@ -1105,14 +1149,8 @@ def test_gemma4_image_roundtrip(t : T?) {
 def test_tower_image_roundtrip(t : T?) {
     t |> run("ultravox-1b tower: mapped image planes are element-exact vs gguf") @(t : T?) {
         if (!family_on(t, "ultravox") || !arm_on(t, "tower")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "mmproj-ultravox-1b-f32.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         let img = image_path_for(path, "tower-f32")
         remove(img)
         // the truth is the OFF-RAIL staged read: cold and warm are both image-backed now, so a
@@ -1148,8 +1186,7 @@ def private whisper_transcribe_text(path : string; samples : array<float>; cache
         mint_whisper_model(stg, w)
     }
     var text = ""
-    with_job_que() {
-        setup_dasllama_jobque()
+    with_dasllama_jobque() {
         var s <- create_session(w)
         transcribe(w, s, samples) $(seg) {
             text += seg.text
@@ -1164,14 +1201,8 @@ def private whisper_transcribe_text(path : string; samples : array<float>; cache
 def test_whisper_image_roundtrip(t : T?) {
     t |> run("whisper tiny: gguf load vs mapped image, transcript-exact") @(t : T?) {
         if (!family_on(t, "whisper") || !arm_on(t, "whisper")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(whisper_dir(), "ggml-tiny.bin")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
         if (empty(samples)) {
             t |> skip("jfk.wav not present")
@@ -1248,14 +1279,8 @@ def test_whisper_metal_tower(tst : T?) {
     tst |> run("whisper tiny f32: the Metal tower blocks - transcript + counters + knob") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!family_on(t, "whisper") || !arm_on(t, "mtower")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
             let path = path_join(whisper_dir(), "ggml-tiny.bin")
-            if (!model_available(t, path)) {
-                return
-            }
+            return if (!jit_model_available(t, path))
             var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
             if (empty(samples)) {
                 t |> skip("jfk.wav not present")
@@ -1321,8 +1346,7 @@ def test_whisper_metal_tower(tst : T?) {
             }
             mint_whisper_model(stgz, wpz)
             var z_text = ""
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 var sz <- create_session(wpz)
                 transcribe(wpz, sz, samples) $(seg) {
                     z_text += seg.text
@@ -1339,8 +1363,7 @@ def test_whisper_metal_tower(tst : T?) {
             t |> success(w8.enc.q8, "the q8 flavor is on the q8 rail")
             let sq0 = metal_tower_stats()
             var q8_text = ""
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 var s8 <- create_session(w8)
                 transcribe(w8, s8, samples) $(seg) {
                     q8_text += seg.text
@@ -1357,8 +1380,7 @@ def test_whisper_metal_tower(tst : T?) {
             set_metal_mode(MetalMode.required)
             var tripped = false
             try {
-                with_job_que() {
-                    setup_dasllama_jobque()
+                with_dasllama_jobque() {
                     var s9 <- create_session(w8)
                     transcribe(w8, s9, samples) $(seg) {
                         pass
@@ -1396,8 +1418,7 @@ def test_whisper_metal_tower(tst : T?) {
 
 def private wdec_transcribe(w : WhisperModel; samples : array<float>) : string {
     var text = ""
-    with_job_que() {
-        setup_dasllama_jobque()
+    with_dasllama_jobque() {
         var s <- create_session(w)
         transcribe(w, s, samples) $(seg) {
             text += seg.text
@@ -1415,14 +1436,8 @@ def test_whisper_metal_cross_kv(tst : T?) {
     tst |> run("whisper tiny q8: GPU cross-KV - transcript + counters + knob + declines") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!family_on(t, "whisper") || !arm_on(t, "mtower")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
             let path = path_join(whisper_dir(), "ggml-tiny.bin")
-            if (!model_available(t, path)) {
-                return
-            }
+            return if (!jit_model_available(t, path))
             var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
             if (empty(samples)) {
                 t |> skip("jfk.wav not present")
@@ -1470,8 +1485,7 @@ def test_whisper_metal_cross_kv(tst : T?) {
             set_metal_mode(MetalMode.required)
             var tripped = false
             try {
-                with_job_que() {
-                    setup_dasllama_jobque()
+                with_dasllama_jobque() {
                     var s9 <- create_session(wf)
                     transcribe(wf, s9, samples) $(seg) {
                         pass
@@ -1541,14 +1555,8 @@ def test_parakeet_tower_metal(tst : T?) {
     tst |> run("parakeet tower: the Metal FastConformer block loop matches the CPU f32 rail on jfk") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!family_on(t, "parakeet") || !arm_on(t, "mtower")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
             let path = path_join(whisper_dir(), "ggml-parakeet-tdt-0.6b-v3-f32.bin")
-            if (!model_available(t, path)) {
-                return
-            }
+            return if (!jit_model_available(t, path))
             var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
             if (empty(samples)) {
                 t |> skip("jfk.wav not present")
@@ -1563,16 +1571,34 @@ def test_parakeet_tower_metal(tst : T?) {
             var blk_delta = 0l
             var off_encodes = 0l
             var off_declines = 0l
-            var enc_rel_rms = 0.0
-            var poison_rel_rms = 0.0
+            var enc_rel_l2 = 0.0
+            var poison_rel_l2 = 0.0
             var rows_gpu = 0l
-            with_job_que() {
-                setup_dasllama_jobque_()
+            var twin_delta = 0l
+            var tile_delta = 0l
+            var twin_rel_l2 = 0.0
+            var tile_rel_l2 = 0.0
+            var front_delta = 0l
+            var cpu_front_convs = 0l
+            var cpu_front_encodes = 0l
+            var cpu_front_rel_l2 = 0.0
+            var dev_delta = 0l
+            var dev_off_delta = 0l
+            var dev_rel_l2 = 0.0
+            var dev_off_rel_l2 = 0.0
+            var dev_text = ""
+            with_dasllama_jobque_() {
                 var inscope m = AsrModel(kind = AsrKind.parakeet)
                 var inscope stg <- stage_parakeet_model(path, false)
                 mint_parakeet_model(stg, m.pk, false)
                 t |> success(!m.pk.q8, "model is on the f32 rail")
                 nlayer = m.pk.n_layer
+                // every lever a leg below depends on, set here and put back at the cell's end
+                let crowns_prev = get_metal_tensor_crowns()
+                let front_prev = set_metal_parakeet_front(true)
+                let dev_prev = set_metal_fc_attn_dev(true)
+                let twin_prev = get_metal_tower_f16()
+                set_metal_tower_f16(true)
                 set_metal_tower(false)
                 let d0 = metal_tower_stats()
                 var inscope s <- create_session(m, "en")
@@ -1593,24 +1619,87 @@ def test_parakeet_tower_metal(tst : T?) {
                 let s1 = metal_tower_stats()
                 enc_delta = s1.encodes - s0.encodes
                 blk_delta = s1.blocks - s0.blocks
+                front_delta = s1.convs - s0.convs
                 var inscope stc = ParakeetState()
                 var inscope stg2 = ParakeetState()
                 set_metal_tower(false)
                 parakeet_log_mel(samples, m.pk, stc)
-                let tt = parakeet_encode(m.pk, stc)
+                parakeet_encode(m.pk, stc)
                 set_metal_tower(true)
                 parakeet_log_mel(samples, m.pk, stg2)
                 let e0 = metal_tower_stats().encodes
                 parakeet_encode(m.pk, stg2)
                 rows_gpu = metal_tower_stats().encodes - e0
-                enc_rel_rms = rel_rms(stc.x, stg2.x, tt * m.pk.n_state)
+                enc_rel_l2 = rel_l2(stg2.x, stc.x)
                 // the control: the same clip with its mel scaled x3 through the GPU chain must red the bar
                 for (i in range(length(stg2.mel.data))) {
                     stg2.mel.data[i] *= 3.0
                 }
                 parakeet_encode(m.pk, stg2)
-                poison_rel_rms = rel_rms(stc.x, stg2.x, tt * m.pk.n_state)
+                poison_rel_l2 = rel_l2(stg2.x, stc.x)
+                // the front left to the CPU: the block seat serves behind it
+                parakeet_log_mel(samples, m.pk, stg2)
+                set_metal_parakeet_front(false)
+                let f0 = metal_tower_stats()
+                parakeet_encode(m.pk, stg2)
+                let f1 = metal_tower_stats()
+                set_metal_parakeet_front(true)
+                cpu_front_convs = f1.convs - f0.convs
+                cpu_front_encodes = f1.encodes - f0.encodes
+                cpu_front_rel_l2 = rel_l2(stg2.x, stc.x)
+                // the two GEMM routes under a pinned tensor crown: the device twin, then the knob's f32 tiles
+                set_metal_tensor_crowns("mulmm_q8")
+                metal_prefill_shutdown()
+                parakeet_log_mel(samples, m.pk, stg2)
+                let tw0 = metal_tower_f16_encodes()
+                parakeet_encode(m.pk, stg2)
+                twin_delta = metal_tower_f16_encodes() - tw0
+                twin_rel_l2 = rel_l2(stg2.x, stc.x)
+                set_metal_tower_f16(false)
+                let tw1 = metal_tower_f16_encodes()
+                parakeet_encode(m.pk, stg2)
+                tile_delta = metal_tower_f16_encodes() - tw1
+                tile_rel_l2 = rel_l2(stg2.x, stc.x)
+                set_metal_tower_f16(true)
+                // the all-heads attention under the device pair's crown, then its lever off: the per-head loop serves
+                set_metal_tensor_crowns("mulmm_q8,attn_dev")
+                metal_prefill_shutdown()
+                let dv0 = metal_tower_fc_dev_encodes()
+                parakeet_encode(m.pk, stg2)
+                dev_delta = metal_tower_fc_dev_encodes() - dv0
+                dev_rel_l2 = rel_l2(stg2.x, stc.x)
+                var inscope s3 <- create_session(m, "en")
+                transcribe(m, s3, samples) $(seg) {
+                    dev_text += seg.text
+                }
+                set_metal_fc_attn_dev(false)
+                let dv1 = metal_tower_fc_dev_encodes()
+                parakeet_encode(m.pk, stg2)
+                dev_off_delta = metal_tower_fc_dev_encodes() - dv1
+                dev_off_rel_l2 = rel_l2(stg2.x, stc.x)
+                set_metal_fc_attn_dev(dev_prev)
+                set_metal_parakeet_front(front_prev)
+                set_metal_tower_f16(twin_prev)
+                set_metal_tensor_crowns(crowns_prev)
+                metal_prefill_shutdown()
             }
+            t |> equal(dev_delta, 1l, "under the device pair's crown the attention ran over every head at once")
+            t |> success(dev_rel_l2 < 5.0e-2, "the all-heads attention tracks the CPU rail (rel-l2 {dev_rel_l2})")
+            t |> equal(dev_text, cpu_text, "the all-heads attention's transcript is the CPU's")
+            t |> equal(dev_off_delta, 0l, "all-heads lever off: the route never engaged")
+            t |> success(dev_off_rel_l2 < 5.0e-2, "all-heads lever off: the per-head loop tracks the CPU rail (rel-l2 {dev_off_rel_l2})")
+            t |> success(dev_rel_l2 != dev_off_rel_l2, "the two attention forms round apart - the lever switched the route")
+            to_log(LOG_INFO, "parakeet mtower encode rel-l2 by attention form: all heads {dev_rel_l2}, per head {dev_off_rel_l2}\n")
+            t |> equal(front_delta, enc_delta, "every GPU encode ran the subsample front on the device ({front_delta} of {enc_delta})")
+            t |> equal(cpu_front_convs, 0l, "front lever off: the front never dispatched")
+            t |> equal(cpu_front_encodes, 1l, "front lever off: the block seat still served the encode")
+            t |> success(cpu_front_rel_l2 < 5.0e-2, "front lever off: the CPU front under the device blocks tracks the CPU rail (rel-l2 {cpu_front_rel_l2})")
+            to_log(LOG_INFO, "parakeet mtower encode rel-l2 with the CPU front: {cpu_front_rel_l2}\n")
+            t |> equal(twin_delta, 1l, "under a tensor crown the encode rode the device twin")
+            t |> success(twin_rel_l2 < 5.0e-2, "the twin route tracks the CPU rail (rel-l2 {twin_rel_l2})")
+            t |> equal(tile_delta, 0l, "twin knob off: the route never engaged")
+            t |> success(tile_rel_l2 < 5.0e-2, "twin knob off: the f32 tile route tracks the CPU rail (rel-l2 {tile_rel_l2})")
+            to_log(LOG_INFO, "parakeet mtower encode rel-l2 by route: twin {twin_rel_l2}, f32 tiles {tile_rel_l2}\n")
             t |> success(parakeet_gpu_serves(), "the driver reports serving with the tower on")
             t |> success(!parakeet_serves_q8(), "the un-pinned lane is the f32 planes while the driver serves")
             t |> equal(off_encodes, 0l, "the tower-off leg never dispatched")
@@ -1619,9 +1708,9 @@ def test_parakeet_tower_metal(tst : T?) {
             t |> success(enc_delta >= 1l, "GPU leg dispatched ({enc_delta} encodes)")
             t |> equal(blk_delta, nlayer * enc_delta, "blocks delta = n_layer x encodes")
             // the canary cell's bar (f32 GEMMs both sides; the device GEMM tiles re-order accumulation), logged either way
-            t |> success(enc_rel_rms < 5.0e-2, "GPU encode tracks the CPU rail element-level (rel-rms {enc_rel_rms})")
-            t |> success(poison_rel_rms >= 5.0e-2, "a poisoned GPU element reds the bar (rel-rms {poison_rel_rms})")
-            to_log(LOG_INFO, "parakeet mtower encode rel-rms: {enc_rel_rms}\n")
+            t |> success(enc_rel_l2 < 5.0e-2, "GPU encode tracks the CPU rail element-level (rel-l2 {enc_rel_l2})")
+            t |> success(poison_rel_l2 >= 5.0e-2, "a poisoned GPU element reds the bar (rel-l2 {poison_rel_l2})")
+            to_log(LOG_INFO, "parakeet mtower encode rel-l2: {enc_rel_l2}\n")
             to_log(LOG_INFO, "parakeet mtower CPU eyeball: {cpu_text}\n")
             to_log(LOG_INFO, "parakeet mtower GPU eyeball: {gpu_text}\n")
             t |> success(!empty(gpu_text), "non-empty transcript")
@@ -1644,14 +1733,8 @@ def test_parakeet_tower_q8_decline(tst : T?) {
     tst |> run("parakeet tower: the q8 lane records the quant_mode decline and never dispatches") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!family_on(t, "parakeet") || !arm_on(t, "mtower")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
             let path = path_join(whisper_dir(), "ggml-parakeet-tdt-0.6b-v3-f32.bin")
-            if (!model_available(t, path)) {
-                return
-            }
+            return if (!jit_model_available(t, path))
             var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
             if (empty(samples)) {
                 t |> skip("jfk.wav not present")
@@ -1660,8 +1743,7 @@ def test_parakeet_tower_q8_decline(tst : T?) {
             var text = ""
             var enc_delta = 0l
             var dec_delta = 0l
-            with_job_que() {
-                setup_dasllama_jobque_()
+            with_dasllama_jobque_() {
                 var inscope m = AsrModel(kind = AsrKind.parakeet)
                 var inscope stg <- stage_parakeet_model(path, true)
                 mint_parakeet_model(stg, m.pk, true)
@@ -1684,18 +1766,6 @@ def test_parakeet_tower_q8_decline(tst : T?) {
     }
 }
 
-//! the encoder rows' distance as a fraction of their magnitude: sqrt(sum (a-b)^2 / sum a^2) over the first n
-def private rel_rms(a, b : array<float>; n : int64) : float {
-    var sd = 0.0lf
-    var sa = 0.0lf
-    for (i in range64(n)) {
-        let df = a[i] - b[i]
-        sd += double(df * df)
-        sa += double(a[i] * a[i])
-    }
-    return float(sqrt(sd / max(sa, 1.0e-18lf)))
-}
-
 def private parakeet_transcribe_text(path : string; samples : array<float>; cached : bool = true) : tuple<text : string; mapped : bool> {
     var inscope m = AsrModel()
     if (cached) {
@@ -1709,8 +1779,7 @@ def private parakeet_transcribe_text(path : string; samples : array<float>; cach
         mint_parakeet_model(stg, m.pk, cached_lane_q8)
     }
     var text = ""
-    with_job_que() {
-        setup_dasllama_jobque()
+    with_dasllama_jobque() {
         var s <- create_session(m, "en")
         text = transcribe(m, s, samples)
         delete s
@@ -1723,14 +1792,8 @@ def private parakeet_transcribe_text(path : string; samples : array<float>; cach
 def test_parakeet_image_roundtrip(t : T?) {
     t |> run("parakeet v3: bin load vs mapped image, transcript-exact") @(t : T?) {
         if (!family_on(t, "parakeet") || !arm_on(t, "parakeet")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(whisper_dir(), "ggml-parakeet-tdt-0.6b-v3-f32.bin")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
         if (empty(samples)) {
             t |> skip("jfk.wav not present")
@@ -1759,14 +1822,8 @@ def test_parakeet_image_roundtrip(t : T?) {
 def test_qwen3a_tower_image_roundtrip(t : T?) {
     t |> run("qwen3a 0.6B tower: mapped image planes are element-exact vs gguf") @(t : T?) {
         if (!family_on(t, "qwen3a") || !arm_on(t, "qwen3a")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         set_qwen3a_q8(true)
         let img = image_path_for(path, "qwen3a-q8")
         remove(img)
@@ -1810,14 +1867,8 @@ def test_qwen3a_tower_image_roundtrip(t : T?) {
 def test_gemma4uv_embedder_image_roundtrip(t : T?) {
     t |> run("gemma4uv embedder: mapped image planes are element-exact vs mmproj, bf16 lane") @(t : T?) {
         if (!family_on(t, "gemma") || !arm_on(t, "gemma4uv")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "mmproj-gemma-4-12B-it-BF16.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         let img = image_path_for(path, "gemma4uv")
         remove(img)
         // off-rail truth: the staged read — both cached loads are image-backed and cannot check
@@ -1868,14 +1919,8 @@ def test_gemma4uv_embedder_image_roundtrip(t : T?) {
 def test_gemma4v_tower_image_roundtrip(t : T?) {
     t |> run("gemma4v tower: mapped image planes are element-exact vs mmproj, bf16 lane") @(t : T?) {
         if (!family_on(t, "gemma") || !arm_on(t, "gemma4v")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "mmproj-gemma-4-E2B-it-bf16.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         let img = image_path_for(path, "gemma4v")
         remove(img)
         set_gemma4v_q8(false)   // the exact-plane lane first; the q8 serving lane is the second half
@@ -1933,14 +1978,8 @@ def test_gemma3v_tower_image_roundtrip(t : T?) {
         if (!family_on(t, "gemma") || !arm_on(t, "gemma3v")) {
             return
         }
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "mmproj-gemma-3-4b-it-F16.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         let img = image_path_for(path, "gemma3v")
         remove(img)
         set_gemma3v_q8(false)   // the exact-plane (f32-widened) lane first; the q8 serving lane follows
@@ -1994,14 +2033,8 @@ def test_gemma4uv_metal_tower(tst : T?) {
     tst |> run("gemma4uv: the Metal tower serves the embedder - parity + counters + knob") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!family_on(t, "gemma") || !arm_on(t, "gemma4uv-metal")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
             let path = path_join(models_dir(), "mmproj-gemma-4-12B-it-BF16.gguf")
-            if (!model_available(t, path)) {
-                return
-            }
+            return if (!jit_model_available(t, path))
             var inscope emb <- load_gemma4uv_embedder(path)
             var st = Gemma4uvState()
             // 672x336 is the non-square/orientation gate, 384x384 the no-pad shape (npos % 32 == 0)
@@ -2070,14 +2103,8 @@ def test_gemma4uv_metal_tower(tst : T?) {
 def test_canary_encoder_image_roundtrip(t : T?) {
     t |> run("canary encoder: mapped image planes are element-exact vs bin") @(t : T?) {
         if (!family_on(t, "canary") || !arm_on(t, "canary")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "canary-qwen-2.5b-encoder-f32.bin")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         let img = image_path_for(path, "canary-f32")
         remove(img)
         // off-rail truth: both cached loads are image-backed, so they cannot check each other.
@@ -2104,14 +2131,8 @@ def test_canary_encoder_image_roundtrip(t : T?) {
 def test_canary_encoder_q8_image_roundtrip(t : T?) {
     t |> run("canary encoder q8: mapped image planes are element-exact vs bin transcode") @(t : T?) {
         if (!family_on(t, "canary") || !arm_on(t, "canary")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "canary-qwen-2.5b-encoder-f32.bin")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         let img = image_path_for(path, "canary-q8")
         remove(img)
         // off-rail truth: the staging carrier re-runs the read-time transcode + repack under
@@ -2147,14 +2168,8 @@ def test_canary_encoder_q8_image_roundtrip(t : T?) {
 def test_gemma4a_encoder_image_roundtrip(t : T?) {
     t |> run("gemma4a encoder q8: mapped image planes are element-exact vs gguf transcode") @(t : T?) {
         if (!family_on(t, "gemma4a") || !arm_on(t, "gemma4a")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "mmproj-gemma-4-E2B-it-bf16.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         set_gemma4a_q8(true)
         let img = image_path_for(path, "gemma4a-q8")
         remove(img)
@@ -2196,11 +2211,7 @@ def test_gemma4a_encoder_image_roundtrip(t : T?) {
 [test]
 def test_gemma4a_transcribe_q8_ab(t : T?) {
     t |> run("gemma4a transcribe: the q8 tower vs the f32 rail on jfk, same text") @(t : T?) {
-        if (!family_on(t, "gemma4a") || !arm_on(t, "gemma4a")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
+        return if (!family_on(t, "gemma4a") || !arm_on(t, "gemma4a") || !jit_only(t))
         let dec_path = path_join(models_dir(), "gemma-4-E2B-it-Q8_0.gguf")
         let mmp_path = path_join(models_dir(), "mmproj-gemma-4-E2B-it-bf16.gguf")
         if (!model_available(t, dec_path) || !model_available(t, mmp_path)) return
@@ -2212,8 +2223,7 @@ def test_gemma4a_transcribe_q8_ab(t : T?) {
         var q8_text = ""
         var f32_text = ""
         var lang = ""
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             // decoder off-rail (REVIEW: suites load decoders with load_model_) — loaded ONCE; only the tower flips rails
             var dec <- load_model_(dec_path, QuantMode.q8)
             set_gemma4a_q8(true)
@@ -2244,11 +2254,7 @@ def test_gemma4a_transcribe_q8_ab(t : T?) {
 def test_gemma4a_tower_metal(t : T?) {
     t |> run("gemma4a tower: the Metal Conformer block loop matches the CPU f32 rail on jfk") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!family_on(t, "gemma4a") || !arm_on(t, "mtower")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
+            return if (!family_on(t, "gemma4a") || !arm_on(t, "mtower") || !jit_only(t))
             let dec_path = path_join(models_dir(), "gemma-4-E2B-it-Q8_0.gguf")
             let mmp_path = path_join(models_dir(), "mmproj-gemma-4-E2B-it-bf16.gguf")
             if (!model_available(t, dec_path) || !model_available(t, mmp_path)) return
@@ -2263,9 +2269,8 @@ def test_gemma4a_tower_metal(t : T?) {
             var nlayer = 0l
             var enc_delta = 0l
             var blk_delta = 0l
-            var enc_rel_rms = 0.0
-            with_job_que() {
-                setup_dasllama_jobque_()
+            var enc_rel_l2 = 0.0
+            with_dasllama_jobque_() {
                 var dec <- load_model_(dec_path, QuantMode.q8)
                 dec.config.seq_len = min(dec.config.seq_len, 8192l)
                 set_gemma4a_q8(false)
@@ -2294,14 +2299,14 @@ def test_gemma4a_tower_metal(t : T?) {
                 set_metal_tower(true)
                 gemma4a_log_mel(enc, samples, 0l, long_length(samples), stg)
                 gemma4a_encode(enc, stg)
-                enc_rel_rms = rel_rms(stc.out, stg.out, long_length(stc.out))
+                enc_rel_l2 = rel_l2(stg.out, stc.out)
                 reset_gemma4a_q8()
                 delete dec
             }
             t |> success(enc_delta >= 1l, "GPU leg dispatched ({enc_delta} encodes)")
             t |> equal(blk_delta, nlayer * enc_delta, "blocks delta = n_layer x encodes")
             //! measured 3.9e-4 on the jfk fixture (12 blocks, window-12 attention caps the mixing)
-            t |> success(enc_rel_rms < 5.0e-3, "GPU encode tracks the CPU rail element-level (rel-rms {enc_rel_rms})")
+            t |> success(enc_rel_l2 < 5.0e-3, "GPU encode tracks the CPU rail element-level (rel-l2 {enc_rel_l2})")
             to_log(LOG_INFO, "gemma4a mtower CPU eyeball: {cpu_text}\n")
             to_log(LOG_INFO, "gemma4a mtower GPU eyeball: {gpu_text}\n")
             t |> success(!empty(gpu_text), "non-empty transcript")
@@ -2317,11 +2322,7 @@ def test_gemma4a_tower_metal(t : T?) {
 def test_canary_tower_metal(t : T?) {
     t |> run("canary tower: the Metal FastConformer block loop matches the CPU f32 rail on jfk") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!family_on(t, "canary") || !arm_on(t, "mtower")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
+            return if (!family_on(t, "canary") || !arm_on(t, "mtower") || !jit_only(t))
             let dec_path = path_join(models_dir(), "canary-qwen-2.5b-decoder-q8_0.gguf")
             let mmp_path = path_join(models_dir(), "canary-qwen-2.5b-encoder-f32.bin")
             if (!model_available(t, dec_path) || !model_available(t, mmp_path)) return
@@ -2335,11 +2336,10 @@ def test_canary_tower_metal(t : T?) {
             var nlayer = 0l
             var enc_delta = 0l
             var blk_delta = 0l
-            var enc_rel_rms = 0.0
-            var poison_rel_rms = 0.0
+            var enc_rel_l2 = 0.0
+            var poison_rel_l2 = 0.0
             var rows_gpu = 0l
-            with_job_que() {
-                setup_dasllama_jobque_()
+            with_dasllama_jobque_() {
                 var dec <- load_model_(dec_path, QuantMode.q8)
                 dec.config.seq_len = min(dec.config.seq_len, 8192l)
                 set_canary_enc_q8(false)
@@ -2371,13 +2371,13 @@ def test_canary_tower_metal(t : T?) {
                 let e0 = metal_tower_stats().encodes
                 canary_encode(enc, stg)
                 rows_gpu = metal_tower_stats().encodes - e0
-                enc_rel_rms = rel_rms(stc.out, stg.out, long_length(stc.out))
+                enc_rel_l2 = rel_l2(stg.out, stc.out)
                 // the control: the same clip with its mel scaled x3 through the GPU chain must red the bar
                 for (i in range(length(stg.mel))) {
                     stg.mel[i] *= 3.0
                 }
                 canary_encode(enc, stg)
-                poison_rel_rms = rel_rms(stc.out, stg.out, long_length(stc.out))
+                poison_rel_l2 = rel_l2(stg.out, stc.out)
                 reset_canary_enc_q8()
                 delete dec
             }
@@ -2386,9 +2386,9 @@ def test_canary_tower_metal(t : T?) {
             //! measured 3.1e-4 on the jfk fixture (f32 GEMMs both sides; the online-softmax
             //! attention re-orders accumulation) - the bar leaves deep-GPU headroom
             t |> equal(rows_gpu, 1l, "the rows compare's GPU encode dispatched")
-            t |> success(enc_rel_rms < 5.0e-2, "GPU encode tracks the CPU rail element-level (rel-rms {enc_rel_rms})")
-            t |> success(poison_rel_rms >= 5.0e-2, "a poisoned GPU element reds the bar (rel-rms {poison_rel_rms})")
-            to_log(LOG_INFO, "canary mtower encode rel-rms: {enc_rel_rms}\n")
+            t |> success(enc_rel_l2 < 5.0e-2, "GPU encode tracks the CPU rail element-level (rel-l2 {enc_rel_l2})")
+            t |> success(poison_rel_l2 >= 5.0e-2, "a poisoned GPU element reds the bar (rel-l2 {poison_rel_l2})")
+            to_log(LOG_INFO, "canary mtower encode rel-l2: {enc_rel_l2}\n")
             to_log(LOG_INFO, "canary mtower CPU eyeball: {cpu_text}\n")
             to_log(LOG_INFO, "canary mtower GPU eyeball: {gpu_text}\n")
             t |> success(!empty(gpu_text), "non-empty transcript")
@@ -2404,12 +2404,8 @@ def test_canary_tower_metal(t : T?) {
 def test_qwen3a_tower_q8_ab(t : T?) {
     t |> run("qwen3a tower: the q8 core tracks the f32 rail on jfk window 0") @(t : T?) {
         if (!family_on(t, "qwen3a") || !arm_on(t, "qwen3a")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
-        if (!model_available(t, path)) return
+        return if (!jit_model_available(t, path))
         var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
         if (empty(samples)) {
             t |> skip("jfk.wav not present beside the models")
@@ -2427,29 +2423,20 @@ def test_qwen3a_tower_q8_ab(t : T?) {
         var inscope encf <- make_encoder_state(twf.core)
         var inscope csq = Qwen3aConvState()
         var inscope csf = Qwen3aConvState()
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             var inscope win <- qwen3a_mel_window(mel, 0l)
             qwen3a_encode(twq, encq, csq, win)
             var inscope winf <- qwen3a_mel_window(mel, 0l)
             qwen3a_encode(twf, encf, csf, winf)
         }
-        var maxd = 0.0
-        var maxa = 0.0
-        var sd = 0.0lf
-        var sa = 0.0lf
         let nv = long_length(encq.out)
-        for (i in range64(nv)) {
-            let df = encq.out[i] - encf.out[i]
-            maxd = max(maxd, abs(df))
-            maxa = max(maxa, abs(encf.out[i]))
-            sd += double(df * df)
-            sa += double(encf.out[i] * encf.out[i])
+        t |> equal(nv, long_length(encf.out), "the q8 and f32 cores encode one window's rows")
+        if (nv == long_length(encf.out)) {
+            let rel = rel_l2(encq.out, encf.out)
+            to_log(LOG_INFO, "qwen3a q8-vs-f32 window 0: rel-l2 {rel}, maxdiff {logits_maxdiff(encq.out, encf.out)} (signal max {logits_maxabs(encf.out)}) over {nv} values\n")
+            // element-level tripwire; the real gate is transcript-level (test_qwen3a_transcribe_q8_ab)
+            t |> success(rel < 0.05, "q8 core tracks the f32 rail (element-level bar)")
         }
-        let rel_rms = float(sqrt(sd / max(sa, 1.0e-18lf)))
-        to_log(LOG_INFO, "qwen3a q8-vs-f32 window 0: rel-rms {rel_rms}, maxdiff {maxd} (signal max {maxa}) over {nv} values\n")
-        // element-level tripwire; the real gate is transcript-level (test_qwen3a_transcribe_q8_ab)
-        t |> success(rel_rms < 0.05, "q8 core tracks the f32 rail (element-level bar)")
         reset_qwen3a_q8()
         delete samples
     }
@@ -2458,11 +2445,7 @@ def test_qwen3a_tower_q8_ab(t : T?) {
 [test]
 def test_qwen3a_transcribe_q8_ab(t : T?) {
     t |> run("qwen3a transcribe: the q8 tower core vs the f32 rail on jfk, same text") @(t : T?) {
-        if (!family_on(t, "qwen3a") || !arm_on(t, "qwen3a")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
+        return if (!family_on(t, "qwen3a") || !arm_on(t, "qwen3a") || !jit_only(t))
         let dec_path = path_join(models_dir(), "Qwen3-ASR-0.6B-Q8_0.gguf")
         let mmp_path = path_join(models_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
         if (!model_available(t, dec_path) || !model_available(t, mmp_path)) return
@@ -2474,8 +2457,7 @@ def test_qwen3a_transcribe_q8_ab(t : T?) {
         var q8_text = ""
         var f32_text = ""
         var lang = ""
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             // decoder off-rail (REVIEW: suites load decoders with load_model_) — loaded ONCE; only the tower flips rails
             var dec <- load_model_(dec_path, QuantMode.q8)
             dec.config.seq_len = min(dec.config.seq_len, 8192l)
@@ -2510,11 +2492,7 @@ def test_qwen3a_transcribe_q8_ab(t : T?) {
 def test_qwen3a_metal_tower(tst : T?) {
     tst |> run("qwen3a f32 rail: the Metal tower blocks - transcript + counters") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!family_on(t, "qwen3a") || !arm_on(t, "mtower")) return
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
+            return if (!family_on(t, "qwen3a") || !arm_on(t, "mtower") || !jit_only(t))
             let dec_path = path_join(models_dir(), "Qwen3-ASR-0.6B-Q8_0.gguf")
             let mmp_path = path_join(models_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
             if (!model_available(t, dec_path) || !model_available(t, mmp_path)) return
@@ -2530,9 +2508,8 @@ def test_qwen3a_metal_tower(tst : T?) {
             var enc_delta = 0l
             var blk_delta = 0l
             var conv_delta = 0l
-            var enc_rel_rms = 0.0
-            with_job_que() {
-                setup_dasllama_jobque_()
+            var enc_rel_l2 = 0.0
+            with_dasllama_jobque_() {
                 var dec <- load_model_(dec_path, QuantMode.q8)
                 dec.config.seq_len = min(dec.config.seq_len, 8192l)
                 set_qwen3a_q8(false)
@@ -2568,7 +2545,7 @@ def test_qwen3a_metal_tower(tst : T?) {
                 set_metal_tower(true)
                 var inscope w2 <- qwen3a_mel_window(mel, 0l)
                 qwen3a_encode(tw, egpu, c2, w2)
-                enc_rel_rms = rel_rms(ecpu.out, egpu.out, long_length(ecpu.out))
+                enc_rel_l2 = rel_l2(egpu.out, ecpu.out)
                 set_metal_tower_f16(true)
                 let tw0 = metal_tower_f16_encodes()
                 var twin_text = ""
@@ -2586,7 +2563,7 @@ def test_qwen3a_metal_tower(tst : T?) {
             t |> success(conv_delta >= 1l, "the conv2d frontend served on the GPU ({conv_delta} convs)")
             // 5e-3, not 1e-3: the tower's attention score slab is f16 (written half once,
             // read half twice) - measured 2.5e-3 on the jfk fixture; transcripts stay exact
-            t |> success(enc_rel_rms < 5.0e-3, "GPU encode tracks the CPU rail element-level (rel-rms {enc_rel_rms})")
+            t |> success(enc_rel_l2 < 5.0e-3, "GPU encode tracks the CPU rail element-level (rel-l2 {enc_rel_l2})")
             to_log(LOG_INFO, "qwen3a mtower CPU eyeball: {cpu_text}\n")
             to_log(LOG_INFO, "qwen3a mtower GPU eyeball: {gpu_text}\n")
             t |> success(!empty(gpu_text), "non-empty transcript")
@@ -2601,14 +2578,8 @@ def test_qwen3a_metal_tower(tst : T?) {
 def test_fp32_decoder_image_roundtrip(t : T?) {
     t |> run("canary decoder fp32: gguf load vs mapped image, token-for-token") @(t : T?) {
         if (!family_on(t, "canary") || !arm_on(t, "canary-dec")) return
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "canary-qwen-2.5b-decoder-f16.gguf")
-        if (!model_available(t, path)) {
-            return
-        }
+        return if (!jit_model_available(t, path))
         // the fp32 rail is opt-in (image_fp32) — the parity-pinned ASR decoders' lane
         let img = image_path_for(path, "", "fp32")
         remove(img)
@@ -2660,14 +2631,14 @@ def test_dlim_flavor_lanes(t : T?) {
         t |> equal(dlim_image_verdict(p, current), "CURRENT", "own planar identity")
         // a cross-context GPU identity: winners impossible on any box (mr9/kq9), so it can never
         // coincide with THIS process's own identity the way a realistic fixture once did
-        p.identity = "v{IMAGE_VERSION}|q8|foreignbox|s16|q8 mr9 b7 g5|kq 9/9/9/9|q51 mr9|nat 0000|metal"
+        p.identity = "v{IMAGE_VERSION}|q8|foreignbox|s16|q8 mr9 b7 g5|kq 9/9/9/9|q51 mr9|iq4nl32 mr9|nat 00000|metal"
         t |> equal(dlim_image_verdict(p, current), "FOREIGN", "cross-context metal image is FOREIGN, not OTHER")
-        p.identity = "v{IMAGE_VERSION}|q8|foreignbox|s16|q8 mr9 b7 g5|kq 9/9/9/9|q51 mr9|nat 0000|{vk_tag}"
+        p.identity = "v{IMAGE_VERSION}|q8|foreignbox|s16|q8 mr9 b7 g5|kq 9/9/9/9|q51 mr9|iq4nl32 mr9|nat 00000|{vk_tag}"
         t |> equal(dlim_image_verdict(p, current), "FOREIGN", "cross-context vulkan image is FOREIGN")
         // a family tag whose module is not loaded in the judging process: unrecomputable, so
         // FOREIGN — the 2026-08-02 board's step-zero GC reaped every whisper/parakeet image
         // this way before the rule generalized
-        p.identity = "v{IMAGE_VERSION}|q8|arm64-gen|s16|q8 mr8 b0 g4|kq 8/8/4/8|q51 mr4|nat 1101|not-a-registered-family"
+        p.identity = "v{IMAGE_VERSION}|q8|arm64-gen|s16|q8 mr8 b0 g4|kq 8/8/4/8|q51 mr4|iq4nl32 mr4|nat 11010|not-a-registered-family"
         t |> equal(dlim_image_verdict(p, current), "FOREIGN", "unregistered family tag is FOREIGN")
         // a REGISTERED family tag is judgeable — whisper's module is required by this suite
         p.identity = image_identity("whisper-q8")

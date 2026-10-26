@@ -17,8 +17,10 @@ carriers name, and no TTS family file (`dasllama_kitten`, `dasllama_kokoro`, `da
 - **`dasllama_tower.das`** - the family-neutral encoder-tower home, composed by every audio AND
   vision tower: the oracle-exact activations (erf / tanh-LUT / quick-LUT gelu, swiglu, geglu),
   the LayerNorm/RMS row forms, bias and residual row adds, the
-  `mm_blob_b`/`mm_bf16_b`/`mm_plane_b` GEMM wrappers, `Clamp`/`read_clamp`,
-  `im2col_rgb_patches`, `rope_neox_2d_rows`, `rope_neox_tab_rows`, `avg_pool2d_rows`,
+  `mm_blob_b`/`mm_bf16_b`/`mm_plane_b` GEMM wrappers, `Clamp`/`read_clamp` (`read_clamp` returns
+  the four scalars the projector file stores beside a weight tensor - `<base>.input_min` /
+  `.input_max` / `.output_min` / `.output_max` - or an inactive +/-FLT_MAX clamp where the file
+  carries none), `im2col_rgb_patches`, `rope_neox_2d_rows`, `rope_neox_tab_rows`, `avg_pool2d_rows`,
   `interpolate_grid_bilinear_aa`, `tower_read_conv_pair_folded`, the padded stage readers
   (`tower_read_gemm_q8`, `tower_stage_q8_zero_rows`/`tower_stage_q8_pad_cols` and their f32
   twins `tower_stage_f32_zero_rows`/`tower_stage_f32_pad_cols` - the load-scope padded
@@ -185,7 +187,8 @@ A family file owns the hook SLOT for a stage the GPU can serve - a `var private`
 plus a `register_*` entry - and a tower driver fills it at `[init]`: the Metal driver on a Metal
 build, the Vulkan driver (`dasllama_vulkan_tower.das`) on a build without das_metal, for the
 blocks seats it serves and the front seats it fills (qwen3a's mel and conv front, gemma4a's
-whole chunk, canary's front, and the whisper-class blocks-with-post-norm seat
+whole chunk, canary's front, parakeet's whole encode - the Metal driver's, asked ahead of the CPU
+front with the blocks seat behind a decline - and the whisper-class blocks-with-post-norm seat
 `register_tower_blocks_ln_post_gpu`, which the whisper encode asks ahead of its CPU block loop and
 post-norm - a decline asks no second seat, its driver's blocks seat declining the same way, while a
 driver with no post-norm seat (Metal) serves the blocks at the blocks seat and the CPU norms; the
@@ -245,3 +248,24 @@ the Metal blob included. The canary serving artifact is Q8_0 for exactly this re
 classifier serves the q8 plane, while the f16 parity carrier still mints planar on its own because
 the blob drivers decline a tied-fp32 classifier at mint. Whisper and parakeet stay planar - their
 decoders are hand-written CPU loops that read planes directly.
+
+### The parakeet decode step is one team publish over half-precision weights {#parakeet-decode-step}
+
+A TDT decode step is a few hundred thousand multiply-adds a lane, so two things other than
+arithmetic set its time: the bytes it reads and the times it meets the team. Both lanes of the
+model decode off HALVES the session lays once a weight plane - the LSTM stack and the joint's
+prediction projection as they sit (`ParakeetPredState.wh`), the joint net transposed into logit
+blocks (`ParakeetState.joint_wt`: a block of `PK_JOINT_BLOCK` logits holds its input columns back
+to back, so a lane walks its block forward; a lane's slice of a whole-row column table is short
+runs a column apart, which the prefetcher does not follow). The halves read through `dot_f16` and
+`axpy_f16`, and a token's predictor reads 13 MB where the f32 planes were 26.
+
+`pk_step` runs a step as ONE `team_parallel_stages` publish: a layer's gate dots (the input's and
+the hidden's dot of a row summed in one pass), its gate math, the next layer's pair, the joint's
+prediction projection, then the joint's logits a block a chunk - six stages for the two-layer
+predictor, the publish's limit. A blank step publishes the logits stage alone. Each lane applies
+the joint's ReLU itself: a column whose `enc + pred` is not positive is skipped, about half of
+them. Under one dispatch lane (`get_dispatch_lanes()` - single-thread mode) the stages run in
+order on the caller with no publish. The token probability's log-sum leaves out a logit
+`PK_LSE_CUT` under the row's maximum, which is under 1e-10 of the sum with every other logit
+beside it.

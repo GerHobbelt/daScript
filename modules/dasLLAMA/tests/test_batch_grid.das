@@ -9,11 +9,12 @@ require ?llvm dasllama/dasllama_math_gen  // the gen batch walk (the knob's targ
 require dasllama/dasllama_convert
 require daslib/jobque_boost
 require math
+require _compares   // mismatch_exact: the bit-for-bit compare
 
 // The 2-D batch chunk grid (batch_grid_2d) must be BIT-FOR-BIT the 1-D walk: only chunk
 // boundaries move, never the per-(token,row) dot fold. Every registered backend runs the same
-// batch under knob 0/1/2 and the outputs must match exactly (portable/sdot ignore the knob —
-// trivial equality; the gen batch walk is the real subject). target_chunk_work=1 admits the
+// batch under knob 0/1/2 and the outputs must match exactly (portable/sdot and a bf16 tile walk
+// ignore the knob — trivial equality; the gen batch walk is the real subject). target_chunk_work=1 admits the
 // full lane pool so the starved shapes engage the grid on any box with enough lanes; a tiny
 // q8_token_block exercises the TB-block loop INSIDE a token cell.
 
@@ -27,16 +28,6 @@ def private run_batch(var y : array<float>; wq : array<int8>; ws : array<float>;
     set_batch_grid_2d(knob)
     matmul_q8q8_batch(y, wq, ws, xq, xs, n, d, ntok)
     set_batch_grid_2d(0)
-}
-
-def private mismatches(a, b : array<float>) : int {
-    var bad = 0
-    for (va, vb in a, b) {
-        if (va != vb) {
-            bad++
-        }
-    }
-    return bad
 }
 
 def private check_shape(t : T?; n, d, ntok, tb : int64) {
@@ -66,7 +57,7 @@ def private check_shape(t : T?; n, d, ntok, tb : int64) {
     }
     set_q8_token_block(tb)
     set_target_chunk_work(1l)   // admit every lane — the small d is then chunk-starved for real
-    let saved = active_kernel_backend()
+    let seat = kernel_backend_seat()
     for (name in kernel_backend_names()) {
         pin_kernel_backend(name)
         var wq : array<int8>
@@ -85,18 +76,15 @@ def private check_shape(t : T?; n, d, ntok, tb : int64) {
         run_batch(y0, wq, ws, xq, xs, n, d, ntok, 0)
         run_batch(y1, wq, ws, xq, xs, n, d, ntok, 1)
         run_batch(y2, wq, ws, xq, xs, n, d, ntok, 2)
-        t |> equal(mismatches(y1, y0), 0, "fine grid == 1-D ({n}x{d} ntok={ntok} tb={tb}, backend {name})")
-        t |> equal(mismatches(y2, y0), 0, "wave-aligned grid == 1-D ({n}x{d} ntok={ntok} tb={tb}, backend {name})")
+        t |> equal(mismatch_exact(y1, y0), 0, "fine grid == 1-D ({n}x{d} ntok={ntok} tb={tb}, backend {name})")
+        t |> equal(mismatch_exact(y2, y0), 0, "wave-aligned grid == 1-D ({n}x{d} ntok={ntok} tb={tb}, backend {name})")
         delete wq
         delete ws
         delete y0
         delete y1
         delete y2
     }
-    clear_kernel_backend_pin()
-    if (saved != "") {
-        select_kernel_backend(saved)
-    }
+    restore_kernel_backend(seat)
     restore_grid_knobs()
     delete wf
     delete xf
@@ -107,8 +95,7 @@ def private check_shape(t : T?; n, d, ntok, tb : int64) {
 
 [test]
 def test_batch_grid_bit_exact(t : T?) {
-    with_job_que() {
-        setup_dasllama_jobque_()
+    with_dasllama_jobque_() {
         restore_grid_knobs()
         t |> run("starved 64x64, ragged token tail (33 = 8 tiles + 1)") @(t : T?) {
             check_shape(t, 64l, 64l, 33l, 128l)

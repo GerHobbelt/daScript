@@ -17,10 +17,15 @@ require dasllama/dasllama_kqformat
 require dasllama/dasllama_math
 require dasllama/dasllama_rope        // build_rope_row_packed — the one source for every resident rope row
 require dasllama/dasllama_gguf        // kq_disk_bytes - the file bytes a device plane is measured against
+require dasllama/dasllama_gemm_schema   // the q8 block geometry the trim's emb pack writes
 require daslib/f16_cvt   // f32_to_f16 — the trim pass re-packs the emb scale plane
 require daslib/enum_trait
 require dasllama/dasllama_par
 require dasllama/dasllama_env
+require daslib/fio
+require strings
+require dasllama/dasllama_moe   // moe_select + moe_routed_sum: the host's routed sum between a split token command's segments
+require dasllama/dasllama_blocks   // moe_routed_sum_rows: the host's routed sums of a window's rows between the hyper-connection chain's segments
 require math
 
 //! The upload-walk stage a baked gather belongs to — set by the walk, stamped per entry.
@@ -80,6 +85,7 @@ def vulkan_bake_role(r : VkBakeRole) {
 def vulkan_bake_begin {
     g_vk_bake = VkBakeMode.collect
     g_vk_bake_role = VkBakeRole.none
+    g_vk_mint_on = false
     g_vk_bake_blob |> clear()
     g_vk_bake_plan |> clear()
 }
@@ -87,19 +93,69 @@ def vulkan_bake_begin {
 //! Move the collected planes into the model and disarm; false = nothing collected (no GPU walk ran).
 def vulkan_bake_take(var t : Model) : bool {
     g_vk_bake = VkBakeMode.off
+    g_vk_mint_on = false
     if (empty(g_vk_bake_plan)) {
         delete g_vk_bake_blob
         return false
     }
+    delete t.vkblob
+    delete t.vkplan
     t.vkblob <- g_vk_bake_blob
     t.vkplan <- g_vk_bake_plan
     return true
+}
+
+//! the mint's gather: `fmt`, the entry's element window and its gather geometry, answered from a source other than the
+//! model's planes (the gguf mapping, one job at a time); false = the source has no such entry, the model's planes serve
+typedef VkMintGatherFn = function<(fmt : int; woff, n, rows, slice_rows, mr, kgroup, wbias : int64; var wq : array<uint8>; var ws : array<uint8>) : bool>
+//! the mint's sink: where a collected entry's bytes go instead of the RAM blob (the image writer)
+typedef VkMintSinkFn = function<(p : void?; nbytes : uint64) : void>
+
+var private g_vk_mint_on = false
+var private g_vk_mint_gather : VkMintGatherFn
+var private g_vk_mint_sink : VkMintSinkFn
+var private g_vk_mint_sink_off = 0l   //! bytes the sink took, the alignment pads included: the plan's offsets are relative to the sink's start
+var private g_vk_mint_zeros : array<uint8>
+
+//! Arm the streaming mint for the next GPU walk: each entry gathers through `gather` and its bytes go to `sink`
+[arch(at="../ARCHITECTURE_IMAGE_VULKAN.md#image-vulkan-mint")]
+def vulkan_mint_begin(gather : VkMintGatherFn; sink : VkMintSinkFn) {
+    vulkan_bake_begin()
+    g_vk_mint_on = true
+    g_vk_mint_gather = gather
+    g_vk_mint_sink = sink
+    g_vk_mint_sink_off = 0l
+}
+
+def vulkan_mint_end {
+    g_vk_mint_on = false
+}
+
+//! the alignment every collected entry starts at in the twin - the slice walk's import windows
+let VK_ENTRY_ALIGN = 4096l
+
+def private vk_mint_sink_append(a : array<uint8>) : int64 {
+    let off = (g_vk_mint_sink_off + VK_ENTRY_ALIGN - 1l) / VK_ENTRY_ALIGN * VK_ENTRY_ALIGN
+    let pad = off - g_vk_mint_sink_off
+    if (pad > 0l) {
+        if (long_length(g_vk_mint_zeros) < VK_ENTRY_ALIGN) {
+            g_vk_mint_zeros |> resize(VK_ENTRY_ALIGN)
+        }
+        invoke(g_vk_mint_sink, unsafe(addr<void?>(g_vk_mint_zeros[0])), uint64(pad))
+    }
+    let abytes = long_length(a)
+    if (abytes > 0l) {
+        invoke(g_vk_mint_sink, unsafe(addr<void?>(a[0])), uint64(abytes))
+    }
+    g_vk_mint_sink_off = off + abytes
+    return off
 }
 
 //! Arm slicing for a mapped vulkan-flavor load: the walk reads t.vkblob instead of gathering.
 def vulkan_bake_slice_begin {
     g_vk_bake = VkBakeMode.slice
     g_vk_bake_role = VkBakeRole.none
+    g_vk_mint_on = false
     g_vk_bake_cursor = 0l
     g_vk_slice_windows |> clear()
 }
@@ -116,11 +172,12 @@ def vulkan_bake_slice_end(t : Model) {
 //! Disarm without verification (a flavor-load attempt that never ran the walk).
 def vulkan_bake_disarm {
     g_vk_bake = VkBakeMode.off
+    g_vk_mint_on = false
 }
 
 def private vk_bake_append(a : array<uint8>) : int64 {
-    // 4KB-aligned starts (import windows); long_ forms — the blob crosses the int32 array rail
-    let off = (long_length(g_vk_bake_blob) + 4095l) / 4096l * 4096l
+    // long_ forms — the blob crosses the int32 array rail
+    let off = (long_length(g_vk_bake_blob) + VK_ENTRY_ALIGN - 1l) / VK_ENTRY_ALIGN * VK_ENTRY_ALIGN
     let abytes = long_length(a)
     let need = off + abytes
     // growth capped at 2GB steps past 4GB — doubling a multi-GB blob wastes up to half its size
@@ -146,10 +203,18 @@ def private vk_bake_collect(fmt : int; woff, n, rows : int64; wq, ws : array<uin
     }
     var e = VkPlanEntry(fmt = fmt, role = int(g_vk_bake_role), woff = woff, n = n, rows = rows,
                         wq_bytes = long_length(wq), ws_bytes = long_length(ws))
-    e.wq_off = vk_bake_append(wq)
-    e.ws_off = vk_bake_append(ws)
+    if (g_vk_mint_on) {
+        e.wq_off = vk_mint_sink_append(wq)
+        e.ws_off = vk_mint_sink_append(ws)
+    } else {
+        e.wq_off = vk_bake_append(wq)
+        e.ws_off = vk_bake_append(ws)
+    }
     g_vk_bake_plan |> push(e)
 }
+
+def private vk_mint_gather(fmt : int; woff, n, rows, slice_rows, mr, kgroup, wbias : int64; var wq : array<uint8>; var ws : array<uint8>) : bool
+    => g_vk_mint_on && invoke(g_vk_mint_gather, fmt, woff, n, rows, slice_rows, mr, kgroup, wbias, wq, ws)
 
 def private vk_bake_slice(t : Model; fmt : int; woff, n, rows : int64;
                           var wq : array<uint8>; var ws : array<uint8>) : bool {
@@ -179,6 +244,9 @@ def private vk_bake_slice(t : Model; fmt : int; woff, n, rows : int64;
         return false
     }
     g_vk_bake_cursor++
+    if (e.wq_off + e.wq_bytes > long_length(t.vkblob) || e.ws_off + e.ws_bytes > long_length(t.vkblob)) {
+        panic("dasLLAMA vulkan image: baked gather {g_vk_bake_cursor - 1l} reaches past the device twin ({e.wq_off}+{e.wq_bytes} / {e.ws_off}+{e.ws_bytes} of {long_length(t.vkblob)} bytes) - the lane is corrupt, delete it to re-mint")
+    }
     // record the mapped window (P2: the stream-mirror path imports it instead of copying)
     unsafe {
         g_vk_slice_windows |> insert(e.woff * 8l + int64(fmt), SliceWindow(
@@ -203,102 +271,102 @@ def private vk_bake_slice(t : Model; fmt : int; woff, n, rows : int64;
     return true
 }
 
-def private moe_gpu_gather_stack(t : Model; woff : int64; n, rows, slice_rows : int64; mr, kgroup, wbias : int64;
-                                 var wq : array<uint8>; var ws : array<uint8>) {
-    if (vk_bake_slice(t, 0, woff, n, rows, wq, ws)) {
+def private moe_gpu_gather(t : Model; f : KqFmt; woff : int64; n, rows, slice_rows : int64; mr, kgroup, wbias : int64;
+                           var wq : array<uint8>; var ws : array<uint8>) {
+    if (vk_bake_slice(t, int(f), woff, n, rows, wq, ws) || vk_mint_gather(int(f), woff, n, rows, slice_rows, mr, kgroup, wbias, wq, ws)) {
         return
     }
-    if (t.planes_trimmed) {
-        panic("dasLLAMA: planes_trimmed image - live gather impossible (baked plan diverged, or a re-gather was requested); rebake without --trim or match the image's config")
+    if (t.planes_trimmed && !g_vk_mint_on) {   // the mint's own fallthrough reads planes the load left whole; a served trimmed image has none
+        panic("dasLLAMA: planes_trimmed vulkan lane - a live gather is impossible (the whole-model driver declined this run, or the baked plan diverged; the decline line above): the lane's identity folds DASLLAMA_TRIM but not DASLLAMA_GPU_CTX_MAX / DASLLAMA_VK_KV32 / DASLLAMA_GPU_RESIDENT - match the mint's knobs, delete the lane to re-mint, or DASLLAMA_TRIM=0")
     }
-    layout_gather_stack(t, woff, n, rows, slice_rows, mr, kgroup, wbias, wq, ws)
+    layout_gather_dispatch(t, f, woff, n, rows, slice_rows, mr, kgroup, wbias, wq, ws)
 }
 
-def private moe_gpu_gather_stack_kq(t : Model; fmt : KqFmt; woff : int64; n, rows, slice_rows : int64;
-                                    repacked : bool; mr : int64; var wq : array<uint8>; var ws : array<uint8>) {
-    if (vk_bake_slice(t, int(fmt), woff, n, rows, wq, ws)) {
-        return
+//! every entry of the baked plan sits in the whole-model driver's arena: the trimmed lane's admission
+def vk_plan_arena_only(t : Model) : bool {
+    var arena = !empty(t.vkplan)
+    for (e in t.vkplan) {
+        arena = arena && e.role == int(VkBakeRole.arena)
     }
-    if (t.planes_trimmed) {
-        panic("dasLLAMA: planes_trimmed image - live gather impossible (baked plan diverged, or a re-gather was requested); rebake without --trim or match the image's config")
-    }
-    layout_gather_stack_kq(t, fmt, woff, n, rows, slice_rows, repacked, mr, wq, ws)
-}
-
-def private moe_gpu_gather_stack_q51(t : Model; woff : int64; n, rows, slice_rows : int64;
-                                     var wq : array<uint8>; var ws : array<uint8>) {
-    if (vk_bake_slice(t, int(KqFmt.q51), woff, n, rows, wq, ws)) {
-        return
-    }
-    if (t.planes_trimmed) {
-        panic("dasLLAMA: planes_trimmed image - live gather impossible (baked plan diverged, or a re-gather was requested); rebake without --trim or match the image's config")
-    }
-    let qmr = active_q51_layout_mr()   //! the q51 expert stacks sit in the active backend's grp<mr> layout (repack_q51_stacks), disk order at mr 1
-    layout_gather_stack_q51(t, woff, n, rows, slice_rows, qmr > 1l, qmr, wq, ws)
-}
-
-def private moe_gpu_gather_stack_mx4(t : Model; woff : int64; n, rows, slice_rows : int64;
-                                     var wq : array<uint8>; var ws : array<uint8>) {
-    if (vk_bake_slice(t, int(KqFmt.mx4), woff, n, rows, wq, ws)) {
-        return
-    }
-    if (t.planes_trimmed) {
-        panic("dasLLAMA: planes_trimmed image - live gather impossible (baked plan diverged, or a re-gather was requested); rebake without --trim or match the image's config")
-    }
-    //! the mx4 stacks ride the Q8 layout's grp<mr> interleave when the CPU repacked them (repack_mx4_stacks under the q8q8 perm), disk order otherwise
-    layout_gather_stack_mx4(t, woff, n, rows, slice_rows, t.mx4_repacked, active_q8_layout_mr(), wq, ws)
+    return arena
 }
 
 //! an expert stack's device format tag: the native-MXFP4 planes carry no per-tensor tag (the loader keeps `experts_mx4`), so the tag is mx4 for every routed stack of such a model
 def private rdec_efmt(t : Model; tags : array<KqFmt>; l : int64) : KqFmt => t.experts_mx4 ? KqFmt.mx4 : fmt_at(tags, l)
 
-//! P3 trim (generate-then-free): pack the emb/cls region into embq/embs, mark the model
+//! The emb/cls region packed into `t.embq` / `t.embs` off `src`'s planes, whose offset 0 is `t`'s element `rebase` (0 when
+//! `src` is `t` itself, a job's `woff` for the job view the streaming mint feeds it): q8 as mblob-style 34B interleaved
+//! blocks (dequant_embq_row's layout), a kq classifier as its plane pair verbatim; fp32 embeddings ride fblob, kept
+[arch(at="../ARCHITECTURE_IMAGE_VULKAN.md#image-vulkan-mint")]
+def trim_pack_emb(src : Model; var t : Model; rebase : int64) : bool {
+    let r = trim_emb_region(t)
+    let off0 = r.off - rebase
+    if (t.emb_q8) {
+        let nb = r.n / Q8_BLOCK_ELEMS
+        let blk = Q8_QPB + Q8_SPB
+        t.embq |> reserve_resize(nb * blk)   // vocab-scaled: ~600 MB at a 248k-vocab 27B, one grow
+        unsafe {
+            for (b in range64(nb)) {
+                let off = off0 + b * Q8_BLOCK_ELEMS
+                var bp = addr(t.embq[b * blk])
+                let sc = src.wscale_f16 ? uint(src.qscales16[off / Q8_BLOCK_ELEMS]) : f32_to_f16(src.qscales[off / Q8_BLOCK_ELEMS])
+                bp[0] = uint8(sc & 0xFFu)
+                bp[1] = uint8((sc >> 8u) & 0xFFu)
+                memcpy(addr<void?>(t.embq[b * blk + Q8_SPB]), addr<void?>(src.qblob[off]), Q8_QPB)
+            }
+        }
+    } elif (cls_kq(t)) {
+        let f = r.f
+        if (!kq_sb(f)) {
+            to_log(LOG_WARNING, "dasLLAMA trim: emb fmt '{f}' has no kq plane pair - declining\n")
+            return false
+        }
+        let nsb = r.n / kq_elems(f)
+        let sb0 = off0 / kq_elems(f)
+        let qsb = kq_qsb(f)
+        let ssb = kq_ssb(f)
+        t.embq |> reserve_resize(nsb * qsb)
+        t.embs |> reserve_resize(nsb * ssb)
+        unsafe {
+            memcpy(addr<void?>(t.embq[0]), addr<void?>(src.kq[int(f)].q[sb0 * qsb]), nsb * qsb)
+            memcpy(addr<void?>(t.embs[0]), addr<void?>(src.kq[int(f)].s[sb0 * ssb]), nsb * ssb)
+        }
+    }
+    return true
+}
+
+//! the element offset and length of the emb/cls region `trim_pack_emb` reads, and its format
+def trim_emb_region(t : Model) : tuple<off : int64; n : int64; f : KqFmt> {
+    let n = t.config.vocab_size * t.config.dim
+    return t.emb_q8 ? (off = t.emb_q8_off, n = n, f = KqFmt.q8) : (off = t.wcls_off, n = n, f = t.emb_fmt)
+}
+
+//! the bytes the packed emb region takes in a trimmed lane; 0 where an fp32 table rides fblob and nothing packs
+def trim_emb_bytes(t : Model) : int64 {
+    let r = trim_emb_region(t)
+    if (t.emb_q8) {
+        return (r.n / Q8_BLOCK_ELEMS) * (Q8_QPB + Q8_SPB)
+    }
+    if (cls_kq(t) && kq_sb(r.f)) {
+        return (r.n / kq_elems(r.f)) * (kq_qsb(r.f) + kq_ssb(r.f))
+    }
+    return 0l
+}
+
+//! The trim (generate-then-free): pack the emb/cls region into embq/embs, mark the model
 //! trimmed, and FREE the big CPU weight families — the save then writes them as empty planes.
 //! Arena-only plans qualify (pure resident-driver dense); false = declined, nothing changed.
 def trim_model_planes(var t : Model) : bool {
     if (empty(t.vkplan) || t.config.n_layer_nextn > 0l) {
         return false
     }
-    for (e in t.vkplan) {
-        if (e.role != int(VkBakeRole.arena)) {
-            to_log(LOG_WARNING, "dasLLAMA trim: baked plan carries non-arena role {e.role} - only pure resident-driver dense models trim; declining\n")
-            return false
-        }
+    if (!vk_plan_arena_only(t)) {
+        to_log(LOG_WARNING, "dasLLAMA trim: the baked plan carries a non-arena role - only pure resident-driver dense models trim; declining\n")
+        return false
     }
-    let dim = t.config.dim
-    let vocab = t.config.vocab_size
-    if (t.emb_q8) {
-        // mblob-style 34B interleaved blocks over the emb region (dequant_embq_row's layout)
-        let nb = vocab * dim / 32l
-        t.embq |> reserve_resize(nb * 34l)   // vocab-scaled: ~600 MB at a 248k-vocab 27B, one grow
-        unsafe {
-            for (b in range64(nb)) {
-                let off = t.emb_q8_off + b * 32l
-                var bp = addr(t.embq[b * 34l])
-                let sc = t.wscale_f16 ? uint(t.qscales16[off / 32l]) : f32_to_f16(t.qscales[off / 32l])
-                bp[0] = uint8(sc & 0xFFu)
-                bp[1] = uint8((sc >> 8u) & 0xFFu)
-                memcpy(addr<void?>(t.embq[b * 34l + 2l]), addr<void?>(t.qblob[off]), 32l)
-            }
-        }
-    } elif (cls_kq(t)) {
-        // the region's plane pair verbatim (repack layout preserved), rebased to superblock 0
-        let nsb = vocab * (dim / 256l)
-        let sb0 = t.wcls_off / 256l
-        let f = t.emb_fmt
-        if (!kq_sb(f)) {
-            to_log(LOG_WARNING, "dasLLAMA trim: emb fmt '{f}' has no kq plane pair - declining\n")
-            return false
-        }
-        let qsb = kq_qsb(f)
-        let ssb = kq_ssb(f)
-        t.embq |> reserve_resize(nsb * qsb)
-        t.embs |> reserve_resize(nsb * ssb)
-        unsafe {
-            memcpy(addr<void?>(t.embq[0]), addr<void?>(t.kq[int(f)].q[sb0 * qsb]), nsb * qsb)
-            memcpy(addr<void?>(t.embs[0]), addr<void?>(t.kq[int(f)].s[sb0 * ssb]), nsb * ssb)
-        }
-    }   // fp32 embeddings ride fblob, which the trim keeps
+    if (!trim_pack_emb(t, t, 0l)) {
+        return false
+    }
     t.planes_trimmed = true
     delete t.qblob
     delete t.qscales
@@ -311,6 +379,8 @@ def trim_model_planes(var t : Model) : bool {
     }
     delete t.q51q
     delete t.q51s
+    delete t.iq4nl32q
+    delete t.iq4nl32s
     delete t.mxq
     delete t.mxs
     delete t.q4blob
@@ -340,16 +410,7 @@ def private dense_shexp_uploadable(t : Model; l : int64) : bool {
 def private moe_gpu_gather_upload(t : Model; f : KqFmt; woff : int64; n, rows, slice_rows : int64;
                                   mr, kgroup, wbias : int64; var wq : array<uint8>; var ws : array<uint8>;
                                   stream : bool = false) : bool {
-    if (f == KqFmt.q8) {
-        moe_gpu_gather_stack(t, woff, n, rows, slice_rows, mr, kgroup, wbias, wq, ws)
-    } elif (f == KqFmt.q51) {
-        moe_gpu_gather_stack_q51(t, woff, n, rows, slice_rows, wq, ws)
-    } elif (f == KqFmt.mx4) {
-        moe_gpu_gather_stack_mx4(t, woff, n, rows, slice_rows, wq, ws)
-    } else {
-        let kmr = kq_active_mr(t, f)
-        moe_gpu_gather_stack_kq(t, f, woff, n, rows, slice_rows, t.kq_repacked, kmr, wq, ws)
-    }
+    moe_gpu_gather(t, f, woff, n, rows, slice_rows, mr, kgroup, wbias, wq, ws)
     let ok = moe_gpu_upload_stack(wq, ws, woff, n, rows, int(f), stream)
     if (ok) {
         vk_bake_collect(int(f), woff, n, rows, wq, ws)
@@ -370,6 +431,9 @@ struct ResidentPlan {
     others_bytes : int64    //!< dedicated video memory every other process holds, when the OS answers (0 otherwise) - named in a decline
     emb_f32_bytes : int64   //!< the raw f32 embd table the gather would upload - counted only when it rides the headroom left after weights + KV (0 = the CPU embed serves)
     ple_tbl_bytes : int64   //!< the per-layer-embedding token table (gemma-4 E-series, q8) the window chain would gather on device - counted the same way, after the embd table (0 = the host gathers)
+    host_layers : int64     //!< the routed layers whose experts serve on the host - the first this many in layer order (every one on a hyper-connection model)
+    hot_slots : int64       //!< the hot expert pool's slots a routed layer, where the routed experts serve on the host (0 = no pool)
+    hot_bytes : int64       //!< ... and the pool's bytes over every routed layer
     fits : bool
     memory : bool         //!< the decline is the card's room at the session's context, not a feature the driver lacks
     reason : string       //!< "" when it fits; otherwise why, with a remedy where one exists
@@ -382,6 +446,7 @@ let private RDEC_VRAM_HEADROOM = 2_147_483_648l    // auto-arm slack past the ti
 let private RDEC_VRAM_HEADROOM_PCT = 27l
 let private RDEC_OS_RESERVE = 1_073_741_824l
 let private RDEC_MISC_BYTES = 67_108_864l          // decode smalls + batch act planes + metas
+let RDEC_HOT_CHAIN_BYTES = 335_544_320l    //! the batch arm's cm2 chain the hot expert pool's windows ride: its activation, hidden, output and combine planes
 
 //! Layer `l` routes through expert stacks: past the dense lead, with its expert planes present.
 def layer_is_moe(t : Model; l : int64) : bool => (t.config.n_expert > 0l && l >= t.config.n_layer_dense_lead
@@ -424,25 +489,140 @@ def private rdec_dn_geom(t : Model) : RdecDnGeom {
     for (l in range64(c.n_layers)) {
         if (layer_is_recurrent(c, l)) {
             return RdecDnGeom(cd = dn_conv_dim(c), kd = dn_key_dim(c), di = c.ssm_d_inner, nvh = c.ssm_dt_rank,
-                              nkh = c.ssm_n_group, ds = c.ssm_d_state, dconv = c.ssm_d_conv, ba_f32 = t.dn_ba_f32)
+                              nkh = c.ssm_n_group, ds = c.ssm_d_state, dconv = c.ssm_d_conv, ba_f32 = t.dn_ba_f32, zsig = c.dn_z_sigmoid)
         }
     }
     return RdecDnGeom()
 }
 
+//! the NextN head's planes in placement order - eh_proj, q, k, v, o, gate, up, down - each a row length, a row count, a format and its offset
+def private resident_head_planes(t : Model) : array<tuple<n : int64; rows : int64; f : KqFmt; off : int64>> {
+    let c = t.config
+    let l = c.n_layers
+    let dim = c.dim
+    let lf = resident_head_fmts(t)
+    let qd = layer_qd(c, l)
+    let kvd = layer_kv_dim(c, l)
+    let hid = resident_dense_width(t, l)
+    let p1 = resident_head_ffn_plane(t, 1)
+    let p3 = resident_head_ffn_plane(t, 3)
+    let p2 = resident_head_ffn_plane(t, 2)
+    return <- [(n = 2l * dim, rows = dim, f = t.mtp_ehproj_fmt, off = t.mtp_ehproj_off),
+        (n = dim, rows = c.q_gated ? 2l * qd : qd, f = lf.fq, off = t.wq_offs[l]),
+        (n = dim, rows = kvd, f = lf.fk, off = t.wk_offs[l]),
+        (n = dim, rows = kvd, f = lf.fv, off = t.wv_offs[l]),
+        (n = qd, rows = dim, f = lf.fo, off = t.wo_offs[l]),
+        (n = dim, rows = hid, f = lf.f1, off = p1),
+        (n = dim, rows = hid, f = lf.f3, off = p3),
+        (n = hid, rows = dim, f = lf.f2, off = p2)]
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head")]
+def private resident_head_ffn_plane(t : Model; kind : int) : int64 {
+    let l = t.config.n_layers
+    if (layer_is_moe(t, l)) return resident_shexp_plane(t, l, kind).off
+    return kind == 1 ? t.w1_offs[l] : (kind == 3 ? t.w3_offs[l] : t.w2_offs[l])
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head")]
+def private resident_head_fmts(t : Model) : tuple<fq : KqFmt; fk : KqFmt; fv : KqFmt; fo : KqFmt; f1 : KqFmt; f3 : KqFmt; f2 : KqFmt> {
+    let l = t.config.n_layers
+    var lf = resident_layer_fmts(t, l)
+    if (layer_is_moe(t, l)) {
+        lf.f1 = resident_shexp_plane(t, l, 1).f
+        lf.f3 = resident_shexp_plane(t, l, 3).f
+        lf.f2 = resident_shexp_plane(t, l, 2).f
+    }
+    return lf
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head")]
+def private resident_head_decline(t : Model) : string {
+    let c = t.config
+    let l = c.n_layers
+    if (c.n_layer_nextn != 1l) return "{c.n_layer_nextn} NextN heads (the draft command serves one)"
+    if (!rdec_draft_installed()) return "the tier installed no draft seat"
+    if (!rdec_carry_installed()) return "the tier installed no carry landing (the draft's hidden rides it)"
+    if (t.mtp_ehproj_off < 0l) return "no eh_proj plane"
+    if (!dense_plane_ok(t, t.mtp_ehproj_fmt) || !kq_rows_ok(2l * c.dim, t.mtp_ehproj_fmt)) return "the eh_proj plane's format {t.mtp_ehproj_fmt} has no resident GEMV at width {2l * c.dim}"
+    if (layer_is_moe(t, l) && !resident_host_experts(c)) return "its FFN is routed"
+    let why = resident_layer_decline(t, l)
+    if (!empty(why)) return why
+    if (t.kv_src[l] != l || resident_v_from_k(c, l)) return "it reads another layer's K/V or takes V off its k row"
+    var feats = ""
+    name_list_add(feats, c.attn_qkv_bias, "the q/k/v projection bias")
+    name_list_add(feats, c.attn_out_bias, "the attention output bias")
+    name_list_add(feats, c.pre_post_norm, "the post-attention and post-FFN norms")
+    name_list_add(feats, has_ple(c), "per-layer embeddings")
+    name_list_add(feats, c.attn_sinks, "attention sinks")
+    name_list_add(feats, c.layer_out_scale, "a per-layer output scale")
+    name_list_add(feats, c.v_norm, "the v-norm")
+    if (!empty(feats)) return "the draft command has no step for: {feats}"
+    let lf = resident_head_fmts(t)
+    for (f in [lf.fq, lf.fk, lf.fv, lf.fo, lf.f1, lf.f3, lf.f2]) {
+        if (!dense_plane_ok(t, f)) return "a plane in format {f} the resident GEMVs do not serve"
+    }
+    let cq = rdec_quant_class(lf.fq)
+    if (cq != rdec_quant_class(lf.fk) || cq != rdec_quant_class(lf.fv) || rdec_quant_class(lf.f1) != rdec_quant_class(lf.f3)) return "its planes mix activation-quant forms"
+    var hs = 0l
+    var kvd = 0l
+    for (i in range64(l)) {
+        continue if (layer_is_recurrent(c, i))
+        hs = max(hs, layer_head_size(c, i))
+        kvd = max(kvd, layer_kv_dim(c, i))
+    }
+    if (layer_head_size(c, l) != hs || layer_kv_dim(c, l) > kvd) return "its head size {layer_head_size(c, l)} or kv width {layer_kv_dim(c, l)} is off the trunk's {hs} / {kvd}"
+    if (layer_hidden(t, l) > resident_hidden(t)) return "its FFN width {layer_hidden(t, l)} is past the trunk's {resident_hidden(t)}"
+    return ""
+}
+
+def private resident_head_on(t : Model) : bool => t.config.n_layer_nextn > 0l && empty(resident_head_decline(t))
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head")]
+def private resident_head_routed(t : Model) : bool => t.config.hyper_conn && layer_is_moe(t, t.config.n_layers) && resident_head_on(t)
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head")]
+def private resident_routed_layers(t : Model) : int64 => t.config.n_layers + (resident_head_routed(t) ? 1l : 0l)
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command")]
+def private rdec_verify_rows_want(t : Model) : int64 => (resident_head_on(t) && rdec_verify_installed()) ? get_mtp_depth() + 1l : 0l
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command")]
+def private resident_host_experts(c : Config) : bool => c.hyper_conn && c.n_expert > 0l && rdec_hc_installed()
+
+//! a hyper-connection layer's planes: two mixer sites' q8 down [lr x hc_dim] and up [hc_dim x lr]; the side input's layer adds key [hc_dim x ind] and value [dim x ind]
+def private resident_hc_layer_planes(c : Config; l : int64; var planes : array<tuple<n : int64; rows : int64; f : KqFmt>>) {
+    planes |> reserve(length(planes) + 6)
+    for (_s in range(2)) {
+        planes |> push((n = hc_dim(c), rows = c.hc_low_rank, f = KqFmt.q8))
+        planes |> push((n = c.hc_low_rank, rows = hc_dim(c), f = KqFmt.q8))
+    }
+    if (has_ple_ngram(c) && l == c.ple_layer) {
+        planes |> push((n = ple_in_dim(c), rows = hc_dim(c), f = KqFmt.q8))
+        planes |> push((n = ple_in_dim(c), rows = c.dim, f = KqFmt.q8))
+    }
+}
+
 [arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
-def private resident_planes(t : Model; dng : RdecDnGeom; ple_tbl : bool) : array<tuple<n : int64; rows : int64; f : KqFmt>> {
+def private resident_planes(t : Model; dng : RdecDnGeom; ple_tbl : bool; host_layers : int64) : array<tuple<n : int64; rows : int64; f : KqFmt>> {
     let c = t.config
     let dim = c.dim
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     var planes : array<tuple<n : int64; rows : int64; f : KqFmt>>
-    planes |> reserve(c.n_layers * 11l + 1l)
+    planes |> reserve(c.n_layers * 13l + 5l)
+    var routed_idx = 0l
     for (l in range64(c.n_layers)) {
         let lf = resident_layer_fmts(t, l)
+        if (c.hyper_conn) {
+            resident_hc_layer_planes(c, l, planes)
+        }
         if (layer_is_moe(t, l)) {
-            planes |> push((n = dim, rows = c.n_expert * c.n_ff_exp, f = rdec_efmt(t, t.we1_fmt, l)))
-            planes |> push((n = dim, rows = c.n_expert * c.n_ff_exp, f = rdec_efmt(t, t.we3_fmt, l)))
-            planes |> push((n = c.n_ff_exp, rows = c.n_expert * dim, f = rdec_efmt(t, t.we2_fmt, l)))
+            if (routed_idx >= host_layers) {
+                planes |> push((n = dim, rows = c.n_expert * c.n_ff_exp, f = rdec_efmt(t, t.we1_fmt, l)))
+                planes |> push((n = dim, rows = c.n_expert * c.n_ff_exp, f = rdec_efmt(t, t.we3_fmt, l)))
+                planes |> push((n = c.n_ff_exp, rows = c.n_expert * dim, f = rdec_efmt(t, t.we2_fmt, l)))
+            }
+            routed_idx++
             if (c.moe_dense_shexp) {
                 let hid_l = layer_hidden(t, l)
                 planes |> push((n = dim, rows = hid_l, f = lf.f1))
@@ -486,10 +666,32 @@ def private resident_planes(t : Model; dng : RdecDnGeom; ple_tbl : bool) : array
         }
     }
     planes |> push((n = dim, rows = c.vocab_size, f = cls_fmt))
+    if (c.hyper_conn) {   //! the head mixer's pair
+        planes |> push((n = hc_dim(c), rows = c.hc_low_rank, f = KqFmt.q8))
+        planes |> push((n = c.hc_low_rank, rows = hc_dim(c), f = KqFmt.q8))
+    }
     if (ple_tbl) {
         planes |> push((n = c.n_layers * c.n_embd_per_layer, rows = c.vocab_size, f = KqFmt.q8))
     }
+    if (resident_head_on(t)) {
+        resident_head_plan_planes(t, planes)
+    }
     return <- planes
+}
+
+//! the NextN head's planes in the plan: its dense set, and on the chain its block seams and its own head mixer
+def private resident_head_plan_planes(t : Model; var planes : array<tuple<n : int64; rows : int64; f : KqFmt>>) {
+    let c = t.config
+    var inscope head <- resident_head_planes(t)
+    planes |> reserve(length(planes) + length(head))
+    for (pl in head) {
+        planes |> push((n = pl.n, rows = pl.rows, f = pl.f))
+    }
+    if (c.hyper_conn) {
+        resident_hc_layer_planes(c, c.n_layers, planes)
+        planes |> push((n = hc_dim(c), rows = c.hc_low_rank, f = KqFmt.q8))
+        planes |> push((n = c.hc_low_rank, rows = hc_dim(c), f = KqFmt.q8))
+    }
 }
 
 //! the recurrent layers' beta / alpha rows on the f32 arm: device f16 rows beside the planes (`vk_rdec_upload_dn_ba` halves
@@ -535,10 +737,25 @@ def private rdec_scratch_bytes(t : Model) : int64 {
         moe = ((nk + TILE_READ_SLACK) * (c.dim + nfe) * 2l + nk * (2l * nfe + c.dim) * 4l
             + RDEC_PF_ROWS * (c.n_expert + 1l) * 4l + nk * 12l)
     }
-    let nb = max(g_rdec_regions_want, 1l)   //! the N-row command's planes hold a row a region: the logits and the attention pieces scale with it
+    let nb = max(max(g_rdec_regions_want, 1l), rdec_verify_rows_want(t))
     let pieces = hs > 0l ? (qd / hs) * RDEC_ATTN_SPLIT_CAP * (hs + 2l) * 4l : 0l
     return RDEC_PF_ROWS * (16l * c.dim + 2l * wide + 10l * qd + 12l * kvd
-        + 8l * hid + 4l * resident_cos_elems(c) + 4l * hs) + (c.vocab_size * 4l + pieces) * nb + RDEC_MISC_BYTES + moe
+        + 8l * hid + 4l * resident_cos_elems(c) + 4l * hs) + (c.vocab_size * 4l + pieces) * nb + RDEC_MISC_BYTES + moe + rdec_rollback_bytes(t)
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback")]
+def private rdec_rollback_bytes(t : Model) : int64 {
+    let c = t.config
+    let rows = rdec_verify_rows_want(t) - 1l
+    return 0l if (c.recr_mask == 0ul || rows <= 0l || !rdec_rollback_installed())
+    let dng = rdec_dn_geom(t)
+    var nrec = 0l
+    for (l in range64(c.n_layers)) {
+        if (layer_is_recurrent(c, l)) {
+            nrec++
+        }
+    }
+    return rows * nrec * (dng.nvh * dng.ds * dng.ds + 2l * dng.cd * (dng.dconv - 1l)) * 4l
 }
 
 //! The auto arm's headroom where no OS answers: the WDDM share on Windows (the demotion collapse
@@ -574,6 +791,10 @@ def private fill_plan_room(var p : ResidentPlan) {
 [arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
 def resident_region_ctx(seq_cap, bctx, regions : int64) : int64 => bctx > 0l ? min(seq_cap, bctx / max(regions, 1l)) : seq_cap
 
+//! a context asked whole that the binding range over the regions does not hold is a decline before any plan, never a shorter mirror
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
+def resident_region_ctx_declines(asked, region_ctx : int64; asked_whole : bool) : bool => asked_whole && region_ctx < asked
+
 //! the positions one mirror side's binding holds under the device's range cap; 0 = no cap known, or no attention layer
 [arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
 def resident_binding_ctx(t : Model; dt : KVDtype; bcap : int64) : int64 {
@@ -581,12 +802,14 @@ def resident_binding_ctx(t : Model; dt : KVDtype; bcap : int64) : int64 {
     return (bcap > 0l && side_row_bytes > 0l) ? bcap / side_row_bytes : 0l
 }
 
-//! one position's K and V mirror bytes over the layers that hold rows of their own (a shared-KV layer reads its donor's)
+//! one position's K and V mirror bytes over the layers that hold rows of their own (a shared-KV layer reads its donor's), and the
+//! NextN head's slot where the driver takes the head
 def private resident_kv_row_bytes(t : Model; kdt, vdt : KVDtype) : tuple<krow : int64; vrow : int64> {
     let c = t.config
     var krow = 0l
     var vrow = 0l
-    for (l in range64(c.n_layers)) {
+    let head = resident_head_on(t)
+    for (l in range64(c.n_layers + (head ? 1l : 0l))) {
         continue if (t.kv_src[l] != l)
         krow += kv_row_bytes(kdt, layer_kv_dim(c, l))
         vrow += kv_row_bytes(vdt, layer_kv_dim(c, l))
@@ -594,8 +817,9 @@ def private resident_kv_row_bytes(t : Model; kdt, vdt : KVDtype) : tuple<krow : 
     return (krow = krow, vrow = vrow)
 }
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
-def resident_plan(t : Model; seq_cap : int64; kdt, vdt : KVDtype) : ResidentPlan {
+//! `hot_cap` holds the pool at the slots an earlier plan of this pick settled on; -1 = this plan sizes it
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan"), arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def resident_plan(t : Model; seq_cap : int64; kdt, vdt : KVDtype; hot_cap : int64 = HOT_SLOTS_AUTO; host_layers : int64 = -1l) : ResidentPlan {
     let c = t.config
     var p = ResidentPlan(budget_bytes = moe_gpu_weight_budget_())
     if (p.budget_bytes <= 0l) {
@@ -610,19 +834,24 @@ def resident_plan(t : Model; seq_cap : int64; kdt, vdt : KVDtype) : ResidentPlan
     p.kv_bytes = g_rdec_regions_want * seq_cap * (krow + vrow)
     p.scratch_bytes = rdec_scratch_bytes(t)
     fill_plan_room(p)
-    var n_moe = 0l
-    for (l in range64(c.n_layers)) {
-        if (layer_is_moe(t, l)) {
-            n_moe++
-        }
-    }
-    var inscope planes <- resident_planes(t, rdec_dn_geom(t), false)
+    let n_moe = resident_moe_layers(t)
+    p.host_layers = host_layers >= 0l ? min(host_layers, n_moe) : (resident_host_experts(c) ? n_moe : 0l)
+    var inscope planes <- resident_planes(t, rdec_dn_geom(t), false, p.host_layers)
     for (pl in planes) {
         p.weight_bytes += moe_gpu_plane_bytes(pl.n, pl.rows, int(pl.f))
     }
     p.weight_bytes += resident_dn_ba_f32_bytes(t)
     p.weight_bytes += resident_router_bytes(c, n_moe)
-    let total = p.weight_bytes + p.kv_bytes + p.scratch_bytes
+    if (p.host_layers > 0l && rdec_hot_installed() && c.n_expert_used <= int64(RDEC_HOT_PICKS)) {
+        let room = p.usable_bytes - p.weight_bytes - p.scratch_bytes
+        let floor_kv = g_rdec_regions_want * resident_hot_floor_ctx(seq_cap, rdec_ctx_asked_whole()) * (krow + vrow) * 8l / 7l
+        let slots_ask = g_env_gpu.gpu_heat ?? (gpu_want_heat() > 0l ? gpu_want_heat() : HOT_SLOTS_AUTO)
+        let fit = resident_hot_fit(slots_ask, hot_cap, room - p.kv_bytes, room - floor_kv, resident_hot_slot_bytes_host_layers(t, p.host_layers), c.n_expert)
+        p.hot_slots = fit.slots
+        p.hot_bytes = fit.hot_bytes
+        p.scratch_bytes += fit.chain_bytes
+    }
+    let total = p.weight_bytes + p.kv_bytes + p.scratch_bytes + p.hot_bytes
     let usable = p.usable_bytes
     let emb_want = g_env_vulkan.vk_gpu_embed && rdec_prefill_ids_installed() && !t.cls_q8 && !cls_kq(t) && !t.planes_trimmed
     let emb_bytes = emb_want ? rdec_emb_f32_bytes(c.vocab_size, c.dim) : 0l
@@ -636,7 +865,7 @@ def resident_plan(t : Model; seq_cap : int64; kdt, vdt : KVDtype) : ResidentPlan
     if (!p.fits) {
         p.memory = true
         // a shorter context is the remedy that actually works — weights are fixed, KV is not
-        let kv_fit = max(usable - p.weight_bytes - p.scratch_bytes, 0l)
+        let kv_fit = max(usable - p.weight_bytes - p.scratch_bytes - p.hot_bytes, 0l)
         let cap_fit = (krow + vrow) > 0l ? kv_fit / (krow + vrow) : 0l
         var room = ""
         if (p.others_bytes > 0l) {
@@ -649,6 +878,160 @@ def resident_plan(t : Model; seq_cap : int64; kdt, vdt : KVDtype) : ResidentPlan
             : "needs {total >> 20l} MB of {usable >> 20l} MB (weights alone {p.weight_bytes >> 20l} MB){room}")
     }
     return p
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
+def resident_mirror_dtype() : KVDtype => g_env_vulkan.vk_kv32 != 0l ? KVDtype.f32 : KVDtype.f16
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
+def private resident_pinned_seq_cap(t : Model; announce : bool) : int64 {
+    var seq_cap = t.config.seq_len
+    let ctx_max = rdec_ctx_pin()
+    if (ctx_max > 0l && ctx_max < seq_cap) {
+        seq_cap = max(ctx_max, rdec_min_ctx())
+        if (announce) {
+            to_log(LOG_INFO, "dasLLAMA: resident driver - KV mirror capped at {seq_cap} positions (DASLLAMA_GPU_CTX_MAX, or set_gpu_ctx_max in process; 0 lifts the cap)\n")
+        }
+    }
+    return seq_cap
+}
+
+//! the plan the walk uploads against; `seq_cap` comes back as the context the plan settled on; `announce` prints the
+//! pinned cap once per walk - a prediction of the plan asks quietly
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
+def resident_plan_pick(t : Model; rkdt : KVDtype; var seq_cap : int64&; announce : bool = true) : ResidentPlan {
+    seq_cap = resident_pinned_seq_cap(t, announce)
+    let asked = seq_cap
+    let bctx = resident_binding_ctx(t, rkdt, moe_gpu_binding_cap(g_rdec_regions_want))
+    seq_cap = resident_region_ctx(seq_cap, bctx, g_rdec_regions_want)
+    if (resident_region_ctx_declines(asked, seq_cap, rdec_ctx_asked_whole())) {
+        var short = resident_plan(t, seq_cap, rkdt, rkdt)
+        short.fits = false
+        short.memory = true
+        short.reason = "one K/V binding's range on this device ({moe_gpu_binding_cap(g_rdec_regions_want) >> 20l} MB) holds {seq_cap} positions over {g_rdec_regions_want} regions, under the {asked} asked whole (set_gpu_ctx_strict, DASLLAMA_GPU_CTX_STRICT) - fewer regions would hold more"
+        return short
+    }
+    var plan = resident_plan(t, seq_cap, rkdt, rkdt)
+    var room_bound = false
+    if (!plan.fits && plan.weight_bytes > 0l && plan.kv_bytes > 0l) {
+        let fit_ctx = (max(plan.usable_bytes - plan.weight_bytes - plan.scratch_bytes - plan.hot_bytes, 0l) / 8l * 7l) / (plan.kv_bytes / seq_cap)
+        if (fit_ctx >= rdec_min_ctx()) {
+            seq_cap = fit_ctx
+            room_bound = true
+            plan = resident_plan(t, seq_cap, rkdt, rkdt, plan.hot_slots, plan.host_layers)
+        } elif (rdec_ctx_asked_whole() && resident_host_layers_ok(t.config)) {
+            plan = resident_plan_host_layers(t, rkdt, seq_cap, announce)
+        } elif (rdec_ctx_asked_whole()) {
+            plan.reason = "{plan.reason} - the context was asked whole ({rdec_ctx_pin()} positions a region: set_gpu_ctx_strict, DASLLAMA_GPU_CTX_STRICT), so the mirror is not shortened to fit"
+        } elif (resident_host_layers_ok(t.config)) {
+            plan.reason = "{plan.reason} - a context asked whole (set_gpu_ctx_strict, the server's --ctx) would serve it with the experts the card cannot hold on the host; unasked, the per-op rails serve this model"
+        }
+    }
+    if (announce && plan.fits && seq_cap < asked) {
+        resident_ctx_shortened_say(plan, asked, seq_cap, room_bound)
+    }
+    return plan
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command")]
+def resident_host_layers_ok(c : Config) : bool => c.n_expert > 0l && !c.hyper_conn && !c.moe_dense_shexp && rdec_hc_installed() && c.n_expert_used <= int64(RDEC_HOT_PICKS)
+
+//! the bytes of a routed layer's gate, up and down planes over `n_exp` experts in device layout
+def private resident_expert_planes_bytes(t : Model; l, n_exp : int64) : int64 {
+    let c = t.config
+    return (moe_gpu_plane_bytes(c.dim, n_exp * c.n_ff_exp, int(rdec_efmt(t, t.we1_fmt, l))) + moe_gpu_plane_bytes(c.dim, n_exp * c.n_ff_exp, int(rdec_efmt(t, t.we3_fmt, l)))
+        + moe_gpu_plane_bytes(c.n_ff_exp, n_exp * c.dim, int(rdec_efmt(t, t.we2_fmt, l))))
+}
+
+def private resident_moe_layers(t : Model) : int64 {
+    var n = 0l
+    for (l in range64(resident_routed_layers(t))) {
+        n += layer_is_moe(t, l) ? 1l : 0l
+    }
+    return n
+}
+
+//! the fewest first routed layers to move to the host so the other expert stacks fit in `room`; -1 where moving all does not
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def resident_host_layers_fit(need : array<int64>; room : int64) : int64 {
+    var resident = 0l
+    for (b in need) {
+        resident += b
+    }
+    for (h in range64(long_length(need))) {
+        return h if (resident <= room)
+        resident -= need[h]
+    }
+    return resident <= room ? long_length(need) : -1l
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan"), arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private resident_plan_host_layers(t : Model; rkdt : KVDtype; seq_cap : int64; announce : bool) : ResidentPlan {
+    let c = t.config
+    let n_moe = resident_moe_layers(t)
+    let all_host = resident_plan(t, seq_cap, rkdt, rkdt, HOT_SLOTS_AUTO, n_moe)
+    var @exact_size need : array<int64>
+    need |> reserve(n_moe)
+    for (l in range64(resident_routed_layers(t))) {
+        continue if (!layer_is_moe(t, l))
+        need |> push(resident_expert_planes_bytes(t, l, c.n_expert))
+    }
+    let expert_room = all_host.usable_bytes - all_host.weight_bytes - all_host.scratch_bytes + (all_host.hot_slots > 0l ? RDEC_HOT_CHAIN_BYTES : 0l) - all_host.kv_bytes
+    let h0 = resident_host_layers_fit(need, expert_room)
+    delete need
+    return all_host if (h0 < 0l)
+    var plan = all_host
+    var h = h0
+    while (h <= n_moe) {   // the pool over the host layers takes room the count did not see: one more layer to the host where the candidate misses
+        plan = resident_plan(t, seq_cap, rkdt, rkdt, HOT_SLOTS_AUTO, h)
+        break if (plan.fits)
+        h++
+    }
+    if (announce && plan.fits) {
+        to_log(LOG_INFO, "dasLLAMA: resident driver - a plain MoE the card does not hold whole at {seq_cap} positions asked whole (set_gpu_ctx_strict, DASLLAMA_GPU_CTX_STRICT): the first {h} of {n_moe} routed layers' experts serve on the host, the rest on the device\n")
+    }
+    return plan
+}
+
+//! the one line that says why the mirror's context is under the model's (or the pin's): the card's room, or one binding's range, over the regions
+[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
+def private resident_ctx_shortened_say(plan : ResidentPlan; asked, seq_cap : int64; room_bound : bool) {
+    let regions = g_rdec_regions_want
+    let kv_per_k = seq_cap > 0l ? (plan.kv_bytes / regions) * 1000l / seq_cap >> 20l : 0l
+    let each = regions > 1l ? " a region ({regions} regions, set_gpu_resident_regions - a server's streams - share the mirror)" : ""
+    let hot = plan.hot_bytes > 0l ? " and the hot expert pool {plan.hot_bytes >> 20l} MB" : ""
+    var why = "one K/V binding's range on this device ({moe_gpu_binding_cap(regions) >> 20l} MB) over the regions"
+    if (room_bound) {
+        why = "the card's room: {plan.usable_bytes >> 20l} MB usable, the weights {plan.weight_bytes >> 20l} MB and the scratch {plan.scratch_bytes >> 20l} MB{hot} leave {plan.kv_bytes >> 20l} MB for the K/V mirror at {kv_per_k} MB a thousand positions"
+    }
+    to_log(LOG_WARNING, "dasLLAMA: resident driver - K/V mirror {seq_cap} positions{each} of the {asked} asked: {why}; fewer regions, a smaller model or an f16 mirror (DASLLAMA_VK_KV32=0) raise it, and a context asked whole (set_gpu_ctx_strict, DASLLAMA_GPU_CTX_STRICT) declines the driver instead\n")
+}
+
+//! Whether the whole-model driver takes `t`, as far as the plan tells before a byte uploads; a later device refusal (a kernel class, an arena reserve) is the walk's to report
+[arch(at="../ARCHITECTURE_IMAGE_VULKAN.md#image-vulkan-mint")]
+def resident_would_serve(t : Model) : bool {
+    let c = t.config
+    return false if (!(moe_gpu_resident_installed() && gpu_resident_requested() && gpu_want_resident())
+        || t.quant != QuantMode.q8 || c.n_expert > 0l || c.hyper_conn || has_ple(c) || !empty(resident_unserved_features(c)))
+    for (l in range64(c.n_layers)) {
+        return false if (!empty(resident_layer_decline(t, l)))
+    }
+    return false if (c.n_layer_nextn > 0l && !empty(resident_head_decline(t)))
+    var seq_cap = 0l
+    return resident_plan_pick(t, resident_mirror_dtype(), seq_cap, false).fits
+}
+
+[arch(at="../ARCHITECTURE_IMAGE_VULKAN.md#image-vulkan-mint")]
+def trim_plane_dropped(name : string) : bool {
+    return true if (name == "qblob" || name == "qscales" || name == "qscales16" || name == "wblob" || name == "bf16blob"
+        || name == "q51q" || name == "q51s" || name == "iq4nl32q" || name == "iq4nl32s" || name == "mxq" || name == "mxs"
+        || name == "q4blob" || name == "q4scales")
+    for (f in type<KqFmt>) {
+        if (kq_sb(f) && (name == kq_plane_name(f, "q") || name == kq_plane_name(f, "s"))) {
+            return true
+        }
+    }
+    return false
 }
 
 // ===== the resident whole-stack decode driver (dense models that fully fit) =====
@@ -670,6 +1053,8 @@ struct RdecRegion {
     gen : int64     //!< the owning claim's generation; a session whose `rdec_gen` differs owns none of these rows (0 = never claimed)
     used : int64    //!< the tick of its last bind: a session with no region takes the least recently used one
     pinned : bool   //!< a live device-home session owns the rows, which exist nowhere else: no other session takes this region
+    head_cnt : int64   //!< the NextN head's K/V rows the device holds: a draft brings the host's rows past them up first
+    head_host : int64   //!< the head's rows the owner's host cache holds as the session's: the device's rows above them come down on a pass
 }
 
 var private g_rdec_regions : array<RdecRegion>
@@ -680,6 +1065,9 @@ var private g_rdec_regions_want = 1l
 def set_gpu_resident_regions_(n : int64) {
     g_rdec_regions_want = max(n, 1l)
 }
+
+//! The mirror regions the next load asks for (`set_gpu_resident_regions_`).
+def gpu_resident_regions_want() : int64 => g_rdec_regions_want
 
 //! The mirror region `s` prefills and decodes in, or -1 when every region holds a live device-home session and the call must pass.
 def private rdec_bind_region(var s : Session) : int64 {
@@ -709,6 +1097,8 @@ def private rdec_owns(s : Session; r : int64) : bool
 
 def private rdec_claim(var s : Session; r, cnt : int64) {
     g_rdec_regions[r].cnt = cnt
+    g_rdec_regions[r].head_cnt = 0l
+    g_rdec_regions[r].head_host = 0l
     g_rdec_regions[r].gen = ++g_rdec_gen_seq
     g_rdec_regions[r].pinned = s.device_kv
     s.rdec_gen = g_rdec_gen_seq
@@ -724,27 +1114,37 @@ def set_resident_prefill_allowed_(allowed : bool) {
 
 // Bulk-hydrate the session's host KV from the live rows of the mirror region it owns — the rail that
 // keeps host KV authoritative at rest after device-resident prefills/decodes.
-[cold_path]   // the continuation/steal/drop rail, not the steady-state token path
+[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head")]   // the continuation/steal/drop rail, not the steady-state token path
 def private rdec_hydrate_host(t : Model; var s : Session) {
     let c = t.config
     rdec_select_region(s.rdec_region)
     let cnt = g_rdec_regions[s.rdec_region].cnt
-    for (l in range64(c.n_layers)) {
-        continue if (layer_is_recurrent(c, l) || t.kv_src[l] != l)   //! a shared-KV layer reads its donor's slab, gathered once through the donor
-        rdec_read_kv_bulk(l, kv_layer_kbase(s, l, c.seq_len), kv_layer_vbase(s, l, c.seq_len), cnt)
+    if (!s.rdec_host_current) {
+        for (l in range64(c.n_layers)) {
+            continue if (layer_is_recurrent(c, l) || t.kv_src[l] != l)   // a shared-KV layer reads its donor's slab, gathered once through the donor
+            rdec_read_kv_bulk(l, kv_layer_kbase(s, l, c.seq_len), kv_layer_vbase(s, l, c.seq_len), cnt)
+        }
+        s.rdec_host_current = true
+        to_log(LOG_INFO, "dasLLAMA: resident KV hydrated to host ({cnt} positions x {c.n_layers} layers)\n")
     }
-    s.rdec_host_current = true
-    to_log(LOG_INFO, "dasLLAMA: resident KV hydrated to host ({cnt} positions x {c.n_layers} layers)\n")
+    if (s.ple_ring_device) {   //! the n-gram conv ring the device advanced comes home before the CPU rails read it
+        rdec_ngram_ring(unsafe(addr(s.ple_conv_hist[0])), false)
+        s.ple_ring_device = false
+    }
+    rdec_head_hydrate(t, s, g_rdec_regions[s.rdec_region].head_cnt)
 }
 
 //! only hydration saves them from a steal, a CPU-rails continuation or a drop (a device-home session has no host cache to fill)
 def private rdec_has_device_only_rows(s : Session) : bool {
-    return !s.device_kv && rdec_owns(s, s.rdec_region) && g_rdec_regions[s.rdec_region].cnt > 0l && !s.rdec_host_current
+    return false if (s.device_kv || !rdec_owns(s, s.rdec_region))
+    let reg = g_rdec_regions[s.rdec_region]
+    return (reg.cnt > 0l && !s.rdec_host_current) || reg.head_host < reg.head_cnt
 }
 let private RDEC_MIN_CTX = 4096l        // smallest ctx worth arming a capped mirror at
 let private RDEC_ATTN_SPLIT_CAP = 16l   //! the key splits the plan budgets the attention partials for: the most the driver ever picks, whatever the card's SM count
 
 var private g_rdec_ctx_max = 0l   //! the in-process cap on the mirror's positions (0 = none): the test rigs pin 32768, a server keeps the model's context
+var private g_rdec_ctx_strict = false
 
 //! Cap the resident driver's KV mirror at `n` positions for the models this process loads next (0 lifts the pin):
 //! the in-process form of DASLLAMA_GPU_CTX_MAX. A program serving long contexts leaves it alone.
@@ -752,38 +1152,36 @@ def set_gpu_ctx_max_(n : int64) {
     g_rdec_ctx_max = max(n, 0l)
 }
 
-// the arming floor: DASLLAMA_GPU_MIN_CTX lowers it for a short-context session (a 3B on an 8GB card fits at 3429), and a
-// context pin under it (set_gpu_ctx_max in process, else DASLLAMA_GPU_CTX_MAX) lowers it to the pin, never under 256
-def private rdec_min_ctx : int64 {
-    let pin = g_rdec_ctx_max > 0l ? g_rdec_ctx_max : g_env_gpu.gpu_ctx_max
-    return resident_arm_floor(g_env_gpu.gpu_min_ctx, pin)
+def set_gpu_ctx_strict_(on : bool) {
+    g_rdec_ctx_strict = on
 }
 
-//! a caller's own context pin (`set_gpu_ctx_max`, DASLLAMA_GPU_CTX_MAX) under the floor wins: the pin IS the shape it serves
+def private rdec_ctx_pin() : int64 => g_rdec_ctx_max > 0l ? g_rdec_ctx_max : g_env_gpu.gpu_ctx_max
+def private rdec_ctx_strict() : bool => g_rdec_ctx_strict || g_env_gpu.gpu_ctx_strict
+def private rdec_ctx_asked_whole() : bool => rdec_ctx_strict() && rdec_ctx_pin() > 0l
+
+def gpu_ctx_pins_() : tuple<ctx_max : int64; strict : bool> => (ctx_max = g_rdec_ctx_max, strict = g_rdec_ctx_strict)
+
+// the arming floor: DASLLAMA_GPU_MIN_CTX lowers it for a short-context session (a 3B on an 8GB card fits at 3429), a
+// context pin under it (set_gpu_ctx_max in process, else DASLLAMA_GPU_CTX_MAX) lowers it to the pin, never under 256,
+// and a pin asked whole (set_gpu_ctx_strict, DASLLAMA_GPU_CTX_STRICT) is the floor whatever its size
+def private rdec_min_ctx : int64 => resident_arm_floor(g_env_gpu.gpu_min_ctx, rdec_ctx_pin(), rdec_ctx_strict())
+
 [arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
-def resident_arm_floor(env_floor, pin : int64) : int64 {
+def resident_arm_floor(env_floor, pin : int64; strict : bool = false) : int64 {
     let floor = env_floor > 0l ? max(env_floor, 256l) : RDEC_MIN_CTX
+    return max(pin, 256l) if (strict && pin > 0l)
     return pin > 0l && pin < floor ? max(pin, 256l) : floor
 }
 
 // gather one prepared plane into device-layout bytes and place it in its format's arena; returns
-// the arena block index. Same gather the per-op tier uses (moe_gpu_gather_stack / _kq), then place
+// the arena block index. The same gather the per-op tier's upload takes (moe_gpu_gather), then place
 // instead of upload_stack.
 def private resident_place(t : Model; f : KqFmt; woff : int64; n, rows : int64;
                            mr, kgroup, wbias : int64; slice_rows : int64 = -1l) : int64 {
     var wq : array<uint8>
     var ws : array<uint8>
-    let srows = slice_rows > 0l ? slice_rows : rows
-    if (f == KqFmt.q8) {
-        moe_gpu_gather_stack(t, woff, n, rows, srows, mr, kgroup, wbias, wq, ws)
-    } elif (f == KqFmt.q51) {
-        moe_gpu_gather_stack_q51(t, woff, n, rows, srows, wq, ws)
-    } elif (f == KqFmt.mx4) {
-        moe_gpu_gather_stack_mx4(t, woff, n, rows, srows, wq, ws)
-    } else {
-        let kmr = kq_active_mr(t, f)
-        moe_gpu_gather_stack_kq(t, f, woff, n, rows, srows, t.kq_repacked, kmr, wq, ws)
-    }
+    moe_gpu_gather(t, f, woff, n, rows, slice_rows > 0l ? slice_rows : rows, mr, kgroup, wbias, wq, ws)
     let blk = rdec_place(wq, ws, n, rows, int(f))
     if (blk >= 0l) {
         vk_bake_collect(int(f), woff, n, rows, wq, ws)
@@ -791,6 +1189,85 @@ def private resident_place(t : Model; f : KqFmt; woff : int64; n, rows : int64;
     delete wq
     delete ws
     return blk
+}
+
+//! a routed layer's expert triple: placed in the arena, or -1 blocks where the host serves them
+def private resident_place_experts_or_host(t : Model; l : int64; host_experts : bool; mr, kg, wb : int64) : tuple<be1 : int64; be3 : int64; be2 : int64> {
+    if (host_experts) {
+        return (be1 = -1l, be3 = -1l, be2 = -1l)
+    }
+    let eb = resident_place_experts(t, l, mr, kg, wb)
+    return (be1 = (eb.be1 < 0l || eb.be3 < 0l || eb.be2 < 0l) ? -1l : eb.be1, be3 = eb.be3, be2 = eb.be2)
+}
+
+//! "" when the seats took every hyper-connection plane, else the decline reason
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command"), arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head")]
+def private resident_upload_hc(t : Model; nextn : bool; mr, kg, wb : int64) : string {
+    let c = t.config
+    let dim = c.dim
+    let hc = c.hc_count
+    let hcd = hc_dim(c)
+    let lr = c.hc_low_rank
+    let n_sites = 2l * (c.n_layers + (nextn ? 1l : 0l))
+    var norm_rows : array<float>
+    norm_rows |> reserve(n_sites * hcd)
+    norm_rows |> resize(n_sites * hcd)
+    for (i in range64(n_sites * hcd)) {
+        norm_rows[i] = t.fblob[t.hc_norm_off + i]
+    }
+    var inject_rows : array<float>
+    inject_rows |> reserve(n_sites * hc * hcd)
+    inject_rows |> resize(n_sites * hc * hcd)
+    for (i in range64(n_sites * hc * hcd)) {
+        inject_rows[i] = t.fblob[t.hc_inject_off + i]
+    }
+    let head_norm <- [for (i in range64(hcd)); t.fblob[t.hc_head_norm_off + i]]
+    var down_blks : array<int64>
+    var up_blks : array<int64>
+    down_blks |> reserve(n_sites)
+    up_blks |> reserve(n_sites)
+    for (site in range64(n_sites)) {
+        let bd = resident_place(t, KqFmt.q8, t.hc_down_offs[site], hcd, lr, mr, kg, wb)
+        let bu = resident_place(t, KqFmt.q8, t.hc_up_offs[site], lr, hcd, mr, kg, wb)
+        if (bd < 0l || bu < 0l) return "arena placement failed at mixer site {site} (the hyper-connection planes)"
+        down_blks |> push(bd)
+        up_blks |> push(bu)
+    }
+    let bhd = resident_place(t, KqFmt.q8, t.hc_head_down_off, hcd, lr, mr, kg, wb)
+    let bhu = resident_place(t, KqFmt.q8, t.hc_head_up_off, lr, hcd, mr, kg, wb)
+    if (bhd < 0l || bhu < 0l) return "arena placement failed at the head mixer (the hyper-connection planes)"
+    let mtp_norm <- [for (i in range64(nextn ? hcd : 0l)); t.fblob[t.mtp_hc_head_norm_off + i]]
+    let hnorm_rows <- [for (i in range64(nextn ? hcd : 0l)); t.fblob[t.mtp_hnorm_off + i]]
+    var bmd = -1l
+    var bmu = -1l
+    if (nextn) {
+        bmd = resident_place(t, KqFmt.q8, t.mtp_hc_head_down_off, hcd, lr, mr, kg, wb)
+        bmu = resident_place(t, KqFmt.q8, t.mtp_hc_head_up_off, lr, hcd, mr, kg, wb)
+        if (bmd < 0l || bmu < 0l) return "arena placement failed at the NextN head's head mixer (the hyper-connection planes)"
+    }
+    if (!rdec_set_hc(hc, lr, n_sites, norm_rows, inject_rows, down_blks, up_blks, head_norm, bhd, bhu, mtp_norm, bmd, bmu, hnorm_rows)) {
+        return "the hyper-connection seats declined (the tier's line above)"
+    }
+    if (has_ple_ngram(c)) {
+        let ind = ple_in_dim(c)
+        let kern = c.ple_conv_kernel
+        let bkey = resident_place(t, KqFmt.q8, t.ple_key_off, ind, hcd, mr, kg, wb)
+        let bval = resident_place(t, KqFmt.q8, t.ple_val_off, ind, dim, mr, kg, wb)
+        if (bkey < 0l || bval < 0l) return "arena placement failed at the n-gram side input's planes"
+        var side_norms : array<float>
+        side_norms |> reserve(3l * hcd)
+        side_norms |> resize(3l * hcd)
+        for (i in range64(hcd)) {
+            side_norms[i] = t.fblob[t.ple_nkey_off + i]
+            side_norms[hcd + i] = t.fblob[t.ple_nquery_off + i]
+            side_norms[2l * hcd + i] = t.fblob[t.ple_nconv_off + i]
+        }
+        let taps <- [for (i in range64(hcd * kern)); t.fblob[t.ple_conv_off + i]]
+        if (!rdec_set_ngram(c.ple_layer, ind, ple_hist_rows(c), kern, c.ple_ngram_size, bkey, bval, side_norms, taps)) {
+            return "the n-gram side input's seats declined (the tier's line above)"
+        }
+    }
+    return ""
 }
 
 let private RDEC_PLE_TBL_PIECE_ROWS = 65_536l   //! a token-table piece: 65536 rows of the E4B's 10752 stay under the host gather's 2 GB array
@@ -838,6 +1315,7 @@ def private name_list_add(var names : string&; on : bool; name : string) {
 
 //! The model features the whole-model driver has no arm for, as a comma-separated list; "" when
 //! it serves every feature the config carries. The list is the decline reason a user reads.
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command")]
 def resident_unserved_features(c : Config) : string {
     var names = ""
     name_list_add(names, c.attn_qkv_bias && !rdec_bias_installed(), "attention qkv bias")
@@ -852,11 +1330,14 @@ def resident_unserved_features(c : Config) : string {
     name_list_add(names, c.q_gated && !c.qk_norm, "gated attention without qk-norm")
     name_list_add(names, c.rope_dim > 0l && c.rope_dim != c.head_size && !c.qk_norm, "partial rotary ({c.rope_dim} of {c.head_size}) without qk-norm")
     if (c.n_expert > 0l) {
+        let host = resident_host_experts(c)
         name_list_add(names, c.moe_gate != MoeGate.softmax && c.moe_gate != MoeGate.softmax_weight, "a {c.moe_gate} router")
         name_list_add(names, c.moe_exp_probs, "an expert selection bias")
-        name_list_add(names, c.n_expert > 256l, "{c.n_expert} experts (the select kernels reach 256)")
+        name_list_add(names, !host && c.n_expert > 256l, "{c.n_expert} experts (the select kernels reach 256)")
         name_list_add(names, c.n_expert_used > 64l, "{c.n_expert_used} routed experts (the slot metas hold 64)")
     }
+    name_list_add(names, c.hyper_conn && !rdec_hc_installed(), "hyper-connection residual (qwen4exp) - the tier installed no hyper-connection seats")
+    name_list_add(names, c.hyper_conn && c.n_expert == 0l, "hyper-connection residual on a dense model (the chain serves the routed form)")
     return names
 }
 
@@ -902,17 +1383,19 @@ def resident_layer_decline(t : Model; l : int64) : string {
         let fe1 = rdec_efmt(t, t.we1_fmt, l)
         let fe3 = rdec_efmt(t, t.we3_fmt, l)
         let fe2 = rdec_efmt(t, t.we2_fmt, l)
-        if (c.moe_exps_bias && kq_sb(fe2)) {
-            return "layer {l}'s biased expert stacks feed a K-quant down plane ({int(fe2)}) - the biased act has no Q8_K form"
-        }
-        if (!rdec_moe_ok(int(fe1), int(fe3), int(fe2))) {
-            return "layer {l}'s expert formats {int(fe1)}/{int(fe3)}/{int(fe2)} are outside the resident MoE block's tile family (the f16-fed cm2 tiles, or the KHR tile in mm mode)"
-        }
-        if (kq_sb(fe1) != kq_sb(fe3)) {
-            return "layer {l}'s expert gate and up stacks mix activation-quant forms ({int(fe1)}/{int(fe3)}) - one feed serves both"
-        }
-        if (!kq_rows_ok(c.n_ff_exp, fe2)) {
-            return "layer {l}'s expert width {c.n_ff_exp} is not a block multiple of its down plane's format {int(fe2)}"
+        if (!resident_host_experts(c)) {   //! the host's routed chain reads the CPU planes in any format
+            if (c.moe_exps_bias && kq_sb(fe2)) {
+                return "layer {l}'s biased expert stacks feed a K-quant down plane ({int(fe2)}) - the biased act has no Q8_K form"
+            }
+            if (!rdec_moe_ok(int(fe1), int(fe3), int(fe2))) {
+                return "layer {l}'s expert formats {int(fe1)}/{int(fe3)}/{int(fe2)} are outside the resident MoE block's tile family (the f16-fed cm2 tiles, or the KHR tile in mm mode)"
+            }
+            if (kq_sb(fe1) != kq_sb(fe3)) {
+                return "layer {l}'s expert gate and up stacks mix activation-quant forms ({int(fe1)}/{int(fe3)}) - one feed serves both"
+            }
+            if (!kq_rows_ok(c.n_ff_exp, fe2)) {
+                return "layer {l}'s expert width {c.n_ff_exp} is not a block multiple of its down plane's format {int(fe2)}"
+            }
         }
         let shexp_why = resident_shexp_decline(t, l)
         if (!empty(shexp_why)) return shexp_why
@@ -1073,12 +1556,13 @@ def private log_resident_image(planes : array<tuple<n : int64; rows : int64; f :
 //! Reserve arenas + place every dense plane + wire the resident decode driver. Returns false (and
 //! leaves the driver unarmed) if the model is not a servable dense shape or does not fit at seq_cap;
 //! every decline logs its reason through `rdec_decline`.
-[arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]
+[arch(at="../ARCHITECTURE_GPU.md#gpu-backends"), arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command")]
 def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentPlan) : bool {   // nolint:STYLE037,STYLE038 — all-or-nothing arm: one reject per unsupported family feature, no seam
     rdec_set_active(false)
     g_rdec_emb_gpu = false
     rdec_ple_proj_set(false)
     g_rdec_pass_said |> clear()
+    g_rdec_head_warm_decline_said = false
     set_gpu_cpu_pass_reasons([for (k in type<RdecPass>); "{k}"], [for (k in type<RdecPass>); rdec_pass_words(k)])
     vulkan_bake_role(VkBakeRole.arena)
     if (!moe_gpu_resident_installed()) return rdec_decline("the tier installed no resident-driver seams")
@@ -1103,6 +1587,9 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentP
         }
     }
     if (n_attn == 0l) return rdec_decline("no attention layer (the whole-model driver serves attention or hybrid stacks)")
+    let host_layers = plan.host_layers
+    let host_experts = host_layers > 0l
+    if (c.hyper_conn && g_rdec_regions_want > 1l) return rdec_decline("hyper-connection residual (qwen4exp) - the split token command serves one mirror region")
     let n_recurrent = c.n_layers - n_attn
     let dim = c.dim
     let neox = c.rope_neox
@@ -1123,17 +1610,19 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentP
             mir_elems += seq_cap * layer_kv_dim(c, l)
         }
     }
+    let head_why = c.n_layer_nextn > 0l ? resident_head_decline(t) : ""
+    let head = c.n_layer_nextn > 0l && empty(head_why)
+    if (!empty(head_why)) {
+        to_log(LOG_WARNING, "dasLLAMA: resident driver - the NextN draft head stays off the device ({head_why}); the CPU draft serves\n")
+    }
+    let head_kv_elems = head ? seq_cap * layer_kv_dim(c, c.n_layers) : 0l
+    mir_elems += head_kv_elems
     let cos_elems = resident_cos_elems(c)
     let dng = rdec_dn_geom(t)
     // tally arena blocks per format
     var need : table<int; int64>
-    var planes <- resident_planes(t, dng, plan.ple_tbl_bytes > 0l)
-    var n_moe = 0l
-    for (l in range64(c.n_layers)) {
-        if (layer_is_moe(t, l)) {
-            n_moe++
-        }
-    }
+    var planes <- resident_planes(t, dng, plan.ple_tbl_bytes > 0l, host_layers)
+    let n_moe = resident_moe_layers(t)
     for (pl in planes) {
         if (!kq_rows_ok(pl.n, pl.f)) {
             let why = "a fmt {int(pl.f)} plane's row length {pl.n} is not a block multiple"   // pl refers into planes: read it before the delete
@@ -1162,11 +1651,16 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentP
     let rot = resident_rot(c)
     if (!rdec_prepare(c.n_layers, n_attn, dim, qd, kvd, hs, c.n_heads, resident_hidden(t), c.vocab_size, seq_cap, neox,
                       c.norm_eps, c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(hs)), c.qk_norm,
-                      rkdt == KVDtype.f16, c.q_gated, rot, dng, mir_elems, cos_elems, g_rdec_regions_want)) {
+                      rkdt == KVDtype.f16, c.q_gated, rot, dng, mir_elems, cos_elems, g_rdec_regions_want, rdec_carry_planned(c), head, head ? rdec_verify_rows_want(t) : 0l)) {
         return rdec_decline("the device prepare declined (a kernel class or the mirror range - the tier's line above)")
     }
     rdec_note_weight_bytes(plan.weight_bytes)
     let sh_gated = c.n_ff_shexp > 0l && c.moe_shexp_gated
+    if (host_experts) {
+        rdec_set_host_experts(true)
+        let which = host_layers == n_moe ? "the {n_moe} routed layers' experts" : "the first {host_layers} of {n_moe} routed layers' experts"
+        to_log(LOG_INFO, "dasLLAMA: resident driver - {which} serve on the host: the token command splits at each such block, the device holds every other plane\n")
+    }
     if (n_moe > 0l && !resident_prepare_moe(t, n_moe, sh_gated)) {
         return rdec_decline("the MoE seats declined (the tier's line above)")
     }
@@ -1276,8 +1770,9 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentP
             }
             rec_idx++
             if (moe) {
-                let eb = resident_place_experts(t, l, mr, kg, wb)
-                if (eb.be1 < 0l || eb.be3 < 0l || eb.be2 < 0l) return rdec_decline("arena placement failed at recurrent layer {l} (the expert stacks)")
+                let is_host_layer = router_slot < host_layers
+                let eb = resident_place_experts_or_host(t, l, is_host_layer, mr, kg, wb)
+                if (eb.be1 < 0l && !is_host_layer) return rdec_decline("arena placement failed at recurrent layer {l} (the expert stacks)")
                 rdec_set_moe_experts(l, router_slot, eb.be1, eb.be3, eb.be2, int(rdec_efmt(t, t.we1_fmt, l)), int(rdec_efmt(t, t.we3_fmt, l)), int(rdec_efmt(t, t.we2_fmt, l)))
                 router_slot++
             }
@@ -1299,8 +1794,9 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentP
         // a placement can fail (arena exhausted); fail closed to the CPU loop rather than wire a -1 block
         if (bq < 0l || (!kvsh && bk < 0l) || (!g.vfk && !kvsh && bv < 0l) || bo < 0l) return rdec_decline("arena placement failed at layer {l}")
         if (moe) {
-            let eb = resident_place_experts(t, l, mr, kg, wb)
-            if (eb.be1 < 0l || eb.be3 < 0l || eb.be2 < 0l) return rdec_decline("arena placement failed at layer {l} (the expert stacks)")
+            let is_host_layer = router_slot < host_layers
+            let eb = resident_place_experts_or_host(t, l, is_host_layer, mr, kg, wb)
+            if (eb.be1 < 0l && !is_host_layer) return rdec_decline("arena placement failed at layer {l} (the expert stacks)")
             rdec_set_moe_layer(l, mir_idx, router_slot, bq, bk, bv, bo, b1, b3, b2, eb.be1, eb.be3, eb.be2,
                 int(lf.fq), int(lf.fk), int(lf.fv), int(lf.fo), int(lf.f1), int(lf.f3), int(lf.f2),
                 int(rdec_efmt(t, t.we1_fmt, l)), int(rdec_efmt(t, t.we3_fmt, l)), int(rdec_efmt(t, t.we2_fmt, l)), g)
@@ -1343,10 +1839,31 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentP
     let bcls = resident_place(t, cls_fmt, t.wcls_off, dim, c.vocab_size, mr, kg, wb)
     if (bcls < 0l) return rdec_decline("classifier placement failed")
     rdec_set_cls(bcls, int(cls_fmt), c.final_logit_softcap, t.suppress)
-    //! a per-layer-embedding model keeps the CPU embed unless its token table sits on the device too: the pre-step wants both gathers in one place
-    let emb_q8_want = (g_env_vulkan.vk_gpu_embed && rdec_prefill_ids_installed() && (!has_ple(c) || (ple_tbl_placed && rdec_ple_proj_on()))
-        && c.shared_weights && t.cls_q8 && cls_fmt == KqFmt.q8)
-    let emb_f32_want = (g_env_vulkan.vk_gpu_embed && rdec_prefill_ids_installed() && (!has_ple(c) || (ple_tbl_placed && rdec_ple_proj_on()))
+    if (c.hyper_conn) {
+        let hc_why = resident_upload_hc(t, head, mr, kg, wb)
+        if (!empty(hc_why)) return rdec_decline(hc_why)
+    }
+    g_rdec_experts_host = host_experts
+    g_rdec_host_layers = host_layers
+    if (host_experts && !c.hyper_conn) {
+        set_rdec_host_rows(@@rdec_host_experts_rows)
+    }
+    if (host_experts) {
+        g_rdec_trace_header = (layers = int(resident_routed_layers(t)), experts = int(c.n_expert), k = int(c.n_expert_used))
+        if (!empty(g_env_gpu.moe_trace)) {
+            to_log(LOG_INFO, "dasLLAMA: DASLLAMA_MOE_TRACE - the routed picks of every host expert step record to {g_env_gpu.moe_trace}\n")
+        }
+        g_rdec_trace_header_written = false
+        resident_hot_arm(t, plan)
+    }
+    if (head) {
+        resident_place_head(t, mir_base, head_kv_elems * g_rdec_regions_want * (rkdt == KVDtype.f16 ? 2l : 4l) * 2l, mr, kg, wb)
+    }
+    //! a per-layer-embedding model keeps the CPU embed unless its token table sits on the device too: the pre-step wants both gathers in one
+    //! place; a hyper-connection model keeps it too - its window chain reads the pre-step's rows, never token ids
+    let emb_dev_ok = g_env_vulkan.vk_gpu_embed && rdec_prefill_ids_installed() && !c.hyper_conn && (!has_ple(c) || (ple_tbl_placed && rdec_ple_proj_on()))
+    let emb_q8_want = emb_dev_ok && c.shared_weights && t.cls_q8 && cls_fmt == KqFmt.q8
+    let emb_f32_want = (emb_dev_ok
         && !t.emb_q8 && !cls_kq(t) && !t.planes_trimmed   // an untied q8 table has no f32 copy to upload: the CPU embed loop serves it
         && plan.emb_f32_bytes > 0l)   // the plan counted it at this context
     var emb_q8_placed = false
@@ -1367,16 +1884,17 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentP
         }
     }
     g_rdec_emb_gpu = emb_q8_placed || emb_f32_placed
-    //! past the layers' RDEC_NORM_ROWS rows: rms_final, then qk_norm's per-head [rms_q, rms_k] x L at the widest class's stride
     var norms : array<float>
-    let norms_len = c.n_layers * RDEC_NORM_ROWS * dim + dim + (c.qk_norm ? c.n_layers * 2l * hs : 0l)
+    let norms_len = rdec_norms_len(c.n_layers, dim, c.qk_norm ? hs : 0l, head)
     norms |> reserve(norms_len)
     norms |> resize(norms_len)
     for (l in range64(c.n_layers)) {
         let lb = l * RDEC_NORM_ROWS * dim
-        for (i in range64(dim)) {
-            norms[lb + i] = t.fblob[t.rms_att_off + l * dim + i]
-            norms[lb + dim + i] = t.fblob[t.rms_ffn_off + l * dim + i]
+        if (!c.hyper_conn) {
+            for (i in range64(dim)) {
+                norms[lb + i] = t.fblob[t.rms_att_off + l * dim + i]
+                norms[lb + dim + i] = t.fblob[t.rms_ffn_off + l * dim + i]
+            }
         }
         if (c.pre_post_norm) {
             for (i in range64(dim)) {
@@ -1404,12 +1922,14 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentP
             }
         }
     }
-    for (i in range64(dim)) {
-        norms[c.n_layers * RDEC_NORM_ROWS * dim + i] = t.fblob[t.rms_final_off + i]
+    if (!c.hyper_conn) {
+        for (i in range64(dim)) {
+            norms[c.n_layers * RDEC_NORM_ROWS * dim + i] = t.fblob[t.rms_final_off + i]
+        }
     }
     if (c.qk_norm) {
         let qkw = c.n_layers * RDEC_NORM_ROWS * dim + dim
-        for (l in range64(c.n_layers)) {
+        for (l in range64(c.n_layers + (head ? 1l : 0l))) {
             continue if (layer_is_recurrent(c, l))   // no q/k norm rows on a recurrent layer; its slots stay zero
             for (i in range64(layer_head_size(c, l))) {
                 norms[qkw + l * 2l * hs + i] = t.fblob[t.rms_q_offs[l] + i]
@@ -1418,6 +1938,9 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentP
                 }
             }
         }
+    }
+    if (head) {
+        resident_head_norm_rows(t, rdec_head_norm_base(c.n_layers, dim, c.qk_norm ? hs : 0l), norms)
     }
     rdec_upload_norms(norms, c.attn_out_bias)
     delete norms
@@ -1438,6 +1961,51 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype; plan : ResidentP
     return true
 }
 
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head"), arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head")]
+def private resident_place_head(t : Model; mir_base, slot_bytes, mr, kg, wb : int64) {
+    let c = t.config
+    let l = c.n_layers
+    var inscope planes <- resident_head_planes(t)
+    var inscope blks : array<int64>
+    blks |> reserve(long_length(planes))
+    var plane_bytes = 0l
+    for (pl in planes) {
+        let blk = resident_place(t, pl.f, pl.off, pl.n, pl.rows, mr, kg, wb)
+        if (blk < 0l) {
+            to_log(LOG_WARNING, "dasLLAMA: resident driver - the NextN draft head stays off the device (an arena placement failed on its {pl.f} plane {pl.n} x {pl.rows}); the CPU draft serves\n")
+            return
+        }
+        blks |> push(blk)
+        plane_bytes += moe_gpu_plane_bytes(pl.n, pl.rows, int(pl.f))
+    }
+    let lf = resident_head_fmts(t)
+    if (!rdec_set_head(blks[0], int(planes[0].f), blks[1], blks[2], blks[3], blks[4], blks[5], blks[6], blks[7],
+            int(lf.fq), int(lf.fk), int(lf.fv), int(lf.fo), int(lf.f1), int(lf.f3), int(lf.f2), resident_layer_geom(t, l, mir_base))) {
+        to_log(LOG_WARNING, "dasLLAMA: resident driver - the NextN draft head stays off the device (the device declined its classes, the tier's line above); the CPU draft serves\n")
+        return
+    }
+    if (resident_head_routed(t)) {
+        var slot = 0l
+        for (i in range64(c.n_layers)) {
+            slot += layer_is_moe(t, i) ? 1l : 0l
+        }
+        rdec_set_moe_experts(l, slot, -1l, -1l, -1l, int(rdec_efmt(t, t.we1_fmt, l)), int(rdec_efmt(t, t.we3_fmt, l)), int(rdec_efmt(t, t.we2_fmt, l)))
+    }
+    to_log(LOG_INFO, "dasLLAMA: resident driver - the NextN draft head in the arena ({plane_bytes >> 10l} KB of planes, a {slot_bytes >> 10l} KB K/V slot over every region): the draft runs on the device\n")
+}
+
+def private resident_head_norm_rows(t : Model; hb : int64; var norms : array<float>) {
+    let c = t.config
+    let dim = c.dim
+    let l = c.n_layers
+    let head_out = t.mtp_headnorm_off >= 0l ? t.mtp_headnorm_off : t.rms_final_off
+    copy_floats(t.fblob, t.rms_att_off + l * dim, norms, hb + RDEC_HEAD_ATT * dim, dim)
+    copy_floats(t.fblob, t.rms_ffn_off + l * dim, norms, hb + RDEC_HEAD_FFN * dim, dim)
+    copy_floats(t.fblob, t.mtp_enorm_off, norms, hb + RDEC_HEAD_ENORM * dim, dim)
+    copy_floats(t.fblob, t.mtp_hnorm_off, norms, hb + RDEC_HEAD_HNORM * dim, dim)
+    copy_floats(t.fblob, head_out, norms, hb + RDEC_HEAD_OUT * dim, dim)
+}
+
 [arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan"), arch(at="../ARCHITECTURE_GPU_VULKAN_MOE.md#resident-moe-token")]
 def private resident_prepare_moe(t : Model; n_moe : int64; sh_gated : bool) : bool {
     let c = t.config
@@ -1448,7 +2016,7 @@ def private resident_prepare_moe(t : Model; n_moe : int64; sh_gated : bool) : bo
     router |> reserve(n_moe * ner * dim)
     router |> resize(n_moe * ner * dim)
     var li = 0l
-    for (l in range64(c.n_layers)) {
+    for (l in range64(resident_routed_layers(t))) {
         continue if (!layer_is_moe(t, l))
         unsafe {
             memcpy(addr<void?>(router[li * ner * dim]), addr<void?>(t.fblob[t.router_off + l * ne * dim]), ne * dim * 4l)
@@ -1482,7 +2050,7 @@ def private resident_prepare_moe(t : Model; n_moe : int64; sh_gated : bool) : bo
         dbias |> reserve_resize(n_moe * ne * dim)
     }
     var bi = 0l
-    for (l in range64(c.n_layers)) {
+    for (l in range64(resident_routed_layers(t))) {
         continue if (!layer_is_moe(t, l))
         if (c.moe_router_bias) {
             copy_floats(t.fblob, t.router_b_off + l * ne, rbias, bi * ne, ne)
@@ -1563,12 +2131,10 @@ var private g_rdec_picks_served = 0l
 //! the rows whose argmax the device landed alone this process: a cell reads the difference across its steps
 def public rdec_picks_served() : int64 => g_rdec_picks_served
 
-//! a landed pick into the session: the next sample_ returns it (a row that landed its logits, -1, leaves the sampler to them)
+//! a landed pick into the session (`land_pick`), counted: the next sample_ returns it (a row that landed its logits, -1, leaves the sampler to them)
 def private rdec_land_pick(var s : Session; pick : int64) {
     if (pick >= 0l) {
-        verify(!s.pick_ready, "dasLLAMA resident: a session's landed pick was never sampled before its next step - engine bug")
-        s.pick_tok = pick
-        s.pick_ready = true
+        land_pick(s, pick)
         g_rdec_picks_served++
     }
 }
@@ -1588,9 +2154,9 @@ var private @scratch g_rdec_cnts : array<int64>
 var private @scratch g_rdec_regs : array<int64>
 
 // per-token scratch rows (capacity-retained; the driver is single-resident by the arbiter)
-var private @scratch g_rdec_x : array<float>
-var private @scratch g_rdec_cossin : array<float>
-var private @scratch g_rdec_tmp : array<float>
+var private @scratch @exact_size g_rdec_x : array<float>
+var private @scratch @exact_size g_rdec_cossin : array<float>
+var private @scratch @exact_size g_rdec_tmp : array<float>
 
 // why a resident override handed a call back to the CPU rails; each kind is said once per armed model
 enum private RdecPass {
@@ -1604,6 +2170,9 @@ enum private RdecPass {
     pinned_off
     rewind
     busy
+    unhomed
+    verify_rows
+    verify_window
 }
 
 var private g_rdec_pass_said : table<int>
@@ -1653,6 +2222,9 @@ def private rdec_pass_words(kind : RdecPass) : string {
     if (kind == RdecPass.span) return "the prompt carried an image or audio span"
     if (kind == RdecPass.rewind) return "the stream stepped back in a conversation the GPU only steps forward"
     if (kind == RdecPass.busy) return "every GPU cache slot was held by a live stream"
+    if (kind == RdecPass.unhomed) return "the stream's cache never reached the GPU"
+    if (kind == RdecPass.verify_rows) return "the GPU checks fewer drafted tokens at once than the stream drafted"
+    if (kind == RdecPass.verify_window) return "the speculative round's CPU verify window: the head runs on the CPU, the trunk's rows stay on the device"
     if (kind == RdecPass.pinned_off) return "a prompt was read on the CPU: the server keeps host-cached streams off the GPU's prompt path"
     return "{kind}"
 }
@@ -1678,6 +2250,12 @@ def private rdec_pass_text(kind : RdecPass; a, b : int64) : string {
         why = "position {a} is not the deltanet state's next position {b} (the recurrent state is forward-only)"
     } elif (kind == RdecPass.busy) {
         why = "all {a} mirror regions hold a live device-home session"
+    } elif (kind == RdecPass.unhomed) {
+        why = "the session holds no mirror region (its history never came to the device), so the NextN head has no slot to draft in"
+    } elif (kind == RdecPass.verify_rows) {
+        why = "the speculative verify's {a} rows pass the {b} rows the driver's same-slab verify steps at once (0: the NextN head or an N-column leaf is off the device - the lines above name it)"
+    } elif (kind == RdecPass.verify_window) {
+        why = "the CPU verify's two-row window: the round reads its rows on the host, so the resident prefill leaves the window to the CPU rails and the trunk's rows on the device"
     } else {
         why = "the resident prefill is pinned off (a multi-stream scheduler owns the sessions)"
     }
@@ -1723,6 +2301,380 @@ def private rdec_dn_own_all(var s : Session; n_layers : int64) {
 
 var private @scratch g_rdec_one_tok : array<int64>   //! the token's id as the gather's one-row list
 
+//! the plan carries the landing's planes: a NextN head and the tier's landing, whatever the knob says at the load
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-spec-knob-gate")]
+def private rdec_carry_planned(c : Config) : bool => c.n_layer_nextn > 0l && rdec_carry_installed()
+
+//! the carry lands this step: the planned landing and the speculative round on - the knob read per step, so a round switched off pays no carry
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-spec-knob-gate")]
+def private rdec_carry_on(c : Config) : bool => rdec_carry_planned(c) && get_mtp_spec()
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#logits-transfer-queue")]
+def private rdec_stash_carry(c : Config; var s : Session; row, pos1 : int64) {
+    return if (!rdec_carry_on(c) || s.device_kv)
+    rdec_land_carry(row, s.mtp_h)
+    s.mtp_h_pos1 = pos1
+}
+
+var private g_rdec_drafts = 0l
+var private g_rdec_draft_pick = -1l
+
+//! How many NextN drafts the resident driver's head served in this process (a cell's served witness)
+def moe_gpu_resident_drafts() : int64 => g_rdec_drafts
+
+//! The last device draft's pick, the argmax of the logits it landed (-1 before the first)
+def moe_gpu_resident_draft_pick() : int64 => g_rdec_draft_pick
+
+[hot_path]   // per speculative round, reached through the engine's registered seat owner
+def private vulkan_mtp_owns(t : Model) : bool => g_rdec_active && t.config.n_layer_nextn > 0l
+
+def private rdec_head_device_rows_stale_from(s : Session; row : int64) {
+    if (rdec_owns(s, s.rdec_region)) {
+        g_rdec_regions[s.rdec_region].head_cnt = clamp(row, 0l, g_rdec_regions[s.rdec_region].head_cnt)
+    }
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head")]
+def private rdec_head_device_wrote(r, row0, row1 : int64) {
+    g_rdec_regions[r].head_cnt = row1
+    g_rdec_regions[r].head_host = min(g_rdec_regions[r].head_host, row0)
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head")]
+def private rdec_head_host_writes(s : Session; row0, row1 : int64) {
+    return if (!rdec_owns(s, s.rdec_region))
+    rdec_head_device_rows_stale_from(s, row0)
+    if (g_rdec_regions[s.rdec_region].head_host >= row0) {
+        g_rdec_regions[s.rdec_region].head_host = row1
+    }
+}
+
+def private rdec_head_rows_cut(s : Session; row : int64) {
+    return if (!rdec_owns(s, s.rdec_region))
+    rdec_head_device_rows_stale_from(s, row)
+    g_rdec_regions[s.rdec_region].head_host = min(g_rdec_regions[s.rdec_region].head_host, row)
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head")]
+def private rdec_head_hydrate(t : Model; var s : Session; upto : int64) {
+    return if (s.device_kv || !rdec_owns(s, s.rdec_region))
+    let r = s.rdec_region
+    let hi = min(g_rdec_regions[r].head_cnt, upto)
+    let lo = g_rdec_regions[r].head_host
+    return if (lo >= hi)
+    let c = t.config
+    rdec_select_region(r)
+    rdec_head_read_rows(lo, hi - lo, kv_layer_kbase(s, c.n_layers, c.seq_len), kv_layer_vbase(s, c.n_layers, c.seq_len))
+    g_rdec_regions[r].head_host = hi
+}
+
+//! The NextN head's K/V rows the device holds in the region `s` owns (-1 where it owns none)
+def moe_gpu_resident_head_rows(s : Session) : int64 => rdec_owns(s, s.rdec_region) ? g_rdec_regions[s.rdec_region].head_cnt : -1l
+
+//! ... and the head's rows the host cache holds as the session's: the device's rows past them come down on a pass (-1 where it owns none)
+def moe_gpu_resident_head_host_rows(s : Session) : int64 => rdec_owns(s, s.rdec_region) ? g_rdec_regions[s.rdec_region].head_host : -1l
+
+var private g_rdec_head_warm_decline_said = false   //! the latch its callers test: the say runs on the first decline alone
+
+[cold_path]
+def private rdec_head_warm_decline_say(reason : string) {
+    g_rdec_head_warm_decline_said = true
+    to_log(LOG_WARNING, "dasLLAMA: resident prefill - the NextN head's prompt rows are not warmed on the device ({reason}); the draft's acceptance may dip until the round rewrites them\n")
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-head-prompt-warm")]
+def private rdec_head_warm_want(t : Model) : bool {
+    let c = t.config
+    return false if (!get_mtp_spec() || c.n_layer_nextn <= 0l || !rdec_head_warm_installed())
+    if (c.embed_scale != 1.0) {
+        if (!g_rdec_head_warm_decline_said) {
+            rdec_head_warm_decline_say("the chain's embed rows carry the model's embed scale, and the head reads them unscaled")
+        }
+        return false
+    }
+    return true
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-head-prompt-warm")]
+def private rdec_prefill_head_rows(t : Model; var s : Session; r, npos, start_pos : int64) {
+    let c = t.config
+    return if (c.n_layer_nextn <= 0l || s.device_kv)
+    let rows = rdec_head_warm_rows()
+    if (rows <= 0l) {
+        if (!g_rdec_head_warm_decline_said && rdec_head_warm_want(t)) {
+            rdec_head_warm_decline_say("the head is off the device, so the chain wrote no head row")
+        }
+        return
+    }
+    if (rows != npos - 1l) {
+        panic("dasLLAMA resident prefill: the chain warmed {rows} head rows for a {npos}-row prompt - engine bug")
+    }
+    let l = c.n_layers
+    var kp = kv_layer_kbase(s, l, c.seq_len)
+    var vp = kv_layer_vbase(s, l, c.seq_len)
+    let held = g_rdec_regions[r].head_cnt
+    rdec_head_hydrate(t, s, held)   // the device's rows the host never saw come down first: the count below claims no row nobody wrote
+    if (held < start_pos) {
+        rdec_head_sync_rows(held, start_pos - held, kp, vp)
+    }
+    rdec_head_read_rows(start_pos, rows, kp, vp)
+    g_rdec_regions[r].head_cnt = start_pos + rows
+    g_rdec_regions[r].head_host = start_pos + rows
+}
+
+[cold_path]
+def private rdec_nonfinite_panic(what : string; row, idx : int64; v : float) {
+    panic("dasLLAMA resident {what}: the device landed non-finite logits at row {row} (logit {idx} reads {v}) - a poisoned head or trunk row reached the classifier")
+}
+
+//! the landed row's pick and its logit 0 are finite: logit 0 is the host argmax's seed, so a NaN there is where the host and the device would part
+def private rdec_landed_finite(logits : array<float>; off, pick : int64; what : string; row : int64) {
+    if (!is_finite(logits[off + pick])) {
+        rdec_nonfinite_panic(what, row, pick, logits[off + pick])
+    }
+    if (!is_finite(logits[off])) {
+        rdec_nonfinite_panic(what, row, 0l, logits[off])
+    }
+}
+
+[hot_path, arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head")]   //! per speculative round
+def private vulkan_resident_draft(t : Model; var s : Session; token, row : int64; pick_only : bool) : int64 {
+    let pick = vulkan_resident_draft_go(t, s, token, row, pick_only)
+    if (pick < 0l) {
+        rdec_head_hydrate(t, s, row)
+        rdec_head_host_writes(s, row, row + 1l)
+    }
+    return pick
+}
+
+//! the session's cache is the mirror's shape - the armed codec, unpaged - else the pass is counted and the call is the CPU's
+def private rdec_session_codec_ok(s : Session) : bool {
+    if (s.kv_dtype_k != g_rdec_kvdt || s.kv_dtype_v != g_rdec_kvdt) {
+        rdec_pass_once(RdecPass.codec, int64(int(s.kv_dtype_k)), int64(int(s.kv_dtype_v)))
+        return false
+    }
+    if (s.kv_pool != null) {
+        rdec_pass_once(RdecPass.paged, 0l, 0l)
+        return false
+    }
+    return true
+}
+
+//! the region a head seat (`what`: the draft or the verify) serves `s` in through row `end`, or -1 with the pass counted -
+//! the draft's and the verify's shared decline ladder, every rung of it before any state moves
+def private rdec_head_seat_region(s : Session; what : string; end : int64) : int64 {
+    if (s.device_kv) {
+        panic("dasLLAMA resident {what}: a device-home session keeps no host K/V rows for the NextN head - the speculative round serves host-cached sessions")
+    }
+    return -1l if (!rdec_session_codec_ok(s))
+    if (end > g_rdec_cap) {
+        rdec_pass_once(RdecPass.cap, end, g_rdec_cap)
+        return -1l
+    }
+    let r = s.rdec_region
+    if (!rdec_owns(s, r)) {
+        rdec_pass_once(s.rdec_gen != 0l ? RdecPass.superseded : RdecPass.unhomed, 0l, 0l)
+        return -1l
+    }
+    return r
+}
+
+def private vulkan_resident_draft_go(t : Model; var s : Session; token, row : int64; pick_only : bool) : int64 {
+    return -1l if (!g_rdec_active || !rdec_draft_installed())
+    let r = rdec_head_seat_region(s, "draft", row + 1l)
+    return -1l if (r < 0l)
+    g_rdec_regions[r].used = ++g_rdec_tick
+    rdec_select_region(r)
+    let c = t.config
+    let l = c.n_layers
+    g_rdec_x |> grow_resize(c.dim)
+    embed_row(t, token, unsafe(addr(g_rdec_x[0])))   // unscaled, as `forward_mtp` embeds
+    g_rdec_cossin |> grow_resize(g_rdec_cos_elems)
+    rdec_rope_rows(t, row, g_rdec_cossin, 0l)
+    g_rdec_hx_t = unsafe(addr(t))
+    g_rdec_hx_s = unsafe(addr(s))
+    let pick = rdec_draft(g_rdec_x, s.mtp_h, g_rdec_cossin, row, min(g_rdec_regions[r].head_cnt, row),
+        kv_layer_kbase(s, l, c.seq_len), kv_layer_vbase(s, l, c.seq_len), pick_only, s.logits, @@rdec_host_experts_step)
+    g_rdec_hx_t = null
+    g_rdec_hx_s = null
+    return -1l if (pick < 0l)
+    if (!pick_only) {
+        rdec_landed_finite(s.logits, 0l, pick, "draft", row)
+    }
+    rdec_land_carry(0l, s.mtp_h)
+    s.mtp_h_pos1 = 0l   // the head's own hidden, not a trunk row: the prefill seam must not consume it
+    rdec_head_device_wrote(r, row, row + 1l)
+    g_rdec_draft_pick = pick
+    g_rdec_drafts++
+    return pick
+}
+
+var private g_rdec_verifies = 0l
+var private @scratch g_rdec_verify_picks : array<int64>
+var private @scratch @exact_size g_rdec_verify_head_embeds : array<float>
+var private @scratch @exact_size g_rdec_verify_head_rope : array<float>
+
+//! How many speculative verifies the resident driver served in this process (a cell's served witness)
+def moe_gpu_resident_verifies() : int64 => g_rdec_verifies
+
+var private g_rdec_experts_host = false
+var private g_rdec_host_layers = 0l
+
+//! the armed model sums some routed layers' experts on the host (a hyper-connection MoE, or a plain MoE the card's room does not hold whole): the split token command's form
+def gpu_resident_experts_host_() : bool => g_rdec_active && g_rdec_experts_host
+
+//! The routed layers of the armed model whose experts serve on the host - the first this many in layer order; 0 = every expert on the device.
+def gpu_resident_host_layers() : int64 => g_rdec_active ? g_rdec_host_layers : 0l
+
+//! the rows the last device verify landed
+def moe_gpu_resident_verify_rows() : int64 => long_length(g_rdec_verify_picks)
+
+//! Row `i`'s pick of the last device verify, the argmax of the logits it landed (-1 past its rows)
+def moe_gpu_resident_verify_pick(i : int64) : int64 => (i >= 0l && i < long_length(g_rdec_verify_picks)) ? g_rdec_verify_picks[i] : -1l
+
+//! The positions the mirror region `s` owns holds (-1 where it owns none): the rows past them are dead
+def moe_gpu_resident_rows(s : Session) : int64 => rdec_owns(s, s.rdec_region) ? g_rdec_regions[s.rdec_region].cnt : -1l
+
+[hot_path, arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command")]   //! per speculative round
+def private vulkan_resident_verify(t : Model; var s : Session; toks : array<int64>; n, pos : int64; pick_only : bool) : bool {
+    let served = vulkan_resident_verify_gated(t, s, toks, n, pos, pick_only)
+    if (!served) {
+        rdec_head_hydrate(t, s, pos)
+        rdec_head_host_writes(s, pos, pos + n - 1l)
+    }
+    return served
+}
+
+def private vulkan_resident_verify_gated(t : Model; var s : Session; toks : array<int64>; n, pos : int64; pick_only : bool) : bool {
+    return false if (!g_rdec_active || !rdec_verify_installed() || !get_mtp_spec())   //! with the knob off the last layer stores no row for the verify to land
+    let r = rdec_head_seat_region(s, "verify", pos + n)
+    return false if (r < 0l)
+    if (pos > g_rdec_regions[r].cnt) {
+        rdec_pass_once(RdecPass.gap, pos, g_rdec_regions[r].cnt)
+        return false
+    }
+    let c = t.config
+    if (c.recr_mask != 0ul && pos != s.dn_pos) {
+        rdec_pass_once(RdecPass.rewind, pos, s.dn_pos)
+        return false
+    }
+    rdec_select_region(r)
+    let rows = rdec_verify_rows()
+    if (n > rows) {
+        rdec_pass_once(RdecPass.verify_rows, n, rows)
+        return false
+    }
+    g_rdec_regions[r].used = ++g_rdec_tick
+    return vulkan_resident_verify_go(t, s, toks, n, pos, r, pick_only)
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-verify-rows")]
+def private vulkan_resident_verify_go(t : Model; var s : Session; toks : array<int64>; n, pos, r : int64; pick_only : bool) : bool {
+    let c = t.config
+    let dim = c.dim
+    let vocab = c.vocab_size
+    let ce = g_rdec_cos_elems
+    kv_ensure(s, pos + n)
+    if (c.recr_mask != 0ul) {
+        if (pos == 0l) {
+            dn_reset(s)
+        }
+        s.dn_pos = pos + n
+        rdec_dn_own_all(s, c.n_layers)
+    }
+    let carry_dim = mtp_h_dim(c)
+    g_rdec_x_n |> grow_resize(dim * n)
+    g_rdec_cos_n |> grow_resize(ce * n)
+    g_rdec_verify_head_embeds |> grow_resize(dim * n)
+    g_rdec_verify_head_rope |> grow_resize(ce * n)
+    for (i in range64(n)) {
+        unsafe {
+            embed_row(t, toks[i], addr(g_rdec_x_n[i * dim]))
+            embed_row(t, toks[i], addr(g_rdec_verify_head_embeds[i * dim]))   // unscaled, as `forward_mtp` embeds
+        }
+        rdec_rope_rows(t, pos + i + s.rope_pos_delta, g_rdec_cos_n, i * ce)
+        rdec_rope_rows(t, pos - 1l + i, g_rdec_verify_head_rope, i * ce)
+    }
+    if (c.embed_scale != 1.0) {
+        scale_inplace(unsafe(addr(g_rdec_x_n[0])), c.embed_scale, dim * n)
+    }
+    if (c.hyper_conn) {
+        mtp_ple_window_snapshot(s)
+        g_rdec_verify_toks |> resize(n)
+        for (i in range64(n)) {
+            g_rdec_verify_toks[i] = toks[i]
+        }
+        if (t.blocks.pre_stack_prefill != null) {
+            invoke(t.blocks.pre_stack_prefill, t, s, toks, n, pos)
+        }
+    }
+    s.mtp_logits_b |> overwrite_resize(n * vocab)   // sized under a pick ask too: a guard step lands the rows' logits for the over-commit check
+    s.mtp_hrows |> overwrite_resize(n * carry_dim)
+    s.mtp_picks |> resize(n)
+    verify(long_length(s.mtp_xb_save) >= carry_dim, "dasLLAMA resident verify: the round saved no pre-draft carry in mtp_xb_save - engine bug")
+    verify(g_rdec_regions[r].head_cnt >= pos - 1l, "dasLLAMA resident verify: the device holds no head rows below the re-warm's first row - the round's draft leaves them there; engine bug")
+    g_rdec_hx_t = unsafe(addr(t))
+    g_rdec_hx_s = unsafe(addr(s))
+    g_rdec_verify_rows_in_flight = true
+    let ok = rdec_verify(g_rdec_x_n, g_rdec_cos_n, g_rdec_verify_head_embeds, g_rdec_verify_head_rope, s.mtp_xb_save, s.ple_emb_b, pos, n, pick_only,
+        s.mtp_logits_b, s.mtp_picks, s.mtp_hrows, @@rdec_host_experts_rows)
+    g_rdec_verify_rows_in_flight = false
+    g_rdec_hx_t = null
+    g_rdec_hx_s = null
+    verify(ok, "dasLLAMA resident verify: the driver declined rows it answered it steps - engine bug")
+    g_rdec_verify_picks |> resize(n)
+    for (i in range64(n)) {
+        g_rdec_verify_picks[i] = s.mtp_picks[i]
+    }
+    if (!pick_only || rdec_verify_landed_logits()) {   // a guard round under the pick ask lands the logits too, and they are checked wherever they land
+        for (i in range64(n)) {
+            rdec_landed_finite(s.mtp_logits_b, i * vocab, s.mtp_picks[i], "verify", pos + i)
+        }
+    }
+    if (!pick_only) {
+        copy_floats(s.mtp_logits_b, 0l, s.mtp_logits, 0l, vocab)
+        copy_floats(s.mtp_logits_b, (n - 1l) * vocab, s.logits, 0l, vocab)
+    }
+    copy_floats(s.mtp_hrows, 0l, s.mtp_h0, 0l, carry_dim)
+    copy_floats(s.mtp_hrows, (n - 1l) * carry_dim, s.mtp_h, 0l, carry_dim)
+    s.mtp_h_pos1 = pos + n
+    g_rdec_regions[r].cnt = pos + n
+    rdec_head_device_wrote(r, pos - 1l, pos + n - 1l)
+    s.rdec_host_current = false   // the mirror advanced past any earlier hydration
+    g_rdec_verifies++
+    return true
+}
+
+var private g_rdec_rollbacks = 0l
+
+//! How many rejected rounds the resident driver rolled back on the device in this process (a cell's served witness)
+def moe_gpu_resident_rollbacks() : int64 => g_rdec_rollbacks
+
+[hot_path, arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback"), arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-verify-rows")]   //! per rejected round
+def private vulkan_resident_rollback(t : Model; var s : Session; pos, a : int64) : bool {
+    return false if (!g_rdec_active || !rdec_rollback_installed())
+    let r = s.rdec_region
+    return false if (!rdec_owns(s, r))
+    rdec_select_region(r)
+    let c = t.config
+    if (c.recr_mask != 0ul) {
+        return false if (!rdec_rollback(a))
+        s.dn_pos = pos + a + 1l
+    }
+    if (c.hyper_conn) {
+        mtp_ple_window_restore(s)
+        if (t.blocks.pre_stack_prefill != null && a + 1l <= long_length(g_rdec_verify_toks)) {
+            invoke(t.blocks.pre_stack_prefill, t, s, g_rdec_verify_toks, a + 1l, pos)
+        }
+    }
+    g_rdec_regions[r].cnt = pos + a + 1l
+    rdec_head_rows_cut(s, pos + a)
+    g_rdec_rollbacks++
+    return true
+}
+
+var private @scratch g_rdec_verify_toks : array<int64>
+
 // the resident whole-stack decode override (registered as "vulkan") — the mirror builds as positions arrive
 [hot_path]   // per token
 def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int64) : bool {
@@ -1737,17 +2689,7 @@ def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int6
 }
 
 def private vulkan_resident_decode_go(t : Model; var s : Session; token, pos : int64) : bool {
-    if (!g_rdec_active) {
-        return false
-    }
-    if (s.kv_dtype_k != g_rdec_kvdt || s.kv_dtype_v != g_rdec_kvdt) {
-        rdec_pass_once(RdecPass.codec, int64(int(s.kv_dtype_k)), int64(int(s.kv_dtype_v)))
-        return false
-    }
-    if (s.kv_pool != null) {
-        rdec_pass_once(RdecPass.paged, 0l, 0l)
-        return false
-    }
+    return false if (!g_rdec_active || !rdec_session_codec_ok(s))
     if (pos + 1l > g_rdec_cap) {
         return rdec_pass_hydrated(t, s, RdecPass.cap, pos, g_rdec_cap)
     }
@@ -1776,15 +2718,21 @@ def private vulkan_resident_decode_go(t : Model; var s : Session; token, pos : i
         rdec_dn_own_all(s, c.n_layers)
     }
     let dim = c.dim
-    g_rdec_x |> resize(dim)
+    g_rdec_x |> grow_resize(dim)
     embed_row(t, token, unsafe(addr(g_rdec_x[0])))
     if (c.embed_scale != 1.0) {
         scale_inplace(unsafe(addr(g_rdec_x[0])), c.embed_scale, dim)
     }
-    g_rdec_cossin |> resize(g_rdec_cos_elems)
+    g_rdec_cossin |> grow_resize(g_rdec_cos_elems)
     rdec_rope_rows(t, pos + s.rope_pos_delta, g_rdec_cossin, 0l)   // rope at the delta'd position; KV stays at pos
     let cnt = pos + 1l
-    if (s.ple_gpu_pending) {
+    if (g_rdec_experts_host) {   // the split command: on a hyper-connection model forward() ran the side row's n-gram gather before this override; the routed sums run here between the segments
+        if (c.hyper_conn && has_ple_ngram(c) && !s.ple_ring_device) {   //! the ring the CPU prefill (or a pass) wrote goes up once; the device advances it from there
+            rdec_ngram_ring(unsafe(addr(s.ple_conv_hist[0])), true)
+            s.ple_ring_device = true
+        }
+        rdec_land_pick(s, rdec_token_split_host(t, s, pos, cnt, s.pick_asked, s.logits))
+    } elif (s.ple_gpu_pending) {
         g_rdec_one_tok |> resize(1l)
         g_rdec_one_tok[0] = token
         resident_prefill_ple_rows(t, g_rdec_one_tok, 1l)
@@ -1793,6 +2741,7 @@ def private vulkan_resident_decode_go(t : Model; var s : Session; token, pos : i
     } else {
         rdec_land_pick(s, rdec_token(g_rdec_x, g_rdec_cossin, s.ple_inp, pos, cnt, s.pick_asked, s.logits))   //! forward() ran the PLE pre-step into s.ple_inp before the override; empty elsewhere
     }
+    rdec_stash_carry(c, s, 0l, pos + 1l)
     g_rdec_regions[r].cnt = pos + 1l
     s.rdec_host_current = false   // the mirror advanced past any earlier hydration
     decode_override_logits_done()   // logits produced on device
@@ -1800,6 +2749,631 @@ def private vulkan_resident_decode_go(t : Model; var s : Session; token, pos : i
 }
 
 var private @scratch g_rdec_ple_rows : array<float>   //! the gather half of the per-layer-embedding pre-step, position-major, when the driver finishes it on device
+
+var private g_rdec_hx_t : Model const?   //! the model and session the host's routed sums run on, set around one split token
+var private g_rdec_hx_s : Session?
+
+//! the caller leaves the row in `g_rdec_x` and the rope in `g_rdec_cossin`
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command")]
+def private rdec_token_split_host(t : Model; var s : Session; pos, cnt : int64; pick_only : bool; var logits : array<float>) : int64 {
+    g_rdec_hx_t = unsafe(addr(t))
+    g_rdec_hx_s = unsafe(addr(s))
+    let picked = rdec_token_split(g_rdec_x, g_rdec_cossin, t.config.hyper_conn ? s.ple_emb : g_rdec_no_side, pos, cnt, pick_only, logits, @@rdec_host_experts_step)
+    g_rdec_hx_t = null
+    g_rdec_hx_s = null
+    return picked
+}
+
+var private g_rdec_no_side : array<float>
+
+let private RDEC_HOT_SLOTS_MAX = 64l      //! the auto arm's slots a layer where they fit beside the whole mirror
+let private RDEC_HOT_SLOTS_YIELD = 32l    //! ... and the slots the mirror's context yields room for
+let private RDEC_HOT_CTX_FLOOR = 32_768l  //! the context the mirror keeps whatever the pool asks
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def resident_hot_floor_ctx(seq_cap : int64; strict : bool) : int64 => strict ? seq_cap : min(seq_cap, RDEC_HOT_CTX_FLOOR)
+let private RDEC_HOT_SLOTS_MIN = 4l       //! under this the pool's hits do not pay for its submit
+let private RDEC_HOT_DECAY = 256l         //! a layer's pick counts halve every this many routed rows
+let private RDEC_HOT_SWAPS_STEP = 1l      //! experts a decode step may swap into a full pool
+let private RDEC_HOT_FILLS_STEP = 2l      //! ... and into free slots
+let private RDEC_HOT_SWAPS_WINDOW = 8l    //! experts a window's host step may swap into a full pool
+let private RDEC_HOT_PICKS = int(RDEC_ROUTED_SLOTS)   //! a step's picks at most: the device's routed slots
+let HOT_SLOTS_AUTO = -1l                  //! the pool's slot count unasked: the plan sizes it
+let HOT_SLOTS_NONE = 0l                   //! ... asked away
+let RDEC_HOT_WINDOW_MIN = 32l     //! under this many rows a window's picks stay the host's: the chain's submit costs more than their sums
+let private RDEC_HOT_SAY_PICKS = 15_360l  //! the profile line's period in picks: 32 tokens of 48 routed layers at ten picks
+
+//! a routed layer's pool as the host sees it: the slot every expert sits in, the expert every slot holds, the pick counts
+struct private HotLayer {
+    on : bool
+    base, stride : int64      //! the offset the gate plane's slot 0 answers to in the tier's expert chains; the up and down planes a stride and two past it
+    @exact_size slot_of : array<int>      //! [ne] the expert's slot, -1 = on the host
+    @exact_size expert_of : array<int>    //! [slots] the slot's expert, -1 = free
+    @exact_size heat : array<float>       //! [ne] decaying pick counts
+    rows : int64              //! routed rows counted since the last decay
+    nfree : int64
+    @scratch order : array<int>   //! a window's candidates, hottest first
+    hits, picks, swaps : int64    //! the layer's own counts since the pool armed: the profile's per-layer line
+}
+
+var private g_rdec_hot : array<HotLayer>
+var private g_rdec_hot_slots = 0l
+var private g_rdec_hot_declined : table<string>   //! the window fallbacks said, a reason once
+var private g_rdec_hot_hits = 0l
+var private g_rdec_hot_picks = 0l
+var private g_rdec_hot_uploads = 0l
+var private g_rdec_hot_window_hits = 0l   //! a window's slot rows the device served
+var private g_rdec_hot_window_rows = 0l   //! ... of the slot rows of the windows the chain took
+var private g_rdec_hot_gather_us = 0l
+var private g_rdec_hot_upload_us = 0l
+var private g_rdec_hot_said : tuple<hits : int64; picks : int64; uploads : int64; gather_us : int64; upload_us : int64>
+var private @scratch g_hot_wq1 : array<uint8>
+var private @scratch g_hot_ws1 : array<uint8>
+var private @scratch g_hot_wq3 : array<uint8>
+var private @scratch g_hot_ws3 : array<uint8>
+var private @scratch g_hot_wq2 : array<uint8>
+var private @scratch g_hot_ws2 : array<uint8>
+
+//! The slots a routed layer's hot expert pool holds on the armed driver; 0 = no pool.
+def gpu_resident_hot_slots() : int64 => g_rdec_hot_slots
+
+//! The hot expert pool's counts since the driver armed: the decode picks the device served, every decode pick of a layer
+//! with a pool, the experts uploaded, and the windows' slot rows the device served of those of the windows its chain took.
+def gpu_resident_hot_stats() : tuple<hits : int64; picks : int64; uploads : int64; window_hits : int64; window_rows : int64>
+    => (hits = g_rdec_hot_hits, picks = g_rdec_hot_picks, uploads = g_rdec_hot_uploads, window_hits = g_rdec_hot_window_hits, window_rows = g_rdec_hot_window_rows)
+
+//! one slot's bytes across the host layers: an expert's gate, up and down planes in device layout
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private resident_hot_slot_bytes_host_layers(t : Model; host_layers : int64) : int64 {
+    var bytes = 0l
+    var routed_idx = 0l
+    for (l in range64(resident_routed_layers(t))) {
+        continue if (!layer_is_moe(t, l))
+        routed_idx++
+        break if (routed_idx > host_layers)
+        bytes += resident_expert_planes_bytes(t, l, 1l)
+    }
+    return bytes
+}
+
+//! The slots a routed layer's pool takes from the room beside the whole mirror (`room_bytes`) or beside a mirror at its
+//! floor (`floor_bytes`), a slot costing `slot_bytes_all_layers` over the routed layers; `want` > 0 is a count asked, < 0 the auto arm, 0 no pool
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def resident_hot_slots(want, room_bytes, floor_bytes, slot_bytes_all_layers, n_expert : int64) : int64 {
+    return 0l if (want == HOT_SLOTS_NONE || slot_bytes_all_layers <= 0l)
+    let beside = max(room_bytes, 0l) / slot_bytes_all_layers
+    let yielded = max(floor_bytes, 0l) / slot_bytes_all_layers
+    var slots = want > 0l ? min(want, yielded) : min(RDEC_HOT_SLOTS_MAX, beside)
+    if (want == HOT_SLOTS_AUTO && slots < RDEC_HOT_SLOTS_YIELD) {
+        slots = min(RDEC_HOT_SLOTS_YIELD, yielded)
+    }
+    slots = min(slots, n_expert)
+    return slots >= RDEC_HOT_SLOTS_MIN ? slots : 0l
+}
+
+//! The pool's share of the plan: the slots (`resident_hot_slots` over the room the chain's scratch leaves, capped by
+//! `hot_cap` where a first plan settled one), their bytes, and the chain's scratch - charged only with a pool
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def resident_hot_fit(want, hot_cap, room_bytes, floor_bytes, slot_bytes_all_layers, n_expert : int64) : tuple<slots : int64; hot_bytes : int64; chain_bytes : int64> {
+    var slots = resident_hot_slots(want, room_bytes - RDEC_HOT_CHAIN_BYTES, floor_bytes - RDEC_HOT_CHAIN_BYTES, slot_bytes_all_layers, n_expert)
+    if (hot_cap != HOT_SLOTS_AUTO) {
+        slots = min(slots, hot_cap)
+    }
+    return (slots = slots, hot_bytes = slots * slot_bytes_all_layers, chain_bytes = slots > 0l ? RDEC_HOT_CHAIN_BYTES : 0l)
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private resident_hot_arm(t : Model; plan : ResidentPlan) {
+    let c = t.config
+    g_rdec_hot |> clear()
+    g_rdec_hot_slots = 0l
+    g_rdec_hot_declined |> clear()
+    g_rdec_hot_hits = 0l
+    g_rdec_hot_picks = 0l
+    g_rdec_hot_uploads = 0l
+    g_rdec_hot_window_hits = 0l
+    g_rdec_hot_window_rows = 0l
+    g_rdec_hot_gather_us = 0l
+    g_rdec_hot_upload_us = 0l
+    g_rdec_hot_said = (hits = 0l, picks = 0l, uploads = 0l, gather_us = 0l, upload_us = 0l)
+    if (!rdec_hot_installed()) {
+        to_log(LOG_INFO, "dasLLAMA: resident driver - no hot expert pool (the tier installed no pool seats)\n")
+        return
+    }
+    let slot_bytes = resident_hot_slot_bytes_host_layers(t, plan.host_layers)
+    let slots = plan.hot_slots
+    let asked = g_env_gpu.gpu_heat ?? (gpu_want_heat() > 0l ? gpu_want_heat() : HOT_SLOTS_AUTO)
+    let ask = (asked == HOT_SLOTS_AUTO ? "" : " (DASLLAMA_GPU_HEAT={asked})") + (rdec_ctx_asked_whole() ? " under the context asked whole (set_gpu_ctx_strict, DASLLAMA_GPU_CTX_STRICT), which the pool yields to" : "")
+    if (slots == 0l) {
+        let room = plan.usable_bytes - plan.weight_bytes - plan.kv_bytes - plan.scratch_bytes
+        let why = c.n_expert_used > int64(RDEC_HOT_PICKS) ? "{c.n_expert_used} picks a step pass the {RDEC_HOT_PICKS} routed slots" : (asked == HOT_SLOTS_NONE ? "none asked" : "{room >> 20l} MB left past the plan, {slot_bytes >> 20l} MB a slot across the routed layers")
+        to_log(LOG_INFO, "dasLLAMA: resident driver - no hot expert pool{ask}: {why}; DASLLAMA_GPU_HEAT=<slots> asks a count, 0 none\n")
+        return
+    }
+    g_rdec_hot |> reserve(resident_routed_layers(t))
+    g_rdec_hot |> resize(resident_routed_layers(t))
+    var armed = 0l
+    var routed_idx = 0l
+    for (l in range64(resident_routed_layers(t))) {
+        continue if (!layer_is_moe(t, l))
+        routed_idx++
+        break if (routed_idx > plan.host_layers)
+        let at = rdec_hot_layer(l, slots, int(rdec_efmt(t, t.we1_fmt, l)), int(rdec_efmt(t, t.we3_fmt, l)), int(rdec_efmt(t, t.we2_fmt, l)))
+        continue if (at.base < 0l)
+        var H & = unsafe(g_rdec_hot[l])
+        H.on = true
+        H.base = at.base
+        H.stride = at.stride
+        H.nfree = slots
+        H.slot_of <- [for (_e in range64(c.n_expert)); -1]
+        H.expert_of <- [for (_s in range64(slots)); -1]
+        H.heat |> reserve_resize(c.n_expert)
+        H.order |> reserve(c.n_expert)
+        armed++
+    }
+    g_rdec_hot_slots = armed > 0l ? slots : 0l
+    to_log(LOG_INFO, "dasLLAMA: resident driver - hot expert pool{ask}: {slots} slots on {armed} routed layers ({(armed > 0l ? slots * slot_bytes : 0l) >> 20l} MB); the host sums the picks outside it\n")
+}
+
+//! expert `e` of layer `l` gathered into the scratch planes and uploaded into `slot`, whose expert leaves the pool
+def private rdec_hot_place(t : Model; l : int64; var H : HotLayer; e, slot : int) {
+    let c = t.config
+    let ege = c.dim * c.n_ff_exp
+    let lay = active_q8_repack_layout(g_active_needs_repack)
+    let t0 = ref_time_ticks()
+    layout_gather_dispatch(t, rdec_efmt(t, t.we1_fmt, l), t.we1_offs[l] + int64(e) * ege, c.dim, c.n_ff_exp, c.n_ff_exp, lay.mr, lay.kgroup, lay.wbias, g_hot_wq1, g_hot_ws1)
+    layout_gather_dispatch(t, rdec_efmt(t, t.we3_fmt, l), t.we3_offs[l] + int64(e) * ege, c.dim, c.n_ff_exp, c.n_ff_exp, lay.mr, lay.kgroup, lay.wbias, g_hot_wq3, g_hot_ws3)
+    layout_gather_dispatch(t, rdec_efmt(t, t.we2_fmt, l), t.we2_offs[l] + int64(e) * ege, c.n_ff_exp, c.dim, c.dim, lay.mr, lay.kgroup, lay.wbias, g_hot_wq2, g_hot_ws2)
+    let t1 = ref_time_ticks()
+    rdec_hot_upload(l, int64(slot), g_hot_wq1, g_hot_ws1, g_hot_wq3, g_hot_ws3, g_hot_wq2, g_hot_ws2)
+    g_rdec_hot_gather_us += int64(get_time_usec(t0)) - int64(get_time_usec(t1))
+    g_rdec_hot_upload_us += int64(get_time_usec(t1))
+    let old = H.expert_of[slot]
+    if (old >= 0) {
+        H.slot_of[old] = -1
+        H.swaps++
+    } else {
+        H.nfree--
+    }
+    H.expert_of[slot] = e
+    H.slot_of[e] = slot
+    g_rdec_hot_uploads++
+}
+
+[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private rdec_hot_say {
+    let d = (hits = g_rdec_hot_hits - g_rdec_hot_said.hits, picks = g_rdec_hot_picks - g_rdec_hot_said.picks, uploads = g_rdec_hot_uploads - g_rdec_hot_said.uploads,
+        gather_us = g_rdec_hot_gather_us - g_rdec_hot_said.gather_us, upload_us = g_rdec_hot_upload_us - g_rdec_hot_said.upload_us)
+    g_rdec_hot_said = (hits = g_rdec_hot_hits, picks = g_rdec_hot_picks, uploads = g_rdec_hot_uploads, gather_us = g_rdec_hot_gather_us, upload_us = g_rdec_hot_upload_us)
+    if (g_env_gpu.gpu_prof) {
+        let line = build_string() $(var w) {
+            for (l in range64(long_length(g_rdec_hot))) {
+                let H & = unsafe(g_rdec_hot[l])
+                if (H.on) {
+                    let pct = H.picks > 0l ? int(double(H.hits) * 100.0lf / double(H.picks)) : 0
+                    w |> write("{l}:{pct}%/{H.swaps} ")
+                }
+            }
+        }
+        to_log(LOG_INFO, "hot expert pool per layer (hits%/swaps since the arm): {line}\n")
+    }
+    to_log(LOG_INFO, "hot expert pool: {d.hits} of {d.picks} picks on the device ({double(d.hits) * 100.0lf / double(max(d.picks, 1l)):.1f}%), {d.uploads} experts placed (gather {double(d.gather_us) / 1000.0lf:.1f} ms, upload {double(d.upload_us) / 1000.0lf:.1f} ms)\n")
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private rdec_hot_note(var H : HotLayer; idx : int64 const?; n, rows : int64) {
+    for (j in range64(n)) {
+        H.heat[unsafe(idx[j])]++
+    }
+    H.rows += rows
+    if (H.rows >= RDEC_HOT_DECAY) {
+        H.rows = 0l
+        for (h in H.heat) {
+            h *= 0.5
+        }
+    }
+}
+
+//! the slot expert `e` may take: a free one, else the coldest slot outside the step's picks when `e` is past twice its heat; -1 = none
+def private rdec_hot_slot_for(H : HotLayer; e : int; idx : int64 const?; k : int64) : int {
+    if (H.nfree > 0l) {
+        return find_index(H.expert_of, -1)
+    }
+    var victim = -1
+    for (sl in range(length(H.expert_of))) {
+        let ex = H.expert_of[sl]
+        var picked = false
+        for (j in range64(k)) {
+            picked = picked || unsafe(idx[j]) == int64(ex)
+        }
+        continue if (picked)
+        if (victim < 0 || H.heat[ex] < H.heat[H.expert_of[victim]]) {
+            victim = sl
+        }
+    }
+    return (victim >= 0 && H.heat[e] > 2.0 * H.heat[H.expert_of[victim]] + 1.0) ? victim : -1
+}
+
+//! returns the miss count: the misses packed to the front of s.moe_idx / s.moe_w, the hits handed to the device
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private rdec_hot_step(t : Model; var s : Session; l : int64) : int64 {
+    let k = t.config.n_expert_used
+    var H & = unsafe(g_rdec_hot[l])
+    var hit_slot : int64[RDEC_HOT_PICKS]
+    var hit_w : float[RDEC_HOT_PICKS]
+    var nh = 0l
+    var km = 0l
+    let idx = unsafe(addr<int64 const?>(s.moe_idx[0]))
+    rdec_hot_note(H, idx, k, 1l)
+    var budget = H.nfree > 0l ? RDEC_HOT_FILLS_STEP : RDEC_HOT_SWAPS_STEP
+    for (j in range64(k)) {
+        break if (budget == 0l)
+        let e = int(s.moe_idx[j])
+        continue if (H.slot_of[e] >= 0)
+        let slot = rdec_hot_slot_for(H, e, idx, k)
+        continue if (slot < 0)
+        rdec_hot_place(t, l, H, e, slot)
+        budget--
+    }
+    for (j in range64(k)) {
+        let sl = H.slot_of[s.moe_idx[j]]
+        if (sl >= 0) {
+            hit_slot[nh] = int64(sl)
+            hit_w[nh] = s.moe_w[j]
+            nh++
+        } else {
+            s.moe_idx[km] = s.moe_idx[j]
+            s.moe_w[km] = s.moe_w[j]
+            km++
+        }
+    }
+    rdec_hot_submit(l, nh, unsafe(addr<int64 const?>(hit_slot[0])), unsafe(addr<float const?>(hit_w[0])))
+    g_rdec_hot_hits += nh
+    g_rdec_hot_picks += k
+    H.hits += nh
+    H.picks += k
+    if (g_env_gpu.gpu_prof && g_rdec_hot_picks - g_rdec_hot_said.picks >= RDEC_HOT_SAY_PICKS) {
+        rdec_hot_say()
+    }
+    return km
+}
+
+//! returns the device's region count; writes s.moe_exp_gpu, s.moe_w_gpu / s.moe_w_cpu, s.moe_offs1 / 3 / 2 and s.moe_inv
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private rdec_hot_regions(t : Model; var s : Session; l, nrows : int64) : int64 {
+    let c = t.config
+    let ne = c.n_expert
+    let nk = nrows * c.n_expert_used
+    let ege = c.dim * c.n_ff_exp
+    let H & = unsafe(g_rdec_hot[l])
+    s.moe_exp_gpu |> grow_resize(ne)
+    s.moe_w_gpu |> grow_resize(nk)
+    s.moe_w_cpu |> grow_resize(nk)
+    s.moe_inv |> grow_resize(nk)
+    s.moe_ord |> clear()
+    s.moe_ord |> reserve(ne)
+    for (e in range64(ne)) {
+        let cnt = s.moe_cnt[e] - (e == 0l ? 0l : s.moe_cnt[e - 1l])
+        let pooled = H.slot_of[e] >= 0 && cnt > 0l
+        s.moe_exp_gpu[e] = int8(pooled ? 1 : 0)
+        if (pooled) {
+            s.moe_ord |> push(int2(int(e), int(cnt)))
+        }
+    }
+    lpt_order(s.moe_ord)
+    s.moe_offs1 |> clear()
+    s.moe_offs3 |> clear()
+    s.moe_offs2 |> clear()
+    let nreg = long_length(s.moe_ord)
+    s.moe_offs1 |> reserve(nreg * 3l)
+    s.moe_offs3 |> reserve(nreg * 3l)
+    s.moe_offs2 |> reserve(nreg * 3l)
+    for (oe in s.moe_ord) {
+        let e = int64(oe.x)
+        let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
+        let at = H.base + int64(H.slot_of[e]) * ege
+        s.moe_offs1 |> push_from(fixed_array(at, b0, int64(oe.y)))
+        s.moe_offs3 |> push_from(fixed_array(at + H.stride, b0, int64(oe.y)))
+        s.moe_offs2 |> push_from(fixed_array(at + 2l * H.stride, b0, int64(oe.y)))
+    }
+    for (j in range64(nk)) {
+        let dev = s.moe_exp_gpu[s.moe_idx_b[j]] != int8(0)
+        s.moe_w_gpu[j] = dev ? s.moe_w_b[j] : 0.0
+        s.moe_w_cpu[j] = dev ? 0.0 : s.moe_w_b[j]
+        s.moe_inv[s.moe_bkt[j]] = uint(j)
+    }
+    return nreg
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private rdec_hot_window(t : Model; s : Session; l, nrows : int64) {
+    let k = t.config.n_expert_used
+    var H & = unsafe(g_rdec_hot[l])
+    rdec_hot_note(H, unsafe(addr<int64 const?>(s.moe_idx_b[0])), nrows * k, nrows)
+    H.order |> clear()
+    for (e in range(length(H.heat))) {
+        if (H.heat[e] > 0.0 && H.slot_of[e] < 0) {
+            H.order |> push(e)
+        }
+    }
+    H.order |> sort() $(a, b) => H.heat[a] > H.heat[b]
+    var swaps = RDEC_HOT_SWAPS_WINDOW
+    for (e in H.order) {
+        break if (H.nfree == 0l && swaps == 0l)
+        let filling = H.nfree > 0l
+        let slot = rdec_hot_slot_for(H, e, null, 0l)
+        break if (slot < 0)   //! the order descends: an expert the coldest slot outranks ends the walk
+        rdec_hot_place(t, l, H, e, slot)
+        if (!filling) {
+            swaps--
+        }
+    }
+}
+
+[hot_path, arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command")]
+def private rdec_host_experts_step(l : int64; xb : float const?; logits : float const?; var acc : float?) {
+    unsafe {
+        let t & = *g_rdec_hx_t
+        var s & = *g_rdec_hx_s
+        let c = t.config
+        let ne = c.n_expert
+        memcpy(addr<void?>(s.xb[0]), reinterpret<void const?>(xb), c.dim * 4l)
+        memcpy(addr<void?>(s.moe_logits[0]), reinterpret<void const?>(logits), ne * 4l)
+        if (c.moe_router_bias) {
+            add_bias(s.moe_logits, 0l, t.fblob, t.router_b_off + l * ne, ne)
+        }
+        var ebp : float const?
+        if (c.moe_exp_probs) {
+            ebp = addr<float const?>(t.fblob[t.exp_probs_off + l * ne])
+        }
+        moe_select(c, addr(s.moe_logits[0]), s.moe_idx, s.moe_w, 0l, ebp)
+        moe_routed_note(t, s, l)
+        rdec_trace_picks(l, 1l, c.n_expert_used, addr<int64 const?>(s.moe_idx[0]), addr<float const?>(s.moe_w[0]))
+        let pooled = l < long_length(g_rdec_hot) && g_rdec_hot[l].on
+        moe_routed_sum_k(t, s, l, pooled ? rdec_hot_step(t, s, l) : c.n_expert_used)
+        memcpy(reinterpret<void?>(acc), addr<void const?>(s.moe_acc[0]), c.dim * 4l)
+    }
+}
+
+// ===== the routed pick trace: the pool policy's offline instrument =====
+
+var private @scratch g_rdec_trace_layers : array<int>
+var private @scratch g_rdec_trace_rows : array<int>
+var private @scratch @exact_size g_rdec_trace_idx : array<int>
+var private @scratch @exact_size g_rdec_trace_w : array<float>
+var private g_rdec_trace_header : tuple<layers : int; experts : int; k : int>
+var private g_rdec_trace_header_written = false   //! later flushes append
+let private RDEC_TRACE_FLUSH_RECORDS = 490   //! records held before a flush: one a routed layer a token, so ten tokens of a 49-layer model end without a drop at most
+let RDEC_TRACE_PROMPT_MARK = -1   //! the layer of the record marking a prompt that starts at position 0 (no rows)
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private rdec_trace_picks(l, nrows, k : int64; idx : int64 const?; w : float const?) {
+    return if (empty(g_env_gpu.moe_trace))
+    g_rdec_trace_layers |> push(int(l))
+    g_rdec_trace_rows |> push(int(nrows))
+    g_rdec_trace_idx |> reserve(long_length(g_rdec_trace_idx) + nrows * k)
+    g_rdec_trace_w |> reserve(long_length(g_rdec_trace_w) + nrows * k)
+    for (j in range64(nrows * k)) {
+        g_rdec_trace_idx |> push(int(unsafe(idx[j])))
+        g_rdec_trace_w |> push(unsafe(w[j]))
+    }
+    if (length(g_rdec_trace_layers) >= RDEC_TRACE_FLUSH_RECORDS) {
+        rdec_trace_write()
+    }
+}
+
+[cold_path]
+def private rdec_trace_prompt_start() {
+    return if (empty(g_env_gpu.moe_trace))
+    g_rdec_trace_layers |> push(RDEC_TRACE_PROMPT_MARK)
+    g_rdec_trace_rows |> push(0)
+}
+
+let MOET_MAGIC = int(0x54454f4d)   //! the trace file's leading "MOET"
+
+[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private rdec_trace_write() {
+    return if (empty(g_env_gpu.moe_trace) || empty(g_rdec_trace_layers))
+    var pos = 0l
+    let k = int64(g_rdec_trace_header.k)
+    fopen(g_env_gpu.moe_trace, g_rdec_trace_header_written ? "ab" : "wb") $(f) {
+        if (f == null) {
+            to_log(LOG_WARNING, "dasLLAMA: DASLLAMA_MOE_TRACE - cannot open {g_env_gpu.moe_trace} for writing\n")
+            return
+        }
+        if (!g_rdec_trace_header_written) {
+            fwrite(f, MOET_MAGIC)
+            fwrite(f, g_rdec_trace_header.layers)
+            fwrite(f, g_rdec_trace_header.experts)
+            fwrite(f, g_rdec_trace_header.k)
+            g_rdec_trace_header_written = true
+        }
+        for (i in range(length(g_rdec_trace_layers))) {
+            fwrite(f, g_rdec_trace_layers[i])
+            fwrite(f, g_rdec_trace_rows[i])
+            let n = int64(g_rdec_trace_rows[i]) * k
+            if (n > 0l) {
+                var ids <- [for (j in range64(n)); g_rdec_trace_idx[pos + j]]
+                var ws <- [for (j in range64(n)); g_rdec_trace_w[pos + j]]
+                fwrite(f, ids)
+                fwrite(f, ws)
+                pos += n
+            }
+        }
+    }
+    g_rdec_trace_layers |> clear()
+    g_rdec_trace_rows |> clear()
+    g_rdec_trace_idx |> clear()
+    g_rdec_trace_w |> clear()
+}
+
+//! forward_prefill's pre-step left the rows in s.x_b and the side rows in s.ple_emb_b
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-window-chain")]
+def private rdec_prefill_hc_run(t : Model; var s : Session; cb : array<float>; npos, start_pos : int64) {
+    if (start_pos == 0l) {
+        rdec_trace_prompt_start()
+    }
+    g_rdec_hx_t = unsafe(addr(t))
+    g_rdec_hx_s = unsafe(addr(s))
+    rdec_prefill_hc(s.x_b, cb, s.ple_emb_b, npos, start_pos, s.logits, @@rdec_host_experts_rows)
+    g_rdec_hx_t = null
+    g_rdec_hx_s = null
+    s.embed_gpu_pending = false
+    s.ple_gpu_pending = false
+    s.ple_ring_device = has_ple_ngram(t.config)
+}
+
+var private g_rdec_verify_rows_in_flight = false   //! while set, a layer's pooled picks go through `rdec_hot_rows_step`: one hit chain over the verify's rows
+
+//! false where no row hit: no chain submitted, the host sums every pick
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-verify-rows")]
+def private rdec_hot_rows_step(t : Model; var s : Session; l, nrows : int64) : bool {
+    let c = t.config
+    let k = c.n_expert_used
+    let ne = c.n_expert
+    let nk = nrows * k
+    var H & = unsafe(g_rdec_hot[l])
+    if (nk > int64(RDEC_HOT_PICKS)) {
+        panic("dasLLAMA resident: the verify's {nrows} rows x {k} picks ({nk}) pass the {RDEC_HOT_PICKS} routed slots")
+    }
+    let idx = unsafe(addr<int64 const?>(s.moe_idx_b[0]))
+    rdec_hot_note(H, idx, nk, nrows)
+    var budget = (H.nfree > 0l ? RDEC_HOT_FILLS_STEP : RDEC_HOT_SWAPS_STEP) * nrows
+    for (j in range64(nk)) {
+        break if (budget == 0l)
+        let e = int(s.moe_idx_b[j])
+        continue if (H.slot_of[e] >= 0)
+        let slot = rdec_hot_slot_for(H, e, idx, nk)
+        continue if (slot < 0)
+        rdec_hot_place(t, l, H, e, slot)
+        budget--
+    }
+    s.moe_exp_gpu |> grow_resize(ne)
+    for (e in range64(ne)) {
+        s.moe_exp_gpu[e] = int8(0)
+    }
+    s.moe_w_cpu |> grow_resize(nk)
+    var hit_slot : int64[RDEC_HOT_PICKS]
+    var hit_w : float[RDEC_HOT_PICKS]
+    var hits = 0l
+    for (r in range64(nrows)) {
+        var nh = 0l
+        for (j in range64(k)) {
+            let e = s.moe_idx_b[r * k + j]
+            let sl = H.slot_of[e]
+            if (sl >= 0) {
+                hit_slot[r * k + nh] = int64(sl)
+                hit_w[r * k + nh] = s.moe_w_b[r * k + j]
+                nh++
+                s.moe_exp_gpu[e] = int8(1)
+                s.moe_w_cpu[r * k + j] = 0.0
+            } else {
+                s.moe_w_cpu[r * k + j] = s.moe_w_b[r * k + j]
+            }
+        }
+        for (j in range64(nh, k)) {
+            hit_slot[r * k + j] = 0l
+            hit_w[r * k + j] = 0.0
+        }
+        hits += nh
+    }
+    g_rdec_hot_picks += nk
+    H.picks += nk
+    H.hits += hits
+    if (hits == 0l) {
+        return false
+    }
+    g_rdec_hot_hits += hits
+    rdec_hot_submit_rows(l, nrows, unsafe(addr<int64 const?>(hit_slot[0])), unsafe(addr<float const?>(hit_w[0])))
+    return true
+}
+
+//! whether the layer has a pool at all
+def private rdec_hot_on(l : int64) : bool => l < long_length(g_rdec_hot) && g_rdec_hot[l].on
+
+//! returns the device's region count; 0 = the host sums every row (no pool on the layer, no pick in it, a window the chain does not take)
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private rdec_hot_rows_begin(t : Model; var s : Session; l, nrows : int64) : int64 {
+    return 0l if (!rdec_hot_on(l))
+    let c = t.config
+    let nk = nrows * c.n_expert_used
+    rdec_hot_window(t, s, l, nrows)
+    let f1 = int(rdec_efmt(t, t.we1_fmt, l))
+    let f3 = int(rdec_efmt(t, t.we3_fmt, l))
+    let f2 = int(rdec_efmt(t, t.we2_fmt, l))
+    if (nrows < RDEC_HOT_WINDOW_MIN) {
+        return 0l   // a short window's picks are the host's by design: no line
+    }
+    let chunk = moe_gpu_ffn_xf_async_rows(c.dim, c.n_ff_exp)
+    if (nk > chunk) {
+        rdec_hot_window_declined(true, nk, chunk, nrows, f1, f3, f2)
+        return 0l
+    }
+    if (!moe_gpu_ffn_xf_ok(nrows, c.dim, f1, f3, f2)) {
+        rdec_hot_window_declined(false, nk, chunk, nrows, f1, f3, f2)
+        return 0l
+    }
+    let nreg = rdec_hot_regions(t, s, l, nrows)
+    if (nreg > 0l) {
+        matmul_moe_gpu_ffn_combined_xf_begin(s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg, s.xb_b, s.moe_w_gpu, s.moe_inv,
+            c.dim, c.n_ff_exp, nk, nrows, f1, f3, f2, c.ffn_act == FfnAct.gelu)
+        g_rdec_hot_window_rows += nk
+        for (oe in s.moe_ord) {
+            g_rdec_hot_window_hits += int64(oe.y)
+        }
+    }
+    return nreg
+}
+
+//! a window the expert chain does not take - past its one chunk (`chunk`), or on formats its f16 feed does not admit - said once per reason per armed model
+[cold_path]
+def private rdec_hot_window_declined(past_chunk : bool; nk, chunk, nrows : int64; f1, f3, f2 : int) {
+    let why = past_chunk ? "the window's {nk} slot rows pass the expert chain's one chunk of {chunk}" : "the expert chain's f16 feed does not admit formats {f1}/{f3}/{f2} at {nrows} rows"
+    if (!key_exists(g_rdec_hot_declined, why)) {
+        g_rdec_hot_declined |> insert(why)
+        to_log(LOG_WARNING, "dasLLAMA: resident driver - the hot expert pool leaves a window's picks to the host: {why} (said once per reason)\n")
+    }
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+def private rdec_hot_rows_join(var s : Session; nelem : int64) {
+    s.moe_gpu_out |> grow_resize(nelem)
+    matmul_moe_gpu_ffn_combined_xf_join(s.moe_gpu_out)
+    unsafe {
+        add_inplace(addr(s.xb2_b[0]), addr<float const?>(s.moe_gpu_out[0]), nelem)
+    }
+}
+
+[hot_path, arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-window-chain")]
+def private rdec_host_experts_rows(l : int64; xb : float const?; logits : float const?; var acc : float?; row0, nrows : int64) {
+    unsafe {
+        let t & = *g_rdec_hx_t
+        var s & = *g_rdec_hx_s
+        let c = t.config
+        let dim = c.dim
+        let ne = c.n_expert
+        let ner = ne + (c.n_ff_shexp > 0l && c.moe_shexp_gated ? 1l : 0l)   //! the device's router plane carries the shared expert's gate row last
+        s.xb_b |> grow_resize(nrows * dim)
+        s.moe_rlog |> grow_resize(nrows * ne)
+        memcpy(addr<void?>(s.xb_b[0]), reinterpret<void const?>(xb + row0 * dim), nrows * dim * 4l)
+        for (r in range64(nrows)) {
+            memcpy(addr<void?>(s.moe_rlog[r * ne]), reinterpret<void const?>(logits + (row0 + r) * ner), ne * 4l)
+        }
+        moe_routed_rows_select(t, s, l, nrows)
+        rdec_trace_picks(l, nrows, c.n_expert_used, addr<int64 const?>(s.moe_idx_b[0]), addr<float const?>(s.moe_w_b[0]))
+        if (g_rdec_verify_rows_in_flight) {
+            let chained = rdec_hot_on(l) && rdec_hot_rows_step(t, s, l, nrows)
+            moe_routed_rows_sum(t, s, l, nrows, chained)
+        } else {
+            let nreg = rdec_hot_rows_begin(t, s, l, nrows)
+            moe_routed_rows_sum(t, s, l, nrows, nreg > 0l)
+            if (nreg > 0l) {
+                rdec_hot_rows_join(s, nrows * dim)
+            }
+        }
+        memcpy(reinterpret<void?>(acc + row0 * dim), addr<void const?>(s.xb2_b[0]), nrows * dim * 4l)
+    }
+}
 
 //! ONE gate for both PLE pre-step seats, taken when the armed driver holds the projection:
 //! forward_prefill's, where the token ids land in the session's stash and the prefill override gathers the table rows,
@@ -1811,14 +3385,25 @@ def private vulkan_ple_gate(t : Model; s : Session; npos, start_pos : int64) : b
 // the "vulkan" whole-prefill override — host KV hydrates back on demand, so the CPU rails always take over from a valid authority
 [hot_path, arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]   // per prefill call
 def private vulkan_resident_prefill(t : Model; var s : Session; npos, start_pos : int64) : bool {
+    rdec_head_device_rows_stale_from(s, start_pos - 1l)  // the prefill's seam and warm rewrite the head's host rows from start_pos - 1, whoever serves the trunk
     let seq0 = g_rdec_pass_seq
     let done = vulkan_resident_prefill_go(t, s, npos, start_pos)
     rdec_device_home_guard(s, done, "prefill", seq0)
+    if (!done && get_mtp_spec() && t.config.n_layer_nextn > 0l) {
+        rdec_head_host_writes(s, start_pos, start_pos + npos - 1l)
+    }
     if (!done && s.ple_gpu_pending) {   //! the gate took the pre-step and the driver then declined: the CPU pre-step runs late, off the stashed ids
         ple_pre_prefill(t, s, s.ple_gpu_tokens, npos)
         s.ple_gpu_pending = false
     }
     return done
+}
+
+[hot_path, unused_argument(token), arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head")]   //! per continuation prefill
+def private vulkan_resident_seam(t : Model; var s : Session; token, pos : int64) : bool {
+    rdec_head_hydrate(t, s, pos - 1l)
+    rdec_head_host_writes(s, pos - 1l, pos)
+    return false
 }
 
 //! Always false, the override's answer: the CPU rails take the call, so the session's device-only rows come down first.
@@ -1854,21 +3439,16 @@ def private rdec_prefill_region(t : Model; var s : Session; start_pos : int64) :
     return r
 }
 
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-window")]
 def private vulkan_resident_prefill_go(t : Model; var s : Session; npos, start_pos : int64) : bool {
-    if (!g_rdec_active) {
-        return false
+    return false if (!g_rdec_active)
+    if (mtp_verify_window_active(s)) {
+        return rdec_pass_hydrated(t, s, RdecPass.verify_window, 0l, 0l)
     }
     if (!g_resident_prefill_allowed && !s.device_kv) {
         return rdec_pass_hydrated(t, s, RdecPass.pinned_off, 0l, 0l)
     }
-    if (s.kv_dtype_k != g_rdec_kvdt || s.kv_dtype_v != g_rdec_kvdt) {
-        rdec_pass_once(RdecPass.codec, int64(int(s.kv_dtype_k)), int64(int(s.kv_dtype_v)))
-        return false
-    }
-    if (s.kv_pool != null) {
-        rdec_pass_once(RdecPass.paged, 0l, 0l)
-        return false
-    }
+    return false if (!rdec_session_codec_ok(s))
     if (s.attn_uniform_end != 0l) {
         return rdec_pass_hydrated(t, s, RdecPass.span, 0l, 0l)
     }
@@ -1887,26 +3467,36 @@ def private vulkan_resident_prefill_go(t : Model; var s : Session; npos, start_p
         dn_reset(s)
     }
     let ce = g_rdec_cos_elems
-    g_rdec_tmp |> resize(npos * ce)   // the rope-plane batch borrows the scratch row
+    g_rdec_tmp |> grow_resize(npos * ce)   // the rope-plane batch borrows the scratch row
     var cb & = g_rdec_tmp
     let ts_rope = ref_time_ticks()
     resident_prefill_rope_rows(t, s.rope_pos_delta + start_pos, npos, ce, cb)
     let us_rope = get_time_usec(ts_rope)
     var us_gather = 0
     let ts_run = ref_time_ticks()
-    if (s.embed_gpu_pending) {
-        rdec_prefill_ids(s.embed_gpu_tokens, c.embed_scale, cb, npos, start_pos, s.logits)
-        s.embed_gpu_pending = false
-        s.ple_gpu_pending = false   //! the ids form gathers the side rows on device too: no late CPU pre-step
+    rdec_head_warm_ask(rdec_head_warm_want(t))
+    if (c.hyper_conn) {
+        rdec_prefill_hc_run(t, s, cb, npos, start_pos)
     } else {
-        if (s.ple_gpu_pending) {
+        if (g_rdec_experts_host) {
+            g_rdec_hx_t = unsafe(addr(t))
+            g_rdec_hx_s = unsafe(addr(s))
+        }
+        if (s.embed_gpu_pending) {
+            rdec_prefill_ids(s.embed_gpu_tokens, c.embed_scale, cb, npos, start_pos, s.logits)
+            s.embed_gpu_pending = false
+            s.ple_gpu_pending = false   //! the ids form gathers the side rows on device too: no late CPU pre-step
+        } elif (s.ple_gpu_pending) {
             us_gather = resident_prefill_ple_rows(t, s.ple_gpu_tokens, npos)
             rdec_prefill(s.x_b, cb, g_rdec_ple_rows, true, npos, start_pos, s.logits)
             s.ple_gpu_pending = false
         } else {
             rdec_prefill(s.x_b, cb, s.ple_inp, false, npos, start_pos, s.logits)   //! forward_prefill ran the PLE pre-step into s.ple_inp (position-major) before the override; empty elsewhere
         }
+        g_rdec_hx_t = null
+        g_rdec_hx_s = null
     }
+    rdec_stash_carry(c, s, 0l, start_pos + npos)
     if (g_env_gpu.gpu_prof) {
         to_log(LOG_INFO, "dasLLAMA: resident prefill host: {npos} rows, rope rows {us_rope} us, ple gather {us_gather} us, the driver's run {get_time_usec(ts_run) - us_gather} us\n")   // nolint:PERF026,PERF028 — the profile flag's report leg
     }
@@ -1924,6 +3514,7 @@ def private vulkan_resident_prefill_go(t : Model; var s : Session; npos, start_p
     } else {
         g_rdec_regions[r].cnt = start_pos + npos
     }
+    rdec_prefill_head_rows(t, s, r, npos, start_pos)   // after the claim: a fresh prompt's claim zeroes the head rows it would otherwise count
     s.rdec_host_current = false
     g_rdec_prefills++
     prefill_override_logits_done()
@@ -1949,14 +3540,7 @@ def private rdec_batch_rows_served(t : Model; ws : BatchWorkspace; sessions : ar
     let c = t.config
     for (i in range64(nrows)) {
         var s = sessions[i]
-        if (s.kv_dtype_k != g_rdec_kvdt || s.kv_dtype_v != g_rdec_kvdt) {
-            rdec_pass_once(RdecPass.codec, int64(int(s.kv_dtype_k)), int64(int(s.kv_dtype_v)))
-            return false
-        }
-        if (s.kv_pool != null) {
-            rdec_pass_once(RdecPass.paged, 0l, 0l)
-            return false
-        }
+        return false if (!rdec_session_codec_ok(*s))
         if (ws.positions[i] + 1l > g_rdec_cap) {
             rdec_pass_once(RdecPass.cap, ws.positions[i], g_rdec_cap)
             return false
@@ -2047,6 +3631,7 @@ def private rdec_batch_rows_at_once(t : Model; ws : BatchWorkspace; var sessions
         rdec_land_pick(s, g_rdec_picks[i])
         let pos = g_rdec_poss[i]
         let r = g_rdec_regs[i]
+        rdec_stash_carry(c, s, i, pos + 1l)
         if (!s.device_kv) {
             rdec_select_region(r)   //! the readback reads the selected region: this row's, bound above
             for (l in range64(c.n_layers)) {
@@ -2078,12 +3663,13 @@ def private vulkan_resident_batch_decode_go(t : Model; ws : BatchWorkspace; var 
     if (dasllama_noisy()) {
         to_log(LOG_INFO, "dasLLAMA: resident batch decode engaged ({nrows} streams)\n")   // nolint:PERF026,PERF028 — noisy-gated diagnostics
     }
-    if (nrows > 1l && rdec_token_n_rows() >= nrows && rdec_batch_rows_at_once(t, ws, sessions, nrows)) {
+    // the N-row command takes a region a row: a plan short of the rows (one region under a verify-widened nb) steps them one at a time
+    if (nrows > 1l && long_length(g_rdec_regions) >= nrows && rdec_token_n_rows() >= nrows && rdec_batch_rows_at_once(t, ws, sessions, nrows)) {
         return true
     }
-    g_rdec_x |> resize(dim)
-    g_rdec_cossin |> resize(g_rdec_cos_elems)
-    g_rdec_tmp |> resize(c.vocab_size)
+    g_rdec_x |> grow_resize(dim)
+    g_rdec_cossin |> grow_resize(g_rdec_cos_elems)
+    g_rdec_tmp |> grow_resize(c.vocab_size)
     for (i in range64(nrows)) {
         var s & = unsafe(*sessions[i])
         let pos = ws.positions[i]
@@ -2109,7 +3695,8 @@ def private vulkan_resident_batch_decode_go(t : Model; ws : BatchWorkspace; var 
         if (ple) {
             rdec_batch_ple_row(t, ws, i)
         }
-        let picked = rdec_token(g_rdec_x, g_rdec_cossin, g_rdec_ple_rows, pos, pos + 1l, s.pick_asked, g_rdec_tmp)
+        let picked = g_rdec_experts_host ? rdec_token_split_host(t, s, pos, pos + 1l, s.pick_asked, g_rdec_tmp) : rdec_token(g_rdec_x, g_rdec_cossin, g_rdec_ple_rows, pos, pos + 1l, s.pick_asked, g_rdec_tmp)
+        rdec_stash_carry(c, s, 0l, pos + 1l)
         for (l in range64(c.n_layers)) {
             continue if (s.device_kv || layer_is_recurrent(c, l) || t.kv_src[l] != l)
             let kvd = layer_kv_dim(c, l)
@@ -2134,7 +3721,7 @@ def private vulkan_resident_batch_decode_go(t : Model; ws : BatchWorkspace; var 
 
 [hot_path, arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]   // per prefill quantum - reached only through the engine's registered probe
 def private vulkan_embed_gpu_gate(t : Model; s : Session; npos, start_pos : int64) : bool {
-    return (active_prefill_override() == "vulkan" && g_rdec_active && (g_resident_prefill_allowed || s.device_kv) && g_rdec_emb_gpu
+    return (active_prefill_override() == "vulkan" && g_rdec_active && !mtp_verify_window_active(s) && (g_resident_prefill_allowed || s.device_kv) && g_rdec_emb_gpu
         && (start_pos == 0l || t.config.recr_mask == 0ul) && start_pos + npos <= g_rdec_cap
         && s.kv_dtype_k == g_rdec_kvdt && s.kv_dtype_v == g_rdec_kvdt && s.kv_pool == null
         && s.attn_uniform_end == 0l && empty(s.mrope_pos) && !s.ds_active)
@@ -2146,6 +3733,11 @@ def resident_driver_register() {
     register_decode_override("vulkan", @@vulkan_resident_decode)
     register_batch_decode_override("vulkan", @@vulkan_resident_batch_decode)
     register_prefill_override("vulkan", @@vulkan_resident_prefill)
+    register_mtp_seat_owner("vulkan", @@vulkan_mtp_owns)
+    register_mtp_seam_override("vulkan", @@vulkan_resident_seam)
+    register_mtp_draft_override("vulkan", @@vulkan_resident_draft)
+    register_mtp_verify_override("vulkan", @@vulkan_resident_verify)
+    register_mtp_rollback_override("vulkan", @@vulkan_resident_rollback)
     register_ple_gpu_gate(@@vulkan_ple_gate)
     register_ple_gpu_decode_gate(@@vulkan_ple_gate)   //! the token command gathers the row on device too
     register_prefill_override_split_span("vulkan")
@@ -2305,13 +3897,24 @@ def moe_gpu_drop_model_() {
     if (!moe_gpu_tier_installed()) {
         return
     }
+    rdec_trace_write()
+    g_rdec_trace_header_written = false
+    g_rdec_trace_header = (layers = 0, experts = 0, k = 0)
+    g_rdec_experts_host = false
+    g_rdec_host_layers = 0l
+    clear_rdec_host_rows()
+    rdec_set_host_experts(false)
     moe_gpu_dn_invalidate()
     rdec_set_active(false)
     reset_gpu_cpu_passes()
+    g_rdec_draft_pick = -1l
+    g_rdec_verify_picks |> clear()
     g_rdec_regions |> clear()
     g_rdec_cap = 0l
     g_rdec_emb_gpu = false
     rdec_ple_proj_set(false)
+    g_rdec_hot |> clear()
+    g_rdec_hot_slots = 0l
     // resident_upload selected the "vulkan" overrides; deselect so (a) a later re-arm's
     // resident_upload passes its no-active-override gate (the warm re-arm decline), and (b) a
     // dropped model's prefill/decode take the plain CPU path without consulting dead state
@@ -2441,30 +4044,13 @@ def moe_gpu_upload_resident(t : Model) {   // nolint:STYLE037,STYLE038 — seven
     // subsumes every rail below; a decline falls through
     let resident_try = (moe_gpu_resident_installed() && gpu_resident_requested() && gpu_want_resident()
         && (t.config.n_expert == 0l || rdec_moe_installed()))
-    // the mirror codec: f16 rows by default (native fa feed, ~2x plannable ctx);
-    // DASLLAMA_VK_KV32=1 arms f32 mirrors instead (A/B; then only f32 sessions serve)
-    let rkdt = g_env_vulkan.vk_kv32 != 0l ? KVDtype.f32 : KVDtype.f16
-    var seq_cap = t.config.seq_len
-    let ctx_max = g_rdec_ctx_max > 0l ? g_rdec_ctx_max : g_env_gpu.gpu_ctx_max
-    if (ctx_max > 0l && ctx_max < seq_cap) {   // a mirror sized to a 131072-token model max is 8 GB on a 4B: the rigs pin 32768
-        seq_cap = max(ctx_max, rdec_min_ctx())
-        to_log(LOG_INFO, "dasLLAMA: resident driver - KV mirror capped at {seq_cap} positions (DASLLAMA_GPU_CTX_MAX, or set_gpu_ctx_max in process; 0 lifts the cap)\n")
-    }
+    let rkdt = resident_mirror_dtype()
+    var seq_cap = 0l
     var plan : ResidentPlan
     if (resident_try) {
-        let bctx = resident_binding_ctx(t, rkdt, moe_gpu_binding_cap(g_rdec_regions_want))
-        seq_cap = resident_region_ctx(seq_cap, bctx, g_rdec_regions_want)
-        plan = resident_plan(t, seq_cap, rkdt, rkdt)
-        if (!plan.fits && plan.weight_bytes > 0l && plan.kv_bytes > 0l) {
-            // weights are fixed, the KV mirror is not: retry at the context that fits (the plan's
-            // own remedy), as long as it stays a usable window. The driver guards decode past the cap.
-            //! seven eighths of the room: a mirror sized to the last byte fails on a heap the previous model fragmented
-            let fit_ctx = (max(plan.usable_bytes - plan.weight_bytes - plan.scratch_bytes, 0l) / 8l * 7l) / (plan.kv_bytes / seq_cap)
-            if (fit_ctx >= rdec_min_ctx()) {
-                seq_cap = fit_ctx
-                plan = resident_plan(t, seq_cap, rkdt, rkdt)
-            }
-        }
+        plan = resident_plan_pick(t, rkdt, seq_cap)
+    } else {
+        seq_cap = resident_pinned_seq_cap(t, true)
     }
     let resident_fits = resident_try && plan.fits
     // size the tier's streamed-slot reserve from THIS model's largest expert layer — a fixed

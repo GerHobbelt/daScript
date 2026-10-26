@@ -15,6 +15,7 @@ require dasllama/dasllama_math
 require dasllama/dasllama_spm
 require dasllama/dasllama_unicode
 require dasllama/dasllama_tower   // add_inplace_rows: the residual add the block home shares with the towers
+require dasllama/dasllama_gpu_math   // tts_modulate
 require dasllama/dasllama_tts_types
 require dasllama/dasllama_tts_blocks
 
@@ -762,10 +763,7 @@ def private carry_init(var cr : PocketConvCarry; c : TtsConv1d) {
 //! the first window's carry for a conv whose pad replicates the edge: `n` copies of the window's first row
 def private carry_replicate(var cr : PocketConvCarry; x : array<float>; n, w : int64) {
     cr.n = n
-    cr.rows |> reserve_resize(n * w)
-    for (r in range64(n)) {
-        copy_floats(x, 0l, cr.rows, r * w, w)
-    }
+    pad_edge_left_rows(x, 0l, w, n, cr.rows)
 }
 
 //! x [n][cin], one window of a stream, through a codec conv: the carried rows lead the window,
@@ -1271,7 +1269,7 @@ def private frame_step(m : PocketModel; var vs : PocketVoiceState; pos : int64; 
 //! The flow head's adaLN modulation of one row in place: x * (1 + scale) + shift, `mod` holding the shift half then the scale half.
 def modulate(var x : array<float>; mod : array<float>; n : int64) {
     for (j in range64(n)) {
-        x[j] = x[j] * (1.0 + mod[n + j]) + mod[j]
+        x[j] = tts_modulate(x[j], mod[j], mod[n + j])
     }
 }
 
@@ -1369,12 +1367,10 @@ def set_pocket_frame_batch(n : int64) {
 
 def pocket_frame_batch() : int64 => g_pocket_frame_batch
 
-//! A GPU seat's host frame loop in batches of up to `batch`: the noise drawn in the CPU loop's order into `noise(k)`, `run(f0, k)` the batch's
-//! frames (false on a failed submit), `eos(f0, i)` frame f0 + i's EOS logit; the EOS rule walked between batches, the last batch's draws past
-//! the frames made rewound as the CPU loop leaves the generator. The frames made and the EOS frame (frames -1 on a failed submit); `f0` the frames run.
+//! a GPU seat's frame loop: `noise(k)` takes a batch's draws, `run(first, k)` submits the batch at its first frame (false fails: frames -1), `eos(first, i)` reads a logit
 def pocket_frames_batched(m : PocketModel; batch, max_frames : int64; std : float; frames_after_eos : int; captured : array<float>;
-                          var sc : PocketScratch; var f0 : int64&; noise : block<(k : int64) : float?>; run : block<(f0, k : int64) : bool>;
-                          eos : block<(f0, i : int64) : float>) : tuple<frames : int64; eos_at : int64> {
+                          var sc : PocketScratch; var f0 : int64&; noise : block<(k : int64) : float?>; run : block<(first, k : int64) : bool>;
+                          eos : block<(first, i : int64) : float>) : tuple<frames : int64; eos_at : int64> {
     let ld = m.latent_dim
     var frames = 0l
     var eos_at = -1l
@@ -1382,7 +1378,7 @@ def pocket_frames_batched(m : PocketModel; batch, max_frames : int64; std : floa
     while (!done && f0 < max_frames) {
         let k = min(batch, max_frames - f0)
         let rb = sc.rng
-        let fb = frames
+        let frames_before = frames
         var np = invoke(noise, k)
         for (i in range64(k * ld)) {
             unsafe(np[i]) = pocket_noise_at(sc, captured, f0 * ld + i, std)
@@ -1398,9 +1394,9 @@ def pocket_frames_batched(m : PocketModel; batch, max_frames : int64; std : floa
             }
             frames++
         }
-        if (frames - fb < k) {
+        if (frames - frames_before < k) {
             sc.rng = rb
-            for (i in range64((frames - fb) * ld)) {
+            for (i in range64((frames - frames_before) * ld)) {
                 if (f0 * ld + i >= long_length(captured)) {
                     rng_normal(sc.rng)
                 }

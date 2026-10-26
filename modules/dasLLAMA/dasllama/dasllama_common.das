@@ -179,6 +179,27 @@ struct Config {
     // MTP/NextN (qwen35 family -MTP files): block_count includes the appended draft block(s).
     // n_layers stays the TRUNK count everywhere; the MTP block lives at layer index n_layers.
     n_layer_nextn : int64 = 0          // 0 = no MTP block; 1 = single NextN head (only value supported)
+    // qwen4exp (Qwen3.8-Flash-Next): the residual is hc_count parallel streams, mixed into every block's input and
+    // scattered back after it (hyper-connections); the mixers carry the norms (no attn_norm / ffn_norm / output_norm
+    // tensors). The bools are arch opt-ins (configure); the geometry is loader-filled from {arch}.hyper_connection.*
+    hyper_conn : bool = false
+    hc_count : int64 = 0               // parallel residual streams (4)
+    hc_low_rank : int64 = 0            // the mixer's bottleneck width (320)
+    dn_z_sigmoid : bool = false        // deltanet out-gate σ(z) (qwen4exp) instead of silu(z) (qwen35)
+    // qwen4exp PLE: an n-gram HASH table (not gemma-4's per-token-id table): loader-detected from
+    // {arch}.ple.layers; the hash constants (multipliers, head offsets, head vocab sizes) are Model arrays
+    ple_ngram : bool = false           // arch opt-in: read the ple.* keys when the file carries them
+    ple_layer : int64 = -1             // the ONE layer whose block the n-gram side input precedes (-1 = none)
+    ple_ngram_size : int64 = 0         // n of the widest n-gram (3: bigram + trigram heads)
+    ple_heads_per_ngram : int64 = 0    // rows gathered per n-gram order (8)
+    ple_head_dim : int64 = 0           // row width of the hash table (160) - NOT n_embd_per_layer (gemma-4's rail)
+    ple_conv_kernel : int64 = 0        // the depthwise causal conv's taps (4), dilated by ple_ngram_size
+    ple_eos_token : int64 = 0          // resets the n-gram window (a missing predecessor reads as this)
+    ple_image_token : int64 = 0        // stands in for an embedding-fed row (0 = the EOS id)
+    // qwen4exp QSA (query-sparse attention) indexer geometry; a compress ratio per layer is a Model array
+    indexer_n_head : int64 = 0         // indexer query heads (4)
+    indexer_head_size : int64 = 0      // indexer key width (128)
+    indexer_top_k : int64 = 0          // the attended-token budget (2048); dense attention below it
 }
 
 // Swappable block kernels — one per (attention|ffn) x (decode|prefill). Decode is the fused
@@ -191,6 +212,11 @@ typedef FfnPrefillFn  = function<(t : Model; var s : Session; l : int64; npos : 
 //! One layer of the CPU batched decode step over B sessions: the arch's own form where the std
 //! batched attention (`attention_batch_decode`) does not fit its graph - null keeps the std form.
 typedef AttnBatchFn   = function<(t : Model; var ws : BatchWorkspace; var sessions : array<Session?>; l : int64; nrows : int64) : void>
+//! The arch's residual-shape seams around the layer loop (ArchBlocks.pre_stack_* / final_norm): the pre-stack step sees the
+//! embedded row(s) and the token ids; final_norm writes the classifier's input row into xb from residual row `row` (decode: x; prefill: x_b)
+typedef PreStackDecodeFn  = function<(t : Model; var s : Session; token : int64; pos : int64) : void>
+typedef PreStackPrefillFn = function<(t : Model; var s : Session; tokens : array<int64>; npos : int64; start_pos : int64) : void>
+typedef FinalNormFn       = function<(t : Model; var s : Session; row : int64; batched : bool) : void>
 
 //! A whole-prefill override: claims the ENTIRE per-layer stack of one prefill. On true the KV
 //! cache is filled for every position; x_b holds the final residual stream at row npos-1 always,
@@ -292,6 +318,15 @@ var private g_embed_gpu_gate_set = false
 def register_embed_gpu_gate(fn : EmbedGpuGateFn) {
     g_embed_gpu_gate = fn
     g_embed_gpu_gate_set = true
+}
+
+//! the gate as a fixture finds it, put back by `register_embed_gpu_gate` or, where none was installed, `unregister_embed_gpu_gate`
+def embed_gpu_gate_installed() : bool => g_embed_gpu_gate_set
+
+def embed_gpu_gate() : EmbedGpuGateFn => g_embed_gpu_gate
+
+def unregister_embed_gpu_gate() {
+    g_embed_gpu_gate_set = false
 }
 
 // ===== gemma-4 PLE pre-step hooks (registered by dasllama_ple at [init]) =====
@@ -418,9 +453,7 @@ def register_decode_override(name : string; fn : DecodeOverrideFn) {
     g_decode_overrides[name] = fn
 }
 
-// The MTP spec-step override: a backend's complete mtp_spec_eval twin (cold gates + accept/
-// reject bookkeeping inside). Keyed by the DECODE override name — selecting "metal" activates
-// both; consulted only for blob models (planar models keep the CPU spec rail).
+//! The MTP spec-step seat: a backend's whole mtp_spec_eval twin, cold gates included, keyed by the decode override's name and consulted where it owns the model (`mtp_seats_own`)
 typedef MtpSpecOverrideFn = function<(t : Model; var s : Session; tok : int64; var accepted : int64&) : bool>
 var private g_mtp_spec_overrides : table<string; MtpSpecOverrideFn>
 
@@ -438,9 +471,7 @@ def register_mtp_spec_batch_override(name : string; fn : MtpSpecBatchOverrideFn)
     g_mtp_spec_batch_overrides[name] = fn
 }
 
-// The MTP seam-row override: writes the draft head's row pos-1 on a blob model BEFORE a
-// continuation window's trunk body (forward_mtp(..., false)'s GPU twin) — the body's own
-// tail overwrites mtp_h, so the seam must consume the pre-window handoff first
+//! The MTP seam-row seat (forward_mtp(..., false)'s GPU twin): the head's row pos-1 before a continuation window's trunk body overwrites mtp_h; a declined seam on a model with CPU planes falls to the CPU seam
 typedef MtpSeamOverrideFn = function<(t : Model; var s : Session; token, pos : int64) : bool>
 var private g_mtp_seam_overrides : table<string; MtpSeamOverrideFn>
 
@@ -450,6 +481,69 @@ var private g_mtp_round_overrides : table<string; MtpRoundOverrideFn>
 def register_mtp_round_override(name : string; fn : MtpRoundOverrideFn) {
     g_mtp_round_overrides[name] = fn
 }
+
+//! The MTP draft seat (`forward_mtp`'s GPU twin, the drafting form): the head's row `pos` from (embed(token), s.mtp_h) - the draft's
+//! token id answered (the device's argmax), `s.mtp_h` the head's own hidden at `mtp_h_pos1` 0, the head's row `pos` written where the seat
+//! keeps it, `s.logits` the draft's unless `pick_only` (the logits stay on the device); -1 declines to the CPU draft. Consulted under `mtp_seats_own`
+typedef MtpDraftOverrideFn = function<(t : Model; var s : Session; token, pos : int64; pick_only : bool) : int64>
+var private g_mtp_draft_overrides : table<string; MtpDraftOverrideFn>
+
+def register_mtp_draft_override(name : string; fn : MtpDraftOverrideFn) {
+    g_mtp_draft_overrides[name] = fn
+}
+
+//! The MTP verify seat, the CPU verify's GPU twin over one stream's `n` rows `toks` at `pos`, leaving the session as `forward_prefill`,
+//! `mtp_prefill_warm` and `mtp_verify_logits` do: every row's pick in `s.mtp_picks` and hidden in `s.mtp_hrows`, the logits in `s.mtp_logits_b`,
+//! `s.mtp_logits` (row 0) and `s.logits` (the last) unless `pick_only`, where none land and the round publishes the committed row's pick (`land_pick`); the head re-warmed from `s.mtp_xb_save`; false declines, the session untouched. Consulted under `mtp_seats_own`
+typedef MtpVerifyOverrideFn = function<(t : Model; var s : Session; toks : array<int64>; n, pos : int64; pick_only : bool) : bool>
+var private g_mtp_verify_overrides : table<string; MtpVerifyOverrideFn>
+
+def register_mtp_verify_override(name : string; fn : MtpVerifyOverrideFn) {
+    g_mtp_verify_overrides[name] = fn
+}
+
+//! The MTP rollback seat, a served verify's reject on the backend that served it: the session's recurrent state, cached rows and
+//! head rows back to the state after verify row `a` (the rows the round committed), `dn_pos` at `pos + a + 1`. The round takes
+//! no snapshot before a verify this seat follows, so false is an engine bug it panics on. Consulted where the verify seat served
+typedef MtpRollbackOverrideFn = function<(t : Model; var s : Session; pos, a : int64) : bool>
+var private g_mtp_rollback_overrides : table<string; MtpRollbackOverrideFn>
+
+def register_mtp_rollback_override(name : string; fn : MtpRollbackOverrideFn) {
+    g_mtp_rollback_overrides[name] = fn
+}
+
+//! whether the MTP seats registered under a decode override's name serve model `t`: the override that owns `t`'s
+//! round - an override with no owner registered never takes a round, and a model its owner refuses runs the CPU round
+typedef MtpSeatOwnerFn = function<(t : Model) : bool>
+var private g_mtp_seat_owners : table<string; MtpSeatOwnerFn>
+
+def register_mtp_seat_owner(name : string; fn : MtpSeatOwnerFn) {
+    g_mtp_seat_owners[name] = fn
+}
+
+//! the active decode override owns `t`'s speculative round: its seats, where it registered them, serve the round
+def mtp_seats_own(t : Model) : bool {
+    return (!empty(g_decode_override_name) && key_exists(g_mtp_seat_owners, g_decode_override_name)
+        && invoke(g_mtp_seat_owners[g_decode_override_name], t))   // nolint:PERF026 — key_exists guards the index, so it cannot insert
+}
+
+//! the active decode override holds a seat in `seats` and owns `t`'s round: the one lookup every MTP seat table answers through
+def private mtp_seated(t : Model; seats : table<string; auto(FnT)>) : bool
+    => mtp_seats_own(t) && key_exists(seats, g_decode_override_name)
+
+//! the active decode override's draft seat's token for `forward_mtp`'s draft of `token` at row `pos`; -1 where no seat served
+def private mtp_draft_seat(t : Model; var s : Session; token, pos : int64; pick_only : bool) : int64 {
+    return -1l if (!mtp_seated(t, g_mtp_draft_overrides))
+    return invoke(g_mtp_draft_overrides[g_decode_override_name], t, s, token, pos, pick_only)   // nolint:PERF026 — key_exists guards the index, so it cannot insert
+}
+
+//! the verify seat took the round's `n` rows `toks` at `pos` (the caller asked `mtp_seated(t, g_mtp_verify_overrides)` first)
+def private mtp_verify_served(t : Model; var s : Session; toks : array<int64>; n, pos : int64; pick_only : bool) : bool
+    => invoke(g_mtp_verify_overrides[g_decode_override_name], t, s, toks, n, pos, pick_only)
+
+//! the rollback seat put the session back to the state after verify row `a` (the caller asked `mtp_seated(t, g_mtp_rollback_overrides)` first)
+def private mtp_rollback_served(t : Model; var s : Session; pos, a : int64) : bool
+    => invoke(g_mtp_rollback_overrides[g_decode_override_name], t, s, pos, a)
 
 //! The accept walk's sampler seam (the decode-override shape: the engine never requires the sampler):
 //! draws one token from row `off` of `rows` through the session's spec_params, consuming the row.
@@ -488,6 +582,13 @@ def mtp_walk_samples(s : Session) : bool {
     return true
 }
 
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#logits-transfer-queue")]
+def land_pick(var s : Session; pick : int64) {
+    verify(!s.pick_ready, "dasLLAMA: a session's landed pick was never sampled before its next step - engine bug")
+    s.pick_tok = pick
+    s.pick_ready = true
+}
+
 //! Every speculative round opens here: a token the previous round parked, or a pick a device driver landed, must have
 //! been consumed by the caller's sample_ - a caller that read s.logits instead would emit a stale token later.
 def mtp_round_begin(s : Session) {
@@ -520,11 +621,12 @@ def mtp_walk_sampled(var s : Session; k, vocab : int64) : int64 {
 }
 
 //! One speculative round at the configured depth (get_mtp_depth): commits `tok`, returns the
-//! accepted draft count a with the accepted drafts in s.mtp_vbatch[1..a]. The metal round serves
-//! any depth for blob models; every other rail is the depth-1 mtp_spec_eval.
+//! accepted draft count a with the accepted drafts in s.mtp_vbatch[1..a]. The active decode
+//! override's round seat serves any depth where it owns `t` (`mtp_seats_own`); else the rail is the depth-1 mtp_spec_eval.
+[hot_path]   // the per-round entry a greedy walk re-enters once per committed token
 def mtp_spec_round(t : Model; var s : Session; tok : int64) : int64 {
-    if (t.metal_blob && !empty(g_decode_override_name) && key_exists(g_mtp_round_overrides, g_decode_override_name)) {
-        return invoke(g_mtp_round_overrides[g_decode_override_name], t, s, tok, get_mtp_depth())
+    if (mtp_seated(t, g_mtp_round_overrides)) {
+        return invoke(g_mtp_round_overrides[g_decode_override_name], t, s, tok, get_mtp_depth())   // nolint:PERF026 — mtp_seated holds key_exists, so the index cannot insert
     }
     var acc = 0l
     if (mtp_spec_eval(t, s, tok, acc)) {
@@ -572,24 +674,48 @@ var private g_layout_repack_q8 : ModelRepackFn
 var private g_layout_repack_kq : ModelRepackFn
 var private g_layout_repack_mx4 : ModelRepackFn
 var private g_layout_repack_q51 : ModelRepackFn
+var private g_layout_repack_iq4nl32 : ModelRepackFn
 typedef GatherStackB32Fn = function<(t : Model; woff : int64; n, rows, slice_rows : int64;
                                      repacked : bool; mr : int64; var wq : array<uint8>; var ws : array<uint8>) : void>
 var private g_layout_gather : GatherStackFn
 var private g_layout_gather_kq : GatherStackKqFn
 var private g_layout_gather_q51 : GatherStackB32Fn
+var private g_layout_gather_iq4nl32 : GatherStackB32Fn
 var private g_layout_gather_mx4 : GatherStackB32Fn
 var private g_layout_hooks_set = false
 
-def register_model_layout(rq8, rkq, rmx4, rq51 : ModelRepackFn; gs : GatherStackFn; gskq : GatherStackKqFn; gsq51, gsmx4 : GatherStackB32Fn) {
+def register_model_layout(rq8, rkq, rmx4, rq51, riq4nl32 : ModelRepackFn; gs : GatherStackFn; gskq : GatherStackKqFn; gsq51, gsiq4nl32, gsmx4 : GatherStackB32Fn) {
     g_layout_repack_q8 = rq8
     g_layout_repack_kq = rkq
     g_layout_repack_mx4 = rmx4
     g_layout_repack_q51 = rq51
+    g_layout_repack_iq4nl32 = riq4nl32
     g_layout_gather = gs
     g_layout_gather_kq = gskq
     g_layout_gather_q51 = gsq51
+    g_layout_gather_iq4nl32 = gsiq4nl32
     g_layout_gather_mx4 = gsmx4
     g_layout_hooks_set = true
+}
+
+//! the per-format layout gather over `src`'s planes - the model's, or a job view whose offset 0 is the job's `woff`
+def layout_gather_dispatch(src : Model; f : KqFmt; woff, n, rows, slice_rows, mr, kgroup, wbias : int64;
+                           var wq : array<uint8>; var ws : array<uint8>) {
+    let srows = slice_rows > 0l ? slice_rows : rows
+    if (f == KqFmt.q8) {
+        layout_gather_stack(src, woff, n, rows, srows, mr, kgroup, wbias, wq, ws)
+    } elif (f == KqFmt.q51) {
+        let qmr = active_q51_layout_mr()   // the q51 expert stacks sit in the active backend's grp<mr> layout (repack_q51_stacks), disk order at mr 1
+        layout_gather_stack_q51(src, woff, n, rows, srows, qmr > 1l, qmr, wq, ws)
+    } elif (f == KqFmt.iq4nl32) {
+        let qmr = active_iq4nl32_layout_mr()   // the iq4nl32 expert stacks sit in the active backend's grp<mr> layout, disk order at mr 1
+        layout_gather_stack_iq4nl32(src, woff, n, rows, srows, qmr > 1l, qmr, wq, ws)
+    } elif (f == KqFmt.mx4) {
+        // the mx4 stacks ride the Q8 layout's grp<mr> interleave when the CPU repacked them (repack_mx4_stacks under the q8q8 perm), disk order otherwise
+        layout_gather_stack_mx4(src, woff, n, rows, srows, src.mx4_repacked, active_q8_layout_mr(), wq, ws)
+    } else {
+        layout_gather_stack_kq(src, f, woff, n, rows, srows, src.kq_repacked, kq_active_mr(src, f), wq, ws)
+    }
 }
 
 def private layout_hooks_check {
@@ -618,6 +744,11 @@ def layout_repack_q51(var t : Model) {
     invoke(g_layout_repack_q51, t)
 }
 
+def layout_repack_iq4nl32(var t : Model) {
+    layout_hooks_check()
+    invoke(g_layout_repack_iq4nl32, t)
+}
+
 // The GPU walk's gather half of the same hook contract. The residency rail intercepts each gather
 // for the flavor bake before calling through, so these stay thin and the hook globals stay private.
 
@@ -643,6 +774,12 @@ def layout_gather_stack_mx4(t : Model; woff : int64; n, rows, slice_rows : int64
                             repacked : bool; mr : int64; var wq : array<uint8>; var ws : array<uint8>) {
     layout_hooks_check()
     invoke(g_layout_gather_mx4, t, woff, n, rows, slice_rows, repacked, mr, wq, ws)
+}
+
+def layout_gather_stack_iq4nl32(t : Model; woff : int64; n, rows, slice_rows : int64;
+                                repacked : bool; mr : int64; var wq : array<uint8>; var ws : array<uint8>) {
+    layout_hooks_check()
+    invoke(g_layout_gather_iq4nl32, t, woff, n, rows, slice_rows, repacked, mr, wq, ws)
 }
 
 // ===== whole-model GPU residency hook (registered by dasllama_gpu_resident at [init]) =====
@@ -884,6 +1021,11 @@ struct ArchBlocks {
     // Metal gate: the FFN is the plain dense gated pair (ffn_dense_*). Block sets that route
     // experts (or MAY, per file — gemma4) set this false and the GPU drivers decline `graph`.
     ffn_is_dense : bool = true
+    // the residual's shape is the arch's: pre_stack_* runs after the embedding lands in x / x_b (null = nothing),
+    // final_norm replaces the output_norm rmsnorm into xb (null = rms_at(rms_final_off)) - qwen4exp binds both
+    pre_stack_decode : PreStackDecodeFn
+    pre_stack_prefill : PreStackPrefillFn
+    final_norm : FinalNormFn
 }
 
 //! One lattice format's planes on a Model: the quant plane, the scale plane, and the grp<mr>
@@ -985,6 +1127,9 @@ struct Model {
     // the q51 tier's plane pair, per 32-BLOCK: 20B nibbles+qh / 4B f16 d+m (never repacked)
     q51q : array<uint8>
     q51s : array<uint8>
+    // the iq4nl32 tier's plane pair, per 32-BLOCK: 16B nibbles / 2B f16 d
+    iq4nl32q : array<uint8>
+    iq4nl32s : array<uint8>
     kquant_native : bool = false
     // kq stage 4: the kq planes were repacked at load into the active backend's grp<mr> layout.
     // From then on every kq matmul MUST run the backend slots — disk-order portable kernels would
@@ -1111,6 +1256,43 @@ struct Model {
     mtp_enorm_off : int64 = -1      // fblob: nextn.enorm (token-embedding RMS weight), dim
     mtp_hnorm_off : int64 = -1      // fblob: nextn.hnorm (trunk-hidden RMS weight), dim
     mtp_headnorm_off : int64 = -1   // fblob: nextn.shared_head_norm, dim (-1 = output_norm)
+    // under hyper-connections the draft head carries the WIDE residual (hnorm is hc x dim) and
+    // collapses it through its own head mixer before the classifier
+    mtp_hc_head_norm_off : int64 = -1   // fblob: nextn.hc_head_norm, hc x dim
+    mtp_hc_head_down_off : int64 = -1   // q8: [low_rank x hc_dim]
+    mtp_hc_head_up_off : int64 = -1     // q8: [hc_dim x low_rank]
+    // qwen4exp hyper-connections (config.hyper_conn). Per layer TWO mixer sites, attn (0) then ffn
+    // (1), indexed (l * 2 + site): the grouped norm gammas and the f32 inject matrices in fblob,
+    // the low-rank down/up pair on the q8 plane. The head mixer (no inject) replaces output_norm.
+    hc_norm_off : int64 = -1        // fblob: sites x (hc x dim), the converter's folded (1 + w)
+    hc_inject_off : int64 = -1      // fblob: sites x (hc x (hc x dim)) - one hc_dim row per stream
+    hc_down_offs : array<int64>     // q8: per site [low_rank x hc_dim]
+    hc_up_offs : array<int64>       // q8: per site [hc_dim x low_rank]
+    hc_head_norm_off : int64 = -1   // fblob: hc x dim
+    hc_head_down_off : int64 = -1   // q8: [low_rank x hc_dim]
+    hc_head_up_off : int64 = -1     // q8: [hc_dim x low_rank]
+    // qwen4exp PLE n-gram side input (config.ple_layer >= 0): the hash table stays in its DISK
+    // block form and is gathered per token (ple_head_dim elements per row); the two projections
+    // ride the q8 plane, the three grouped norms and the conv taps are fblob
+    ngram_tab : array<uint8>        // per_layer_token_embd raw rows: ngram_rows x ngram_row_bytes
+    ngram_type : int = 0            // the table's GGML type (IQ4_NL / Q8_0 / F16 / BF16 / F32 decode)
+    ngram_rows : int64 = 0
+    ngram_row_bytes : int64 = 0
+    ple_mult : array<uint64>        // ple.layer_multipliers: one per n-gram position
+    ple_head_off : array<int64>     // ple.head_offsets: first row of head h
+    ple_head_vocab : array<int64>   // ple.head_vocab_sizes: rows of head h (the modulus)
+    ple_key_off : int64 = -1        // q8: [hc_dim x (heads x head_dim)]
+    ple_val_off : int64 = -1        // q8: [dim x (heads x head_dim)]
+    ple_nkey_off : int64 = -1       // fblob: hc x dim
+    ple_nquery_off : int64 = -1     // fblob: hc x dim
+    ple_nconv_off : int64 = -1      // fblob: hc x dim
+    ple_conv_off : int64 = -1       // fblob: (hc x dim) x conv_kernel, taps contiguous per channel
+    // qwen4exp QSA indexer (config.indexer_n_head > 0): f32 in fblob, attention layers only
+    idx_q_offs : array<int64>       // per layer [ (n_head x head_size) x dim ], -1 on recurrent layers
+    idx_k_offs : array<int64>       // per layer [ head_size x dim ]
+    idx_qn_offs : array<int64>      // per layer [head_size]
+    idx_kn_offs : array<int64>      // per layer [head_size]
+    qsa_ratio : array<int64>        // {arch}.attention.compress_ratios per layer (0 = dense)
     // vulkan-flavor bake (dasllama_image): the GPU walk's gathered device-layout planes + the
     // walk-order plan. Empty on planar/metal flavors (empty planes never save); borrowed
     // views on a flavor load — the generic finalizer walk covers both.
@@ -1243,6 +1425,7 @@ def model_weights_bytes(t : Model) : int64 {
         + long_length(t.bf16blob) * 2l
         + kqb.q + kqb.s
         + long_length(t.q51q) + long_length(t.q51s)
+        + long_length(t.iq4nl32q) + long_length(t.iq4nl32s)
         + long_length(t.mblob) + long_length(t.vkblob)
         + long_length(t.embq) + long_length(t.embs))
 }
@@ -1588,8 +1771,16 @@ def apply_box_profile_runtime_at(ppath : string) {   // nolint:STYLE038 — a fl
     } else {
         g_box_profile_runtime_declined = "no_runtime_section"   //! a fallback-stamp sidecar: kernels, no box state
     }
-    apply_i64_knob(rt, "q8_token_block") $(v) { set_q8_token_block(v) }
-    apply_i64_knob(rt, "q8_l2_budget") $(v) { set_q8_l2_budget(v) }
+    apply_i64_knob(rt, "q8_token_block") $(v) {
+        set_q8_token_block(v)
+        if (bf16_token_block() != v) {
+            to_log(LOG_INFO, "dasLLAMA: box profile runtime: q8_token_block = {v} reads as {bf16_token_block()} on a bf16 tile walk (the floor of {bf16_token_block_floor()}, in whole {amx_bf16_tile_tokens()}-token tiles)\n")
+        }
+    }
+    apply_i64_knob(rt, "q8_l2_budget") $(v) {
+        set_q8_l2_budget(v)
+        to_log(LOG_INFO, "dasLLAMA: box profile runtime: q8_l2_budget = {v} cuts the int8 walks' token block; a bf16 tile walk reads no budget\n")
+    }
     apply_i64_knob(rt, "target_chunk_work") $(v) { set_target_chunk_work(v) }
     apply_i64_knob(rt, "attn_par_threshold") $(v) { set_attn_par_threshold(v) }
     apply_i64_knob(rt, "requant_par_threshold") $(v) { set_requant_par_threshold(v) }
@@ -1709,6 +1900,76 @@ def public get_kq_q51_native() : bool {
     return g_kq_q51_native
 }
 
+//! Whether an IQ3_S weight loads as the iq3s4 served form (DASLLAMA_IQ3S_SERVE): `lut` / `grid` decide
+//! outright; `auto` = the LUT form wherever the rails that serve the load decode it - the CPU rails and the
+//! Vulkan tier do, the Metal tier gathers the grid and carries no iq3s4 kernel
+def public iq3s_serve_lut() : bool {
+    let mode = g_env_engine.iq3s_serve
+    if (mode == "lut") {
+        return true
+    }
+    if (mode == "grid") {
+        return false
+    }
+    if (mode != "auto") {
+        to_log(LOG_WARNING, "dasLLAMA: DASLLAMA_IQ3S_SERVE='{mode}' is not one of auto | grid | lut - reading auto\n")
+    }
+    return get_metal_mode() == MetalMode.off
+}
+
+//! The rope-scaling override a load bakes in place of the file's rope.scaling keys: `kind` "" keeps the
+//! file's, yarn / linear replace them, none drops them; a 0 number reads the file's value, else YaRN's
+//! defaults (beta 32 / 1, the original context = the file's context_length)
+struct public RopeScalingOverride {
+    kind : string = ""
+    scale : float = 0.0
+    orig_ctx : int64 = 0l
+    beta_fast : float = 0.0
+    beta_slow : float = 0.0
+}
+
+var private g_rope_override = RopeScalingOverride()
+
+[init]
+def private rope_override_from_env {
+    g_rope_override = RopeScalingOverride(kind = to_lower(g_env_engine.rope_scaling), scale = g_env_engine.rope_scale,
+        orig_ctx = g_env_engine.yarn_orig_ctx, beta_fast = g_env_engine.yarn_beta_fast, beta_slow = g_env_engine.yarn_beta_slow)
+}
+
+//! The tools' spelling of DASLLAMA_ROPE_SCALING / ROPE_SCALE / YARN_ORIG_CTX, set before the load; the loader checks the kind
+[arch(at = "../ARCHITECTURE_ENGINE.md#rope-scaling-bake")]
+def public set_rope_scaling_override(o : RopeScalingOverride) {
+    g_rope_override = o
+    g_rope_override.kind = to_lower(o.kind)
+}
+
+def public rope_scaling_override() : RopeScalingOverride => g_rope_override
+
+def private num_spelling(x : float) : string => fmt(":g", x)   // 4.0 reads "4", 2.5 stays "2.5"
+
+//! The override as an image identity reads it: "" when unset, else yarn<s>/<orig>[/<beta_fast>/<beta_slow>] | linear<s> | none
+def public rope_override_spelling() : string {
+    let o = g_rope_override
+    if (empty(o.kind) || o.kind == "none") {
+        return o.kind
+    }
+    let s = num_spelling(o.scale)
+    if (o.kind != "yarn") {
+        return "{o.kind}{s}"
+    }
+    let betas = (o.beta_fast > 0.0 || o.beta_slow > 0.0) ? "/{num_spelling(o.beta_fast)}/{num_spelling(o.beta_slow)}" : ""
+    return "yarn{s}/{o.orig_ctx}{betas}"
+}
+
+//! The override as an image lane suffix: "" when unset, else yarn<s> | linear<s> | norope
+def public rope_override_lane() : string {
+    let o = g_rope_override
+    if (empty(o.kind)) {
+        return ""
+    }
+    return o.kind == "none" ? "norope" : "{o.kind}{num_spelling(o.scale)}"
+}
+
 // ===== DlimConfiguration sources (dasllama_config) =====
 
 def private dlim_cpu_source_impl(var c : DlimCpuConfig) {
@@ -1725,12 +1986,15 @@ def private dlim_cpu_source_impl(var c : DlimCpuConfig) {
         }
     }
     c.q51_mr = active_q51_layout_mr()
+    c.iq4nl32_mr = active_iq4nl32_layout_mr()
     // OUTCOME, not request: a backend without s16 twins keeps f32 scale planes (wscale_convert_f16)
     c.wscale_f16 = g_wscale_f16 && kernel_backend_has_wscale16()
     c.kquant_native = g_kquant_native
     c.kq_q40_native = g_kq_q40_native
     c.kq_q50_native = g_kq_q50_native
     c.kq_q51_native = g_kq_q51_native
+    c.iq3s_lut = iq3s_serve_lut()
+    c.rope_override = rope_override_spelling()
 }
 
 def private dlim_metal_source_impl(var c : DlimMetalConfig) : bool {
@@ -1766,9 +2030,11 @@ def kq_fmt_row_ok(f : KqFmt; n : int64) : KqFmt {
 }
 
 // Expert-stack tag rule: q51 serves natively off per-32 planes (its whole reason to exist — the
-// 26B-A4B down stacks are 704-wide); the superblock formats keep the % 256 rule.
+// 26B-A4B down stacks are 704-wide), and an IQ4_NL stack off the superblock lattice takes the
+// per-32 iq4nl32 planes (Qwen3.8-Flash-Next's 640-wide down stacks); the superblock formats keep the % 256 rule.
 def kq_fmt_expert_ok(f : KqFmt; n : int64) : KqFmt {
     if (f == KqFmt.q51) return n % 32l == 0l ? f : KqFmt.q8
+    if (f == KqFmt.iq4nl && n % 256l != 0l) return n % 32l == 0l ? KqFmt.iq4nl32 : KqFmt.q8
     return kq_fmt_row_ok(f, n)
 }
 
@@ -1905,8 +2171,8 @@ def footprint(t : Model) : MemFootprint {
     let mx4 = long_length(t.mxq)                  // uint8 (two nibbles) -> 1 byte each
     let mx4s = long_length(t.mxs)                 // raw E8M0 -> 1 byte per 32-block
     let kqb = kq_plane_bytes(t)
-    let kq = kqb.q + long_length(t.q51q)
-    let kqs = kqb.s + long_length(t.q51s)
+    let kq = kqb.q + long_length(t.q51q) + long_length(t.iq4nl32q)
+    let kqs = kqb.s + long_length(t.q51s) + long_length(t.iq4nl32s)
     return MemFootprint(aux_fp32_bytes = aux, weight_fp32_bytes = wf, q8_bytes = q8, q8_scale_bytes = q8s,
                         q4_bytes = q4, q4_scale_bytes = q4s, mx4_bytes = mx4, mx4_scale_bytes = mx4s,
                         kq_bytes = kq, kq_scale_bytes = kqs,
@@ -2232,10 +2498,34 @@ struct Session {
     @scratch dn_wtap : array<float>         // conv weights transposed tap-major for the batched form (d_conv x conv_dim)
     @scratch dn_cws : array<float>          // per-v-head chunk workspace slabs (dt_rank x dn_cws_head_size)
     @scratch dn_tail : array<float>         // GPU deltanet chain: last taps qkv rows back (conv-history store)
+    // hyper-connections (config.hyper_conn): the wide residual and the mixer scratch. hc_res is
+    // the residual the blocks scatter into; x / x_b hold the mixed block INPUT rows meanwhile
+    hc_res : array<float>          // decode: hc x dim
+    hc_xn : array<float>           // grouped-normed streams (hc x dim)
+    hc_lo : array<float>           // low-rank (low_rank)
+    hc_gate : array<float>         // the up projection (hc x dim)
+    hc_inject : array<float>       // this block's scatter logits (hc), set by the mixer, read by the combine
+    @scratch hc_res_b : array<float>       // prefill: npos x hc x dim
+    @scratch hc_xn_b : array<float>        // npos x hc x dim
+    @scratch hc_lo_b : array<float>        // npos x low_rank
+    @scratch hc_gate_b : array<float>      // npos x hc x dim
+    @scratch hc_inject_b : array<float>    // npos x hc
+    // PLE n-gram side input (config.ple_layer >= 0): forward-only state like the deltanet's
+    ple_prev : array<int64>        // the last (ngram_size - 1) token ids, oldest first (-1 = none yet)
+    @exact_size ple_conv_hist : array<float>   // the conv's history ring: (taps-1)*dilation + 1 rows of hc x dim
+    ple_ring_device : bool         //! the ring's current rows sit in the resident driver's device slot, not here (the driver syncs them up before a token and down before a pass)
+    ple_emb : array<float>         // decode: the gathered heads x head_dim row
+    ple_key : array<float>         // hc x dim
+    ple_val : array<float>         // dim
+    ple_gated : array<float>       // hc x dim
+    ple_conv_out : array<float>    // hc x dim
+    @scratch ple_emb_b : array<float>      // prefill: npos x (heads x head_dim)
+    @scratch ple_key_b : array<float>      // npos x hc x dim
+    @scratch ple_val_b : array<float>      // npos x dim
     // MTP/NextN self-spec state (empty unless config.n_layer_nextn > 0). mtp_h is the trunk's
     // post-output-norm hidden of the LAST evaluated position (the MTP draft-head handoff);
     // mtp_h_pos1 is that position PLUS ONE (0 = cold, keeps Session zero-init-safe).
-    mtp_h : array<float>           // h_nextn (dim)
+    mtp_h : array<float>           // h_nextn (dim; hc x dim under hyper-connections - the wide residual before the head mixer)
     mtp_h0 : array<float>          // the verify batch's ROW-0 normed hidden (= h_pos). forward_prefill's
                                    // tail only stashes the LAST row, which a reject discards — this is
                                    // what re-seeds mtp_h so a rejected step needs no re-forward
@@ -2243,16 +2533,19 @@ struct Session {
     mtp_cat : array<float>         // eh_proj input [enorm(embed(tok)) ; hnorm(h)] (2*dim)
     mtp_cat_b : array<float>       // prompt-warm eh_proj concat image ((npos-1) x 2*dim, scratch-sized per warm)
     @scratch mtp_xb_save : array<float>     // prompt-warm x_b preservation (the warm's eh_proj output rides x_b for the arch blocks; consumers like mtp_verify_row0 / embed_forward need the trunk hiddens back)
+    @scratch mtp_hc_save : array<float>     // prompt-warm hc_res_b preservation (the warm's eh_proj output is the draft's wide residual rows; the verify reads the trunk's back)
     mtp_logits : array<float>      // verify-batch row-0 logits (vocab; the draft check reads its argmax)
     mtp_vbatch : array<int64>      // the 2-row verify batch [tok, draft] (persistent — no per-step alloc)
     mtp_norm_b : array<float>      // verify-batch final-normed rows (npos x dim), input to the batched classifier
     @scratch mtp_logits_b : array<float>   // verify-batch logits (rows x vocab), grown once to the round's width
     @scratch mtp_hrows : array<float>      // verify-batch post-final-norm hidden rows (rows x dim) — the drafter's next input / the carry
+    @scratch mtp_picks : array<int64>      //! the last served verify seat's per-row picks, each its row's argmax: the greedy walk's truth, and the token a pick-asking round commits
     mtp_drafted : int64            // session-lifetime telemetry: drafts attempted / accepted
     mtp_accepted : int64
     // deltanet rollback for a rejected verify batch, sized lazily on the first snapshot (a 27B hybrid's state is 151 MB)
     @scratch mtp_snap_conv : array<float>
     @scratch mtp_snap_state : array<float>
+    @scratch mtp_snap_ple : array<int64>   // the n-gram window before the verify (forward-only state like the deltanet's)
     mtp_snap_pos : int64
 }
 
@@ -2372,17 +2665,37 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
         s.dn_qgate |> resize(qd)
     }
     if (c.n_layer_nextn > 0l) {   // MTP/NextN: h_nextn handoff + eh_proj concat input + verify row-0 outputs
-        s.mtp_h |> reserve_resize(c.dim)
-        s.mtp_h0 |> reserve_resize(c.dim)
-        s.mtp_cat |> reserve_resize(2l * MTP_MAX_ROWS * c.dim)   // the verify's embeds (row per verify row) and the warm's cat image
+        s.mtp_h |> reserve_resize(mtp_h_dim(c))
+        s.mtp_h0 |> reserve_resize(mtp_h_dim(c))
+        s.mtp_cat |> reserve_resize(max(2l * MTP_MAX_ROWS * c.dim, c.hc_count * 2l * c.dim))   // the verify's embeds (row per verify row), the warm's cat image, the per-stream cat rows
         s.mtp_logits |> resize(c.vocab_size)
         s.mtp_vbatch |> resize(MTP_MAX_ROWS)
+    }
+    if (c.hyper_conn) {   // hyper-connections: the wide residual + the mixer's four scratch rows
+        s.hc_res |> resize(hc_dim(c))
+        s.hc_xn |> resize(hc_dim(c))
+        s.hc_lo |> resize(c.hc_low_rank)
+        s.hc_gate |> resize(hc_dim(c))
+        s.hc_inject |> resize(c.hc_count)
+    }
+    if (has_ple_ngram(c)) {   // n-gram PLE: the window, the conv ring (zeroed by resize), the decode rows
+        s.ple_prev |> resize(c.ple_ngram_size - 1l)
+        for (i in range64(c.ple_ngram_size - 1l)) {
+            s.ple_prev[i] = -1l
+        }
+        s.ple_conv_hist |> reserve_resize(ple_hist_rows(c) * hc_dim(c))
+        s.ple_emb |> resize(ple_in_dim(c))
+        s.ple_key |> resize(hc_dim(c))
+        s.ple_val |> resize(c.dim)
+        s.ple_gated |> resize(hc_dim(c))
+        s.ple_conv_out |> resize(hc_dim(c))
     }
     s.ffn_offs |> resize(4)
     s.ffn_gu |> resize(2l * ffw)
     // the Q8·Q8 path quantizes whichever activation feeds a matmul; the MTP eh_proj feeds a
-    // 2*dim concat row (don't rely on qd/ffw happening to cover it — 35B-A3B's qd == 2*dim is luck)
-    let maxn = max(max(xdim, ffw), c.n_layer_nextn > 0l ? 2l * c.dim : 0l)
+    // 2*dim concat row (don't rely on qd/ffw happening to cover it — 35B-A3B's qd == 2*dim is luck);
+    // the hyper-connection mixer's down projection feeds the whole hc_dim-wide normed residual
+    let maxn = max(max(max(xdim, ffw), c.n_layer_nextn > 0l ? 2l * c.dim : 0l), max(hc_dim(c), ple_in_dim(c)))
     s.xq |> resize(maxn)
     s.xs |> resize(maxn / 32l)
     s.xq2 |> resize(ffw)        // fused-FFN chain requant (see the Session field comment)
@@ -2660,6 +2973,190 @@ def rms_batch(var out : array<float>; src : array<float>; t : Model; woff : int6
     }
 }
 
+// ===== hyper-connections (config.hyper_conn): the wide residual and the block seams =====
+
+//! grouped RMSNorm of one wide row: stream ch of res normalizes over dim and scales by gamma row ch of w
+def private hc_grouped_norm(var out : float?; res : float const?; w : float const?; dim, nh : int64; eps : float) {
+    unsafe {
+        for (ch in range64(nh)) {
+            rmsnorm(out + ch * dim, res + ch * dim, w + ch * dim, dim, eps)
+        }
+    }
+}
+
+//! the mixer's tail over one normed wide row: `inj_w` null = the head mixer (no scatter logits); xb <- the mean of the sigmoid-gated streams
+def private hc_mix_tail(var xn : float?; gate : float const?; inj_w : float const?; var inject : float?; var xb : float?; dim, nh : int64) {
+    let hcd = nh * dim
+    unsafe {
+        if (inj_w != null) {   // the scatter logits read the normed streams BEFORE the gate lands in them
+            for (ch in range64(nh)) {
+                inject[ch] = dot(inj_w + ch * hcd, xn, hcd)
+            }
+        }
+        sigmoid_gate(xn, gate, hcd)
+        copy_floats(xb, xn, dim)
+        for (ch in range64(1l, nh)) {
+            add_inplace(xb, xn + ch * dim, dim)
+        }
+        scale_inplace(xb, 1.0 / float(nh), dim)
+    }
+}
+
+//! One mixer over the wide row res[roff..]: xb <- the mean of the normed streams, each sigmoid-gated by a
+//! low-rank projection; s.hc_inject <- the scatter logits (inject_off < 0 = the head mixer, no scatter)
+def hc_mix_row(t : Model; var s : Session; res : array<float>; roff, norm_off, down_off, up_off, inject_off : int64) {
+    let c = t.config
+    let hcd = hc_dim(c)
+    let lr = c.hc_low_rank
+    let inv = 1.0 / float(c.hc_count)
+    unsafe {
+        hc_grouped_norm(addr(s.hc_xn[0]), addr < float const? >(res[roff]), addr < float const? >(t.fblob[norm_off]), c.dim, c.hc_count, c.norm_eps)
+    }
+    mm_f(s.hc_lo, t, KqFmt.q8, down_off, s.hc_xn, s.xq, s.xs, s.xbs, hcd, lr)
+    for (j in range64(lr)) {
+        let v = s.hc_lo[j] * inv
+        s.hc_lo[j] = v / (1.0 + exp(-v))
+    }
+    mm_f(s.hc_gate, t, KqFmt.q8, up_off, s.hc_lo, s.xq, s.xs, s.xbs, lr, hcd)
+    unsafe {
+        let inj_w = inject_off >= 0l ? addr < float const? >(t.fblob[inject_off]) : null
+        hc_mix_tail(addr(s.hc_xn[0]), addr < float const? >(s.hc_gate[0]), inj_w, addr(s.hc_inject[0]), addr(s.xb[0]), c.dim, c.hc_count)
+    }
+}
+
+//! The mixer over the decode residual (s.hc_res) into xb
+def hc_mix(t : Model; var s : Session; norm_off, down_off, up_off, inject_off : int64) {
+    hc_mix_row(t, s, s.hc_res, 0l, norm_off, down_off, up_off, inject_off)
+}
+
+//! The mixer over every row of the prefill residual (s.hc_res_b) into xb_b, the scatter logits into hc_inject_b;
+//! the per-row passes split over positions, each row the decode mixer's arithmetic
+def hc_mix_b(t : Model; var s : Session; norm_off, down_off, up_off, inject_off, npos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let hcd = hc_dim(c)
+    let nh = c.hc_count
+    let lr = c.hc_low_rank
+    let eps = c.norm_eps
+    let inv = 1.0 / float(nh)
+    let par = hcd * npos >= g_norm_par_threshold
+    unsafe {
+        var xnp = addr(s.hc_xn_b[0])
+        let resp = addr < float const? >(s.hc_res_b[0])
+        let wp = addr < float const? >(t.fblob[norm_off])
+        maybe_parallel_for(par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
+            unsafe {
+                for (p in range(rb, re)) {
+                    let off = int64(p) * hcd
+                    hc_grouped_norm(xnp + off, resp + off, wp, dim, nh, eps)
+                }
+            }
+        }
+    }
+    mm_b_f(s, s.hc_lo_b, t, KqFmt.q8, down_off, s.hc_xn_b, hcd, lr, npos)
+    for (j in range64(npos * lr)) {
+        let v = s.hc_lo_b[j] * inv
+        s.hc_lo_b[j] = v / (1.0 + exp(-v))
+    }
+    mm_b_f(s, s.hc_gate_b, t, KqFmt.q8, up_off, s.hc_lo_b, lr, hcd, npos)
+    unsafe {
+        var xnp = addr(s.hc_xn_b[0])
+        let gp = addr < float const? >(s.hc_gate_b[0])
+        let inj_w = addr < float const? >(t.fblob[inject_off])
+        var injp = addr(s.hc_inject_b[0])
+        var xbp = addr(s.xb_b[0])
+        maybe_parallel_for(par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
+            unsafe {
+                for (p in range(rb, re)) {
+                    let pp = int64(p)
+                    hc_mix_tail(xnp + pp * hcd, gp + pp * hcd, inj_w, injp + pp * nh, xbp + pp * dim, dim, nh)
+                }
+            }
+        }
+    }
+}
+
+//! Scatter one block output row into its wide row r: stream ch += out * 2 sigmoid(inject_ch / hc)
+def private hc_combine(var r : float?; out : float const?; inject : float const?; dim, nh : int64) {
+    unsafe {
+        for (ch in range64(nh)) {
+            let w = 2.0 / (1.0 + exp(-inject[ch] / float(nh)))
+            var rc = r + ch * dim
+            for (i in range64(dim)) {
+                rc[i] += out[i] * w
+            }
+        }
+    }
+}
+
+//! Scatter a block's output into the streams: res_ch += out * 2 sigmoid(inject_ch / hc) - a zero logit is a plain residual add
+def hc_combine_row(t : Model; var res : array<float>; roff : int64; out : float const?; inject : float const?) {
+    hc_combine(unsafe(addr(res[roff])), out, inject, t.config.dim, t.config.hc_count)
+}
+
+//! A block's input row is xb: the residual through the layer norm at fblob[woff], or - under hyper-connections - the
+//! mixed stream the arch's mixer already left there
+def block_in(t : Model; var s : Session; woff : int64) {
+    if (!t.config.hyper_conn) {
+        rms_at(s.xb, t, woff, s.x, t.config.dim)
+    }
+}
+
+def block_in_b(t : Model; var s : Session; woff, npos : int64) {
+    if (!t.config.hyper_conn) {
+        rms_batch(s.xb_b, s.x_b, t, woff, t.config.dim, npos)
+    }
+}
+
+//! A block's output joins the residual: a plain add into x, or the hyper-connection scatter into hc_res
+def block_resid(t : Model; var s : Session; out : array<float>) {
+    unsafe {
+        if (t.config.hyper_conn) {
+            hc_combine_row(t, s.hc_res, 0l, addr < float const? >(out[0]), addr < float const? >(s.hc_inject[0]))
+        } else {
+            add_inplace(addr(s.x[0]), addr < float const? >(out[0]), t.config.dim)
+        }
+    }
+}
+
+//! block_resid over npos rows of out_b (row p is dim-wide at p * dim)
+def block_resid_b(t : Model; var s : Session; out_b : array<float>; npos : int64) {
+    let c = t.config
+    unsafe {
+        if (c.hyper_conn) {   //! the rows split over positions: each scatters into its own wide row
+            let dim = c.dim
+            let nh = c.hc_count
+            let hcd = hc_dim(c)
+            var rp = addr(s.hc_res_b[0])
+            let op = addr < float const? >(out_b[0])
+            let ip = addr < float const? >(s.hc_inject_b[0])
+            maybe_parallel_for(hcd * npos >= g_norm_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
+                unsafe {
+                    for (p in range(rb, re)) {
+                        let pp = int64(p)
+                        hc_combine(rp + pp * hcd, op + pp * dim, ip + pp * nh, dim, nh)
+                    }
+                }
+            }
+        } else {
+            add_inplace(addr(s.x_b[0]), addr < float const? >(out_b[0]), npos * c.dim)
+        }
+    }
+}
+
+//! block_resid for ONE row p of a batched block output landing in row p of the residual (the per-position MoE prefill)
+def block_resid_row(t : Model; var s : Session; out : array<float>; p : int64) {
+    let c = t.config
+    unsafe {
+        if (c.hyper_conn) {
+            hc_combine_row(t, s.hc_res_b, p * hc_dim(c), addr < float const? >(out[0]),
+                addr < float const? >(s.hc_inject_b[p * c.hc_count]))
+        } else {
+            add_inplace(addr(s.x_b[p * c.dim]), addr < float const? >(out[0]), c.dim)
+        }
+    }
+}
+
 // Threaded per-position RoPE (pass 1 of the two-pass rope+store): rope q_b[p*qd..] and k_b[p*kv_dim..]
 // in place, at absolute pos start_pos+p. Calls the leaf rope_scaled/rope_scaled_neox DIRECTLY, not
 // the rope_apply wrapper — routing through it lets the JIT mark the pointer readonly and silently no-op the write.
@@ -2829,12 +3326,14 @@ def kv_phys_row(s : Session; pos : int64) : int64 {
 }
 
 //! Layer l's base byte pointer in the key cache — THE flat/paged storage branch. Flat: the session
-//! slab at its byte prefix; paged: the pool's owning blob for l. Hoist AFTER kv_ensure: pool
-//! growth resizes blobs, which would dangle this pointer.
+//! slab at its byte prefix; paged: the pool's owning blob for l, null where l's rows are zero bytes wide (a recurrent layer owns no K/V).
+//! Hoist AFTER kv_ensure: pool growth resizes blobs, which would dangle this pointer.
 def kv_layer_kbase(var s : Session; l, seq_len : int64) : uint8? {
     unsafe {
         if (s.kv_pool != null) {
-            return addr(s.kv_pool.kblobs[s.kv_pool.blob_of[l]][0])
+            let b = s.kv_pool.blob_of[l]
+            return null if (s.kv_pool.krow_bytes[b] == 0l)
+            return addr(s.kv_pool.kblobs[b][0])
         }
         return addr(s.key_cache[0]) + kv_base_k(s, l, seq_len)
     }
@@ -2844,7 +3343,9 @@ def kv_layer_kbase(var s : Session; l, seq_len : int64) : uint8? {
 def kv_layer_vbase(var s : Session; l, seq_len : int64) : uint8? {
     unsafe {
         if (s.kv_pool != null) {
-            return addr(s.kv_pool.vblobs[s.kv_pool.blob_of[l]][0])
+            let b = s.kv_pool.blob_of[l]
+            return null if (s.kv_pool.vrow_bytes[b] == 0l)
+            return addr(s.kv_pool.vblobs[b][0])
         }
         return addr(s.value_cache[0]) + kv_base_v(s, l, seq_len)
     }
@@ -2908,6 +3409,24 @@ def kv_pool_alloc_group(var p : KVPool) : int {
     let g = p.free_groups[length(p.free_groups) - 1]
     p.free_groups |> pop()
     p.refcnt[g] = 1
+    return g
+}
+
+//! A new group (refcount 1) holding a copy of group `src`'s rows on every blob.
+def kv_pool_copy_group(var p : KVPool; src : int) : int {
+    let g = kv_pool_alloc_group(p)   //! first: the allocation may move the blobs
+    for (b in range64(p.nblobs)) {
+        let kb = p.page_rows * p.krow_bytes[b]
+        let vb = p.page_rows * p.vrow_bytes[b]
+        unsafe {
+            if (kb > 0l) {
+                memcpy(addr(p.kblobs[b][int64(g) * kb]), addr(p.kblobs[b][int64(src) * kb]), kb)
+            }
+            if (vb > 0l) {
+                memcpy(addr(p.vblobs[b][int64(g) * vb]), addr(p.vblobs[b][int64(src) * vb]), vb)
+            }
+        }
+    }
     return g
 }
 
@@ -3493,6 +4012,22 @@ def mm_b_q51_groupn(var y : array<float>; t : Model; offs : array<int64>; nregio
     matmul_q51q8_batch_groupn(y, t.q51q, t.q51s, offs, nregions, xq, xs, n, d)
 }
 
+// ===== native iq4nl32 dispatch (Q8_0-form activations, q51's shapes over the per-32 IQ4_NL planes) =====
+
+def mm_at_iq4nl32_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    matmul_iq4nl32q8_groupn(y, t.iq4nl32q, t.iq4nl32s, offs, nregions, xq, xs, n, d)
+}
+
+def mm_b_iq4nl32_pre(var y : array<float>; t : Model; woff : int64; xqb : array<int8>; xsb : array<float>; n, d, npos : int64) {
+    let ts_gemm = prof_ticks()
+    matmul_iq4nl32q8_batch(y, t.iq4nl32q, t.iq4nl32s, woff, xqb, xsb, n, d, npos)
+    prof_add("mm_gemm", ts_gemm)
+}
+
+def mm_b_iq4nl32_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    matmul_iq4nl32q8_batch_groupn(y, t.iq4nl32q, t.iq4nl32s, offs, nregions, xq, xs, n, d)
+}
+
 // ===== native K-quant dispatch (kquant_native; fmt != q8 tags) =====
 
 // KqFmt -> the kernel-layer format id (matmul_kq*/kq_rows_fn/kq_qsb take the int form). q8 maps
@@ -3650,6 +4185,8 @@ def mm_at_f_groupn(var y : array<float>; t : Model; fmt : KqFmt; offs, boffs : a
         mm_at_kq_groupn(y, t, fmt, offs, nregions, kxq, kxs, kxbs, n, d)
     } elif (fmt == KqFmt.q51) {
         mm_at_q51_groupn(y, t, offs, nregions, xq, xs, n, d)
+    } elif (fmt == KqFmt.iq4nl32) {
+        mm_at_iq4nl32_groupn(y, t, offs, nregions, xq, xs, n, d)
     } elif (t.experts_mx4) {
         if (biased) {
             mm_at_mx4_groupn(y, t, offs, boffs, nregions, xq, xs, n, d)
@@ -3672,6 +4209,8 @@ def mm_b_f_groupn(var y : array<float>; t : Model; fmt : KqFmt; offs, boffs : ar
         mm_b_kq_groupn(y, t, fmt, offs, nregions, xq, xs, xbs, n, d)
     } elif (fmt == KqFmt.q51) {
         mm_b_q51_groupn(y, t, offs, nregions, xq, xs, n, d)
+    } elif (fmt == KqFmt.iq4nl32) {
+        mm_b_iq4nl32_groupn(y, t, offs, nregions, xq, xs, n, d)
     } elif (t.experts_mx4) {
         if (biased) {
             matmul_mx4q8_batch_groupn(y, t.mxq, t.mxs, offs, nregions, xq, xs, t.fblob, boffs, n, d)
@@ -3691,6 +4230,8 @@ def mm_b_f_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq : 
         mm_b_kq_pre(y, t, fmt, woff, xq, xs, xbs, n, d, npos)
     } elif (fmt == KqFmt.q51) {
         mm_b_q51_pre(y, t, woff, xq, xs, n, d, npos)
+    } elif (fmt == KqFmt.iq4nl32) {
+        mm_b_iq4nl32_pre(y, t, woff, xq, xs, n, d, npos)
     } elif (t.experts_mx4) {
         if (!g_active_mx4_native_batch) {
             panic("mm_b_f_pre: the active backend has no native mx4 batch kernel - expand the region to Q8 at the site")
@@ -3814,6 +4355,21 @@ def dn_key_dim(c : Config) : int64 => c.ssm_n_group * c.ssm_d_state
 
 //! deltanet fused-projection / conv channel count: [q (key_dim) ; k (key_dim) ; v (d_inner)].
 def dn_conv_dim(c : Config) : int64 => 2l * dn_key_dim(c) + c.ssm_d_inner
+
+//! the hyper-connection residual's width: hc_count streams of dim (0 on every other arch)
+def hc_dim(c : Config) : int64 => c.hyper_conn ? c.hc_count * c.dim : 0l
+
+//! the n-gram PLE side input is on: one layer's block is preceded by the hashed rows
+def has_ple_ngram(c : Config) : bool => c.ple_layer >= 0l
+
+//! rows the n-gram gather lands per token: heads_per_ngram per n-gram order from bigram up
+def ple_n_heads(c : Config) : int64 => (c.ple_ngram_size - 1l) * c.ple_heads_per_ngram
+
+//! the gathered side input's width - the key/value projections' K
+def ple_in_dim(c : Config) : int64 => ple_n_heads(c) * c.ple_head_dim
+
+//! rows of the PLE conv's history ring: the deepest tap (taps - 1) x dilation back, plus the current row
+def ple_hist_rows(c : Config) : int64 => (c.ple_conv_kernel - 1l) * c.ple_ngram_size + 1l
 
 // Chunk length (CS) for the blocked (chunked) gated-deltanet prefill.
 let DN_CHUNK = 64l
@@ -4131,6 +4687,9 @@ def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE0
         scale_inplace(unsafe(addr(s.x[0])), c.embed_scale, dim)
     }
     prof_add("embed", ts_embed)
+    if (t.blocks.pre_stack_decode != null) {   // the arch's residual shape (hyper-connection streams, the n-gram gather)
+        invoke(t.blocks.pre_stack_decode, t, s, token, pos)
+    }
     if (has_ple(c)) {  // gemma-4 E-series: build this token's per-(layer) side input before the stack
         let ts_ple = prof_ticks()
         if (ple_gpu_decode_gate(t, s, 1l, pos)) {
@@ -4184,10 +4743,13 @@ def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE0
     blob_only_panic(t, "final-norm/classifier step")
     let ts_final = prof_ticks()
     trace_tag(TRACE_TAG_CLS)
-    rms_at(s.xb, t, t.rms_final_off, s.x, dim)
+    if (t.blocks.final_norm != null) {
+        invoke(t.blocks.final_norm, t, s, 0l, false)
+    } else {
+        rms_at(s.xb, t, t.rms_final_off, s.x, dim)
+    }
     if (c.n_layer_nextn > 0l) {   // stash h_nextn for the MTP draft head
-        copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)
-        s.mtp_h_pos1 = pos + 1l
+        mtp_stash_carry_row(t, s, s.hc_res, 0l, pos + 1l)
     }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
@@ -4204,6 +4766,54 @@ def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE0
         s.logits[id] = -1.0e30
     }
     prof_add("final", ts_final)
+}
+
+//! The draft head's carry width: the trunk's post-norm hidden, or under hyper-connections the wide
+//! residual before the head mixer (the head norms its streams itself)
+def mtp_h_dim(c : Config) : int64 => c.hyper_conn ? hc_dim(c) : c.dim
+
+//! Stash the carry from row `row` of a residual image (`wide` = hc_res / hc_res_b) or from s.xb (the
+//! post-norm hidden the caller just produced), and mark its position
+def private mtp_stash_carry_row(t : Model; var s : Session; wide : array<float>; row, pos1 : int64) {
+    let c = t.config
+    if (c.hyper_conn) {
+        copy_floats(wide, row * hc_dim(c), s.mtp_h, 0l, hc_dim(c))
+    } else {
+        copy_floats(s.xb, 0l, s.mtp_h, 0l, c.dim)
+    }
+    s.mtp_h_pos1 = pos1
+}
+
+//! The verify's row-0 carry (= h_pos): the wide residual row under hyper-connections, else the normed hidden at `normed[noff..]`
+def private mtp_h0_from_row(t : Model; var s : Session; normed : array<float>; noff : int64) {
+    let c = t.config
+    if (c.hyper_conn) {
+        copy_floats(s.hc_res_b, 0l, s.mtp_h0, 0l, hc_dim(c))
+    } else {
+        copy_floats(normed, noff, s.mtp_h0, 0l, c.dim)
+    }
+}
+
+//! The per-stream eh_proj input rows of one token under hyper-connections: row ch of `cat` at
+//! `coff` is [enorm(embed) ; hnorm_ch(h_ch)] - the normed embed row already sits in s.xb
+def private mtp_cat_streams(t : Model; var s : Session; var cat : array<float>; coff : int64; h : array<float>; hoff : int64) {
+    let c = t.config
+    let dim = c.dim
+    unsafe {
+        for (ch in range64(c.hc_count)) {
+            let ro = coff + ch * 2l * dim
+            copy_floats(addr(cat[ro]), addr < float const? >(s.xb[0]), dim)
+            rmsnorm(addr(cat[ro + dim]), addr < float const? >(h[hoff + ch * dim]),
+                addr < float const? >(t.fblob[t.mtp_hnorm_off + ch * dim]), dim, c.norm_eps)
+        }
+    }
+}
+
+//! the batched scratch a draft-side GEMM over `rows` rows of width n reads (a decode session's prefill scratch may be short)
+def private mtp_rows_scratch(var s : Session; rows, n : int64) {
+    s.xqb |> grow_resize(rows * n)
+    s.xsb |> grow_resize(rows * n / 32l)
+    s.xbsb |> grow_resize(rows * n / 16l)
 }
 
 //! One MTP/NextN draft step: from stashed trunk hidden `s.mtp_h` and `token`, produce draft logits
@@ -4228,6 +4838,9 @@ var private g_mtp_force_reject_every = 0l
 def set_mtp_force_reject_every(n : int64) {
     g_mtp_force_reject_every = n
 }
+
+//! Current value of the [[set_mtp_force_reject_every]] seam (0 = off), so a fixture restores what it found.
+def get_mtp_force_reject_every() : int64 => g_mtp_force_reject_every
 
 def private mtp_reject_forced(s : Session) : bool => g_mtp_force_reject_every > 0l && s.mtp_drafted % g_mtp_force_reject_every == 0l
 
@@ -4330,23 +4943,47 @@ def set_mtp_batch_cls(on : bool) {
 //! Current state of the [[set_mtp_batch_cls]] gate.
 def get_mtp_batch_cls() : bool => g_mtp_batch_cls
 
-[no_alloc, no_env, no_io]
+//! the draft head's row `pos` from (embed(token), s.mtp_h): the active override's draft seat where it serves (it allocates, uploads
+//! and logs on its own account), else the CPU body, which keeps the allocation contract
 def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bool = true) {
+    assert(t.config.n_layer_nextn > 0l)
+    kv_ensure(s, pos + 1l)
+    return if (want_logits && mtp_draft_seat(t, s, token, pos, false) >= 0l)
+    forward_mtp_cpu(t, s, token, pos, want_logits)
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head")]
+def private mtp_draft(t : Model; var s : Session; token, pos : int64; pick_only : bool) : int64 {
+    kv_ensure(s, pos + 1l)
+    let picked = mtp_draft_seat(t, s, token, pos, pick_only)
+    return picked if (picked >= 0l)
+    forward_mtp_cpu(t, s, token, pos, true)
+    return parallel_argmax(s.logits, t.config.vocab_size)
+}
+
+[no_alloc, no_env, no_io]
+def private forward_mtp_cpu(t : Model; var s : Session; token, pos : int64; want_logits : bool) {
+    blob_only_panic(t, "NextN draft step")
     let c = t.config
     let dim = c.dim
-    assert(c.n_layer_nextn > 0l)
-    kv_ensure(s, pos + 1l)
     // eh_proj input: [enorm(embed(token)) ; hnorm(h)] — embedding first in the concat
     embed_row(t, token, unsafe(addr(s.x[0])))
     rms_at(s.xb, t, t.mtp_enorm_off, s.x, dim)
-    copy_floats(s.xb, 0l, s.mtp_cat, 0l, dim)
-    rms_at(s.xb, t, t.mtp_hnorm_off, s.mtp_h, dim)
-    copy_floats(s.xb, 0l, s.mtp_cat, dim, dim)
-    // eh_proj: 2*dim -> dim into the residual stream (xq/xs cover 2*dim — sized max(xdim, ffw))
-    if (t.mtp_ehproj_fmt != KqFmt.q8) {
-        mm_kq(s.x, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, s.mtp_cat, s.xq, s.xs, s.xbs, 2l * dim, dim)
+    if (c.hyper_conn) {
+        // per stream, never pooled: stream ch's row [enorm(embed) ; hnorm_ch(h_ch)] projects to the draft's wide residual stream ch - hc rows of one eh_proj GEMM
+        mtp_cat_streams(t, s, s.mtp_cat, 0l, s.mtp_h, 0l)
+        mtp_rows_scratch(s, c.hc_count, 2l * dim)
+        mm_b_f(s, s.hc_res, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, s.mtp_cat, 2l * dim, dim, c.hc_count)
     } else {
-        mm(s.x, t, t.mtp_ehproj_off, s.mtp_cat, s.xq, s.xs, 2l * dim, dim)
+        copy_floats(s.xb, 0l, s.mtp_cat, 0l, dim)
+        rms_at(s.xb, t, t.mtp_hnorm_off, s.mtp_h, dim)
+        copy_floats(s.xb, 0l, s.mtp_cat, dim, dim)
+        // eh_proj: 2*dim -> dim into the residual stream (xq/xs cover 2*dim — sized max(xdim, ffw))
+        if (t.mtp_ehproj_fmt != KqFmt.q8) {
+            mm_kq(s.x, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, s.mtp_cat, s.xq, s.xs, s.xbs, 2l * dim, dim)
+        } else {
+            mm(s.x, t, t.mtp_ehproj_off, s.mtp_cat, s.xq, s.xs, 2l * dim, dim)
+        }
     }
     // this row's RoPE table (partial rotary span, like forward)
     if (g_use_rope_table) {
@@ -4356,12 +4993,16 @@ def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bo
     // the draft block IS one trunk-shaped attention layer at index n_layers — reuse the arch blocks
     t.blocks.attn_decode(t, s, c.n_layers, pos)
     t.blocks.ffn_decode(t, s, c.n_layers)
-    // warm/backfill calls only need the KV row written — the head norm + classifier (a large
-    // share of the head's cost on small models: vocab x dim) run only when drafting
     return if (!want_logits)
-    // head norm (shared_head_norm when shipped, else output_norm) + the trunk classifier
-    rms_at(s.xb, t, t.mtp_headnorm_off >= 0l ? t.mtp_headnorm_off : t.rms_final_off, s.x, dim)
-    copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)   // the head's own h_nextn — recursive drafting handoff
+    if (c.hyper_conn) {
+        // the head's own h_nextn is its wide residual BEFORE the head mixer - the chain's next input
+        copy_floats(s.hc_res, 0l, s.mtp_h, 0l, hc_dim(c))
+        hc_mix_row(t, s, s.hc_res, 0l, t.mtp_hc_head_norm_off, t.mtp_hc_head_down_off, t.mtp_hc_head_up_off, -1l)
+    } else {
+        // head norm (shared_head_norm when shipped, else output_norm) + the trunk classifier
+        rms_at(s.xb, t, t.mtp_headnorm_off >= 0l ? t.mtp_headnorm_off : t.rms_final_off, s.x, dim)
+        copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)   // the head's own h_nextn — recursive drafting handoff
+    }
     s.mtp_h_pos1 = 0l   // NOT a trunk hidden: the warm's seam row must not consume it
     mm_cls(s.logits, t, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
 }
@@ -4437,6 +5078,22 @@ def mtp_state_snapshot(var s : Session) {
     copy_floats_par(s.dn_conv_state, s.mtp_snap_conv, nc)
     copy_floats_par(s.dn_state, s.mtp_snap_state, ns)
     s.mtp_snap_pos = s.dn_pos
+    mtp_ple_window_snapshot(s)
+}
+
+//! the n-gram window into `mtp_snap_ple`: forward-only state, so a rejected draft must not stay a predecessor
+def mtp_ple_window_snapshot(var s : Session) {
+    s.mtp_snap_ple |> overwrite_resize(long_length(s.ple_prev))
+    for (i in range64(long_length(s.ple_prev))) {
+        s.mtp_snap_ple[i] = s.ple_prev[i]
+    }
+}
+
+//! the window back from `mtp_snap_ple`
+def mtp_ple_window_restore(var s : Session) {
+    for (i in range64(min(long_length(s.ple_prev), long_length(s.mtp_snap_ple)))) {
+        s.ple_prev[i] = s.mtp_snap_ple[i]
+    }
 }
 
 [arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#dn-step-owner")]
@@ -4444,17 +5101,89 @@ def mtp_state_restore(var s : Session) {
     copy_floats_par(s.mtp_snap_conv, s.dn_conv_state, long_length(s.mtp_snap_conv))
     copy_floats_par(s.mtp_snap_state, s.dn_state, long_length(s.mtp_snap_state))
     s.dn_pos = s.mtp_snap_pos
+    mtp_ple_window_restore(s)
     moe_gpu_dn_release(s.dn_owner.state_lo, s.dn_owner.state_hi)
 }
 
-// After a 2-row verify forward_prefill([tok, draft], 2, pos): row 0's post-norm hidden and
-// logits (forward_prefill's own tail only produced row 1's). Reads s.x_b row 0 — still intact,
-// the prefill tail never overwrites the batch residual stream.
-def private mtp_verify_row0(t : Model; var s : Session) {
+typedef DnHostSyncFn = function<(var s : Session) : void>
+var private g_dn_host_syncs : array<DnHostSyncFn>
+
+//! A driver that keeps a session's recurrent state off the host registers how it comes back:
+//! `fn` writes the state the driver holds into the session's host arrays and sets `dn_pos` to the
+//! position it stands at, and does nothing for a session it holds no state for.
+def register_dn_host_sync(fn : DnHostSyncFn) {
+    g_dn_host_syncs |> push(fn)
+}
+
+//! The session's recurrent state in its host arrays, `dn_pos` the position it stands at, wherever
+//! the state was living.
+def dn_state_to_host(var s : Session) {
+    dn_flush_all(s)
+    for (f in g_dn_host_syncs) {
+        invoke(f, s)
+    }
+}
+
+//! A session's forward-only state at one position: the recurrent layers' conv history and S, and
+//! the n-gram side input's ring and window. With the K/V rows below `pos` it continues a prompt.
+struct DnSnapshot {
+    pos : int64
+    @exact_size conv : array<float>
+    @exact_size state : array<float>
+    @exact_size ple_hist : array<float>
+    ple_prev : array<int64>
+    mtp_h : array<float>   //! the draft head's carry at `pos` - empty when it stood elsewhere
+}
+
+//! The recurrent state as it stands (brought to the host first), `pos` the position it expects next.
+def dn_snapshot_take(var s : Session) : DnSnapshot {
+    dn_state_to_host(s)
+    var snap <- DnSnapshot(pos = s.dn_pos, ple_prev := s.ple_prev)
+    let nc = long_length(s.dn_conv_state)
+    let ns = long_length(s.dn_state)
+    let np = long_length(s.ple_conv_hist)
+    snap.conv |> reserve_resize(nc)
+    snap.state |> reserve_resize(ns)
+    snap.ple_hist |> reserve_resize(np)
+    copy_floats_par(s.dn_conv_state, snap.conv, nc)
+    copy_floats_par(s.dn_state, snap.state, ns)
+    copy_floats_par(s.ple_conv_hist, snap.ple_hist, np)
+    if (s.mtp_h_pos1 == s.dn_pos && s.dn_pos > 0l) {
+        snap.mtp_h := s.mtp_h
+    }
+    return <- snap
+}
+
+//! `snap` into a session of the same geometry: its host arrays, `dn_pos`, and no device copy standing.
+[arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#dn-step-owner")]
+def dn_snapshot_restore(var s : Session; snap : DnSnapshot) {
+    if (long_length(snap.state) != long_length(s.dn_state) || long_length(snap.conv) != long_length(s.dn_conv_state)) {
+        panic("dn_snapshot_restore: the snapshot holds {long_length(snap.state)} state and {long_length(snap.conv)} conv floats, the session {long_length(s.dn_state)} and {long_length(s.dn_conv_state)} - another model's")
+    }
+    copy_floats_par(snap.conv, s.dn_conv_state, long_length(snap.conv))
+    copy_floats_par(snap.state, s.dn_state, long_length(snap.state))
+    copy_floats_par(snap.ple_hist, s.ple_conv_hist, min(long_length(snap.ple_hist), long_length(s.ple_conv_hist)))
+    for (i in range64(min(long_length(s.ple_prev), long_length(snap.ple_prev)))) {
+        s.ple_prev[i] = snap.ple_prev[i]
+    }
+    s.dn_pos = snap.pos
+    moe_gpu_dn_release(s.dn_owner.state_lo, s.dn_owner.state_hi)
+    if (!empty(snap.mtp_h)) {
+        s.mtp_h := snap.mtp_h
+    }
+    s.mtp_h_pos1 = empty(snap.mtp_h) ? 0l : snap.pos
+}
+
+//! row 0's logits after a rows prefill (the CPU verify's truth for the committed token, into `s.mtp_logits`), and its carry into `s.mtp_h0`
+def mtp_verify_row0(t : Model; var s : Session) {
     let c = t.config
     let dim = c.dim
-    rms_at(s.xb, t, t.rms_final_off, s.x_b, 0l, dim)
-    copy_floats(s.xb, 0l, s.mtp_h0, 0l, dim)   // = h_pos; a reject re-seeds the draft head from it
+    if (t.blocks.final_norm != null) {   // the arch's own tail over row 0 (the hyper-connection head mixer)
+        invoke(t.blocks.final_norm, t, s, 0l, true)
+    } else {
+        rms_at(s.xb, t, t.rms_final_off, s.x_b, 0l, dim)
+    }
+    mtp_h0_from_row(t, s, s.xb, 0l)   // = h_pos; a reject re-seeds the draft head from it
     mm_cls(s.mtp_logits, t, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
     // mirror the plain classifier tail exactly — `truth` must match plain decode BY CONSTRUCTION
     if (c.final_logit_softcap > 0.0) {
@@ -4484,8 +5213,15 @@ def private mtp_verify_logits(t : Model; var s : Session; npos : int64) {
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     s.mtp_norm_b |> overwrite_resize(npos * dim)
     s.mtp_logits_b |> overwrite_resize(npos * vocab)
-    rms_batch(s.mtp_norm_b, s.x_b, t, t.rms_final_off, dim, npos)
-    copy_floats(s.mtp_norm_b, 0l, s.mtp_h0, 0l, dim)   // = h_pos; a reject re-seeds the draft head from it
+    if (t.blocks.final_norm != null) {   // the arch's own tail per row (the hyper-connection head mixer) into the normed image
+        for (p in range64(npos)) {
+            invoke(t.blocks.final_norm, t, s, p, true)
+            copy_floats(s.xb, 0l, s.mtp_norm_b, p * dim, dim)
+        }
+    } else {
+        rms_batch(s.mtp_norm_b, s.x_b, t, t.rms_final_off, dim, npos)
+    }
+    mtp_h0_from_row(t, s, s.mtp_norm_b, 0l)   // = h_pos; a reject re-seeds the draft head from it
     mm_b_f(s, s.mtp_logits_b, t, cls_fmt, t.wcls_off, s.mtp_norm_b, dim, vocab, npos)
     copy_floats(s.mtp_logits_b, 0l, s.mtp_logits, 0l, vocab)
     copy_floats(s.mtp_logits_b, (npos - 1l) * vocab, s.logits, 0l, vocab)
@@ -4509,33 +5245,147 @@ def private mtp_prefill_warm(t : Model; var s : Session; tokens : array<int64>; 
     if (npos > 1l) {
         s.mtp_xb_save |> overwrite_resize(npos * dim)
         copy_floats(s.x_b, 0l, s.mtp_xb_save, 0l, npos * dim)
-        s.mtp_cat_b |> overwrite_resize((npos - 1l) * 2l * dim)
-        for (p in range64(npos - 1l)) {
-            embed_row(t, tokens[p + 1l], unsafe(addr(s.x[0])))
-            rms_at(s.xb, t, t.mtp_enorm_off, s.x, dim)
-            copy_floats(s.xb, 0l, s.mtp_cat_b, p * 2l * dim, dim)
-            rms_at(s.xb, t, t.rms_final_off, s.x_b, p * dim, dim)   // h_{start_pos+p}
-            copy_floats(s.xb, 0l, s.x, 0l, dim)
-            rms_at(s.xb, t, t.mtp_hnorm_off, s.x, dim)
-            copy_floats(s.xb, 0l, s.mtp_cat_b, p * 2l * dim + dim, dim)
+        if (c.hyper_conn) {
+            // hc cat rows a position, one eh_proj GEMM lands the draft's wide rows 0..npos-2 over the trunk's (saved first)
+            let hcd = hc_dim(c)
+            let nh = c.hc_count
+            s.mtp_hc_save |> overwrite_resize(npos * hcd)
+            copy_floats(s.hc_res_b, 0l, s.mtp_hc_save, 0l, npos * hcd)
+            let rows = (npos - 1l) * nh
+            s.mtp_cat_b |> overwrite_resize(rows * 2l * dim)
+            for (p in range64(npos - 1l)) {
+                embed_row(t, tokens[p + 1l], unsafe(addr(s.x[0])))
+                rms_at(s.xb, t, t.mtp_enorm_off, s.x, dim)
+                mtp_cat_streams(t, s, s.mtp_cat_b, p * nh * 2l * dim, s.mtp_hc_save, p * hcd)
+            }
+            mtp_rows_scratch(s, rows, 2l * dim)
+            mm_b_f(s, s.hc_res_b, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, s.mtp_cat_b, 2l * dim, dim, rows)
+        } else {
+            s.mtp_cat_b |> overwrite_resize((npos - 1l) * 2l * dim)
+            for (p in range64(npos - 1l)) {
+                embed_row(t, tokens[p + 1l], unsafe(addr(s.x[0])))
+                rms_at(s.xb, t, t.mtp_enorm_off, s.x, dim)
+                copy_floats(s.xb, 0l, s.mtp_cat_b, p * 2l * dim, dim)
+                rms_at(s.xb, t, t.rms_final_off, s.x_b, p * dim, dim)   // h_{start_pos+p}
+                copy_floats(s.xb, 0l, s.x, 0l, dim)
+                rms_at(s.xb, t, t.mtp_hnorm_off, s.x, dim)
+                copy_floats(s.xb, 0l, s.mtp_cat_b, p * 2l * dim + dim, dim)
+            }
+            mm_b_f(s, s.x_b, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, s.mtp_cat_b, 2l * dim, dim, npos - 1l)
         }
-        mm_b_f(s, s.x_b, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, s.mtp_cat_b, 2l * dim, dim, npos - 1l)
         t.blocks.attn_prefill(t, s, c.n_layers, npos - 1l, start_pos)
         t.blocks.ffn_prefill(t, s, c.n_layers, npos - 1l)
         copy_floats(s.mtp_xb_save, 0l, s.x_b, 0l, npos * dim)
+        if (c.hyper_conn) {
+            copy_floats(s.mtp_hc_save, 0l, s.hc_res_b, 0l, npos * hc_dim(c))
+        }
     }
     // SEAM row start_pos-1 is written by forward_prefill BEFORE the trunk body, so it can't be done here
+}
+
+[cold_path]   //! the CPU round's fail-closed exit: a prefill driver served its verify window
+def private mtp_verify_served_panic {
+    panic("dasLLAMA: the `{g_prefill_override_name}` prefill driver served a speculative verify window; the CPU round cannot read its rows - run without --mtp or on the CPU rails")
+}
+
+def private mtp_verify_seated_save_carry(t : Model; var s : Session) : bool {
+    return false if (!mtp_seated(t, g_mtp_verify_overrides))
+    let hd = mtp_h_dim(t.config)
+    s.mtp_xb_save |> overwrite_resize(hd)
+    copy_floats(s.mtp_h, 0l, s.mtp_xb_save, 0l, hd)
+    return true
+}
+
+def private mtp_snapshot_timed(var s : Session) {
+    let ts_snap = prof_ticks()
+    mtp_state_snapshot(s)
+    prof_add("mtp.snapshot", ts_snap)
+}
+
+var private g_mtp_verify_window_uid : uint64   //! the session whose CPU verify's two-row prefill is in flight (0: none)
+
+//! `s`'s CPU verify's two-row prefill is in flight: a prefill driver that homes the head declines the call, since the round reads
+//! the rows back on the host. The window is the session's, so a panic inside it strands the window on that session alone
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-window")]
+def mtp_verify_window_active(s : Session) : bool => g_mtp_verify_window_uid != 0ul && s.uid == g_mtp_verify_window_uid
+
+//! true where the verify seat served the round's two rows; false where the CPU two-row verify ran
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback"), arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-window")]
+def private mtp_verify_two(t : Model; var s : Session; seated : bool; pos : int64; pick_only : bool) : bool {
+    var restore_covered = t.config.recr_mask == 0ul
+    if (seated) {
+        if (!restore_covered && !mtp_seated(t, g_mtp_rollback_overrides)) {
+            mtp_snapshot_timed(s)
+            restore_covered = true
+        }
+        let ts_seat = prof_ticks()
+        let served = mtp_verify_served(t, s, s.mtp_vbatch, 2l, pos, pick_only)
+        prof_add("mtp.verify", ts_seat)
+        return true if (served)
+    }
+    if (!restore_covered) {
+        mtp_snapshot_timed(s)
+    }
+    let ts_verify = prof_ticks()
+    let batch_cls = mtp_cls_batch_ok(t)
+    g_mtp_verify_window_uid = s.uid
+    forward_prefill(t, s, s.mtp_vbatch, 2l, pos, batch_cls)
+    g_mtp_verify_window_uid = 0ul
+    if (g_prefill_logits_done) {
+        mtp_verify_served_panic()
+    }
+    if (batch_cls) {
+        mtp_verify_logits(t, s, 2l)   // both rows from one classifier stream
+    } else {
+        mtp_verify_row0(t, s)
+    }
+    prof_add("mtp.verify", ts_verify)
+    return false
+}
+
+[cold_path]   //! the round's fail-closed exit: the verify seat served, and the rollback seat behind it declined
+def private mtp_rollback_declined_panic {
+    panic("dasLLAMA: the `{g_decode_override_name}` rollback seat declined a reject after its verify seat served the round - no snapshot holds the recurrent state; engine bug")
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback")]
+def private mtp_reject(t : Model; var s : Session; tok, pos : int64; served, landed_picks_only : bool) {
+    let c = t.config
+    var rolled = c.recr_mask == 0ul
+    if (!rolled && served && mtp_seated(t, g_mtp_rollback_overrides)) {
+        let ts_roll = prof_ticks()
+        rolled = mtp_rollback_served(t, s, pos, 0l)
+        prof_add("mtp.rollback", ts_roll)
+        if (!rolled) {
+            mtp_rollback_declined_panic()
+        }
+    }
+    if (rolled) {
+        if (landed_picks_only) {
+            land_pick(s, s.mtp_picks[0])
+        } else {
+            copy_floats(s.mtp_logits, 0l, s.logits, 0l, c.vocab_size)
+        }
+        copy_floats(s.mtp_h0, 0l, s.mtp_h, 0l, mtp_h_dim(c))   // the carry re-seeds from row 0's hidden: the verify's tail stashed the last row's, which fed the rejected draft
+        s.mtp_h_pos1 = pos + 1l
+        return
+    }
+    let ts_replay = prof_ticks()
+    mtp_state_restore(s)
+    forward(t, s, tok, pos)
+    prof_add("mtp.replay", ts_replay)
 }
 
 //! the depth-1 speculative step over every stream at once: a registered batch override verifies every
 //! stream's rows in one pass; without one each stream steps alone through `mtp_spec_eval`. `accepted[i]`
 //! is stream i's accepted draft or -1; returns how many streams' rows a joint verify carried (0 = none)
+[hot_path]   // the per-step entry the scheduler re-enters once per tick
 def mtp_spec_eval_batch(t : Model; var sessions : array<Session?>; toks : array<int64>; var accepted : array<int64>) : int64 {
-    if (t.metal_blob && !empty(g_decode_override_name) && key_exists(g_mtp_spec_batch_overrides, g_decode_override_name)) {
-        return invoke(g_mtp_spec_batch_overrides[g_decode_override_name], t, sessions, toks, accepted)
+    if (mtp_seated(t, g_mtp_spec_batch_overrides)) {
+        return invoke(g_mtp_spec_batch_overrides[g_decode_override_name], t, sessions, toks, accepted)   // nolint:PERF026 — mtp_seated holds key_exists, so the index cannot insert
     }
     let n = long_length(sessions)
-    accepted |> resize(n)
+    accepted |> resize(n)   // nolint:PERF026 — the caller's reused per-stream row: it grows to the stream count once and keeps its capacity
     for (i in range64(n)) {
         var a = 0l
         accepted[i] = mtp_spec_eval(t, *sessions[i], toks[i], a) ? a : -1l
@@ -4543,14 +5393,19 @@ def mtp_spec_eval_batch(t : Model; var sessions : array<Session?>; toks : array<
     return 0l
 }
 
-//! One greedy self-speculative eval step: evals `tok`, drafting one token ahead with the NextN
-//! head and verifying with a 2-row batched trunk forward. On accept, `accepted` is the draft and
-//! `s.logits` holds the second position's; else one position, plain-eval semantics. Requires [[set_mtp_spec]] ON.
+[cold_path]   //! the round's fail-closed exit: a pick ask beside a sampled walk
+def private mtp_pick_ask_sampled_panic {
+    panic("dasLLAMA: the speculative round was asked for a pick (Session.pick_asked) by a caller whose spec_params sample - a pick ask is a bare argmax's alone; engine bug")
+}
+
+//! One greedy self-speculative eval step: evals `tok`, drafting one token ahead with the NextN head and verifying with a 2-row
+//! batched trunk forward. On accept, `accepted` is the draft and `s.logits` holds the second position's; else one position, plain-eval
+//! semantics. Under the caller's pick ask (`Session.pick_asked`) a served verify seat lands no logits: the next token is published as a pick for sample_. Requires [[set_mtp_spec]] ON.
+[hot_path]   // the per-round entry: the draft, the verify, the walk and the reject all run under it
 def mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : int64&) : bool {
     let c = t.config
-    if (t.metal_blob && !empty(g_decode_override_name) && key_exists(g_mtp_spec_overrides, g_decode_override_name)) {
-        // a blob model never runs the CPU spec rail — the active override's GPU twin owns the step
-        return invoke(g_mtp_spec_overrides[g_decode_override_name], t, s, tok, accepted)
+    if (mtp_seated(t, g_mtp_spec_overrides)) {
+        return invoke(g_mtp_spec_overrides[g_decode_override_name], t, s, tok, accepted)   // nolint:PERF026 — mtp_seated holds key_exists, so the index cannot insert
     }
     let pos = s.n_past
     mtp_round_begin(s)
@@ -4562,62 +5417,46 @@ def mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : int64&
         s.n_past = pos + 1l
         return false
     }
+    let sampled = mtp_walk_samples(s)
+    let asked = s.pick_asked
+    if (asked && sampled) {
+        mtp_pick_ask_sampled_panic()
+    }
+    let seated = mtp_verify_seated_save_carry(t, s)
     // draft x_{pos+1} from (h_{pos-1}, tok) at row pos-1 (rewrites that row's draft KV in place)
     let ts_draft = prof_ticks()
-    forward_mtp(t, s, tok, pos - 1l)
-    let d = parallel_argmax(s.logits, c.vocab_size)
+    let d = mtp_draft(t, s, tok, pos - 1l, !sampled)
     s.mtp_drafted++
     prof_add("mtp.draft", ts_draft)
     // batched verify: trunk over [tok@pos, d@pos+1] — weights stream once for both rows; the
     // warm inside this prefill writes the head's row pos = (h_pos, d), which doubles as the
     // accept-path backfill (a reject leaves it stale; the next draft at that row rewrites it)
-    let ts_snap = prof_ticks()
-    mtp_state_snapshot(s)
-    prof_add("mtp.snapshot", ts_snap)
-    let ts_verify = prof_ticks()
     s.mtp_vbatch[0] = tok
     s.mtp_vbatch[1] = d
-    let batch_cls = mtp_cls_batch_ok(t)
-    forward_prefill(t, s, s.mtp_vbatch, 2l, pos, batch_cls)
-    if (batch_cls) {
-        mtp_verify_logits(t, s, 2l)   // both rows from one classifier stream
-    } else {
-        mtp_verify_row0(t, s)
-    }
-    prof_add("mtp.verify", ts_verify)
+    let served = mtp_verify_two(t, s, seated, pos, asked)
+    let landed_picks_only = served && asked
     let ts_walk = prof_ticks()
     var hit = false
-    if (mtp_walk_samples(s)) {
+    if (sampled) {
         s.mtp_logits_b |> overwrite_resize(2l * c.vocab_size)
         copy_floats(s.mtp_logits, 0l, s.mtp_logits_b, 0l, c.vocab_size)
         copy_floats(s.logits, 0l, s.mtp_logits_b, c.vocab_size, c.vocab_size)
         hit = mtp_walk_sampled(s, 1l, c.vocab_size) == 1l
     } else {
-        hit = parallel_argmax(s.mtp_logits, c.vocab_size) == d && !mtp_reject_forced(s)
+        let truth = served ? s.mtp_picks[0] : parallel_argmax(s.mtp_logits, c.vocab_size)
+        hit = truth == d && !mtp_reject_forced(s)
     }
     prof_add("mtp.walk", ts_walk)
     if (hit) {
         s.mtp_accepted++
         accepted = d
         s.n_past = pos + 2l
+        if (landed_picks_only) {
+            land_pick(s, s.mtp_picks[1])
+        }
         return true
     }
-    // Reject — but the verify already produced what a plain step would: row 0's logits and KV are
-    // correct, so re-forwarding discards real work. The re-forward is only needed to roll back
-    // recurrent state the verify advanced past the draft; an arch without any skips it.
-    if (c.recr_mask == 0ul) {
-        copy_floats(s.mtp_logits, 0l, s.logits, 0l, c.vocab_size)
-        // forward_prefill's tail stashed the LAST row's h — the draft's, now discarded — so re-seed
-        // the draft head from row 0's normed hidden the verify's own classifier computed
-        copy_floats(s.mtp_h0, 0l, s.mtp_h, 0l, c.dim)
-        s.mtp_h_pos1 = pos + 1l
-        s.n_past = pos + 1l
-        return false
-    }
-    let ts_replay = prof_ticks()
-    mtp_state_restore(s)
-    forward(t, s, tok, pos)
-    prof_add("mtp.replay", ts_replay)
+    mtp_reject(t, s, tok, pos, served, landed_picks_only)
     s.n_past = pos + 1l
     return false
 }
@@ -5107,7 +5946,7 @@ def attn_qkv_rope_prefix(t : Model; var s : Session; l : int64; npos : int64; st
     let kv_shared = t.kv_src[l] != l
     // attention rmsnorm, per position
     let ts_norm0 = prof_ticks()
-    rms_batch(s.xb_b, s.x_b, t, t.rms_att_off + l * dim, dim, npos)
+    block_in_b(t, s, t.rms_att_off + l * dim, npos)
     prof_add("norm", ts_norm0)
     // batched q/k/v projections (each re-quantizes xb_b — cheap vs the matmul)
     let ts_qkv = prof_ticks()
@@ -5194,7 +6033,7 @@ def attn_out_suffix(t : Model; var s : Session; l : int64; npos : int64) {
     if (c.pre_post_norm) {  // Gemma2: post-attention RMSNorm per position before residual
         rms_batch(s.xb2_b, s.xb2_b, t, t.rms_post_att_off + l * dim, dim, npos)
     }
-    add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
+    block_resid_b(t, s, s.xb2_b, npos)
     prof_add("act_resid", ts_resid0)
 }
 
@@ -5247,6 +6086,12 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
         }
     }
     prof_add("embed", ts_embed)
+    if (t.blocks.pre_stack_prefill != null) {   // the arch's residual shape (hyper-connection streams, the n-gram gather)
+        if (s.embed_gpu_pending) {
+            embed_backfill_cpu(t, s, npos)   // the streams are made from the rows, so the rows come first
+        }
+        invoke(t.blocks.pre_stack_prefill, t, s, tokens, npos, start_pos)
+    }
     if (has_ple(c)) {  // gemma-4 E-series: build each position's per-(layer) side input before the stack
         let ts_ple = prof_ticks()
         if (g_ple_gpu_gate_set && invoke(g_ple_gpu_gate, t, s, npos, start_pos)) {
@@ -5264,22 +6109,20 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     // spec on: the draft head's SEAM row (start_pos-1) must be written BEFORE the body — the body's
     // own tail overwrites mtp_h with THIS window's last hidden. Cold/foreign handoff just skips it.
     if (g_mtp_spec && c.n_layer_nextn > 0l && start_pos > 0l && s.mtp_h_pos1 == start_pos) {
-        if (t.metal_blob) {
-            if (!empty(g_decode_override_name) && key_exists(g_mtp_seam_overrides, g_decode_override_name)) {
-                if (!invoke(g_mtp_seam_overrides[g_decode_override_name], t, s, tokens[0], start_pos)) {   // nolint:PERF026 — key_exists guards the line above, so the index cannot insert
-                    // quality-only miss: the stale seam row dents draft acceptance until the next
-                    // draft rewrites it (the verify keeps outputs exact) — loud so a dip is traceable
-                    to_log(LOG_WARNING, "dasLLAMA: MTP seam row declined at pos {start_pos} - draft acceptance may dip this window\n")   // nolint:PERF028,PERF026 - fires only on a seam decline; loud by design so a quality dip is traceable
-                }
-            }
-        } else {
+        let seat = mtp_seated(t, g_mtp_seam_overrides)
+        let served = seat && invoke(g_mtp_seam_overrides[g_decode_override_name], t, s, tokens[0], start_pos)   // nolint:PERF026 — `seat` holds key_exists, so the index cannot insert
+        if (!served && !t.metal_blob) {
             forward_mtp(t, s, tokens[0], start_pos - 1l, false)
+        } elif (!served && seat) {
+            // quality-only miss: the stale seam row dents draft acceptance until the next
+            // draft rewrites it (the verify keeps outputs exact) — loud so a dip is traceable
+            to_log(LOG_WARNING, "dasLLAMA: MTP seam row declined at pos {start_pos} - draft acceptance may dip this window\n")   // nolint:PERF028,PERF026 - fires only on a seam decline; loud by design so a quality dip is traceable
         }
     }
     forward_prefill_body(t, s, npos, start_pos, skip_logits)
     // spec on: maintain the draft head's KV alongside the trunk's — CPU rail only (on a blob
     // model the GPU spec loop owns the draft slab; these hooks would CPU-touch blob planes)
-    if (g_mtp_spec && c.n_layer_nextn > 0l && !t.metal_blob) {
+    if (g_mtp_spec && c.n_layer_nextn > 0l && !t.metal_blob && !g_prefill_logits_done) {
         mtp_prefill_warm(t, s, tokens, npos, start_pos)
     }
 }
@@ -5341,7 +6184,7 @@ def forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : int64) {
     let n_heads = c.n_heads
     let qd = n_heads * head_size       // query / attention-output width (== dim except Gemma2/gemma4)
     let xdim = max(dim, qd)            // xb_b holds the norm output (dim) then the attn output (qd)
-    let maxn = max(xdim, hidden)
+    let maxn = max(max(xdim, hidden), max(hc_dim(c), ple_in_dim(c)))   // the hyper-connection mixer's down projection eats the whole wide row
     // no-init: every array here is stage output, fully overwritten before read — zero-fill was ~5ms waste
     s.x_b |> overwrite_resize(npos * dim)
     s.xb_b |> overwrite_resize(npos * xdim)
@@ -5363,6 +6206,19 @@ def forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : int64) {
         s.ple_gate |> grow_resize(npos * c.n_embd_per_layer)
     }
     hybrid_rows_alloc(c, s, npos)
+    if (c.hyper_conn) {   // the wide residual rows + the mixer's row scratch
+        let hcd = hc_dim(c)
+        s.hc_res_b |> grow_resize(npos * hcd)
+        s.hc_xn_b |> grow_resize(npos * hcd)
+        s.hc_gate_b |> grow_resize(npos * hcd)
+        s.hc_lo_b |> grow_resize(npos * c.hc_low_rank)
+        s.hc_inject_b |> grow_resize(npos * c.hc_count)
+    }
+    if (has_ple_ngram(c)) {   // the n-gram rows and the two projections, per position
+        s.ple_emb_b |> grow_resize(npos * ple_in_dim(c))
+        s.ple_key_b |> grow_resize(npos * hc_dim(c))
+        s.ple_val_b |> grow_resize(npos * dim)
+    }
     if (c.recr_mask != 0ul && g_dn_prefill_mode == DnPrefillMode.chunked) {   // batched conv rows + per-head chunk slabs
         s.dn_conv_b |> grow_resize(npos * dn_conv_dim(c))
         s.dn_wtap |> grow_resize(c.ssm_d_conv * dn_conv_dim(c))
@@ -5526,10 +6382,13 @@ def forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64; sk
     blob_only_panic(t, "prefill final-norm/classifier step")
     let ts_final = prof_ticks()
     let last = npos - 1l
-    rms_at(s.xb, t, t.rms_final_off, s.x_b, last * dim, dim)
+    if (t.blocks.final_norm != null) {
+        invoke(t.blocks.final_norm, t, s, last, true)
+    } else {
+        rms_at(s.xb, t, t.rms_final_off, s.x_b, last * dim, dim)
+    }
     if (c.n_layer_nextn > 0l) {   // stash the last position's h_nextn for the MTP draft head
-        copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)
-        s.mtp_h_pos1 = start_pos + last + 1l
+        mtp_stash_carry_row(t, s, s.hc_res_b, last, start_pos + last + 1l)
     }
     if (skip_logits) {   // MTP verify: the caller runs ONE batched classifier covering every row
         prof_add("final", ts_final)

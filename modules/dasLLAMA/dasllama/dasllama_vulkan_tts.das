@@ -129,13 +129,9 @@ def private ts_slab_upload(var sl : TsSlab; key : uint64; host : array<float>; h
     return true
 }
 
-//! the slab for `key` stands: its rows are up under that key
 def private ts_slab_current(sl : TsSlab; key : uint64) : bool => sl.rows.dev != 0ul && sl.key == key
 
-//! the writer's two passes into a fresh slot record, the host floats up (their f16 twin under `half`), the slots taken, the wall said; false
-//! on a failed upload, the resident slab released. A part's attach reaches it through its own [cold_path] rebuild, the one that holds the
-//! writer's block, so the writer's allocations stay off the seat's hot path
-[cold_path]
+[cold_path, arch(at = "../ARCHITECTURE_GPU_TOWER_VULKAN_TTS.md#vk-tts-chain")]
 def private ts_slab_rebuild(var sl : TsSlab; var slots : auto(SS); key : uint64; half : bool; what : string;
                             write : block<(var w : TtsSlabWriter; var s : SS) : void>) : bool {
     var inscope fresh : SS
@@ -372,8 +368,7 @@ def private ts_gemm_args(slot : TtsConvSlot; nin, nout, rows : int64) : F32GemmA
     => F32GemmArgs(n = uint(nin), d = uint(nout), rows = uint(rows), woff = uint(slot.woff), wstride = uint(slot.kdim_p), boff = uint(slot.boff),
         xoff = 0u, xstride = uint(nin), yoff = 0u, ystride = uint(nout))
 
-//! a dense linear's GEMM: y[rows x nout] = x[rows x nin] W^T + b over the slab's rows, the f32 tile; `biased` false leaves the bias row for the
-//! residual seam that follows (`ts_add_ln` adds it there)
+//! a dense linear on the f32 tile, y = x W^T + b over the slab's rows; `biased` false leaves the bias to the seam after (`ts_add_ln`)
 def private ts_lin(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; slot : TtsConvSlot; nin, nout : int64; x, y : TsRows; rows : int64; biased : bool = true) {
     var pa = ts_gemm_args(slot, nin, nout, rows)
     if (biased) {
@@ -434,7 +429,7 @@ def private ts_im2col(raw : VkCommandBuffer; var h : VkHaz; slot : TtsConvSlot; 
     vt_pt(raw, VtProfRole.tts_im2col)
 }
 
-//! the same under a left pad of the caller's choosing (the codec convs run the CPU's first-window pad, not the conv's own)
+//! `ts_conv` under a left pad of the caller's choosing (the codec convs run the CPU's first-window pad, not the conv's own)
 def private ts_conv_padded(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; slot : TtsConvSlot; cv : TtsConv1d; tin, tout, pad_l : int64; x, col, y : TsRows) {
     ts_im2col(raw, h, slot, cv, tin, tout, pad_l, x, col, false)
     var sm = set_f32_gemm_b_cls(fixed_array(slab.dev, col.dev, y.dev, slab.dev), fixed_array(slab.bytes, col.bytes, y.bytes, slab.bytes), fixed_array(0u, col.bit, y.bit, 0u))
@@ -745,7 +740,7 @@ def private ts_adain(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; sc_ : 
 //! the depthwise transposed pool on rows: y [t_out][c] from x [t_in][c] over the slab's w [c][k] at `woff` and b [c] at `boff`
 def private ts_pool_dw(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; cv : TtsConv1d; woff, boff : int64; x, y : TsRows; t_in, t_out : int64) {
     var s = set_tts_pool_dw_cls(fixed_array(x.dev, y.dev, slab.dev), fixed_array(x.bytes, y.bytes, slab.bytes), fixed_array(x.bit, y.bit, 0u))
-    var pa = TtsPoolArgs(c = uint(cv.cin), k = uint(cv.k), stride = uint(cv.stride), pad_l = uint(cv.pad_l), dil = uint(cv.dilation), t_in = uint(t_in),
+    var pa = DwConvRowsArgs(c = uint(cv.cin), k = uint(cv.k), stride = uint(cv.stride), pad_l = uint(cv.pad_l), dil = uint(cv.dilation), t_in = uint(t_in),
         t_out = uint(t_out), woff = uint(woff), boff = uint(boff))
     enc_tts_pool_dw_cls(raw, h, s, pa, t_out * cv.cin)
     vt_pt(raw, VtProfRole.tts_rows)
@@ -926,14 +921,14 @@ let private TS_PR_F0 = 13    //! the F0 branch's projection [t][1]
 let private TS_PR_N = 14     //! ... and the energy branch's
 
 //! a seat's geometry, the shape walks' record (`tts_res_shape` and its kin): the widest row count and width its blocks reach, the widest im2col
-//! row, the aux floats its norms take, and the style width every AdaIN norm's fc must read
+//! row, and the aux floats its norms take
 struct private TsShape {
     t_max : int64
     c_max : int64
     col : int64      //! the widest im2col a conv takes: its output rows x its padded row
     kdim : int64     //! the widest padded row among them
     aux : int64
-    sd : int64
+    style_dim : int64
 }
 
 //! the im2col floats a conv over `rows` output rows takes
@@ -953,9 +948,9 @@ let private TS_COL16_SLACK_ROWS = 64l   //! the half column slot's rows past a c
 def private ts_col16_floats(sh : TsShape) : int64 => (sh.col + TS_COL16_SLACK_ROWS * sh.kdim) / 2l + 1l
 
 //! the shape walks' conv hook: a conv over `rows` output rows noted (its im2col and padded row); a transposed conv serves only as an upsample
-def private tts_note_conv(var sh : TsShape; c : TtsConv1d; rows : int64; upsample : bool) : bool {
-    return false if (c.transposed && !upsample)
-    ts_note_col(sh, c, rows)
+def private tts_note_conv(var sh : TsShape; cv : TtsConv1d; rows : int64; upsample : bool) : bool {
+    return false if (cv.transposed && !upsample)
+    ts_note_col(sh, cv, rows)
     return true
 }
 
@@ -969,7 +964,7 @@ def private tts_note_rows(var sh : TsShape; t, c : int64) {
 def private tts_note_block(var sh : TsShape; b : St2GenResBlock; t, c : int64) : bool {
     for (j in range(length(b.adain1))) {
         return false if (!tts_lin_ok(b.adain1[j].fc) || b.adain1[j].fc.nout != 2l * c || !tts_lin_ok(b.adain2[j].fc) || b.adain2[j].fc.nout != 2l * c
-            || b.adain1[j].fc.nin != sh.sd || b.adain2[j].fc.nin != sh.sd)
+            || b.adain1[j].fc.nin != sh.style_dim || b.adain2[j].fc.nin != sh.style_dim)
     }
     sh.aux += long_length(b.convs1) * (4l * c + 16l)
     return true
@@ -978,7 +973,7 @@ def private tts_note_block(var sh : TsShape; b : St2GenResBlock; t, c : int64) :
 //! an AdaIN block's pool and norms, its norms' fc widths against the style, its rows and style rows
 def private tts_note_res(var sh : TsShape; b : St2AdainResBlk; t1 : int64) : bool {
     return false if (!tts_res_ok(b) || !tts_lin_ok(b.norm1.fc) || b.norm1.fc.nout != 2l * b.dim_in_s || !tts_lin_ok(b.norm2.fc) || b.norm2.fc.nout != 2l * b.dim_out
-        || b.norm1.fc.nin != sh.sd || b.norm2.fc.nin != sh.sd)
+        || b.norm1.fc.nin != sh.style_dim || b.norm2.fc.nin != sh.style_dim)
     tts_note_rows(sh, t1, max(b.dim_in_s, b.dim_out))
     sh.aux += 2l * (b.dim_in_s + b.dim_out) + 8l
     return true
@@ -1122,7 +1117,7 @@ def private vulkan_styletts2_prosody(p : St2Predictor; en : array<float>; cc, fr
         return ts_decline("prosody", VulkanTtsDecline.knob)
     }
     let hd = p.shared_lstm.fwd.hidden
-    var sh = TsShape(t_max = frames, c_max = max(cc, 2l * hd), col = 32l, aux = 4l, sd = long_length(s))
+    var sh = TsShape(t_max = frames, c_max = max(cc, 2l * hd), col = 32l, aux = 4l, style_dim = long_length(s))
     if (frames < 1l || cc % 32l != 0l || !tts_lstm_ok(p.shared_lstm, cc, TS_LSTM_MAX_HIDDEN) || empty(p.f0) || long_length(en) < cc * frames
         || !tts_pred_ok(p, TS_LSTM_MAX_HIDDEN)) {
         return ts_decline("prosody", VulkanTtsDecline.shape)
@@ -1522,7 +1517,7 @@ def private vulkan_styletts2_decode(d : St2Decoder; text_c : int64; source : Sin
     if (!vulkan_tower_on()) {
         return ts_decline("decode", VulkanTtsDecline.knob)
     }
-    var sh = TsDecShape(col = 32l, aux = 8l, sd = long_length(s_ref))
+    var sh = TsDecShape(col = 32l, aux = 8l, style_dim = long_length(s_ref))
     if (!tts_decode_shape(d, text_c, source, frames, f2, noise, TS_MAX_STAGES, sh) || long_length(asr) < text_c * frames
         || long_length(f0) < f2 || long_length(nrg) < f2) {
         return ts_decline("decode", VulkanTtsDecline.shape)
@@ -1585,7 +1580,7 @@ def private vulkan_styletts2_generator(d : St2Decoder; x_rows : array<float>; cx
     if (!vulkan_tower_on()) {
         return ts_decline("generator", VulkanTtsDecline.knob)
     }
-    var sh = TsDecShape(col = 32l, aux = 8l, sd = long_length(s))
+    var sh = TsDecShape(col = 32l, aux = 8l, style_dim = long_length(s))
     let spec_floats = har_frames * (empty(d.noise_convs) ? 0l : d.noise_convs[0].cin)
     if (cx % 32l != 0l || !tts_gen_shape(d, cx, t, har_frames, TS_MAX_STAGES, sh) || !tts_dec_ok(d) || long_length(x_rows) < t * cx || long_length(har_spec) < spec_floats) {
         return ts_decline("generator", VulkanTtsDecline.shape)
@@ -1636,14 +1631,6 @@ var private g_ts_pkf_scratch : TsScratch
 var private @scratch g_ts_pk_rows : array<int64>   //! the codec chain's row counts: the frames, the 200 Hz rows, each stage's rows
 var private @scratch g_ts_pk_kv_host : array<float>
 
-[cold_path]
-def set_vulkan_pocket_frame_batch(n : int64) {
-    set_pocket_frame_batch(n)
-}
-
-[cold_path]
-def vulkan_pocket_frame_batch() : int64 => pocket_frame_batch()
-
 def private ts_pk_codec_attach(mm : PocketMimi) : bool {
     let key = tts_pk_codec_key(mm)
     return ts_slab_current(g_ts_pk_codec, key) || ts_pk_codec_rebuild(mm, key)
@@ -1674,8 +1661,7 @@ def private ts_ensure_log(seat : string; us, drv0, arms_us : int) {
     }
 }
 
-//! the tier's device armed, then the seat's classes built (`ensure`); false on either (the seat's `device` decline); the bring-up and the pipeline
-//! build wall the call paid past it logged when either reached a ms
+//! the device armed, then the seat's classes built (`ensure`); false on either, which the caller declines as `device`; a bring-up or build wall past a ms logged
 def private ts_arm_ensure(seat : string; ensure : function<() : bool>) : bool {
     let te = ref_time_ticks()
     let drv0 = g_vkd_pipe_build_us
@@ -1734,14 +1720,14 @@ def private ts_pk_kv_upload(kc : TtsKvCache; bk, bv : TsRows; r0, r1 : int64) {
     return if (rows <= 0l)
     g_ts_pk_kv_host |> ensure_length(2l * rows * d)
     unsafe {
-        tts_pk_kv_rows(kc, r0, r1, 0l, addr(g_ts_pk_kv_host[0]), addr(g_ts_pk_kv_host[rows * d]))
+        kv_cache_read_rows(kc, r0, r1, 0l, addr(g_ts_pk_kv_host[0]), addr(g_ts_pk_kv_host[rows * d]))
     }
     upload_region_at(bk.dev, r0 * d * 4l, unsafe(addr<uint8 const?>(g_ts_pk_kv_host[0])), rows * d * 4l)
     upload_region_at(bv.dev, r0 * d * 4l, unsafe(addr<uint8 const?>(g_ts_pk_kv_host[rows * d])), rows * d * 4l)
 }
 
 def private ts_pk_voice_attach(vs : PocketVoiceState; tf : PocketTransformer) : bool
-    => tts_pk_voice_current(g_ts_pk_voice.meta, vs, length(g_ts_pk_voice.k)) || ts_pk_voice_rebuild(vs, tf)
+    => tts_pk_voice_current(g_ts_pk_voice.meta, vs, length(g_ts_pk_voice.k), tf.d) || ts_pk_voice_rebuild(vs, tf)
 
 [cold_path]
 def private ts_pk_voice_rebuild(vs : PocketVoiceState; tf : PocketTransformer) : bool {
@@ -1817,10 +1803,10 @@ def private ts_pk_row_scale(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows;
     vt_pt(raw, VtProfRole.tts_pk)
 }
 
-//! the NORM rope over the span `d` wide at column `col` of x's rows [rows][qs], positions pos0.., on the tables in `tabs` (cos at coff, sin at soff)
-def private ts_pk_rope(raw : VkCommandBuffer; var h : VkHaz; tabs : TsRows; coff, soff : int64; x : TsRows; rows, qs, col, d, dh, pos0 : int64) {
+//! the adjacent-pair rope over the span `d` wide at column `col` of x's rows [rows][qs], positions 0.., on the tables in `tabs` (cos at coff, sin at soff)
+def private ts_pk_rope(raw : VkCommandBuffer; var h : VkHaz; tabs : TsRows; coff, soff : int64; x : TsRows; rows, qs, col, d, dh : int64) {
     var s = set_tts_pk_rope_cls(fixed_array(x.dev, tabs.dev, tabs.dev), fixed_array(x.bytes, tabs.bytes, tabs.bytes), fixed_array(x.bit, tabs.bit, tabs.bit))
-    var pa = TtsPkRopeArgs(rows = uint(rows), qs = uint(qs), col = uint(col), d = uint(d), dh = uint(dh), pos0 = uint(pos0), xoff = 0u, coff = uint(coff), soff = uint(soff))
+    var pa = RopeTabArgs(rows = uint(rows), qs = uint(qs), col = uint(col), d = uint(d), dh = uint(dh), coff = uint(coff), soff = uint(soff))
     enc_tts_pk_rope_cls(raw, h, s, pa, rows * d / 2l)
     vt_pt(raw, VtProfRole.tts_pk)
 }
@@ -1993,8 +1979,8 @@ def private ts_pk_transformer(raw : VkCommandBuffer; var h : VkHaz; slab : TsRow
         let s & = unsafe(sl.layers[i])
         ts_ln(raw, h, slab, s.n1, r_x, r_xb, t, d, tf.eps)
         ts_lin(raw, h, slab, s.in_proj, d, 3l * d, r_xb, r_qkv, t)
-        ts_pk_rope(raw, h, slab, sl.rope_cos, sl.rope_sin, r_qkv, t, 3l * d, 0l, d, dh, 0l)
-        ts_pk_rope(raw, h, slab, sl.rope_cos, sl.rope_sin, r_qkv, t, 3l * d, d, d, dh, 0l)
+        ts_pk_rope(raw, h, slab, sl.rope_cos, sl.rope_sin, r_qkv, t, 3l * d, 0l, d, dh)
+        ts_pk_rope(raw, h, slab, sl.rope_cos, sl.rope_sin, r_qkv, t, 3l * d, d, d, dh)
         kc.sc = uint(d)
         ts_pk_rows(raw, h, r_qkv, r_k, kc, false)
         kc.sc = uint(2l * d)
@@ -2038,7 +2024,7 @@ def private ts_pk_codec_chain(raw : VkCommandBuffer; var h : VkHaz; slab : TsRow
     let r_x = ts_rows(sc_, TS_C_X)
     ts_pk_conv(raw, h, slab, sl.quant, mm.quant_proj, frames, ts_rows(sc_, TS_C_LAT), r_col, r_q)
     var sp = set_tts_pool_dw_cls(fixed_array(r_q.dev, r_x.dev, slab.dev), fixed_array(r_q.bytes, r_x.bytes, slab.bytes), fixed_array(r_q.bit, r_x.bit, 0u))
-    var pp = TtsPoolArgs(c = uint(d), k = uint(mm.upsample.k), stride = uint(mm.upsample.stride), pad_l = 0u, dil = uint(mm.upsample.dilation), t_in = uint(frames),
+    var pp = DwConvRowsArgs(c = uint(d), k = uint(mm.upsample.k), stride = uint(mm.upsample.stride), pad_l = 0u, dil = uint(mm.upsample.dilation), t_in = uint(frames),
         t_out = uint(t1), woff = uint(sl.up_w), boff = uint(sl.up_b))
     enc_tts_pool_dw_cls(raw, h, sp, pp, t1 * d)
     vt_pt(raw, VtProfRole.tts_rows)
@@ -2248,8 +2234,7 @@ def private ts_pk_frame(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; sc_
 var private @scratch g_ts_pk_noise_host : array<float>
 var private @scratch g_ts_pk_eos_host : array<float>
 
-//! the host frame loop (`pocket_frames_batched`) on this driver: the noise staged host-side and uploaded ahead of each batch's submit, the
-//! batch's EOS logits read back after it
+//! `pocket_frames_batched` here: the noise staged and uploaded ahead of each batch's submit, its EOS logits read back after
 def private ts_pk_frames_loop(m : PocketModel; sl : TtsPkFramesSlab; slab : TsRows; sc_ : TsScratch; base, batch, max_frames, forced_rows : int64; std : float;
                               frames_after_eos : int; captured : array<float>; var sc : PocketScratch; var f0 : int64&) : tuple<frames : int64; eos_at : int64> {
     let ld = m.latent_dim
@@ -2259,18 +2244,18 @@ def private ts_pk_frames_loop(m : PocketModel; sl : TtsPkFramesSlab; slab : TsRo
     g_ts_pk_eos_host |> ensure_length(batch)
     return pocket_frames_batched(m, batch, max_frames, std, frames_after_eos, captured, sc, f0, $(_k : int64) : float? {
         return unsafe(addr(g_ts_pk_noise_host[0]))
-    }, $(fb, k : int64) : bool {
+    }, $(first, k : int64) : bool {
         ts_upload(r_noise, g_ts_pk_noise_host, k * ld)
         vt_chain_one_shot("pocket frames", long_length(m.backbone.layers), k) $(raw : VkCommandBuffer; var h : VkHaz) {
             for (i in range64(k)) {
-                ts_pk_frame(raw, h, slab, sc_, m, sl, base + fb + i, fb + i, i, forced_rows)
+                ts_pk_frame(raw, h, slab, sc_, m, sl, base + first + i, first + i, i, forced_rows)
             }
         }
         g_ts_encodes++
         var ep = unsafe(addr(g_ts_pk_eos_host[0]))
-        readback_range(r_eos.dev, r_eos.bit, fb * 4l, sc_.hb, ep, k * 4l)
+        readback_range(r_eos.dev, r_eos.bit, first * 4l, sc_.hb, ep, k * 4l)
         return true
-    }, $(_fb, i : int64) : float {
+    }, $(_first, i : int64) : float {
         return g_ts_pk_eos_host[i]
     })
 }

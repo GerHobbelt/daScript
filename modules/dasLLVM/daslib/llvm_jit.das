@@ -763,6 +763,9 @@ class public LlvmJitVisitor : AstVisitor {
         // split mode: function impls (never blocks/lambdas - those stay partition-local) are
         // cross-partition callable
         build_llvm_function_pair(fnmna, isCMRES(fun), fun.arguments, fun.result, null, fun.annotations, g_jit_split_active)
+        if (is_never_fast_math(fun.annotations)) {
+            LLVMAddTargetDependentFunctionAttr(ffunc, JIT_NEVER_FAST_MATH_ATTR, "")
+        }
         thisFunc = null
     }
 
@@ -1759,7 +1762,7 @@ class public LlvmJitVisitor : AstVisitor {
             LLVMPositionBuilderAtEnd(g_builder, guard_end)
         }
         // lookup intrinsics first
-        var intrin_call = lookup_intinsic(g_ctx, g_builder, types, expr, [for (x in expr.arguments); getE(x)])
+        var intrin_call = has_intrinsic(expr) ? lookup_intinsic(g_ctx, g_builder, types, expr, [for (x in expr.arguments); getE(x)]) : null
         if (intrin_call != null) {
             setE(expr, intrin_call)
             return
@@ -1852,7 +1855,7 @@ class public LlvmJitVisitor : AstVisitor {
                     params |> push(cmresPtr, 0)
                     var ccall = build_interop_call(expr.func, typ, func, expr.arguments, params, true, "")
                     setE(expr, cmresEval)
-                } elif (has_interop_lowering(expr)) {
+                } elif (!JIT_HOST_ASAN && has_interop_lowering(expr)) {   //! an interop lowering skips the C++ call, which keeps the asan bookkeeping
                     var ccall = lookup_interop_lowering(g_ctx, g_builder, types, expr,
                         [for (x in expr.arguments); getE(x)]) {
                         return build_interop_call(expr.func, typ, func, expr.arguments, params, false, "")
@@ -6731,6 +6734,9 @@ class public LlvmJitVisitor : AstVisitor {
         build_llvm_function_pair(fnmna, isCmres, thisBlock.arguments, thisBlock.returnType, captureType, expr.annotations)
         // function pair
         ffunc = LLVMGetNamedFunction(g_mod, fnmna.impl())
+        if (func != null && is_never_fast_math(func.annotations)) {
+            LLVMAddTargetDependentFunctionAttr(ffunc, JIT_NEVER_FAST_MATH_ATTR, "")
+        }
         wfunc = LLVMGetNamedFunction(g_mod, fnmna.publ())
         // build wrapper function
         build_wrapper_function(fnmna, block_das_name(thisBlock, func), thisBlock.arguments, thisBlock.returnType, isCmres, captureType, thisBlock.at)
@@ -7134,7 +7140,7 @@ class public LlvmJitVisitor : AstVisitor {
 
 // ExprConstString
     def override visitExprConstString(expr : ExprConstString?) : ExpressionPtr {
-        setE(expr, get_string_constant_ptr(g_builder, string(expr.value)))
+        setE(expr, get_string_constant_ptr(g_builder, expr.value))
         return expr
     }
 
@@ -8075,10 +8081,13 @@ def public reset_codegen_accumulators() {
 }
 
 // The one pipeline-string truth for both the in-place optimize below and the split parallel emit.
-def public opt_pipeline_string(opt_level : uint; size_level : uint) : string {
-    return (size_level >= 2u ? "default<Oz>"
-          : (size_level == 1u ? "default<Os>"
-                              : "default<O{opt_level:d}>"))
+def public opt_pipeline_string(opt_level : uint; size_level : uint; sanitize : JitSanitize) : string {
+    let opt = (size_level >= 2u ? "default<Oz>"
+             : (size_level == 1u ? "default<Os>"
+                                 : "default<O{opt_level:d}>"))
+    //! the sanitizer instruments the optimized IR, where clang runs it too; undefined adds the IR-level
+    //! bounds check, which reads object sizes off allocas, globals and the allocsize heap helpers
+    return "{opt}{sanitize.address ? ",asan" : ""}{sanitize.undefined ? ",function(bounds-checking<rt-abort>)" : ""}"
 }
 
 // The one pass-builder-options truth (vectorize/unroll/inliner) — caller disposes.
@@ -8093,7 +8102,7 @@ def public create_jit_pass_builder_options(inline_threshold : uint) : LLVMOpaque
 }
 
 [macro_function]
-def public optimize_llvm_module(opt_level : uint; size_level : uint; inline_threshold : uint; use_host_cpu : bool) {
+def public optimize_llvm_module(opt_level : uint; size_level : uint; inline_threshold : uint; use_host_cpu : bool; sanitize : JitSanitize) {
     return if (is_in_completion() || is_compiling_macros() || is_folding()
             || g_failed || !LLVM_ENABLE_OPT_PASS)
     var pbopts = create_jit_pass_builder_options(inline_threshold)
@@ -8101,11 +8110,15 @@ def public optimize_llvm_module(opt_level : uint; size_level : uint; inline_thre
     defer() {
         LLVMDisposePassBuilderOptions(pbopts)
     }
-    let pipeline = opt_pipeline_string(opt_level, size_level)
+    let pipeline = opt_pipeline_string(opt_level, size_level, sanitize)
     // use_host_cpu=true for JIT (artifact runs on this host); false for exe emission so the IR
     // pipeline's TTI cost model stays generic and produces redistributable shapes (host-tuned loop
     // unroll / vectorize would otherwise get baked into the emitted object).
     with_default_target_machine(opt_level, use_host_cpu) $(targetMachine : LLVMTargetMachineRef) {
+        stamp_module_target(g_mod, targetMachine)
+        if (sanitize.address) {
+            mark_sanitize_address(g_mod)
+        }
         let err = LLVMRunPasses(g_mod, pipeline, targetMachine, pbopts)
         if (err != null) {
             let msg = LLVMGetErrorMessage(err)

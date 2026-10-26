@@ -1,6 +1,8 @@
 options gen2
 options indenting = 4
 options no_aot = true
+options no_global_variables = false
+options no_aliasing = false
 
 module llvm_tune shared public
 
@@ -73,10 +75,23 @@ def jit_cli_opt_level() : int {
     return cli.opt_level |> unwrap_or(compiling_program().policies.jit_opt_level)
 }
 
+def jit_cli_compile_only() : bool {
+    let r <- parse_args(type<JitCliOptions>)
+    return jit_compile_only(r |> unwrap_or_default, get_ptr(compiling_program()))
+}
+
+var private g_cross_dump_noted = false
+
+//! A cross triple stamps reference bodies - a foreign-arch artifact cannot tune - unless `--jit-compile-only` dumps the grid
 def tune_aot_gate() : bool {
+    let cross_dump = !empty(get_target_triple()) && jit_cli_compile_only()
+    if (cross_dump && !g_cross_dump_noted) {
+        g_cross_dump_noted = true
+        to_log(LOG_INFO, "llvm_tune: --jit-compile-only under the cross triple {get_target_triple()} keeps the tune grid - the emission dump, nothing runs\n")
+    }
     return (compiling_program().policies.tune_frozen
         || compiling_program().policies.aot
-        || !empty(get_target_triple()))
+        || (!empty(get_target_triple()) && !cross_dump))
 }
 
 //! True when this compile must retain reference bodies. Documentation roots
@@ -222,9 +237,9 @@ def tune_box_identity() : string {
     if (!empty(g_box_identity)) {
         return g_box_identity
     }
-    var model_id = ""
+    var model_id = ""   // nolint:LINT003,LINT019 - only the macOS branch writes it, and a host compile with platform folding drops that branch
     var os_build = ""
-    var cpu = ""
+    var cpu : string
     let plat = get_platform_name()
     if (plat == "windows") {
         var build = ""
@@ -1477,7 +1492,7 @@ def tune_pick_fallback(chain : string) : string {
     return ""
 }
 
-let private TUNE_KNOWN_FEATURES = "avx2;f16c;fma;sse4.2;avxvnni;avxvnniint8;avx512f;avx512bw;avx512vl;avx512vnni;avx512vbmi;amx-tile;amx-int8;neon;dotprod;i8mm;bf16;fullfp16;sve;lse"
+let private TUNE_KNOWN_FEATURES = "avx2;f16c;fma;sse4.2;avxvnni;avxvnniint8;avx512f;avx512bw;avx512vl;avx512vnni;avx512vbmi;avx512bf16;amx-tile;amx-int8;amx-bf16;amx-fp16;neon;dotprod;i8mm;bf16;fullfp16;sve;lse"
 
     //! The ';'-joined subset of the known `requires=` feature names this box passes — stamped
     //! into every sidecar's provenance as `features`, which is what lets a shipped profile say

@@ -281,6 +281,9 @@ def public clear_mtp_head_path() {
     g_mtp_head_override_set = false
 }
 
+//! the pinned head path and whether one is pinned at all (an empty pin turns the environment's `DASLLAMA_MTP_HEAD` off)
+def public mtp_head_path_pin() : tuple<set : bool; path : string> => (set = g_mtp_head_override_set, path = g_mtp_head_override)
+
 //! The split NextN/MTP head that rides `path`'s shard walk: the override / `DASLLAMA_MTP_HEAD` when
 //! set, else the `mtp-<trunk basename>` sibling beside the trunk (the published split-head layout),
 //! else "". An assistant drafter is never a head - its weights ride their own lane.
@@ -958,6 +961,34 @@ def gguf_transcode_bf16(m : GGUFMeta; srcbytes : array<uint8> | #; name : string
             }
         }
     }
+}
+
+//! Copy tensor `name`'s bytes VERBATIM into dst (resized to the tensor's disk size) - the gather-only tables
+//! that stay in their block form (qwen4exp's n-gram hash table: rows too narrow for a superblock plane)
+def gguf_read_tensor_raw(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var dst : array<uint8>) : int64 {
+    let ti = gguf_find_tensor(m, name)
+    if (ti < 0) {
+        panic("gguf: tensor '{name}' not found")
+    }
+    let nbytes = ggml_type_bytes(m.tensors[ti].ggml_type, m.tensors[ti].n_elem)
+    dst |> reserve_resize(nbytes)
+    with_tensor_view(m, srcbytes, ti) $(bytes, base) {
+        unsafe {
+            let sp = addr < uint8 const? >(bytes[base])
+            var dp = addr(dst[0])
+            let blk = 1l << 24l
+            let nblk = int((nbytes + blk - 1l) / blk)
+            maybe_parallel_for(0, nblk, transcode_jobs(nbytes, 1l)) $(rb, re) {
+                unsafe {
+                    for (b in range(rb, re)) {
+                        let o = int64(b) * blk
+                        memcpy(reinterpret<void?>(dp + o), reinterpret<void const?>(sp + o), min(blk, nbytes - o))
+                    }
+                }
+            }
+        }
+    }
+    return nbytes
 }
 
 //! The on-disk upstream type of tensor `name` (GGML_TYPE_*), or -1 if the tensor is absent. Lets a

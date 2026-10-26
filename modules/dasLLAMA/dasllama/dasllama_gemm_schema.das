@@ -43,20 +43,22 @@ def q8q8_repack_type(mr : int; wbias : int = 0; kgroup : int = 4) : Q8RepackType
 //! stamped from one manifest entry so both decline in lockstep (M4).
 def GEMM_REFERENCE_MR : int => 4
 
-//! GPU-tier device-plane shape of the Q8 rail: 32-weight blocks, 32B quants + one f16 scale
-//! halfword per block. Every q8 plane sizing (gathers, arena/stack math) derives from these.
-let Q8_BLOCK_ELEMS = 32l
+//! GPU-tier device-plane shape of the Q8 rail: 32-weight blocks (the alias of KQ_B32_ELEMS), 32B
+//! quants + one f16 scale halfword per block. Every q8 plane sizing (gathers, arena/stack math)
+//! derives from these.
+let Q8_BLOCK_ELEMS = KQ_B32_ELEMS
 let Q8_QPB = 32l   // quant bytes per block
 let Q8_SPB = 2l    // scale bytes per block (f16 halfword)
 
-//! kq superblock element count, and the DEVICE scale-row stride the gathers decode a kq format's
-//! scales to (kq_ssb below is the DISK/plane stride, per format); kq_dev_ssb is the per-format form.
-let KQ_SUPERBLOCK_ELEMS = 256l
+//! kq superblock element count (the alias of KQ_SB_ELEMS), and the DEVICE scale-row stride the
+//! gathers decode a kq format's scales to (kq_ssb below is the DISK/plane stride, per format);
+//! kq_dev_ssb is the per-format form.
+let KQ_SUPERBLOCK_ELEMS = KQ_SB_ELEMS
 let KQ_DEV_SSB = 20l
 
 //! The codebook formats whose device scale row is two words: word 0 = f16 d with the format's
 //! native high bits above it, word 1 = eight 4-bit fields.
-def kq_two_word_row(f : KqFmt) : bool => f == KqFmt.iq4xs || f == KqFmt.iq3s || f == KqFmt.iq3xxs || f == KqFmt.iq2xxs
+def kq_two_word_row(f : KqFmt) : bool => f == KqFmt.iq4xs || f == KqFmt.iq3s || f == KqFmt.iq3xxs || f == KqFmt.iq2xxs || f == KqFmt.iq3s4
 
 //! The device scale-row stride of a kq format: 8 B for the two-word-row formats, KQ_DEV_SSB for the rest.
 def kq_dev_ssb(f : KqFmt) : int64 => kq_two_word_row(f) ? 8l : KQ_DEV_SSB
@@ -82,7 +84,7 @@ def kq_ssb(fmt : int) : int64 => kq_ssb(kq_fmt_of_id(fmt, "kq_ssb"))
 //! True for the kq ids whose tile reads the packed quant plane directly; the others (k5/k6 and
 //! the grid formats) read a byte-expanded panel unpacked once per (group, token-block).
 def kq_reads_packed_planes(fmt : int64) : bool {
-    return fmt == 4l || fmt == 40l || fmt == 44l || fmt == 3l || fmt == 45l || fmt == 2l
+    return fmt == 4l || fmt == 40l || fmt == 44l || fmt == 3l || fmt == 45l || fmt == 2l || fmt == 35l
 }
 
 //! eight +-1 bytes for sign byte `sb`, lane k negative when bit k is set

@@ -167,7 +167,7 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
 
    bin/daslang -jit utils/dasllama-server/main.das -- --model <model.gguf> [--port 8080] [--quant q8] \
        [--asr <asr.bin>] [--asr-workers 2] [--mmproj <mmproj.gguf>] [--image-mmproj <mmproj.gguf>] \
-       [--ctx 4096] [--streams 4] [--chunk 64] [--page-rows 64] [--prefix N] [--tune]
+       [--ctx 4096] [--streams 4] [--chunk 512] [--chunk-idle 2048] [--page-rows 64] [--prefix N] [--tune]
 
 .. list-table::
    :header-rows: 1
@@ -260,7 +260,7 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
    * - ``--ctx``
      -
      - *model*
-     - Context-length cap in tokens (default: the model's trained ``context_length``)
+     - Context length in tokens, served whole: the whole-model GPU driver holds it for every stream or declines to the per-op rails, and the load log names the room. Default: the model's trained ``context_length``, shortened to what the card holds (the log says by how much and why)
    * - ``--max-tokens``
      -
      - ``16384``
@@ -276,15 +276,19 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
    * - ``--team-dispatch``
      -
      - ``hybrid``
-     - ``hybrid``: the LLM uses the worker team while the ASR and TTS workers run inline; ``team``: every caller uses serialized team publishes; ``inline``: every caller runs independently
+     - ``hybrid``: the LLM uses the worker team; the ASR workers use it too when every LLM slot decodes on a GPU (Metal, or the whole model resident on a Vulkan device) and run inline otherwise; the TTS worker runs inline; ``team``: every caller uses serialized team publishes; ``inline``: every caller runs independently
    * - ``--affinity``
      -
      - ``-1``
      - Worker CPU affinity: ``-1`` = the platform default (QoS on darwin, off elsewhere), ``0`` = off, ``1`` = an ideal-CPU hint, ``2`` = a hard mask (``DAS_JOBQUE_AFFINITY`` overrides)
    * - ``--chunk``
      -
-     - ``64``
-     - Prefill quantum in tokens: decode stalls at most this many per tick
+     - *backend*
+     - Prefill quantum in tokens while a stream is decoding: decode stalls at most this many per tick. Default: 512 where a GPU prefills (a window's cost is mostly fixed there, so a small chunk runs a prompt at a fraction of the window's rate), 64 on the CPU (a chunk costs its token count, so a short one keeps the stall short at 13 - 29% of the prompt's rate)
+   * - ``--chunk-idle``
+     -
+     - *backend*
+     - Prefill quantum in tokens while no stream is decoding (never under ``--chunk``): nothing waits on the tick, so the window can be wide. Default: 2048 on Metal, 512 on the other backends
    * - ``--page-rows``
      -
      - ``64``
@@ -300,7 +304,19 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
    * - ``--mtp``
      -
      - *auto*
-     - MTP/NextN self-speculative decode. Unset, a slot turns it on when it runs one stream (``streams = 1``) host-cached and leaves it off otherwise: at one stream the draft-and-verify round cuts decode time on the dense Qwen3.5 MTP models (0.8B 1.20x, 4B 1.21x, 9B 1.10x), at several streams the plain batched step is faster, and a device-resident slot (``--gpu vulkan``) keeps plain decode, since an armed round keeps every stream's cache on the host. ``true`` / ``false`` set it outright. It needs a model with an in-file NextN head (the ``-MTP-`` GGUFs); on any other model the server logs one line and serves plain. Greedy requests are output-invariant; a sampled request draws each verify row with its own sampler and keeps the plain sampled distribution, at a lower acceptance rate. ``/v1/stats`` reports ``mtp_drafted`` / ``mtp_accepted``
+     - MTP/NextN self-speculative decode. Unset, a slot turns it on when it runs one stream (``streams = 1``) on a GPU --- Metal, or the whole model resident on a Vulkan device with its routed experts on the card --- and leaves it off otherwise: at one stream on Metal the draft-and-verify round cuts decode time on the dense Qwen3.5 MTP models (0.8B 1.20x, 4B 1.21x, 9B 1.10x), on a Vulkan device more unless the driver sums a MoE's routed experts on the host (there the verify rows' host sums cost more than a plain token), on the CPU the round's second verify row costs a second decode step and the round is slower than plain decode, and at several streams the plain batched step is faster. An armed round keeps every stream's cache on the host, so a drafting Vulkan slot (``--gpu vulkan``) serves host-cached sessions in place of device-home ones. ``true`` / ``false`` set it outright. It needs a model with an in-file NextN head (the ``-MTP-`` GGUFs); on any other model the server logs one line and serves plain. Greedy requests are output-invariant; a sampled request draws each verify row with its own sampler and keeps the plain sampled distribution, at a lower acceptance rate. ``/v1/stats`` reports ``mtp_drafted`` / ``mtp_accepted``
+   * - ``--rope-scaling``
+     -
+     - *file*
+     - RoPE scaling override for the load: ``yarn`` | ``linear`` | ``none``; unset keeps the model file's own ``rope.scaling`` keys, ``none`` drops them (a file's per-pair factor tensors stay, as llama.cpp keeps them). ``yarn`` folds the NTK-by-parts frequency ramp and the ``1 + 0.1 ln(s)`` magnitude into the rope tables the way llama.cpp's ``--rope-scaling yarn`` does. The Qwen families publish the recipe (Qwen2.5-Instruct 7B and up, Qwen3, Qwen3-Next / 3.5 / 3.8: factor 4 over the trained context) and ship no scaling keys because static YaRN costs a little on short texts - arm it when a conversation needs the length; no other vendor validates it, and a non-Qwen file logs a warning. The override is baked into the prepared image under its own lane (``model.gguf.metal-yarn4.dlim``), so the first load with it mints once. Per-model in a ``[[models]]`` roster: ``rope_scaling`` (config key ``rope_scaling``)
+   * - ``--rope-scale``
+     -
+     - *file*
+     - The scaling factor ``s`` (the context multiplier) for the override; unset reads the file's ``rope.scaling.factor``, and ``yarn`` needs one (config key ``rope_scale``)
+   * - ``--yarn-orig-ctx``
+     -
+     - *file*
+     - YaRN: the original training context the factor extends; unset reads the file's ``original_context_length``, else its ``context_length`` (config key ``yarn_orig_ctx``; llama.cpp's ``--yarn-orig-ctx``)
    * - ``--lcpp-bin``
      -
      - ---
@@ -348,8 +364,8 @@ weights stay mmap'd, each slot keeps its own KV pool and prefix cache, and one
 model's GPU state lives in VRAM at a time (the tier drops and re-arms on
 switch; ``backend = "cpu"`` slots never evict the GPU owner). Blank keys
 inherit the flat defaults; ``backend`` is ``auto`` | ``cpu`` | ``gpu``, and
-per-entry ``ctx``, ``quant``, ``kv_dtype``, ``streams``, ``chunk``,
-``page_rows``, ``prefix``, ``mtp`` and ``image_mmproj`` override per model:
+per-entry ``ctx``, ``quant``, ``kv_dtype``, ``streams``, ``chunk``, ``chunk_idle``,
+``page_rows``, ``prefix``, ``mtp``, ``rope_scaling``, ``rope_scale``, ``yarn_orig_ctx`` and ``image_mmproj`` override per model:
 
 .. code-block:: toml
 
@@ -371,7 +387,8 @@ roster boots unchanged.
 Chat and completion requests batch continuously (``dasllama/dasllama_scheduler.das``):
 up to ``--streams`` generations run concurrently through one ``eval_batch``
 decode step per tick, with long prompts prefilled in ``--chunk``-token slices,
-so a new arrival never stalls the running streams for more than one chunk.
+so a new arrival never stalls the running streams for more than one chunk
+(with no stream running, the slices are ``--chunk-idle`` tokens).
 Requests beyond ``--streams`` queue (up to 32; then 503). KV is paged by
 default - cache memory tracks each stream's actual context, and finished
 streams donate their pages to a prefix cache, so a repeated prompt prefix (a
@@ -796,16 +813,18 @@ in :ref:`the dasLLAMA knob reference <dasllama_env>`)::
 - ``test_openai_server_audio.das`` and ``test_openai_server_think.das`` --- the
   native-audio content parts and the thinking control.
 - ``test_openai_server_mtp.das`` --- the self-speculation default: a
-  NextN-headed slot drafts at one stream and decodes plain at four, an explicit
-  ``mtp`` wins either way, a head-less model serves plain; needs
+  NextN-headed slot drafts at one stream on Metal and decodes plain at four or
+  on the CPU, an explicit ``mtp`` wins either way, a head-less model serves
+  plain; the Metal cells skip on a box with no Metal backend; needs
   ``Qwen3.5-0.8B-MTP-Q8_0.gguf`` and the TinyLlama file.
 - ``test_exchange_client.das``, ``test_model_catalog.das``,
   ``test_setup_mode.das`` --- model-free: the sidecar exchange client against a
   fake exchange, the catalog-table invariants, a slotless setup-mode boot.
 - ``test_slot_served.das``, ``test_model_override.das``,
-  ``test_worker_dispatch.das`` --- model-free: every ``served`` /
-  ``served_note`` arm, the ``--model``-over-roster override, the media worker's
-  dispatch under the job queue.
+  ``test_worker_dispatch.das``, ``test_server_flags.das`` --- model-free: every
+  ``served`` / ``served_note`` arm, the ``--model``-over-roster override, the
+  media worker's dispatch under the job queue, the flag-presence test behind
+  the config surface's provenance and the self-speculation default's rule.
 - ``tests/`` --- the control page itself under Playwright (Node + chromium),
   against JSON/SSE fixtures captured from a real server; ``npm ci && npx
   playwright test`` in that directory.

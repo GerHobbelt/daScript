@@ -22,7 +22,7 @@ require _trap_block_ann_helper
 // now resolved at block-make time from the context's sid->data table (jit_ad_by_sid), which is the
 // same route the C++ AOT emitter takes (aot_cpp.das emits __context__->adBySid).
 
-let OUTPUT_DIR = "{get_das_root()}/build/tests"
+let OUTPUT_DIR = test_temp_dir()
 let EXE_SCRIPT = "{OUTPUT_DIR}/trap_block_ann_exe.das"
 let EXE_PATH = "{OUTPUT_DIR}/trap_block_ann_exe"
 let EXE_BINARY = "{OUTPUT_DIR}/trap_block_ann_exe.exe"
@@ -47,6 +47,16 @@ def test_annotated_block(t : T?) {
     t |> equal(ad, DATA_BLOCK_PAYLOAD)
 }
 
+// finish reaches a lambda's block too: block folding used to merge that block into the lambda
+// function's body, dropping its annotations before finalize ran.
+[test]
+def test_finish_reaches_lambda(t : T?) {
+    let l <- @ [finish_mark] () : int {
+        return 0
+    }
+    t |> equal(invoke(l), 1)
+}
+
 def probe_annotation_data(blk : block<(x : int) : int>) : uint64 {
     return testBlockAnnotationData(blk)
 }
@@ -59,7 +69,7 @@ def write_exe_script() : bool {
             fprint(f, "options gen2\n")
             fprint(f, "options disable_auto_inline = true\n")
             fprint(f, "require UnitTest\n")
-            fprint(f, "require ../../tests/jit_tests/_trap_block_ann_helper.das\n")
+            fprint(f, "require %/tests/jit_tests/_trap_block_ann_helper.das\n")
             fprint(f, "def call_block(blk : block<(x : int) : int>) : int \{ return invoke(blk, 20); }\n")
             fprint(f, "def probe(blk : block<(x : int) : int>) : uint64 \{ return testBlockAnnotationData(blk); }\n")
             fprint(f, "[export] def main() \{\n")

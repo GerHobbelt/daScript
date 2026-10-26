@@ -13,6 +13,15 @@ a SPIR-V emitter fixture (a test holding a `*_words` function that compiles a sh
 its emitted words) or a change to `spirv/test_census.das` - `spirv/REVIEW.md`;
 a test that calls `tick_debug_agent` - `debug_agent/REVIEW.md`.
 
+**A file or directory whose path a test names - written by the test itself, a C++-bound function,
+or a program or server the test starts - goes under `test_temp_dir()` (`dastest/testing_boost`,
+repo root) or a directory from `create_temp_directory` (`daslib/fio`, repo root), never under the
+repo tree or at a fixed name in `temp_directory`.** Two runs of one test file can share the tree
+at once, so a fixed path is shared between them. `REVIEW.das` finds only fio's
+`remove`/`rmdir`/`mkdir`/`fwrite`/`rename`/`copy_file` calls, a writing `fopen`, `stbi_write_*` and
+image `save` whose path is built from `get_das_root()`, plus a writing `fopen` of a relative
+literal; the reviewer checks every other write, and weakening that check is a defect.
+
 **A diff that widens the `dasbind` skip in `.das_test` or drops one of the `[extern]` probe
 functions or any of its assertions from `dasbind/test_extern_abi.das` is a defect.** The suite is the only
 check of which register or stack slot an interpreted `[extern]` call puts each argument in - the
@@ -24,9 +33,9 @@ JIT never takes that path - so coverage lost there reports green on every lane.
 `language/`), and the PR body names the run that showed the `test_aot` pass: a local
 `preflight --full`, a `--target run_tests_aot` build, or a CI job link.** Per-PR CI builds only
 the AOT subset binary (`tests/aot/CMakeLists.txt`), so the PR's own checks do not prove
-`test_aot`.
+`test_aot`, and the glob picks a new file up silently.
 
-**A new `.das` file under `tests/` that a glob in `tests/aot/CMakeLists.txt` puts in an
-`AOT_*_FILES` variable and that does not compile on its suite's `test_aot` lane is filtered out
-of that variable or marked `options no_aot`, in the same change, with the reason in a comment
-beside the filter or the option.** The glob picks a new file up silently.
+**A diff that marks a `.das` file under `tests/` `options no_aot`, or filters one out of an
+`AOT_*_FILES` variable of `tests/aot/CMakeLists.txt`, states in a comment beside the option or
+the filter what stops the file compiling or running on its suite's `test_aot` lane.** Without a
+stated reason no later diff can tell whether the opt-out is still needed.

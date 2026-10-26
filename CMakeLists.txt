@@ -51,6 +51,7 @@ option(DAS_CLIPBOARD_DISABLED "Disable dasClipboard (system clipboard transport)
 
 option(DAS_PUGIXML_DISABLED "Disable dasPUGIXML (xml parsing library)" OFF)
 option(DAS_SQLITE_DISABLED "Disable dasSQLITE (sqlite3 library)" ON)
+option(DAS_CRYPTO_DISABLED "Disable dasCrypto (OpenSSL cryptographic primitives)" ON)
 option(DAS_TOOLS_DISABLED "Disable dasTools" OFF)
 option(DAS_TREE_SITTER_DISABLED "Disable dasTreeSitter and the tree-sitter-daslang grammar" OFF)
 option(DAS_TERMINAL_DISABLED "Disable the renderless dasTerminal state machine" OFF)
@@ -186,14 +187,10 @@ MACRO(DAS_AOT_EXT input_files genList mainTarget dasAotTool dasAotToolArg)
     # require graph) that this macro can't discover; empty for normal callers.
     set(all_depends ${dasAotTool} ${PROJECT_SOURCE_DIR}/utils/aot/main.das ${DAS_AOT_DASLIB_DEPENDS} ${DAS_AOT_EXTRA_DEPENDS})
     set(all_outputs "")
-    # Per-batch arg buffer; chunked to keep each invocation under Windows'
+    # Per-file args; chunked to keep each invocation under Windows'
     # 32K command-line limit when worktree paths are long.
     set(_DAS_AOT_BATCH_SIZE 60)
-    set(_batches "")
-    set(_batch_idx 0)
-    set(_batch_count 0)
-    set(_current_batch "")
-    list(LENGTH input_files num_files)
+    set(_aot_args "")
 
     foreach(input ${input_files})
         get_filename_component(input_src ${input} ABSOLUTE)
@@ -224,26 +221,15 @@ MACRO(DAS_AOT_EXT input_files genList mainTarget dasAotTool dasAotToolArg)
         # (error[50101]) and bakes machine-specific paths into the stubs.
         file(RELATIVE_PATH input_rel ${PROJECT_SOURCE_DIR} ${input_src})
 
-        # Build command arguments for the current batch
-        list(APPEND _current_batch ${dasAotToolArg} ${input_rel} ${out_arg})
+        # three arguments per file
+        list(APPEND _aot_args ${dasAotToolArg} ${input_rel} ${out_arg})
 
         file(MAKE_DIRECTORY ${out_dir})
         set_source_files_properties(${out_src} PROPERTIES GENERATED TRUE)
-
-        math(EXPR _batch_count "${_batch_count} + 1")
-        if(_batch_count GREATER_EQUAL ${_DAS_AOT_BATCH_SIZE})
-            set(_batches_${_batch_idx} "${_current_batch}")
-            list(APPEND _batches ${_batch_idx})
-            math(EXPR _batch_idx "${_batch_idx} + 1")
-            set(_current_batch "")
-            set(_batch_count 0)
-        endif()
     endforeach()
-    if(_batch_count GREATER 0)
-        set(_batches_${_batch_idx} "${_current_batch}")
-        list(APPEND _batches ${_batch_idx})
-    endif()
 
+    math(EXPR _aot_chunk_args "${_DAS_AOT_BATCH_SIZE} * 3")
+    DAS_CHUNKS(_batches ${_aot_chunk_args} ${_aot_args})
     set(_commands "")
     foreach(i ${_batches})
         list(APPEND _commands COMMAND ${dasAotTool} ${PROJECT_SOURCE_DIR}/utils/aot/main.das -- ${_batches_${i}} ${CROSS_PLATFORM})
@@ -305,45 +291,38 @@ MACRO(DAS_LLVM_AOT_LIB input_files genList mainTarget)
     file(GLOB _das_llvm_aot_codegen CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/modules/dasLLVM/daslib/*.das)
     set(all_outputs "")
     # Emit in batches of 32 files per daslang process: the ~52-file dasLLVM compile-time load
-    # is paid once per batch, not per file (the way run_tests_jit's --batch amortizes it). Any
+    # is paid once per batch, not per file (as run_tests_jit's 16-file chunks amortize it). Any
     # file in a batch changing re-emits the whole batch; ninja still runs batches in parallel.
-    # MACRO args are text substitutions, not variables -- copy to a real var for list(LENGTH).
-    set(_llvm_aot_inputs ${input_files})
-    list(LENGTH _llvm_aot_inputs _llvm_aot_total)
-    set(_llvm_aot_idx 0)
-    set(_batch_rels "")
-    set(_batch_srcs "")
-    set(_batch_objs "")
-    foreach(input ${_llvm_aot_inputs})
-        math(EXPR _llvm_aot_idx "${_llvm_aot_idx} + 1")
-        get_filename_component(input_src ${input} ABSOLUTE)
-        get_filename_component(input_dir ${input_src} DIRECTORY)
-        get_filename_component(input_name ${input} NAME)
-        set(out_dir ${input_dir}/_llvm_aot_generated)
-        set(out_obj ${out_dir}/${mainTarget}_${input_name}.o)
-        # The compile-time path is baked into hashed constants (same reason as DAS_AOT_EXT),
-        # so spell the input source-root-relative to keep the AOT hash in sync with -use-aot.
-        file(RELATIVE_PATH input_rel ${PROJECT_SOURCE_DIR} ${input_src})
-        file(MAKE_DIRECTORY ${out_dir})
-        list(APPEND all_outputs ${out_obj})
-        list(APPEND ${genList} ${out_obj})
-        set_source_files_properties(${out_obj} PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
-        list(APPEND _batch_rels ${input_rel})
-        list(APPEND _batch_srcs ${input_src})
-        list(APPEND _batch_objs ${out_obj})
+    DAS_CHUNKS(_llvm_aot_batches 32 ${input_files})
+    foreach(_b ${_llvm_aot_batches})
+        set(_batch_rels "")
+        set(_batch_srcs "")
+        set(_batch_objs "")
+        foreach(input ${_llvm_aot_batches_${_b}})
+            get_filename_component(input_src ${input} ABSOLUTE)
+            get_filename_component(input_dir ${input_src} DIRECTORY)
+            set(out_dir ${input_dir}/_llvm_aot_generated)
+            # The compile-time path is baked into hashed constants (same reason as DAS_AOT_EXT),
+            # so spell the input source-root-relative to keep the AOT hash in sync with -use-aot.
+            file(RELATIVE_PATH input_rel ${PROJECT_SOURCE_DIR} ${input_src})
+            string(REPLACE "/" "_" input_id ${input_rel})
+            set(out_obj ${out_dir}/${mainTarget}_${input_id}.o)
+            file(MAKE_DIRECTORY ${out_dir})
+            list(APPEND all_outputs ${out_obj})
+            list(APPEND ${genList} ${out_obj})
+            set_source_files_properties(${out_obj} PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+            list(APPEND _batch_rels ${input_rel})
+            list(APPEND _batch_srcs ${input_src})
+            list(APPEND _batch_objs ${out_obj})
+        endforeach()
         list(LENGTH _batch_rels _batch_n)
-        if(_batch_n EQUAL 32 OR _llvm_aot_idx EQUAL _llvm_aot_total)
-            ADD_CUSTOM_COMMAND(
-                OUTPUT  ${_batch_objs}
-                DEPENDS daslang ${_batch_srcs} ${PROJECT_SOURCE_DIR}/utils/internal/jit/main.das ${_das_llvm_aot_codegen} ${DAS_AOT_DASLIB_DEPENDS} ${DAS_AOT_EXTRA_DEPENDS}
-                WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-                COMMENT "LLVM-AOT compiling ${_batch_n} files"
-                COMMAND daslang ${PROJECT_SOURCE_DIR}/utils/internal/jit/main.das -- ${_batch_rels} --aot-object --aot-object-prefix ${mainTarget}
-            )
-            set(_batch_rels "")
-            set(_batch_srcs "")
-            set(_batch_objs "")
-        endif()
+        ADD_CUSTOM_COMMAND(
+            OUTPUT  ${_batch_objs}
+            DEPENDS daslang ${_batch_srcs} ${PROJECT_SOURCE_DIR}/utils/internal/jit/main.das ${_das_llvm_aot_codegen} ${DAS_AOT_DASLIB_DEPENDS} ${DAS_AOT_EXTRA_DEPENDS}
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMENT "LLVM-AOT compiling ${_batch_n} files"
+            COMMAND daslang ${PROJECT_SOURCE_DIR}/utils/internal/jit/main.das -- ${_batch_rels} --aot-object --aot-object-prefix ${mainTarget}
+        )
     endforeach()
     set(custom_name ${mainTarget}_genllvmaot)
     ADD_CUSTOM_TARGET(${custom_name} DEPENDS ${all_outputs})
@@ -357,22 +336,16 @@ MACRO(UNITIZE_BUILD input_dir genList)
     set(files ${${genList}})
     set(out_dir "${PROJECT_SOURCE_DIR}/${input_dir}/_aot_generated")
     set_source_files_properties(${files} PROPERTIES HEADER_FILE_ONLY true)
-    set(unit_build_file "")
-    set(file_index 0)
-    set(batch_index 0)
-    foreach(source_file ${files} )
-        if(file_index EQUAL "0")
-            set(unit_build_file "${out_dir}/unity_build_${batch_index}.cpp")
-            FILE(WRITE ${unit_build_file} "// unity build batch ${batch_index}\n")
-            list(APPEND unitList ${unit_build_file})
-        endif()
-        get_filename_component(input_name ${source_file} NAME)
-        FILE(APPEND ${unit_build_file} "#include \"${input_name}\"\n")
-        math(EXPR file_index "${file_index} + 1")
-        if(file_index EQUAL ${UNITZE_BUILD_BATCH_SIZE})
-            set(file_index 0)
-            math(EXPR batch_index "${batch_index} + 1")
-        endif()
+    DAS_CHUNKS(_unit_batches ${UNITZE_BUILD_BATCH_SIZE} ${files})
+    foreach(_b ${_unit_batches})
+        math(EXPR batch_index "${_b} - 1")
+        set(unit_build_file "${out_dir}/unity_build_${batch_index}.cpp")
+        FILE(WRITE ${unit_build_file} "// unity build batch ${batch_index}\n")
+        list(APPEND unitList ${unit_build_file})
+        foreach(source_file ${_unit_batches_${_b}})
+            get_filename_component(input_name ${source_file} NAME)
+            FILE(APPEND ${unit_build_file} "#include \"${input_name}\"\n")
+        endforeach()
     endforeach()
     list(APPEND ${genList} ${unitList})
 ENDMACRO()
@@ -647,10 +620,9 @@ ENDMACRO()
 
 ADD_EXAMPLE_RUN("${PROJECT_SOURCE_DIR}/examples/dasbind/dasbind_example.das")
 
-# The canonical application template (init/update/shutdown + main with the GC
-# boundary) — running it per-PR keeps the shape everyone copies compiling and
-# terminating. exe=FALSE: interpreted run is the point, not another AOT exe.
-ADD_EXAMPLE_RUN("${PROJECT_SOURCE_DIR}/examples/application/main.das" FALSE)
+# The template every program copies; its exe build runs the collect-carrier proof over it, per PR
+# (run_example_main is on the extended checks' modules lane).
+ADD_EXAMPLE_RUN("${PROJECT_SOURCE_DIR}/examples/application/main.das")
 
 # CPU path tracer — headless render smoke (no GPU/GUI). Compat gate for the OpenGL<->Vulkan shader
 # harmonization arc (modules/dasOpenGL/HARMONIZATION_PLAN.md section 8.1): the GL path tracers share
@@ -755,6 +727,22 @@ FOREACH(_example ${DAS_ALL_EXAMPLES})
     ADD_DEPENDENCIES(${_example} ${DAS_MODULES_LIBS})
 ENDFOREACH()
 
+# A daslang built with -fsanitize=* JIT-links its artifacts against runtime libraries that
+# reference the sanitizer runtime: the link cmd takes the flag, and runs through the compiler
+# that built daslang - c++ is g++ on Ubuntu, whose asan/tsan runtime the clang-built binary cannot load.
+SET(DAS_JIT_LINKER_STRING "")
+IF(DAS_USE_SANITIZER STREQUAL "address" OR DAS_USE_SANITIZER STREQUAL "asan")
+    SET(DAS_JIT_LINKER_STRING "--jit-linker-string=-fsanitize=address")
+ELSEIF(DAS_USE_SANITIZER STREQUAL "undefined" OR DAS_USE_SANITIZER STREQUAL "ubsan")
+    SET(DAS_JIT_LINKER_STRING "--jit-linker-string=-fsanitize=undefined")
+ELSEIF(DAS_USE_SANITIZER STREQUAL "thread" OR DAS_USE_SANITIZER STREQUAL "tsan")
+    SET(DAS_JIT_LINKER_STRING "--jit-linker-string=-fsanitize=thread")
+ENDIF()
+SET(DAS_JIT_PATH_TO_LINKER "")
+IF(DAS_USE_SANITIZER AND NOT DAS_USE_SANITIZER STREQUAL "none")
+    SET(DAS_JIT_PATH_TO_LINKER "--jit-path-to-linker=${CMAKE_CXX_COMPILER}")
+ENDIF()
+
 # run_examples — runs all .das files registered via ADD_EXAMPLE_RUN.
 # Each example is executed with `daslang <file>` and must exit cleanly.
 #
@@ -794,10 +782,14 @@ if(_rc)
 endif()
 ")
         IF(_do_exe)
+            SET(_exe_jit_args "")
+            IF(DAS_JIT_LINKER_STRING)
+                SET(_exe_jit_args " -- \"${DAS_JIT_LINKER_STRING}\" \"${DAS_JIT_PATH_TO_LINKER}\"")
+            ENDIF()
             FILE(APPEND ${_script}
 "message(STATUS \"Compiling to \${EXEDIR}/${_out_path}\")
 execute_process(
-    COMMAND \"\${DASLANG}\" -exe \"${_das}\" -output \"\${EXEDIR}/${_out_path}\"
+    COMMAND \"\${DASLANG}\" -exe \"${_das}\" -output \"\${EXEDIR}/${_out_path}\"${_exe_jit_args}
     WORKING_DIRECTORY \"\${WORKDIR}\"
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
 if(_rc)
@@ -2242,6 +2234,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/
     PATTERN "_build" EXCLUDE
     PATTERN ".daspkg_cache" EXCLUDE
     PATTERN ".daspkg_tmp" EXCLUDE
+    PATTERN ".cache" EXCLUDE
     PATTERN ".jitted_scripts" EXCLUDE
     PATTERN "jitted_scripts" EXCLUDE
     PATTERN "_aot_generated" EXCLUDE

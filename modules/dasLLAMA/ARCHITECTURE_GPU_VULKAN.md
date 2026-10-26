@@ -13,8 +13,10 @@ the coopmat mode ladder, the class-pipeline build seat, the MoE expert chain on 
 the KHR arm's hand-staged kq tile - are in `ARCHITECTURE_GPU_VULKAN_GEMM.md`, and the decode GEMV
 family's lane split by row length is `ARCHITECTURE_GPU_VULKAN_GEMM.md#kq-gemv-lanes`. What a
 model has to fit on the card before any of this runs - the residency plan, and the marks swap
-that lets one GPU slot serve many models - is in `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`, and the
-N-row token command a batched step's rows go through is in `ARCHITECTURE_GPU_VULKAN_NROW.md`.
+that lets one GPU slot serve many models - is in `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`, the NextN
+draft head the driver homes is `ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`, and the
+N-row token command a batched step's rows go through is in `ARCHITECTURE_GPU_VULKAN_NROW.md`, and
+the hyper-connection chain with its host-served routed experts is `ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command`.
 The decode-era mechanisms of the per-op tier are in `ARCHITECTURE_GPU_VULKAN_DECODE.md`. The GPU
 backend role table these sections build on stays in `ARCHITECTURE_GPU.md#gpu-backends`.
 
@@ -27,7 +29,7 @@ numbers agree. `check_cm2_ladder_sets` walks every `class template <Fmt>Cm2T : K
 `dasllama_vulkan_classes.das` twice and requires each trio's ladders there (`khr_cls_*`, `cm2e_cls_*`) stamped by
 `kq_tile_stamp` over their `tile_<verb>_<tail>` placeholder - the stamp walks every `KqFmt` member, so a format with
 no class fails the compile. The KHR trio needs `<Fmt>KhrBatch` and its `kq_batch_<fmt>_khr_cls` stamp (per-32:
-`<fmt>_batch_khr_cls` - `Q8KhrBatch`, `Q51KhrBatch`, `Mx4KhrBatch`; the expert schedule rides that tile in mm mode); the e
+`<fmt>_batch_khr_cls` - `Q8KhrBatch`, `Q51KhrBatch`, `Mx4KhrBatch`, `Iq4nl32KhrBatch`; the expert schedule rides that tile in mm mode); the e
 trio reads `KQ_CM2E_ALIASES_M` (`dasllama_kqformat.das`): a format whose s stamp steps k by 64 is on it and ships no
 `<Fmt>Cm2EBatch` (its e column is the m stamp byte for byte), a 32-step one is off it and ships `<Fmt>Cm2EBatch` with its `kq_batch_<fmt>_cm2e_cls` (per-32 `<fmt>_batch_cm2e_cls`) stamp; none licensed.
 `check_cm2_stamp_tiles` reads every `[vk_dispatch]` stamp of those templates - in
@@ -70,7 +72,8 @@ past the window - unlike the MoE chain's gathered image and hidden plane, which
 hidden and residual values that nothing reads. The sliced GEMMs do not split k: the split-k
 reduce sums partial planes from row 0, so a region starting below the window's end would reduce
 the wrong rows. The slice takes the f16-fed cm2 route only (`gu6 && dn6`); the other feeds run
-the full window. Only the plain residual step (`cls_ar`) and the f16 activation honor the row base: the fused
+the full window, and so does a window that warms the NextN head's slab, whose rows read every
+row's post-norm hidden (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-head-prompt-warm`). Only the plain residual step (`cls_ar`) and the f16 activation honor the row base: the fused
 residual twins feed the NEXT layer's projections and never run on the last layer, so they index from row 0 by design.
 
 **The k and v GEMMs merge into ONE dispatch when the layer's q, k and v weight planes are all

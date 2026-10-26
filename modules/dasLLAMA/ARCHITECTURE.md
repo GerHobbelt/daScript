@@ -26,14 +26,17 @@ A companion's sections are listed in three places: its line in this document's r
 (under `File charters` or `Mechanisms`), the companion's own opening, and the routing sentence of
 any sibling companion that sends a reader to it.
 
-- `ARCHITECTURE_ENGINE.md` - the engine core, arch-registration, support and serving charters.
+- `ARCHITECTURE_ENGINE.md` - the engine core, arch-registration, support and serving charters, and
+  the decode pick tape a parity cell pins one arm's routing on another with
+  (`ARCHITECTURE_ENGINE.md#moe-pick-tape`), and the prefix cache's checkpoints on a recurrent model.
 - `ARCHITECTURE_ENGINE_FORMATS.md` - the format, load-rail and CPU-kernel-tier charters, plus
   the shapes they key off - the bigram merge heap both tokenizer backends run
   (`ARCHITECTURE_ENGINE_FORMATS.md#bpe-merge-heap`), the one RoPE fill over a position source
   (`ARCHITECTURE_ENGINE_FORMATS.md#rope-one-fill`), and the Model's per-format plane table, its
   only `dim` field (`ARCHITECTURE_ENGINE_FORMATS.md#model-plane-table-dim`).
-- `ARCHITECTURE_GPU.md` - the GPU backend role table and the backend asymmetries
-  (`ARCHITECTURE_GPU.md#gpu-backends`).
+- `ARCHITECTURE_GPU.md` - the GPU backend role table (`ARCHITECTURE_GPU.md#gpu-backends`).
+- `ARCHITECTURE_GPU_ASYMMETRIES.md` - the closed list of the allowed asymmetries between the
+  two GPU backends (`ARCHITECTURE_GPU_ASYMMETRIES.md#gpu-asymmetries`).
 - `ARCHITECTURE_MEDIA.md` - the encoder-tower, audio, ASR and vision charters.
 - `ARCHITECTURE_TTS.md` - the text-to-speech charters - the front end, the block home, the
   shared assembly, the families and the facade.
@@ -50,6 +53,8 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
 
 Each companion's sections are anchored by topic; a citation spells `<doc>.md#<anchor>`.
 
+- `ARCHITECTURE_IMAGE_VULKAN.md` - the vulkan lane's mint: the GPU walk inside the streaming save, the job-span view, the
+  trimmed lane, the walk's decline
 - `ARCHITECTURE_IMAGE.md` - the prepared-image rail, the baked dev-W f16 plane, the lattice-only
   per-format plane table both halves of the rail skip around, the baked tower twin-W plane, the
   layout stamp `REVIEW.das` keeps over the byte-placing code, the meta-field tripwire every
@@ -71,6 +76,9 @@ Each companion's sections are anchored by topic; a citation spells `<doc>.md#<an
   dense-KQ tensor mul_mm scaffold.
 - `ARCHITECTURE_GPU_PREFILL_MOE.md` - the Metal prefill driver's routed block - the MoE bucket
   rail, its tensor-twin scaffold, and the split-format expert twins.
+- `ARCHITECTURE_GPU_PREFILL_WINDOW.md` - the Metal prefill driver's device attention pair (the
+  K/V twins, the device-direct QK and AV, the row softmax written in place), the recurrent scan
+  over half rows, and how a kernel's hot loads are addressed.
 - `ARCHITECTURE_GPU_VULKAN.md` - the Vulkan resident driver's prefill chain and byte stores - the
   prefill window chain, the Q8 requant byte store, the decode GEMV family's grid codebook buffer,
   the tile probe's shared descriptor set layout, the recurrent block of the prefill window, the
@@ -84,9 +92,20 @@ Each companion's sections are anchored by topic; a citation spells `<doc>.md#<an
   seat, the MoE expert chain on those tiles, the KHR arm's hand-staged kq tile - and the decode
   GEMV family's lane split by row length.
 - `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` - what a model has to fit on the card before the driver
-  runs - the residency plan, and the GPU-slot marks swap that lets one slot serve many models.
+  runs - the residency plan, and the GPU-slot marks swap that lets one slot serve many models -
+  and the token command's logits landing.
+- `ARCHITECTURE_GPU_VULKAN_MTP.md` - the NextN draft head the resident driver homes beside the
+  trunk: the draft command that steps it, the prompt warm the window chain gives its slab, the
+  rollback a rejected device verify takes from the verify command's own copies, the verify
+  window a declined verify seat runs the CPU verify in, and the speculative knob's per-step
+  gate on the carry.
 - `ARCHITECTURE_GPU_VULKAN_NROW.md` - the N-row token command a batched step's rows go through,
-  and the residual step's two forms it holds bit for bit.
+  its same-slab form the speculative verify steps one stream's rows through, and the residual
+  step's two forms it holds bit for bit.
+- `ARCHITECTURE_GPU_VULKAN_HC.md` - the whole-model driver's hyper-connection chain (qwen4exp):
+  the wide residual's mixer seams on the device, the n-gram side input, the split token
+  command whose routed experts run on the host between its segments, the hot expert pool, and
+  the NextN head and its verify rows on the chain.
 - `ARCHITECTURE_GPU_VULKAN_DECODE.md` - the per-op tier's decode era - the decode attention block
   over per-layer K/V mirrors, the streamed expert layer's GPU/CPU split, the whole-token decode
   span, the deltanet decode step's per-session resident state, and the whole-model driver's
@@ -104,7 +123,7 @@ Each companion's sections are anchored by topic; a citation spells `<doc>.md#<an
   the hybrid worker pool, the MoE region split, the job queue the engine dispatches on, and the
   mode that dispatches to none.
 - `ARCHITECTURE_MEDIA.md` - the padded tower GEMM widths, the family GPU hooks, the tower weight
-  lane, and the plain-Model ASR decoders.
+  lane, the plain-Model ASR decoders, and the parakeet decode step.
 - `ARCHITECTURE_MEASUREMENT.md` - the benchmark rig, the tune gate, the sanctioned
   instrumentation rails, the ASR board's GPU row pairs, the `[tuned]` perm precedence, the mint
   wall in the sidecar's provenance, and the speculative round's ruler record.
@@ -119,8 +138,8 @@ Each companion's sections are anchored by topic; a citation spells `<doc>.md#<an
 - `ARCHITECTURE_CPU_KERNELS.md` - the sub-block-packed k3/k6 planes, the grid formats' panel and
   row-group decodes, the VBMI symbol lattice, the tier that selects on the target rather than the
   host, the score dot classic prefill shares with decode, the module-scope visibility a lifted
-  worker lambda needs of its kernel, the two interleaves a grp<mr> repack is made of, and the JIT
-  partition a hot leaf instantiates in.
+  worker lambda needs of its kernel, the two interleaves a grp<mr> repack is made of, the bf16
+  tile that keeps its sum in the matrix unit, and the JIT partition a hot leaf instantiates in.
 - `ARCHITECTURE_TTS.md` - the TTS block home's two layouts, tap stacking, the padded concat
   width, the served carrier on the image rail, the sine source's operation order, the heteronym
   context, the rig's scoring, and the two-tier phoneme pack.

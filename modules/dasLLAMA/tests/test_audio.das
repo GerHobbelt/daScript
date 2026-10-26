@@ -6,7 +6,7 @@ options _dasllama_internal = true
 require dastest/testing_boost public
 require dasllama/dasllama_audio
 require dasllama/dasllama_tower
-require dasllama/dasllama_math   // setup_dasllama_jobque_
+require dasllama/dasllama_math   // with_dasllama_jobque_
 require daslib/jobque_boost
 require daslib/fio
 require daslib/defer
@@ -154,14 +154,11 @@ def test_ultravox_tower(t : T?) {
                 mel.data[i] = 1.0
             }
             var enc <- make_encoder_state(tw)
-            let tower_was_on = vulkan_tower_knob()
-            defer() {
-                restore_every_gpu_tower(tower_was_on)
-            }
-            set_every_gpu_tower(false)
-            with_job_que() {
-                setup_dasllama_jobque_()
-                audio_encode(tw, enc, mel)
+            with_gpu_knobs() {
+                set_every_gpu_tower(false)
+                with_dasllama_jobque_() {
+                    audio_encode(tw, enc, mel)
+                }
             }
             // llama-mtmd-debug -p encode --audio one -n 3000 (CPU, f32 mmproj): token 0 opens
             // -0.831656 1.679679 0.112337 -0.558047; stats mean=0.002889 max=4.306354.
@@ -201,14 +198,11 @@ def test_voxtral_tower(t : T?) {
                 mel.data[i] = 1.0
             }
             var enc <- make_encoder_state(tw)
-            let tower_was_on = vulkan_tower_knob()
-            defer() {
-                restore_every_gpu_tower(tower_was_on)
-            }
-            set_every_gpu_tower(false)
-            with_job_que() {
-                setup_dasllama_jobque_()
-                audio_encode(tw, enc, mel)
+            with_gpu_knobs() {
+                set_every_gpu_tower(false)
+                with_dasllama_jobque_() {
+                    audio_encode(tw, enc, mel)
+                }
             }
             // llama-mtmd-debug -p encode --audio one -n 3000 (CPU, f32 mmproj): token 0 opens
             // 0.967699 -0.765652 0.050477 -0.571310; stats mean=-0.001517 max=1.459851.
@@ -265,9 +259,9 @@ def private vulkan_blocks_twin(t : T?; family, file : string; layers_claimed : i
             return
         }
         let tag = "{family} synthetic mel"
-        let tower_was_on = vulkan_tower_on()
+        let knobs = gpu_knobs()
         defer() {
-            set_vulkan_tower(tower_was_on)
+            set_gpu_knobs(knobs)
         }
         var twx <- mint_aud(path, false, -1l)
         var tw <- mint_aud(path, true, -1l)
@@ -356,8 +350,7 @@ def private twin_regrow_legs(t : T?; tag : string; enc : auto(TW); var st : auto
         var dev_fresh : array<float>
         set_vulkan_tower(true)
         let e0 = vulkan_tower_stats().encodes
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             invoke(encode, enc, st, head, dev_head)
             invoke(encode, enc, st, samples, dev_again)
             vulkan_tower_shutdown()
@@ -375,12 +368,11 @@ def private twin_regrow_legs(t : T?; tag : string; enc : auto(TW); var st : auto
         var stp = ST()
         var poisoned : array<float>
         let p0 = vulkan_tower_stats().encodes
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             invoke(encode, encp, stp, samples, poisoned)
         }
         t |> success(vulkan_tower_stats().encodes > p0, "{tag} poison: device-served (encodes delta)")
-        tower_twin_poison(t, tag, r.reference, poisoned, r.bar)
+        tower_twin_poisoned(t, tag, r.reference, poisoned, r.bar)
         delete poisoned
         delete stp
         delete encp
@@ -557,7 +549,7 @@ def private q3a_leg_state(tw : Qwen3aTower) : Q3aLegState {
 //! the device leg (the knob on) encodes the device mel's `dev_win`, the CPU legs the CPU mel's `win`
 [cold_path]
 def private q3a_twin_encode(tw : Qwen3aTower; var s : Q3aLegState; win, dev_win : MelChunk; var out : array<float>) : int64 {
-    if (vulkan_tower_knob()) {
+    if (gpu_knobs().vulkan_tower) {
         qwen3a_encode(tw, s.enc, s.conv, dev_win)
     } else {
         qwen3a_encode(tw, s.enc, s.conv, win)
@@ -630,14 +622,8 @@ def test_qwen3a_vulkan_front(tst : T?) {
 def test_encoder_blocks_gpu(tst : T?) {
     tst |> run("qwen2audio tower: GPU blocks vs CPU encoder, 32 layers") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
             let path = path_join(models_dir(), "qwen2audio-mmproj-f32.gguf")
-            if (!model_available(t, path)) {
-                return
-            }
+            return if (!jit_model_available(t, path))
             var tw <- load_audio_tower(path)
             var mel = MelChunk(n_mel = tw.n_mel, n_len = AUDIO_CHUNK_FRAMES)
             mel.data |> resize(int(tw.n_mel * AUDIO_CHUNK_FRAMES))
@@ -650,8 +636,7 @@ def test_encoder_blocks_gpu(tst : T?) {
             set_metal_tower(false)
             var cpu_out : array<float>
             let s0 = metal_tower_stats()
-            with_job_que() {
-                setup_dasllama_jobque_()
+            with_dasllama_jobque_() {
                 audio_encode(tw, enc, mel)
                 cpu_out := enc.out
                 set_metal_tower(true)
@@ -669,14 +654,8 @@ def test_encoder_blocks_gpu(tst : T?) {
     }
     tst |> run("voxtral tower: GPU blocks vs CPU encoder") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
             let path = path_join(models_dir(), "voxtral-mini-mmproj-f32.gguf")
-            if (!model_available(t, path)) {
-                return
-            }
+            return if (!jit_model_available(t, path))
             var tw <- load_audio_tower(path)
             var mel = MelChunk(n_mel = tw.n_mel, n_len = AUDIO_CHUNK_FRAMES)
             mel.data |> resize(int(tw.n_mel * AUDIO_CHUNK_FRAMES))
@@ -687,8 +666,7 @@ def test_encoder_blocks_gpu(tst : T?) {
             set_metal_tower(false)
             var cpu_out : array<float>
             let s0 = metal_tower_stats()
-            with_job_que() {
-                setup_dasllama_jobque_()
+            with_dasllama_jobque_() {
                 audio_encode(tw, enc, mel)
                 cpu_out := enc.out
                 set_metal_tower(true)
@@ -722,12 +700,8 @@ def test_omni_tower(t : T?) {
 [test]
 def test_encoder_oracle(t : T?) {
     t |> run("all-ones mel through the tower matches mtmd (needs qwen2audio mmproj)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
         let path = path_join(models_dir(), "qwen2audio-mmproj-f32.gguf")
-        if (!model_available(t, path)) return
+        return if (!jit_model_available(t, path))
         var tw <- load_audio_tower(path)
         t |> equal(tw.n_mel, 128l, "n_mel")
         t |> equal(tw.d_model, 1280l, "d_model")
@@ -742,13 +716,12 @@ def test_encoder_oracle(t : T?) {
             mel.data[i] = 1.0
         }
         var enc <- make_encoder_state(tw)
-        let tower_was_on = vulkan_tower_knob()
-        set_every_gpu_tower(false)
-        with_job_que() {
-            setup_dasllama_jobque_()
-            audio_encode(tw, enc, mel)
+        with_gpu_knobs() {
+            set_every_gpu_tower(false)
+            with_dasllama_jobque_() {
+                audio_encode(tw, enc, mel)
+            }
         }
-        restore_every_gpu_tower(tower_was_on)
         // llama-mtmd-debug -p encode --audio one -n 3000 (CPU): token 0 opens
         // 0.251974 0.311756 0.556828 0.005232 -0.838854; stats mean=0.009261 max=7.527778.
         // fp32 CPU re-orders put us ~1e-3 off their flash-attn encoder; gate at 5e-3.
@@ -775,10 +748,7 @@ def test_encoder_oracle(t : T?) {
 [test]
 def test_encoder_state_sizing(t : T?) {
     t |> run("whole-clip encoder state clears max_unreserved_size") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
+        return if (!jit_only(t))
         let tw = AudioTower(n_mel = 128l, d_model = 1088l, n_head = 8l, n_layer = 1l,
             n_ff = 1024l, n_ctx = 16384l, proj_dim = 0l,
             conv1_w_off = 0l, conv1_b_off = 0l, conv2_w_off = 0l, conv2_b_off = 0l,

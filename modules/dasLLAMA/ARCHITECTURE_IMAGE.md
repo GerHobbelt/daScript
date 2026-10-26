@@ -1,6 +1,7 @@
 # dasLLAMA Architecture - the prepared-image rail
 
-Companion to `ARCHITECTURE.md`; a section is cited by its anchor.
+Companion to `ARCHITECTURE.md`; a section is cited by its anchor. The vulkan lane's mint off the gguf is
+`ARCHITECTURE_IMAGE_VULKAN.md`.
 
 ### There is ONE way to load a model {#there-is-one-way-to-load-a}
 
@@ -19,9 +20,10 @@ start on purpose, under the tiebreak in `ARCHITECTURE_INVARIANTS.md#inherited-in
 that handoff for every weight carrier; the streaming forms transcode planes from the gguf
 mapping straight into the image so they never materialize at all.
 
-**An image is judged only where its identity can be recomputed - the LANE rule.** An identity's
-(quant, tag) pair is its lane, and lanes coexist by design: a bake proves dead only its OWN lane's
-siblings, plus BROKEN and version-stale images anywhere. Everything else is `FOREIGN` - kept, and
+**An image is judged only where its identity can be recomputed - the LANE rule.** A lane is the
+file name's lane segment (`#image-lane-name`; for a hash-named legacy image, the identity's
+(quant, tag) pair), and lanes coexist by design: a bake proves dead only its OWN lane's siblings,
+plus BROKEN and version-stale images anywhere. Everything else is `FOREIGN` - kept, and
 counted in the log. Two contexts produce lanes this process cannot reproduce: a GPU flavor (a blob
 bake selects its own backend and winners, so the string differs even where the tag matches:
 `portable|q8 mr4` against a planar `arm64-gen|q8 mr8`), and a family tag whose module is not loaded
@@ -33,6 +35,25 @@ rigs own the model dirs for a whole run, so `dlim_wipe` (verdict-blind, `dasllam
 clears them behind the exe gate at batch start and after each model's last cell, with every image
 re-baked from its gguf on demand. Judging stays forbidden; owning the directory for the batch is
 what licenses deletion without judgment.
+
+### An image is named by its lane {#image-lane-name}
+
+A `.dlim` sits beside its source as `<file>.<lane>.dlim`, and the lane is what a person
+deliberately switches between on one box: `metal` (the blob flavor), `vulkan`, `cpu-<class>` (the
+planar flavor under the box's tune class - `cpu-arm-i8mm`, `cpu-x86-vnni512`; a build without the
+tune framework spells the architecture alone, never the active backend, which is a pin the
+identity supersedes), a family's own tag (`whisper-f32`), with `-lut` / `-grid` appended where
+`DASLLAMA_IQ3S_SERVE` pins the served form, `-yarn<s>` / `-linear<s>` / `-norope` where the rope
+scaling override rides (on the flavors whose identity carries it - a config-free family's does
+not), `-<quant>` off q8, and `-mtp` when a split head rides the load. `image_lane_name` spells it and
+`dlim_file_lane` reads it back off a file name (a hash-named legacy image reads as no lane). The
+lane names the FILE; the header's identity still decides whether the file is current: tune
+winners, backend pins, pack and image versions stay in the identity and supersede within the
+lane, so a stale lane re-bakes in place - the publish writes a temp beside it and renames over -
+and two lanes never reap each other. A lane is a per-box coexistence unit, not a portability
+promise: the class in the CPU lane's name is the box's, and a box of another class re-bakes.
+`image_path_for` adopts a hash-named image at the exact legacy path (identity hash, head fold) by
+renaming it into the lane once, so the switch costs no re-mint.
 
 ### A planar image never stands in for the blob flavor {#image-flavor-rebake}
 
@@ -102,7 +123,8 @@ exact. The walk advances the writer by exactly the bytes it accepted, so the sec
 never drift from the file. An append past the chunk is therefore a disagreement between the sizing
 pass and the walk - a bug, not a disk condition - and the chunk rail panics rather than limping on.
 The one decline it survives is failing to get the chunk at all: that happens before the walk
-starts, so the carrier is still whole and its caller keeps serving it.
+starts, so the carrier is still whole and its caller keeps serving it. The one plane the sizing
+pass bounds instead of knowing is the vulkan lane's twin (`ARCHITECTURE_IMAGE_VULKAN.md`).
 
 ### Identity names the backend, so the backend is selected first {#image-identity-backend-order}
 
@@ -192,13 +214,13 @@ without it the f16 arm silently stays unavailable and every encode takes the f32
 
 **An image path folds in the split NextN head that rides the load.** `image_path_for` resolves
 `mtp_head_sidecar` for the gguf - the resolver excludes an assistant drafter (`gguf_is_assistant`),
-whose weights never enter the trunk's image - and, when a head exists, hashes
-`|mtp:<basename>:<size>` alongside the configuration identity, so a trunk loaded alone and the same
-trunk loaded with its head never share a `.dlim` path. The head's tensors are baked INSIDE the
-minted image - one file serves both - so two identities sharing a path would re-save over each
-other forever. Because the fold changes the path, the head's arrival needed no `IMAGE_VERSION`
-bump: no image at an unchanged path changed content. The fold lives in the path and not yet in
-the baked identity string (`followup_general.md` #99).
+whose weights never enter the trunk's image - and, when a head exists, the lane carries `-mtp`, so a
+trunk loaded alone and the same trunk loaded with its head never share a `.dlim` path. The head's
+tensors are baked INSIDE the minted image - one file serves both - so two identities sharing a
+path would re-save over each other forever. Because the fold changes the path, the head's arrival
+needed no `IMAGE_VERSION` bump: no image at an unchanged path changed content. The fold lives in
+the path and not yet in the baked identity string (`followup_general.md` #99), so two different
+heads on one trunk share the lane and re-bake each other.
 
 ### The assistant drafter is a ledgered non-image lane {#drafter-non-image-lane}
 
@@ -219,9 +241,10 @@ The closure, per file in sorted name order: every `Archive` serializer body (a t
 `def serialize*` taking an `Archive`), `build_image`, `parse_image`, every `*_prepare` mint of
 `dasllama_tts_blocks.das` (the TTS blocks' plane packers; a driver's `*_prepare` places no image byte), the
 layout helpers `pad_to_page`, `plane_end`, `image_total_bytes`, `w_append`, `w_zeros`,
-`w_header`, `store_u32` and `store_u64`, and the declaration lines of the layout constants
-`IMAGE_PAGE`, `IMAGE_HEADER_BYTES`, `SECTION_TABLE_SLACK`, `DWRITE_STAGING_BAND` and
-`METAL_BAND_BLOCKS`. Comments are stripped first, so re-wording one moves nothing, and CRLF
+`w_header`, `store_u32`, `store_u64`, `kq_plane_name`, and the TTS blob's `blob_push`,
+`weight_slot` and `conv1d_weight_row`, and the declaration lines of the layout constants
+`IMAGE_PAGE`, `IMAGE_HEADER_BYTES`, `SECTION_TABLE_SLACK`, `DWRITE_STAGING_BAND`,
+`METAL_BAND_BLOCKS` and `BLOB_ALIGN_FLOATS`. Comments are stripped first, so re-wording one moves nothing, and CRLF
 line ends fold to LF before anything is hashed, so a checkout under `autocrlf` stamps as the
 LF tree does. A body runs from its `def` line to the column-0 `}` that closes it, or, for a
 `def ... => expr` one-liner, to the end of that one line. Each piece folds into one FNV-1a hash
@@ -235,9 +258,10 @@ which the identity string and `layout_fingerprint()` cover instead.
 
 A red says the closure moved, and the two repairs are not the same thing. A **re-stamp** answers
 a change that provably leaves every byte where it was - a renamed local, a tripwire line, a
-helper split, or a content change that also moved the image PATH, since an image at a path
-nothing reads cannot be reinterpreted: `IMAGE_LAYOUT_STAMP_HASH` takes the value the finding
-prints and both version numbers stand. A **bump** answers a change that moves bytes, or that
+helper split, a field added to or dropped from a meta-serialized struct (which
+`layout_fingerprint()` already refuses), or a content change that also moved the image PATH,
+since an image at a path nothing reads cannot be reinterpreted: `IMAGE_LAYOUT_STAMP_HASH` takes
+the value the finding prints and both version numbers stand. A **bump** answers a change that moves bytes, or that
 changes what an image at an UNCHANGED path contains: `IMAGE_VERSION` (`dasllama_image.das`) goes
 up, `IMAGE_LAYOUT_STAMP_VERSION` follows it, and the hash is re-stamped alongside. Without the
 bump a stale image stays structurally valid and silently serves a different model.
@@ -268,7 +292,7 @@ a struct field list, so it has no count to pin. Everything else taking an `Archi
 
 The `Model`'s per-format plane table (`kq`, one `KqPlanes` slot per `KqFmt`) carries planes for the
 256-element lattice formats alone - the formats `kq_sb` is true for. A 32-block format keeps its
-planes as top-level `Model` fields of the same name (`q51q`, `q51s`). The two walks that name
+planes as top-level `Model` fields of the same name (`q51q`/`q51s`, `iq4nl32q`/`iq4nl32s`). The two walks that name
 sections - the image writer and the map-back - skip a slot whose format is not `kq_sb`, because
 `kq_plane_name` gives that slot the same section name as the top-level field, and a `.dlim`
 carrying two sections of one name fails its map-back.

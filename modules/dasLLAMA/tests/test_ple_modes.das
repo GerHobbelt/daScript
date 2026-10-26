@@ -39,8 +39,7 @@ def private file_row(path : string; r, all : int64) : array<float> {
 // (generate's return is prompt echo minus BOS, then continuation, capped at `steps` total)
 def private greedy_turn(var m : Model; user : string; n : int64) : string {
     var text = ""
-    with_job_que() {
-        setup_dasllama_jobque()
+    with_dasllama_jobque() {
         var s <- make_run_state(m.config)
         var chat = create_chat(m, "")
         add_user(chat, user)
@@ -73,10 +72,7 @@ def private letters(s : string) : int {
 [test]
 def test_ple_fp32_rail(t : T?) {
     t |> run("fp32 serving pins the Q8_0 PLE table to its own q8 plane, bit-exact (E2B Q8_0)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
+        return if (!jit_only(t))
         let path = e2b_q8_path()
         if (!model_available(t, path)) {
             return
@@ -130,10 +126,7 @@ def test_ple_fp32_rail(t : T?) {
 [test]
 def test_ple_fp32_kq_table(t : T?) {
     t |> run("fp32 serving pins a K-quant PLE table to its native plane (E2B Q4_K_M)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
+        return if (!jit_only(t))
         let path = e2b_kq_path()
         if (!model_available(t, path)) {
             return
@@ -167,10 +160,7 @@ def test_ple_fp32_kq_table(t : T?) {
 [test]
 def test_ple_mode_forwards(t : T?) {
     t |> run("fp32 and q4 E2B chat turns run end to end (E2B Q8_0)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
+        return if (!jit_only(t))
         let path = e2b_q8_path()
         if (!model_available(t, path)) {
             return

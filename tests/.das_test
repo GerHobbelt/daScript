@@ -25,6 +25,10 @@ def can_visit_folder(folder_name : string; var result : bool?) {
         *result = has_module("clipboard_core")
         return
     }
+    if (folder_name == "crypto") {
+        *result = has_module("crypto")
+        return
+    }
     if (folder_name == "dasHV") {
         *result = has_module("dashv")
         return
@@ -103,7 +107,7 @@ def can_visit_folder(folder_name : string; var result : bool?) {
         }
         return
     }
-    if (folder_name == "jit_tests" || folder_name == ".jitted_scripts") {
+    if (folder_name == "jit_tests" || folder_name == ".cache") {
         let args <- get_command_line_arguments()
         for (arg in args) {
             if (arg == "--use-aot") {

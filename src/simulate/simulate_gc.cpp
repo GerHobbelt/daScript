@@ -944,13 +944,24 @@ namespace das
             collect = (collectStrings && sTotal && sUsed < sTotal - sTotal / 3)
                 || (hTotal && hUsed < hTotal / 3);
             gcPressureInitialized = true;
+#if DAS_ASAN
+            gcHeapBaseline = 0; gcStringBaseline = 0;
+#else
             gcHeapBaseline = hUsed; gcStringBaseline = sUsed;
+#endif
         }
         collect |= (hUsed > gcHeapBaseline && hUsed - gcHeapBaseline >= gcHeapBudget)
             || (collectStrings && sUsed > gcStringBaseline && sUsed - gcStringBaseline >= gcStringBudget);
         if (collect) {
             collectHeap(at, true, false);
             return true;
+        }
+        return false;
+    }
+
+    static bool frameHoldsCollectable ( FuncInfo * info ) {
+        for ( uint32_t i=0, is=info->localCount; i!=is; ++i ) {
+            if ( info->locals[i]->flags & (TypeInfo::flag_heapGC | TypeInfo::flag_stringHeapGC | TypeInfo::flag_ref) ) return true;
         }
         return false;
     }
@@ -962,6 +973,8 @@ namespace das
         // and the owner mismatch is exactly what this catches - the invoke edge the static
         // fastcall denial can't see. gated on persistent+gc so a direct C++ collectHeap on
         // a non-GC context keeps its old silent no-op (the mark() bail-outs below)
+        // incomplete: it sees only frames on the daslang stack, so of compiled code only the top-level
+        // entry frame - a compiled-to-compiled call pushes nothing here (proof: collect_carrier_violation)
         if ( persistent && gcEnabled ) {
             char * scanSp = stack.ap();
             const LineInfo * scanHandoff = at;
@@ -973,7 +986,7 @@ namespace das
                     info = ( iblock & 1 ) ? ((Block *)(iblock & ~1))->info : pp->info;
                 }
                 if ( info && info->locals && info->localCount
-                        && !lineFramePos(scanHandoff, info->spaceId) ) {
+                        && !lineFramePos(scanHandoff, info->spaceId) && frameHoldsCollectable(info) ) {
                     throw_error_at(at, "heap collection can't attribute locals of '%s' - "
                         "the frame was entered through a compiled (AOT/JIT) frame, a "
                         "position-less or embedder-crafted line, or a frameless (fastcall) "

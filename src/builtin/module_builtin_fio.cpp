@@ -196,6 +196,7 @@ namespace das {
     void builtin_fprint(const FILE *f, const char *text, Context *context, LineInfoArg *at) GENERATE_IO_STUB
     void builtin_fclose ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     void builtin_fflush ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_try_fflush ( const FILE * ) { return false; }
     void builtin_map_file(const FILE* f, const TBlock<void, TTemporary<TArray<uint8_t>>>& blk, Context* context, LineInfoArg * at) GENERATE_IO_STUB
     void * builtin_fmap_open ( const char * name, uint64_t * size, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     void * builtin_fmap_open_rw ( const char * name, uint64_t * size, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
@@ -456,6 +457,12 @@ namespace das {
     void builtin_fflush ( const FILE * f, Context * context, LineInfoArg * at ) {
         if ( !f ) context->throw_error_at(at, "can't fflush NULL");
         fflush((FILE *)f);
+    }
+
+    bool builtin_try_fflush ( const FILE * f ) {
+        if ( !f ) return false;
+        auto stream = const_cast<FILE *>(f);
+        return ::fflush(stream) == 0 && ::ferror(stream) == 0;
     }
 
     const FILE * builtin_stdin() {
@@ -1199,11 +1206,13 @@ namespace das {
             dup2(pipefd[1], STDOUT_FILENO);
             dup2(pipefd[1], STDERR_FILENO);
             close(pipefd[1]);
+            setpgid(0, 0);
             execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
             _exit(127);
         }
         // Parent process
         close(pipefd[1]);
+        setpgid(pid, pid);
         FILE * f = fdopen(pipefd[0], "r");
         atomic<bool> timedOut{false};
         atomic<bool> processDone{false};
@@ -1215,7 +1224,7 @@ namespace das {
             }
             if ( !processDone.load() ) {
                 timedOut = true;
-                kill(pid, SIGKILL);
+                killpg(pid, SIGKILL);
             }
         });
         vec4f args[1];
@@ -1579,6 +1588,7 @@ namespace das {
             dup2(pipefd[1], STDOUT_FILENO);
             dup2(pipefd[1], STDERR_FILENO);
             close(pipefd[1]);
+            if ( timeout_sec > 0.0f ) setpgid(0, 0);
             execvp(cargv[0], cargv.data());
             _exit(127);
         }
@@ -1588,6 +1598,7 @@ namespace das {
         atomic<bool> processDone{false};
         thread watchdog;
         if ( timeout_sec > 0.0f ) {
+            setpgid(pid, pid);
             watchdog = thread([pid, timeout_sec, &timedOut, &processDone]() {
                 auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds((int)(timeout_sec * 1000.0f));
                 while ( std::chrono::steady_clock::now() < deadline ) {
@@ -1596,7 +1607,7 @@ namespace das {
                 }
                 if ( !processDone.load() ) {
                     timedOut = true;
-                    kill(pid, SIGKILL);
+                    killpg(pid, SIGKILL);
                 }
             });
         }
@@ -2533,7 +2544,7 @@ namespace das {
         lock_guard<std::recursive_mutex> guard(g_deferred_dynamic_modules_mutex);
         vector<DeferredDynamicModule> all;
         all.swap(g_deferred_dynamic_modules);
-        if ( trace_module_load() && !all.empty() ) {
+        if ( trace_module_load() ) {
             LOG(LogLevel::info) << "[module] loading every deferred module (" << all.size() << ")\n";
         }
         for ( auto & dm : all ) {
@@ -3114,6 +3125,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(builtin_fflush)>(*this, lib, "fflush",
                 SideEffects::modifyExternal, "builtin_fflush")
                     ->args({"file","context","line"});
+            addExtern<DAS_BIND_FUN(builtin_try_fflush)>(*this, lib, "try_fflush",
+                SideEffects::modifyExternal, "builtin_try_fflush")
+                    ->args({"file"})->setNoDiscard();
             addExtern<DAS_BIND_FUN(builtin_fprint)>(*this, lib, "fprint",
                 SideEffects::modifyExternal, "builtin_fprint")
                     ->args({"file","text","context","line"});

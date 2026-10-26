@@ -69,6 +69,10 @@ struct DastestArgs {
     @clarg_doc = "Path to a file listing one test path per line; restricts the collected set to those paths"
     test_list : string
 
+    @clarg_name = "test-only"
+    @clarg_doc = "Restrict the collected set to this test path (repeatable)"
+    test_only : array<string>
+
     @clarg_doc = "Run top-level tests matching this name prefix"
     test_names : array<string>
 
@@ -98,6 +102,9 @@ struct DastestArgs {
 
     @clarg_doc = "Compile every test with the CSE (common-subexpression-elimination) pass disabled (cop.disable_cse)"
     disable_cse : bool = false
+
+    @clarg_doc = "Run every test on the persistent heap (cop.persistent_heap), whose frees and sweeps an address-sanitizer build hands to its own allocator, so a stale pointer into them is reported; a test that pins the default heap's byte counts fails under it"
+    persistent_heap : bool = false
 
     @clarg_doc = "Compile every test with the DSE (dead-store-elimination) pass disabled (cop.disable_dse)"
     disable_dse : bool = false

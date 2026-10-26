@@ -26,6 +26,7 @@ require strings
 require math
 require ../../common/parallel_workers.das
 require ../../common/git_signature.das
+require ../../common/log_floor.das
 require ../../../dastest/worker_policy.das
 require config
 require compile_db
@@ -1420,7 +1421,7 @@ def gate_tests_jit(ctx : PreflightCtx) : GateResult {
         [ctx.daslang, "dastest/dastest.das", "-jit", "--", "--jit-opt-level=3", "--failures-only", "--timing-outliers", "10",
             "--max-file-time", "{ctx.jit_max_file_time}", "--isolated-mode",
             "--isolated-mode-threads", "{ctx.jit_jobs}", "--batch", "4",
-            "--timeout", "1800", "--test", "tests"],
+            "--test-timeout", "300", "--timeout", "1800", "--test", "tests"],
         "JIT suite failures")
 }
 
@@ -1727,10 +1728,7 @@ def report_gate(r : GateResult; verbose : bool) {
 
 [export]
 def main() : int { // nolint:STYLE037,STYLE038 — the gate loop + CLI surface; the phases ARE the readability
-    //! the gate ledger is preflight's output, not a trace: the run reads at info unless the caller set a floor
-    if (empty(get_env_variable("DAS_LOG_LEVEL"))) {
-        set_env_variable("DAS_LOG_LEVEL", "info")
-    }
+    default_log_floor_to_info()
     var args_r <- parse_args(type<Config>)
     if (args_r |> is_err) {
         to_log(LOG_ERROR, "error: {args_r |> unwrap_err}\n\n")

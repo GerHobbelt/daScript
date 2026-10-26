@@ -4,6 +4,7 @@
 #include "daScript/daScript.h"
 #include "daScript/daScriptModule.h"
 #include "daScript/misc/das_common.h"
+#include "daScript/misc/das_asan.h"
 #include "daScript/simulate/fs_file_info.h"
 #include "daScript/ast/ast_aot_cpp.h"
 #include "daScript/ast/ast_serializer.h"
@@ -47,6 +48,13 @@ static bool astVerifyRequired = false;
 static bool scopedStackAllocator = true;
 static bool pauseAfterErrors = false;
 static bool quiet = false;
+
+#if DAS_ASAN
+extern "C" const char * __asan_default_options() {
+    return "quarantine_size_mb=32";
+}
+#endif
+
 #ifndef MAIN_FUNC_NAME
   #define MAIN_FUNC_NAME main
   // the process ends when this returns: the fusion table is orphaned, not torn down - unless
@@ -747,7 +755,7 @@ void print_help() {
         << "    -v2makeSyntax enable version 1 syntax with version 2 constructors syntax (for arrays/structures)\n"
         << "    -jit        enable Just-In-Time compilation\n"
         << "    -jit-no-cache  with -jit: skip the per-script DLL cache, codegen direct in-memory.\n"
-        << "                Useful when the cached .jitted_scripts/ DLL is stale or unwanted.\n"
+        << "                Useful when the cached .cache/daslang/ DLL is stale or unwanted.\n"
         << "    -jit-stack  with -jit: retain every generated call in the logical daslang stack.\n"
         << "    -exe        JIT compile to standalone executable (implies -dry-run)\n"
         << "    -lib        JIT compile to a C-ABI native library: <output>.so/.dylib/.dll plus <output>.h\n"
@@ -759,7 +767,7 @@ void print_help() {
         << "    --force-shared-module <name> with -exe: force-include a shared module by daslang or package name (repeatable)\n"
         << "    -module-cache <path> self-maintaining AST module cache at <path>: read when present, rewritten\n"
         << "                when the compile diverged; prints 'deser: clean'/'partial'/'FALLBACK'. Default ON,\n"
-        << "                silently, at .jitted_scripts/module_cache/<script>-<hash>.dascache for a run that\n"
+        << "                silently, at .cache/daslang/module_cache/<script>-<hash>.dascache for a run that\n"
         << "                executes; off under -exe (one-unit codegen is the faster binary), -compile-only, -documentation, -use-aot\n"
         << "    -MD -MF <path> write a Make dependency file naming every source, data file and\n"
         << "                directory this run read, the way a C compiler's -MD does. -MT <target>\n"

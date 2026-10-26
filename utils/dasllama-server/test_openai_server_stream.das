@@ -23,7 +23,7 @@ require dasllama/dasllama_env
 // as test_openai_server; SmolLM2-135M — small, chatml template (real stop ids). In-dir like its
 // siblings: a require path can't contain the '-' of "dasllama-server".
 
-let TEST_PORT = 18105   // 18099 + 2 = 18101 is test_openai_server.das's; 18097-18147 and 18150-18154 belong to the sibling suites
+let TEST_PORT = 18105   // 18099 + 2 = 18101 is test_openai_server.das's; 18097-18147 and 18150-18156 belong to the sibling suites
 let TEST_CTX = 1024l   // big enough that the eviction arm's 900-token budget outlasts a 1s client timeout
 
 def private models_dir() : string {
@@ -52,7 +52,7 @@ def private with_stream_server(t : T?; model_path : string; port : int; blk : bl
             var m <- load_model(model_path, QuantMode.q8)
             m.config.seq_len = min(m.config.seq_len, TEST_CTX)
             set_model(m, "test-llm-stream")
-            run_server(port)   // scheduler defaults: 4 streams, queue 32, chunk 64
+            run_server(port)
             finished |> notify_and_release
         }
         let base_url = "http://127.0.0.1:{port}"

@@ -35,8 +35,12 @@ input), `s.mtp_h_pos1` and the mirror watermark move to `pos + a + 1`, and `n_pa
 rewrites - and only the watermark keeps them from being read. The CPU depth-1 step
 (`mtp_spec_eval`) takes a rejected draft on a model with no recurrent layer without a re-forward:
 the verify's row 0 already holds the committed token's logits and post-norm hidden, so they stand
-and the draft head is re-seeded from them; a recurrent model restores the pre-verify state and
-re-forwards the committed token. `set_mtp_force_reject_every(n)` rejects every n-th draft of that
+and the draft head is re-seeded from them (a verify seat that landed the rows' picks alone under
+the caller's pick ask publishes row 0's pick in the logits' place,
+`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`); a recurrent model restores the pre-verify state and
+re-forwards the committed token, unless the verify seat that served the round registered a
+rollback seat, which puts the state back on the device and leaves row 0 standing the same way
+(`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`). `set_mtp_force_reject_every(n)` rejects every n-th draft of that
 step's greedy walk whatever the verify said - the seam a test reaches the reject arm through on a
 fixture that accepts every draft.
 
@@ -99,6 +103,12 @@ at `bcat` row `nr`, and `h_i` is verify post-norm row `i-1`. It norms the embeds
 and the hiddens with `mtp_hnorm`, interleaves `[enorm(embed_i) ; hnorm(h_i)]` per row into the cat
 image, runs `mtp_ehproj`, and encodes the verify layer once more at `l == n_layers`. The head
 therefore enters the next round on rows the trunk actually committed, not on the chain's own drafts.
+On a hyper-connection model the carry is the trunk's WIDE residual row before the head mixer
+(`hc_dim` floats, `StepRes.bhc_carry` / `bhc_save`, `Session.mtp_h` sized by `mtp_h_dim`): the
+head's prelude (`hc_draft_prelude`) norms each carry's streams under `mtp_hnorm`, repeats the
+`mtp_enorm` embed row per stream and runs one eh_proj GEMV over every (row, stream) pair, so the
+head's block opens on a wide residual of its own; the head mixer's own weights
+(`mtp_hc_head_{norm,down,up}`) stand where the shared head's would.
 
 ### A recurrent verify writes a shadow region and replays into it {#mtp-dn-shadow-replay}
 
@@ -155,7 +165,9 @@ mirror's live and shadow bases, its tape slots), the route table carries every r
 position, `recurrent_verify` scans each group's rows against that stream's mirror through the
 kargs row index with the shadow-and-tape discipline of `ARCHITECTURE_GPU_MTP.md#mtp-dn-shadow-replay` per group, and the draft head's
 inputs assemble per group (a group's saved pre-draft hidden parks at cat row `nr + its index`).
-The landing scatters each group's K/V rows and logits into its own stream; the accept walk, the
+The landing scatters each group's K/V rows and logits into its own stream - a paged stream's block
+table grows to the round's k+1 rows before its drafts, since a round at a page's last row lands
+the next page's first; the accept walk, the
 replay (one command buffer per replaying group), the flip and the commit run per stream exactly as
 the one-stream round's. The one-stream round is the rounds over one session. `mtp_spec_eval_batch`
 is the engine seat the scheduler ticks through (`register_mtp_spec_batch_override`); without a

@@ -31,7 +31,7 @@ require jit
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let public LLVM_JIT_CODEGEN_VERSION : uint64 = 0x90ul   // 0x90: prologue and epilogue are IR helpers
+let public LLVM_JIT_CODEGEN_VERSION : uint64 = 0x96ul   // 0x96: a call takes an intrinsic only when has_intrinsic accepts it
 
 let public JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -39,6 +39,35 @@ let public JIT_FNV_PRIME : uint64 = 1099511628211ul
 // NON-bit-exact, default off, +8-10% e2e. nnan|ninf|arcp|afn are deliberately NOT stamped: engine
 // kernels make real infs and arcp+ninf's rcp-estimate div computes inf*0=NaN (tests/jit/fast_math_specials.das).
 var public g_jit_fast_math = false
+
+let public JIT_NEVER_FAST_MATH_ATTR = "das-never-fast-math"
+
+def public is_never_fast_math(annotations : AnnotationList) : bool {
+    for (ann in annotations) {
+        if (ann.annotation.name == "never_fast_math") {
+            return true
+        }
+    }
+    return false
+}
+
+//! `--jit-sanitize` / `options jit_sanitize`, resolved: `address` runs LLVM's asan pass over the emitted IR, `undefined`
+//! its bounds check, which reports through the host's ubsan runtime
+struct public JitSanitize {
+    address : bool
+    undefined : bool
+}
+
+let public JIT_UBSAN_RUNTIME_SYMBOL = "__ubsan_handle_local_out_of_bounds_abort"
+
+//! whether this process carries `symbol` - a sanitizer runtime linked into the host exports its entry points
+def public host_has_symbol(symbol : string) : bool {
+    LLVMLoadLibraryPermanently("")
+    return LLVMSearchForAddressOfSymbol(symbol) != null
+}
+
+//! the host runs the asan runtime: its context stack and array buffers are poisoned past what the C++ runtime handed out
+let public JIT_HOST_ASAN = host_has_symbol("__asan_init")
 
 let public LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS_DEFAULT = false   // NOTE - this should be true, to match interpreter and AOT behavior
 var public LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS = LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS_DEFAULT
@@ -139,15 +168,18 @@ def public fold_llvm_code_hints(funcs : array<FunctionPtr>; seed : uint64) : uin
     return h
 }
 
-// [hint(...)] args become LLVM function attributes (alwaysinline/noalias=/optnone/...) — backend-only,
-// no SimNode, so the aot hash is blind to them exactly like loop hints; fold them into both keys
+[arch(at = "../ARCHITECTURE_JIT_ENTRY.md#hint-folds")]
 def public fold_function_hints(funcs : array<FunctionPtr>; seed : uint64) : uint64 {
     var h = seed
     for (fn in funcs) {
         for (ann in fn.annotations) {
             if (ann.annotation.name == "hint") {
+                h = (h ^ hash(get_mangled_name(fn))) * JIT_FNV_PRIME
                 h = (h ^ hash("hint")) * JIT_FNV_PRIME
                 h = fold_annotation_args(ann.arguments, h)
+            } elif (ann.annotation.name == "never_fast_math") {
+                h = (h ^ hash(get_mangled_name(fn))) * JIT_FNV_PRIME
+                h = (h ^ hash("never_fast_math")) * JIT_FNV_PRIME
             }
         }
     }
@@ -173,11 +205,38 @@ def private has_generated_kernel(prog : Program?; jit_all_functions : bool) : bo
     return found
 }
 
+//! one handled type's size, or one of its fields' offsets, as a term of `handled_layout_hash`; a type's term passes "" for the field
+def public handled_layout_term(mod, typ, field : string; value : uint64) : uint64 {
+    var h = (hash(mod) ^ hash(typ)) * JIT_FNV_PRIME
+    h = (h ^ hash(field)) * JIT_FNV_PRIME
+    return (h ^ value) * JIT_FNV_PRIME
+}
+
+//! the size of every handled type the running binary registers and the field offsets of every structure among them, summed so the walk's order is no input
+[arch(at = "../ARCHITECTURE_CODEGEN_IDENTITY.md#handled-layouts-key")]
+def public handled_layout_hash() : uint64 {
+    var acc = 0ul
+    program_for_each_registered_module() $(m) {
+        let mod = string(m.name)
+        module_for_each_annotation(m) $(value) {
+            return if (!value.isTypeAnnotation)
+            let typ = string(value.name)
+            acc += handled_layout_term(mod, typ, "", uint64(get_handled_type_size(unsafe(reinterpret<TypeAnnotation?>(value)))))
+            return if (!value.isBasicStructureAnnotation)
+            for_each_field(*unsafe(reinterpret<BasicStructureAnnotation?>(value))) $(name, _cppName, _xtype, offset) {
+                acc += handled_layout_term(mod, typ, name, uint64(offset))
+            }
+        }
+    }
+    return acc
+}
+
 // The environment/config salt shared by the whole-DLL key AND the per-partition obj cache key.
 // ONE helper on purpose: a salt component folded into the DLL key but not the partition key
 // would let a config change reuse stale cached partition objects.
 def public jit_env_salt(opt_level : int; size_level : int; emit_prologue : bool; debug_info : bool; // nolint:STYLE037,STYLE038 - one flat fold per emission input; a split would hide which inputs key the cache
-                        target_triple : string; split : bool; use_host_cpu : bool) : uint64 {
+                        target_triple : string; split : bool; use_host_cpu : bool; sanitize : JitSanitize;
+                        layouts : uint64 = handled_layout_hash()) : uint64 {
     var h = LLVM_JIT_CODEGEN_VERSION
     // host/binary identity: object format follows the triple (COFF vs ELF on one checkout), and the emitting binary bakes its Context offsets into every global access - neither is in any AST hash
     if (empty(target_triple)) {
@@ -192,6 +251,7 @@ def public jit_env_salt(opt_level : int; size_level : int; emit_prologue : bool;
     h = (h ^ uint64(SIMFUNCTION_OFFSET_OF_JIT_FUNCTION)) * JIT_FNV_PRIME
     h = (h ^ uint64(ARRAY_MAGIC)) * JIT_FNV_PRIME
     h = (h ^ uint64(ARRAY_LOCK_EXEMPT_FLAGS)) * JIT_FNV_PRIME
+    h = (h ^ layouts) * JIT_FNV_PRIME
     // full host-CPU identity when the TargetMachine bakes it - the cpuid bits below cover only the matrix-tier features; a wider box's object is an illegal instruction on a narrower one
     if (use_host_cpu) {
         let host_cpu = LLVMGetHostCPUName()
@@ -212,6 +272,7 @@ def public jit_env_salt(opt_level : int; size_level : int; emit_prologue : bool;
     h = (h ^ (emit_prologue ? 1ul : 0ul)) * JIT_FNV_PRIME
     h = (h ^ (debug_info ? 1ul : 0ul)) * JIT_FNV_PRIME
     h = (h ^ (g_jit_fast_math ? 1ul : 0ul)) * JIT_FNV_PRIME   // fast-math changes codegen → distinct cache
+    h = (h ^ ((sanitize.address ? 1ul : 0ul) | (sanitize.undefined ? 2ul : 0ul) | (JIT_HOST_ASAN ? 4ul : 0ul))) * JIT_FNV_PRIME
     // split-built and monolith DLLs differ in inlining — never share a cache entry (bool only: partition count is data-driven)
     h = (h ^ (split ? 1ul : 0ul)) * JIT_FNV_PRIME
     // EH vs longjmp hosts emit different unwind tables — must not share a cache entry (panic would crash)
@@ -240,6 +301,9 @@ def public jit_env_salt(opt_level : int; size_level : int; emit_prologue : bool;
     }
     if (cpu_supports("amx-tile") && cpu_supports("amx-int8")) {   // tune_cpu_class picks x86-amx, which selects grid decode forms
         h = (h ^ 0x1Cul) * JIT_FNV_PRIME
+    }
+    if (cpu_supports("amx-tile") && cpu_supports("amx-bf16") && cpu_supports("avx512bf16")) {   // the amx_bf16 tile gate: a bf16-less AMX part declines the perm
+        h = (h ^ 0x1Dul) * JIT_FNV_PRIME
     }
     if (cpu_supports("avxvnniint8")) {
         isa |= 32ul
@@ -270,7 +334,7 @@ def public jit_env_salt(opt_level : int; size_level : int; emit_prologue : bool;
 
 def public jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : int;
                             emit_prologue : bool; debug_info : bool; target_triple : string; split : bool;
-                            use_host_cpu : bool) : string {
+                            use_host_cpu : bool; sanitize : JitSanitize) : string {
     var h = LLVM_JIT_CODEGEN_VERSION
     for (fn in funcs) {
         h = (h ^ get_function_aot_hash(fn)) * JIT_FNV_PRIME
@@ -278,7 +342,7 @@ def public jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_le
     h = fold_loop_hints(funcs, h)   // JIT-only loop tune hints (see LoopHintHashVisitor)
     h = fold_llvm_code_hints(funcs, h)   // [llvm_code] generator params (annotation args)
     h = fold_function_hints(funcs, h)   // [hint(...)] function attributes (backend-only, aot-hash-blind)
-    h = (h ^ jit_env_salt(opt_level, size_level, emit_prologue, debug_info, target_triple, split, use_host_cpu)) * JIT_FNV_PRIME
+    h = (h ^ jit_env_salt(opt_level, size_level, emit_prologue, debug_info, target_triple, split, use_host_cpu, sanitize)) * JIT_FNV_PRIME
     return "{h}"
 }
 
@@ -747,9 +811,24 @@ struct public JitPlan {
     exe_host_cpu : bool
     use_host_cpu : bool
     log_jit_time : bool
+    sanitize : JitSanitize
     dll_hash_basename : string
     candidates : array<FunctionPtr>
     disabled : array<FunctionPtr>
+}
+
+def public report_collect_errors(var plan : JitPlan) : bool {
+    //! Logs every function the JIT would compile that reaches a heap collection without proof; true when the program must not be jitted.
+    if (plan.gen_exe || plan.gen_lib) return false
+    var failed = false
+    for (fun in plan.candidates) {
+        let why = collect_carrier_violation(fun)
+        if (!empty(why)) {
+            to_log(LOG_ERROR, "LLVM JIT: {describe(fun.at)}: function '{fun.name}' can reach heap_collect, and {why}; mark it [no_jit] to keep it interpreted\n")
+            failed = true
+        }
+    }
+    return failed
 }
 
 def private jit_selects(fun : FunctionPtr; rqj : bool; aot_host : bool; jit_all : bool; var ctx : Context?) : bool {
@@ -780,6 +859,54 @@ def private resolve_split_options(var plan : JitPlan; cli_opts : JitCliOptions; 
     if (announce && lto_requested && !plan.jit_lto) {
         to_log(LOG_WARNING, "LLVM JIT: --jit-lto applies to a split -exe for the host only (-exe with --jit-split-modules, no --jit-target) - ignored for this run\n")
     }
+}
+
+//! an exe or a library links the runtime libraries, which a sanitizer host built under its sanitizer and which call its
+//! runtime, beside the instrumentation the run asked for; the sanitizer runtimes are the compiler's own, so the link runs
+//! through clang++ unless a linker is named. A static library is archived, not linked, and its host links the runtimes
+def private link_with_sanitizers(var plan : JitPlan; host_ubsan : bool) {
+    return if (!plan.gen_exe || plan.lib_static || plan.gen_wasm || !empty(plan.target_triple) || get_platform_name() == "windows")
+    let wanted = fixed_array(plan.sanitize.address || JIT_HOST_ASAN, plan.sanitize.undefined || host_ubsan, host_has_symbol("__tsan_init"))
+    let names <- [for (name, on in fixed_array("address", "undefined", "thread"), wanted); name; where on]
+    return if (empty(names))
+    plan.linker_string = "-fsanitize={join(names, ",")} {plan.linker_string}"
+    if (empty(plan.path_to_linker)) {
+        plan.path_to_linker = "clang++"
+    }
+}
+
+def private resolve_sanitize_option(var plan : JitPlan; cli_opts : JitCliOptions; prog : Program?; announce : bool) {
+    assume san = plan.sanitize
+    let host_ubsan = host_has_symbol(JIT_UBSAN_RUNTIME_SYMBOL)
+    let requested = cli_opts.sanitize |> unwrap_or((prog._options |> find_arg("jit_sanitize")) ?as tString ?? "")
+    //! the in-memory engine resolves a static constructor by symbol, and asan's module constructor is internal
+    let in_memory = !plan.use_dll && !plan.gen_exe && !plan.compile_only && !plan.emit_aot_object
+    //! a sanitizer host instruments its jitted code with its own sanitizer, unless the run names a list - `none` names nothing
+    let by_default = empty(requested)
+    san.address = by_default && JIT_HOST_ASAN && !in_memory
+    san.undefined = by_default && host_ubsan
+    for (name in split(requested, ",")) {
+        if (name == "address") {
+            san.address = true
+        } elif (name == "undefined") {
+            san.undefined = true
+        } elif (!empty(name) && name != "none") {
+            panic("LLVM JIT: --jit-sanitize={name} names no sanitizer - address, undefined or none")
+        }
+    }
+    if (san.address && in_memory) {
+        panic("LLVM JIT: --jit-sanitize=address runs on the JIT DLL path only - the in-memory engine (-jit-no-cache, a static daslang) cannot run asan's module constructor")
+    }
+    //! the artifact loads into this process and calls its sanitizer runtime
+    let loads_here = !plan.gen_exe && !plan.compile_only
+    if (loads_here && ((san.address && !JIT_HOST_ASAN) || (san.undefined && !host_ubsan))) {
+        panic("LLVM JIT: --jit-sanitize={requested} needs the sanitizer runtime in this process - build daslang with -DDAS_USE_SANITIZER, or pass --jit-compile-only")
+    }
+    if (announce && (san.address || san.undefined)) {
+        let names = san.address && san.undefined ? "address,undefined" : (san.address ? "address" : "undefined")
+        to_log(LOG_INFO, "LLVM JIT: --jit-sanitize={names}{by_default ? " (the host's sanitizer; --jit-sanitize=none turns it off)" : ""}\n")
+    }
+    link_with_sanitizers(plan, host_ubsan)
 }
 
 //! the plan for `prog`; `announce` prints the one-time lines (the baseline class, the exe host
@@ -818,7 +945,7 @@ def public make_jit_plan(prog : Program?; var ctx : Context?; announce : bool; c
     // --jit-compile-only: build + verify + optimize (+dump), write/load/install nothing —
     // the program runs interpreted. Also bypasses the DLL cache probe, so the
     // generators always run (this is the cross-emission smoke rail).
-    plan.compile_only = cli_opts.compile_only |> unwrap_or((prog._options |> find_arg("jit_compile_only")) ?as tBool ?? false)
+    plan.compile_only = jit_compile_only(cli_opts, prog)
     // Offline AOT: emit the whole used function set to a .o for static linking, with a
     // load ctor registering them into the AOT library. Mutually exclusive with dll
     // mode (no in-memory engine work, no instrument).
@@ -831,7 +958,7 @@ def public make_jit_plan(prog : Program?; var ctx : Context?; announce : bool; c
     // strict: a standalone exe with a no_jit function fails the build (collect_standalone_functions)
     plan.exe_strict = true
     plan.config_out_path = string(prog.policies.jit_output_path)
-    plan.output_path = plan.config_out_path |> empty() ? ".jitted_scripts/{prog.thisNamespace}" : plan.config_out_path
+    plan.output_path = plan.config_out_path |> empty() ? ".cache/daslang/{prog.thisNamespace}" : plan.config_out_path
     plan.path_to_shared_lib = string(prog.policies.jit_path_to_shared_lib)
     // CLI --jit-path-to-linker wins over the script-level policy.
     plan.path_to_linker = cli_opts.path_to_linker |> unwrap_or(string(prog.policies.jit_path_to_linker))
@@ -876,6 +1003,7 @@ def public make_jit_plan(prog : Program?; var ctx : Context?; announce : bool; c
     // a runtime built -ffast-math already relaxes the interpreter's own ops, so the JIT inherits
     // that unless the program says otherwise; `options fast_math` still wins either way
     g_jit_fast_math = (prog._options |> find_arg("fast_math") ?as tBool ?? (prog.policies.fast_math || HOST_FAST_MATH)) || (prog._options |> find_arg("_jit_fast_math") ?as tBool ?? false)
+    resolve_sanitize_option(plan, cli_opts, prog, announce)
 
     // nolint:STYLE014
     // Standalone exes target a GENERIC CPU (write_exe use_host_cpu=false default), so
@@ -932,8 +1060,8 @@ def public make_jit_plan(prog : Program?; var ctx : Context?; announce : bool; c
     // inputs → same filename → cache hit. Only in dll-mode with the default output path; a pinned
     // jit_output_path or an exe keeps the user's path.
     if (plan.use_dll && plan.config_out_path |> empty()) {
-        plan.dll_hash_basename = jit_dll_basename(plan.candidates, plan.opt_level, plan.size_level, plan.emit_prologue, plan.debug_info, plan.target_triple, plan.jit_split, plan.use_host_cpu)
-        plan.output_path = ".jitted_scripts/{prog.thisNamespace}/{plan.dll_hash_basename}"
+        plan.dll_hash_basename = jit_dll_basename(plan.candidates, plan.opt_level, plan.size_level, plan.emit_prologue, plan.debug_info, plan.target_triple, plan.jit_split, plan.use_host_cpu, plan.sanitize)
+        plan.output_path = ".cache/daslang/{prog.thisNamespace}/{plan.dll_hash_basename}"
     }
     return <- plan
 }

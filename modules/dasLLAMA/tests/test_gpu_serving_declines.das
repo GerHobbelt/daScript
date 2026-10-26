@@ -4,12 +4,14 @@ options _dasllama_internal = true
 
 require dastest/testing_boost public
 require dasllama/dasllama_common
+require dasllama/dasllama_sampling
 require dasllama/dasllama_gpu_resident
 require dasllama/dasllama_gpu_tier   // install_moe_gpu_resident_bias - the bias seat a served qwen2 needs
 require ?vulkan dasllama/dasllama_vulkan_decode   // rd_routed_slots_fit - the N-row command's slot cap, where the module exists
 require dasllama/dasllama_metal_shapes   // moe_metal_ok - the Metal routed block's admission, portable
 require strings
 require daslib/strings_boost
+require _compares   // panic_text_of: a panic's text read back
 require daslib/enum_trait   // the format-set drift guard walks the whole KqFmt enum
 
 [unused_argument(rows)]
@@ -20,7 +22,8 @@ def private test_upload_sinks(rows : array<float>) : bool => true
 
 // The whole-model driver's decline reasons, decided from a Config or a synthetic Model shell
 // (no weights on disk): every feature and layer shape the driver has no arm for is named in
-// the text a user reads, and a shape it serves yields no text at all.
+// the text a user reads, and a shape it serves yields no text at all. The speculative round's seat
+// ownership rides the same shells: a decode override's seats take a round only on a model its owner claims.
 
 def private shell(n_layers : int64; recr_mask : uint64) : Model {
     var m = Model()
@@ -256,7 +259,7 @@ def private moe_shell(fmt : KqFmt) : Model {
 [test]
 def test_moe_metal_expert_formats(t : T?) {
     t |> run("the Metal routed block admits exactly the expert plane formats it has kernels for; every other format declines") @(t : T?) {
-        for (f in [KqFmt.q8, KqFmt.q51, KqFmt.k4, KqFmt.k5, KqFmt.k6, KqFmt.k3, KqFmt.q40, KqFmt.iq4xs, KqFmt.iq3s, KqFmt.iq3xxs, KqFmt.iq2s, KqFmt.iq2xs, KqFmt.iq2xxs]) {
+        for (f in [KqFmt.q8, KqFmt.q51, KqFmt.iq4nl32, KqFmt.k4, KqFmt.k5, KqFmt.k6, KqFmt.k3, KqFmt.q40, KqFmt.iq4xs, KqFmt.iq3s, KqFmt.iq3xxs, KqFmt.iq2s, KqFmt.iq2xs, KqFmt.iq2xxs]) {
             var m <- moe_shell(f)
             t |> success(moe_metal_ok(m), "{f} expert planes are served")
             delete m
@@ -427,6 +430,45 @@ def test_plan_room(t : T?) {
 }
 
 [test]
+def test_resident_hot_slots(t : T?) {
+    t |> run("the hot expert pool's slots: 64 beside the whole mirror, up to 32 out of the mirror's context, a count asked from the floor's room, none under four") @(t : T?) {
+        let mib = 1_048_576l
+        let column = 125l * mib
+        t |> equal(64l, resident_hot_slots(-1l, 9000l * mib, 12000l * mib, column, 512l), "unasked, 64 slots fit beside the whole mirror: the pool takes them and the mirror keeps its context")
+        t |> equal(40l, resident_hot_slots(-1l, 5000l * mib, 12000l * mib, column, 512l), "unasked, 40 fit beside the mirror: past 32, the mirror yields nothing")
+        t |> equal(32l, resident_hot_slots(-1l, 681l * mib, 5600l * mib, column, 512l), "unasked, five fit beside the mirror: the mirror's context yields the room of 32")
+        t |> equal(20l, resident_hot_slots(-1l, 681l * mib, 2500l * mib, column, 512l), "... and no more than the floor's room holds")
+        t |> equal(44l, resident_hot_slots(48l, 681l * mib, 5600l * mib, column, 512l), "a count asked is served from the floor's room")
+        t |> equal(16l, resident_hot_slots(16l, 9000l * mib, 12000l * mib, column, 512l), "a count asked under the room stands")
+        t |> equal(0l, resident_hot_slots(0l, 9000l * mib, 12000l * mib, column, 512l), "0 asks no pool")
+        t |> equal(0l, resident_hot_slots(-1l, 0l, 3l * column, column, 512l), "three slots do not pay for their submit: no pool")
+        t |> equal(0l, resident_hot_slots(-1l, -500l * mib, -100l * mib, column, 512l), "a plan already past its room takes none")
+        t |> equal(8l, resident_hot_slots(-1l, 9000l * mib, 12000l * mib, column, 8l), "a layer's experts cap its slots")
+    }
+    t |> run("the pool's share of the plan: the chain's scratch is charged with a pool and never without one, and the slots are sized past it") @(t : T?) {
+        let mib = 1_048_576l
+        let column = 125l * mib
+        let chain = RDEC_HOT_CHAIN_BYTES
+        let none = resident_hot_fit(0l, HOT_SLOTS_AUTO, 9000l * mib, 12000l * mib, column, 512l)
+        t |> equal(0l, none.slots, "no pool asked: no slots")
+        t |> equal(0l, none.chain_bytes, "no pool asked: the chain's scratch is not charged")
+        t |> equal(0l, none.hot_bytes, "no pool asked: no pool bytes")
+        let tight = resident_hot_fit(HOT_SLOTS_AUTO, HOT_SLOTS_AUTO, 0l, 3l * column + chain, column, 512l)
+        t |> equal(0l, tight.slots, "three slots past the chain's scratch: no pool")
+        t |> equal(0l, tight.chain_bytes, "... and nothing charged for the chain the pool would have ridden")
+        let some = resident_hot_fit(HOT_SLOTS_AUTO, HOT_SLOTS_AUTO, 64l * column + chain, 12000l * mib, column, 512l)
+        t |> equal(64l, some.slots, "64 slots fit beside the mirror once the chain's scratch is taken off the room")
+        t |> equal(chain, some.chain_bytes, "a pool charges the chain's scratch")
+        t |> equal(64l * column, some.hot_bytes, "the pool's bytes are its slots'")
+        let short = resident_hot_fit(HOT_SLOTS_AUTO, HOT_SLOTS_AUTO, 64l * column, 12000l * mib, column, 512l)
+        t |> equal(61l, short.slots, "the chain's scratch comes out of the same room: 320 MB is two and a half slots of 125 MB, so 61 fit where 64 did")
+        let capped = resident_hot_fit(HOT_SLOTS_AUTO, 16l, 9000l * mib, 12000l * mib, column, 512l)
+        t |> equal(16l, capped.slots, "a cap a first plan settled holds the count")
+        t |> equal(chain, capped.chain_bytes, "... with the chain still charged")
+    }
+}
+
+[test]
 def test_resident_arm_floor(t : T?) {
     t |> run("the smallest context a capped mirror arms at: the built-in floor, the env floor, and a caller's pin under either") @(t : T?) {
         t |> equal(4096l, resident_arm_floor(0l, 0l), "no env floor, no pin: the built-in 4096")
@@ -436,6 +478,39 @@ def test_resident_arm_floor(t : T?) {
         t |> equal(4096l, resident_arm_floor(0l, 8192l), "a pin over the floor leaves the floor alone")
         t |> equal(512l, resident_arm_floor(1024l, 512l), "a pin under the env floor wins over it too")
         t |> equal(256l, resident_arm_floor(0l, 64l), "a pin under 256 reads 256")
+    }
+    t |> run("a strict pin is the floor whatever its size: the mirror holds the context asked or the driver declines") @(t : T?) {
+        t |> equal(131072l, resident_arm_floor(0l, 131072l, true), "a strict pin over the built-in floor raises the floor to the pin")
+        t |> equal(131072l, resident_arm_floor(1024l, 131072l, true), "... over the env floor too")
+        t |> equal(648l, resident_arm_floor(0l, 648l, true), "a strict pin under the floor is the floor, as a plain pin is")
+        t |> equal(256l, resident_arm_floor(0l, 64l, true), "a strict pin under 256 reads 256")
+        t |> equal(4096l, resident_arm_floor(0l, 0l, true), "strict with no pin asks nothing: the built-in floor")
+        t |> equal(4096l, resident_arm_floor(0l, 131072l, false), "control: the same pin, not strict, leaves the floor alone")
+    }
+    t |> run("a plain MoE the card does not hold whole moves its first routed layers' experts to the host: the fewest that make the rest fit") @(t : T?) {
+        var need <- [for (_i in range(6)); 100l]
+        t |> equal(0l, resident_host_layers_fit(need, 600l), "every layer's experts fit: none to the host")
+        t |> equal(1l, resident_host_layers_fit(need, 599l), "one byte short: the first layer goes")
+        t |> equal(3l, resident_host_layers_fit(need, 300l), "half the room: half the layers")
+        t |> equal(6l, resident_host_layers_fit(need, 0l), "no room: every layer")
+        t |> equal(-1l, resident_host_layers_fit(need, -1l), "the dense planes alone pass the card: no count makes it fit")
+        var uneven <- [for (i in range(3)); 100l * int64(i + 1)]
+        t |> equal(1l, resident_host_layers_fit(uneven, 500l), "the first layers go first whatever their size: 200 + 300 fit after 100 leaves")
+        delete need
+        delete uneven
+    }
+    t |> run("the hot expert pool yields to a context asked whole: the mirror's floor is the plan's context, not 32768") @(t : T?) {
+        t |> equal(131072l, resident_hot_floor_ctx(131072l, true), "a strict 131072 keeps every position before a slot is counted")
+        t |> equal(32768l, resident_hot_floor_ctx(131072l, false), "unasked, the pool keeps the 32768 floor and takes the rest")
+        t |> equal(8192l, resident_hot_floor_ctx(8192l, false), "a plan under the floor keeps its own context either way")
+        t |> equal(8192l, resident_hot_floor_ctx(8192l, true), "a strict context under the built-in floor is the pool's floor too")
+    }
+    t |> run("the binding range over the regions bounds a strict context too, and a strict context past it is a decline, not a shorter mirror") @(t : T?) {
+        t |> equal(resident_region_ctx(131072l, 196608l, 4l), 49152l, "four regions share one binding's 196608 positions: 49152 each, under the 131072 asked")
+        t |> equal(resident_region_ctx(131072l, 196608l, 1l), 131072l, "one region holds the ask")
+        t |> success(resident_region_ctx_declines(131072l, 49152l, true), "asked whole, the 49152 a region holds is a decline")
+        t |> success(!resident_region_ctx_declines(131072l, 49152l, false), "unasked, the plan takes the 49152 and says so")
+        t |> success(!resident_region_ctx_declines(131072l, 131072l, true), "a region that holds the ask declines nothing")
     }
 }
 
@@ -450,5 +525,318 @@ def test_routed_slots_fit(t : T?) {
         } else {
             t |> skip("dasVulkan not present")
         }
+    }
+}
+
+let private PROBE_OWNED = "mtp_seat_probe"   //! a fake decode override whose seats carry an owner the probe answers
+let private PROBE_UNOWNED = "mtp_seat_probe_unowned"   //! ... and one whose seats carry none
+var private g_probe_owns = false
+var private g_probe_seat_calls = 0l
+
+[unused_argument(t, s, token, pos)]
+def private probe_decode(t : Model; var s : Session; token, pos : int64) : bool => false
+
+[unused_argument(t)]
+def private probe_owner(t : Model) : bool => g_probe_owns
+
+[unused_argument(t, s, tok, accepted)]
+def private probe_spec(t : Model; var s : Session; tok : int64; var accepted : int64&) : bool {
+    g_probe_seat_calls++
+    return false
+}
+
+[unused_argument(t, s, tok, k)]
+def private probe_round(t : Model; var s : Session; tok : int64; k : int64) : int64 {
+    g_probe_seat_calls++
+    return 0l
+}
+
+[unused_argument(t, sessions, toks, accepted)]
+def private probe_batch(t : Model; var sessions : array<Session?>; toks : array<int64>; var accepted : array<int64>) : int64 {
+    g_probe_seat_calls++
+    return 7l
+}
+
+//! how many of `mtp_spec_eval`, `mtp_spec_round` and `mtp_spec_eval_batch` reached a seat, how many opened the CPU round, and the batch tick's answer
+struct private SeatDispatch {
+    seat : int64
+    cpu : int64
+    batch : int64
+}
+
+//! the three seat-taking entries once each under the fake override `name` (its owner answering `owns`) on a Model shell;
+//! the session carries a parked token, so the CPU round's opening refuses it before any forward and counts as a CPU call
+[cold_path]
+def private seat_dispatch(name : string; owns : bool) : SeatDispatch {
+    for (nm in [PROBE_OWNED, PROBE_UNOWNED]) {
+        register_decode_override(nm, @@probe_decode)
+        register_mtp_spec_override(nm, @@probe_spec)
+        register_mtp_round_override(nm, @@probe_round)
+        register_mtp_spec_batch_override(nm, @@probe_batch)
+    }
+    register_mtp_seat_owner(PROBE_OWNED, @@probe_owner)
+    g_probe_owns = owns
+    g_probe_seat_calls = 0l
+    let prev = active_decode_override()
+    select_decode_override(name)
+    var m = Model()
+    var s : Session
+    s.mtp_pre_drawn = true
+    var out : SeatDispatch
+    try {
+        var acc = 0l
+        mtp_spec_eval(m, s, 1l, acc)
+    } recover {
+        out.cpu++
+    }
+    try {
+        mtp_spec_round(m, s, 1l)
+    } recover {
+        out.cpu++
+    }
+    var sessions : array<Session?>
+    let toks : array<int64>
+    var accepted : array<int64>
+    out.batch = mtp_spec_eval_batch(m, sessions, toks, accepted)
+    select_decode_override(prev)
+    out.seat = g_probe_seat_calls
+    delete s
+    delete m
+    delete accepted
+    return out
+}
+
+[test]
+def test_mtp_seat_owner(t : T?) {
+    t |> run("the speculative seats serve only a model the active decode override's owner claims; otherwise the CPU round runs") @(t : T?) {
+        let refused = seat_dispatch(PROBE_OWNED, false)
+        t |> equal(refused.seat, 0l, "an owner refusing the model reaches no seat")
+        t |> equal(refused.cpu, 2l, "mtp_spec_eval and mtp_spec_round open the CPU round")
+        t |> equal(refused.batch, 0l, "the batch tick steps each stream alone")
+        let unowned = seat_dispatch(PROBE_UNOWNED, true)
+        t |> equal(unowned.seat, 0l, "seats registered with no owner never take a round")
+        t |> equal(unowned.cpu, 2l, "... and the CPU round runs")
+        let owned = seat_dispatch(PROBE_OWNED, true)
+        t |> equal(owned.seat, 3l, "an owner claiming the model hands every entry to its seat")
+        t |> equal(owned.cpu, 0l, "no entry opened the CPU round")
+        t |> equal(owned.batch, 7l, "the batch tick answers the seat's count")
+    }
+}
+
+//! the CPU round's opening on a session carrying an unconsumed landed pick, under the unowned probe override
+[cold_path]
+def private round_refuses_pick() : bool {
+    register_decode_override(PROBE_UNOWNED, @@probe_decode)
+    let prev = active_decode_override()
+    select_decode_override(PROBE_UNOWNED)
+    var m = Model()
+    var s : Session
+    land_pick(s, 3l)
+    var refused = false
+    try {
+        var acc = 0l
+        mtp_spec_eval(m, s, 1l, acc)
+    } recover {
+        refused = true
+    }
+    select_decode_override(prev)
+    delete s
+    delete m
+    return refused
+}
+
+[test]
+def test_land_pick(t : T?) {
+    t |> run("a landed pick is the next sample_'s answer in place of a logits row, consumed once; a second landing before that, and a round opened on it, refuse") @(t : T?) {
+        var s : Session
+        s.logits |> resize(4)
+        s.logits[2] = 9.0
+        t |> equal(sample_(s, SamplingParams()), 2l, "with no pick landed the bare argmax reads the logits row")
+        land_pick(s, 3l)
+        t |> success(s.pick_ready, "the landing arms the pick")
+        t |> equal(sample_(s, SamplingParams()), 3l, "the next sample_ returns the pick, whatever the logits row holds")
+        t |> success(!s.pick_ready, "... and consumes it")
+        t |> equal(sample_(s, SamplingParams()), 2l, "the sample_ after it reads the logits row again")
+        land_pick(s, 5l)
+        var refused = false
+        try {
+            land_pick(s, 6l)
+        } recover {
+            refused = true
+        }
+        t |> success(refused, "a second landing before a sample_ is refused: the first pick would be lost")
+        t |> equal(s.pick_tok, 5l, "the refused landing left the first pick standing")
+        delete s
+        t |> success(round_refuses_pick(), "the CPU round's opening refuses a session whose landed pick nobody sampled")
+    }
+}
+
+let private ROUND_SEATS = "mtp_round_probe"   //! a fake decode override claiming every model, with a draft, a verify and a rollback seat
+let private ROUND_SEATS_NO_ROLLBACK = "mtp_round_probe_no_rollback"   //! ... and one with the draft and verify seats alone
+let private ROUND_DIM = 4l
+let private ROUND_CONV = 6l   //! the shell's conv history floats: what a snapshot must size its buffer to
+let private ROUND_STATE = 8l
+let private ROUND_TOKEN = 3l
+var private g_round_pick = 5l   //! the fake draft's token
+var private g_round_truth = 5l   //! the fake verify's row-0 pick: the draft accepts, any other token rejects
+var private g_round_rollback_ok = true
+var private g_round_draft_calls = 0l
+var private g_round_verify_calls = 0l
+var private g_round_rollback_calls = 0l
+
+[unused_argument(t)]
+def private round_owner(t : Model) : bool => true
+
+[unused_argument(t, s, token, pos, pick_only)]
+def private round_draft(t : Model; var s : Session; token, pos : int64; pick_only : bool) : int64 {
+    g_round_draft_calls++
+    return g_round_pick
+}
+
+//! the fake verify: serves, every row's pick landed (row 0's `g_round_truth`), row 0's hidden a constant row, the carry's
+//! watermark past its rows as the real seat leaves it
+[unused_argument(toks, pick_only)]
+def private round_verify(t : Model; var s : Session; toks : array<int64>; n, pos : int64; pick_only : bool) : bool {
+    g_round_verify_calls++
+    s.mtp_h_pos1 = pos + n
+    s.mtp_picks |> resize(n)
+    s.mtp_picks[0] = g_round_truth
+    for (i in range64(1l, n)) {
+        s.mtp_picks[i] = 9l + i
+    }
+    s.mtp_h0 |> resize(t.config.dim)
+    for (i in range64(t.config.dim)) {
+        s.mtp_h0[i] = 0.25
+    }
+    return true
+}
+
+[unused_argument(t, s, pos, a)]
+def private round_rollback(t : Model; var s : Session; pos, a : int64) : bool {
+    g_round_rollback_calls++
+    return g_round_rollback_ok
+}
+
+//! a NextN shell a round can open on: one head, a small width, room for the round's two rows; `recurrent` sets layer 0 recurrent
+def private round_shell(recurrent : bool) : Model {
+    var m = Model()
+    m.config.n_layer_nextn = 1l
+    m.config.n_layers = 1l
+    m.config.dim = ROUND_DIM
+    m.config.seq_len = 64l
+    m.config.recr_mask = recurrent ? 1ul : 0ul
+    return <- m
+}
+
+//! a session at position 1 with the carry's watermark there, the carry and the verify batch sized, and a recurrent state
+//! sized so a snapshot has something to copy
+def private round_session() : Session {
+    var s <- Session(n_past = 1l, mtp_h_pos1 = 1l)
+    s.mtp_h |> resize(ROUND_DIM)
+    s.mtp_vbatch |> resize(2l)
+    s.dn_conv_state |> reserve(ROUND_CONV)
+    s.dn_conv_state |> resize(ROUND_CONV)
+    s.dn_state |> reserve(ROUND_STATE)
+    s.dn_state |> resize(ROUND_STATE)
+    return <- s
+}
+
+//! the fake seats registered under both names, the counters zeroed, the round's outcome dialed: the draft `pick`, the verify's
+//! row-0 `truth`, the rollback seat's answer
+def private round_seats_arm(pick, truth : int64; rollback_ok : bool) {
+    for (nm in [ROUND_SEATS, ROUND_SEATS_NO_ROLLBACK]) {
+        register_decode_override(nm, @@probe_decode)
+        register_mtp_seat_owner(nm, @@round_owner)
+        register_mtp_draft_override(nm, @@round_draft)
+        register_mtp_verify_override(nm, @@round_verify)
+    }
+    register_mtp_rollback_override(ROUND_SEATS, @@round_rollback)
+    g_round_pick = pick
+    g_round_truth = truth
+    g_round_rollback_ok = rollback_ok
+    g_round_draft_calls = 0l
+    g_round_verify_calls = 0l
+    g_round_rollback_calls = 0l
+}
+
+//! one round of `ROUND_TOKEN` on `s` under the fake override `name`: the panic's text, "" where none fired
+[cold_path]
+def private round_under(name : string; var s : Session; m : Model; var hit : bool&) : string {
+    let prev = active_decode_override()
+    select_decode_override(name)
+    let why = panic_text_of() $ {
+        var acc = 0l
+        hit = mtp_spec_eval(m, s, ROUND_TOKEN, acc)
+    }
+    select_decode_override(prev)
+    return why
+}
+
+[test]
+def test_mtp_round_panics(t : T?) {
+    t |> run("the round's fail-closed exits on a Model shell: a pick ask beside a sampled walk panics before any draft; a rollback seat declining after its verify seat served panics naming the override") @(t : T?) {
+        round_seats_arm(5l, 7l, false)
+        var m <- round_shell(true)
+        var s <- round_session()
+        var sp = SamplingParams(temp = 0.7)
+        s.spec_params = unsafe(addr(sp))
+        s.pick_asked = true
+        var hit = false
+        let asked = round_under(ROUND_SEATS, s, m, hit)
+        to_log(LOG_INFO, "pick ask beside a sampled walk: {empty(asked) ? "no panic" : asked}\n")
+        t |> success(says(asked, "asked for a pick") && says(asked, "sample"), "a pick ask beside a sampled walk panics, naming both: '{asked}'")
+        t |> equal(g_round_draft_calls, 0l, "the panic fired before the draft")
+        s.spec_params = null
+        s.pick_asked = false
+        let declined = round_under(ROUND_SEATS, s, m, hit)
+        to_log(LOG_INFO, "rollback seat declining after a served verify: {empty(declined) ? "no panic" : declined}\n")
+        t |> success(says(declined, "rollback seat declined a reject after its verify seat served") && says(declined, ROUND_SEATS), "the reject panics naming the override whose rollback seat declined: '{declined}'")
+        t |> equal(g_round_verify_calls, 1l, "the verify seat served the round")
+        t |> equal(g_round_rollback_calls, 1l, "the rollback seat was asked once and declined")
+        delete s
+        delete m
+    }
+}
+
+[test]
+def test_mtp_verify_snapshot(t : T?) {
+    t |> run("mtp_verify_two's snapshot on a Model shell: a recurrent model with a verify seat that serves and no rollback seat takes the CPU snapshot before the seat, a non-recurrent one skips it, and a rollback seat that serves takes none - the reject rolling back through it and re-seeding the carry from row 0") @(t : T?) {
+        round_seats_arm(5l, 5l, true)
+        var m <- round_shell(true)
+        var s <- round_session()
+        var hit = false
+        let why = round_under(ROUND_SEATS_NO_ROLLBACK, s, m, hit)
+        t |> success(empty(why), "the round completed ({why})")
+        t |> success(hit, "the fake verify's row-0 pick is the draft: the round accepted")
+        t |> equal(s.n_past, 3l, "an accept commits the token and the draft")
+        t |> equal(long_length(s.mtp_snap_conv), ROUND_CONV, "recurrent, no rollback seat: the CPU snapshot ran before the seat - its conv buffer sized to the history")
+        t |> equal(long_length(s.mtp_snap_state), ROUND_STATE, "... and its state buffer to the state")
+        t |> equal(g_round_verify_calls, 1l, "the verify seat served")
+        delete s
+        delete m
+        var plain <- round_shell(false)
+        var ps <- round_session()
+        let why_plain = round_under(ROUND_SEATS_NO_ROLLBACK, ps, plain, hit)
+        t |> success(empty(why_plain) && hit, "the non-recurrent round completed and accepted ({why_plain})")
+        t |> equal(long_length(ps.mtp_snap_conv), 0l, "non-recurrent: no snapshot - nothing to restore")
+        round_seats_arm(5l, 7l, true)
+        let why_reject = round_under(ROUND_SEATS_NO_ROLLBACK, ps, plain, hit)
+        t |> success(empty(why_reject) && !hit, "the non-recurrent reject completed ({why_reject})")
+        t |> equal(g_round_rollback_calls, 0l, "a non-recurrent reject never reaches a rollback seat")
+        t |> equal(ps.n_past, 4l, "the reject commits the token alone: one row past the accepted round's position")
+        delete ps
+        delete plain
+        round_seats_arm(5l, 7l, true)
+        var rm <- round_shell(true)
+        var rs <- round_session()
+        let why_rolled = round_under(ROUND_SEATS, rs, rm, hit)
+        t |> success(empty(why_rolled) && !hit, "the recurrent reject through a serving rollback seat completed ({why_rolled})")
+        t |> equal(g_round_rollback_calls, 1l, "the rollback seat served the reject")
+        t |> equal(long_length(rs.mtp_snap_conv), 0l, "a rollback seat behind the verify seat: no snapshot was taken")
+        t |> equal(rs.n_past, 2l, "the reject commits the token alone")
+        t |> equal(rs.mtp_h_pos1, 2l, "the carry's watermark sits at the token's row")
+        t |> equal(rs.mtp_h[0], 0.25, "the carry re-seeds from the verify's row-0 hidden")
+        delete rs
+        delete rm
     }
 }

@@ -21,6 +21,7 @@ require math   // the tower-parity statistics
 require dasllama/dasllama_gguf   // gguf_shard_paths — split models tier on their TOTAL size
 require dasllama/dasllama_common   // decode_ — the eyeball rail detokenizes through the model
 require dasllama/dasllama_env
+require dasllama/dasllama_gpu_resident   // resident_mirror_dtype — the mirror codec the box arms
 require _compares public
 
 // Models larger than this are large-tier. 6 GiB cleanly splits the ~5GB-and-under carriers
@@ -29,7 +30,7 @@ let LARGE_TIER_BYTES = 6ul * 1024ul * 1024ul * 1024ul
 
 //! The KV codec a session takes to be served by the armed mirror: f16, or f32 where DASLLAMA_VK_KV32
 //! arms f32 mirrors - a session on the other codec rides the CPU rails.
-def mirror_kv_dtype() : KVDtype => g_env_vulkan.vk_kv32 != 0l ? KVDtype.f32 : KVDtype.f16
+def mirror_kv_dtype() : KVDtype => resident_mirror_dtype()
 
 let SUPPRESSED_LOGIT = -1.0e30   //! a pinned id's logit on both arms
 
@@ -66,20 +67,7 @@ def parity_full_mode() : bool {
 // only arm blocks whose name matches a token run. The skip is LOUD (t |> skip) so a filtered
 // run can never masquerade as full coverage. Unset/empty = every arm runs. Drive through
 // modules/dasLLAMA/tests/run.das — see modules/dasLLAMA/tests/CLAUDE.md.
-def arm_on(t : T?; name : string) : bool {
-    let filter = g_env_test.test_arms
-    if (empty(filter)) {
-        return true
-    }
-    for (tok in split(filter, ",")) {
-        let tk = strip(tok)   // "arm12, batch" — the comma-adjacent space must not defeat the match
-        if (!empty(tk) && find(name, tk) >= 0) {
-            return true
-        }
-    }
-    t |> skip("arm '{name}' filtered out (DASLLAMA_TEST_ARMS={filter})")
-    return false
-}
+def arm_on(t : T?; name : string) : bool => filter_on(t, g_env_test.test_arms, "DASLLAMA_TEST_ARMS", "arm", name, false)
 
 // Family filter for the model-loading suites: DASLLAMA_TEST_FAMILY = comma-separated family
 // tokens (llama, qwen2, qwen3, phi3, gemma, ultravox, whisper, voxtral) matched EXACTLY — not
@@ -87,17 +75,21 @@ def arm_on(t : T?; name : string) : bool {
 // listed family run; model-free blocks (kernel units, the image mechanics arm) carry no tag and
 // always run. Loud-skip contract identical to arm_on. Drive through run.das --family — the
 // profiling cadence gate: a llama-format round re-verifies the llama family only.
-def family_on(t : T?; name : string) : bool {
-    let filter = g_env_test.test_family
+def family_on(t : T?; name : string) : bool => filter_on(t, g_env_test.test_family, "DASLLAMA_TEST_FAMILY", "family", name, true)
+
+//! true when `filter` (the comma list `env` holds) is empty or one of its stripped tokens matches `name` - equal to it
+//! when `exact`, a substring of it otherwise; else the cell has registered the loud skip naming `what`
+def private filter_on(t : T?; filter, env, what, name : string; exact : bool) : bool {
     if (empty(filter)) {
         return true
     }
     for (tok in split(filter, ",")) {
-        if (strip(tok) == name) {
+        let tk = strip(tok)   // "arm12, batch" — the comma-adjacent space must not defeat the match
+        if (exact ? tk == name : (!empty(tk) && find(name, tk) >= 0)) {
             return true
         }
     }
-    t |> skip("family '{name}' filtered out (DASLLAMA_TEST_FAMILY={filter})")
+    t |> skip("{what} '{name}' filtered out ({env}={filter})")
     return false
 }
 
@@ -115,6 +107,50 @@ def log_gen_texts(m : Model; tag : string; cpu_ids, gpu_ids : array<int64>) {
     to_log(LOG_INFO, "{tag} GPU text: {eyeball_text(m, gpu_ids)}\n")
 }
 
+//! `steps` greedy decode steps through `s` from BOS at position 0: each step's pick into `ids`, the last step's logits into `logits`
+def greedy_ids(tr : Model; var s : Session; steps : int; var ids : array<int64>; var logits : array<float>) {
+    ids |> reserve(steps)
+    var token = 1l   // BOS
+    var pos = 0l
+    for (_i in range(steps)) {
+        forward(tr, s, token, pos)
+        pos++
+        token = argmax(s, tr.config.vocab_size)
+        ids |> push(token)
+    }
+    logits := s.logits
+}
+
+//! `a`'s root mean square, accumulated in double; 0 for an empty row
+def rms(a : array<float>) : float {
+    var ss = 0.0lf
+    for (v in a) {
+        ss += double(v) * double(v)
+    }
+    return float(sqrt(ss / double(max(long_length(a), 1l))))
+}
+
+//! sqrt(sum (got - ref)^2 / sum ref^2), accumulated in double: `got`'s distance from `ref` in `ref`'s magnitude; two lengths panic
+def rel_l2(got, ref : array<float>) : float {
+    if (long_length(got) != long_length(ref)) {
+        panic("rel_l2: {length(got)} elements against the reference's {length(ref)}")
+    }
+    var num = 0.0lf
+    var den = 0.0lf
+    for (g, r in got, ref) {
+        let d = double(g) - double(r)
+        num += d * d
+        den += double(r) * double(r)
+    }
+    return float(sqrt(num / max(den, 1e-30lf)))
+}
+
+//! `rel_l2` over the first min(length) elements of each - the deliberate trim of two runs whose lengths may part (a free run, a control)
+def rel_l2_common(got, ref : array<float>) : float {
+    let n = min(long_length(got), long_length(ref))
+    return rel_l2(copy_span(got, 0l, n), copy_span(ref, 0l, n))
+}
+
 // the shared statistic core of the two tower_parity forms below
 struct TowerParityStats {
     max_ad : double
@@ -130,7 +166,6 @@ def tower_parity_stats(t : T?; tag : string; ref, got : array<float>; var st : T
     if (long_length(ref) != long_length(got) || empty(ref)) {
         return false
     }
-    var l2n = 0.0lf
     var na = 0.0lf
     var nb = 0.0lf
     var dot = 0.0lf
@@ -138,14 +173,13 @@ def tower_parity_stats(t : T?; tag : string; ref, got : array<float>; var st : T
         let a = double(rv)
         let b = double(gv)
         st.max_ad = max(st.max_ad, abs(a - b))
-        l2n += (a - b) * (a - b)
         na += a * a
         nb += b * b
         dot += a * b
     }
-    st.rms = sqrt(na / double(long_length(ref)))
+    st.rms = double(rms(ref))
     st.rel_elem = st.max_ad / max(st.rms, 1e-30lf)
-    st.rel_l2 = sqrt(l2n) / max(sqrt(na), 1e-30lf)
+    st.rel_l2 = double(rel_l2(got, ref))
     st.cos = dot / max(sqrt(na) * sqrt(nb), 1e-30lf)
     st.norm_dev = abs(sqrt(nb) - sqrt(na)) / max(sqrt(na), 1e-30lf)
     to_log(LOG_INFO, "{tag}: rel_elem={st.rel_elem} rel_l2={st.rel_l2} cos={st.cos} norm_dev={st.norm_dev} maxdiff={st.max_ad} rms={st.rms} n={long_length(ref)}\n")
@@ -258,4 +292,9 @@ def model_available(t : T?; path : string) : bool {
         return false
     }
     return true
+}
+
+//! true under the JIT with the model at `path` stocked; else the cell has registered the loud skip and its caller returns
+def jit_model_available(t : T?; path : string) : bool {
+    return jit_only(t) && model_available(t, path)
 }

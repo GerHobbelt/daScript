@@ -275,12 +275,7 @@
     (fill non-zero when hasbias=0), the neoxxhasbias confound in the rope-store quant mirrors,
     kq gemv weight reads past exactly-sized buffers (blocks MTL_SHADER_VALIDATION=1 runs), the
     copy_row gate's tg=64 vs production 256, the dead b4 pad-column clamp cell, the q8 region
-    fixture's sel collapsing to a k-slot function (routing untested, padding only), and the 12
-    prefill-file gates still on dump-less tag-less local compares. Also latent: the two rope
-    oracles index tcos/tsin at [0, hs/2) while sizing rot/2 - reads OOB and ropes the
-    pass-through tail the moment a cell pairs neox=false with rot < hs (the flat gate's
-    identity-pad pattern is the fix). Also: migrate the prefill file's tag-less mismatch trio
-    to the shared dumping compares (~25 call sites).
+    fixture's sel collapsing to a k-slot function (routing untested, padding only).
 
 20. **`vk_moe_would_accept` / resident probes vs the wg-cap decline.** The resident decline
     for an over-cap batched-attention class now lives in `vk_rdec_prepare` (live path only).
@@ -1339,22 +1334,13 @@
    top-level key absent from `README.md`. (k) `REVIEW_IMAGE`: an addition on the left of a
    `> msize` compare in `dasllama_image.das`; `REVIEW_TTS`: `styletts2_synthesize` carries
    `[hot_path]`; a family name or tag string in the two shared TTS files.
-118. **Per-box profiles for the classes the fat exe ships - after dasllama-server ships and
-   releases run.** Two of the same nature, each a box and a mint rather than fat-mode plumbing
-   (`modules/dasLLVM/fat_mode_plan.md`, Later). (a) M4/M5: the shipped `arm-i8mm` profile is
-   one mint for M2 through M5, and on the M4 Pro its picks lose ~5% to the `arm-neon` baseline
-   on the CPU (562 vs 593 tok/s pp512 E2B q8, 3 reps); M4 and M5 carry SME and M2/M3 do not,
-   so an `arm-sme` class is the boundary - one `sme` line in `das_cpu_supports` (darwin sysctl
-   `hw.optional.arm.FEAT_SME`), one `JIT_CPU_CLASSES` row, one mint. (b) Intel AMX: the shipped
-   `x86-amx` profile crowns no AMX perm, so the class ties `x86-vnni512` (2888 vs 2949 tok/s
-   pp512 Qwen3-0.6B q8 on the 8488C). The session-5 SPR record says why: `nrsplit1` ties vnni at
-   24 lanes, wins at 48 (+15% geomean) and wins the classifier everywhere (1.45-1.84x), but the
-   tuner's confirm rejected the crown end to end (2969 vs 3218 tok/s) because the gemv companion
-   rides the family's stamp and decode lost 8.5%. The fix is families as separate backends - the
-   tile on AMX, the gemv on vnni, mixed per slot by the `set_batch_backend` hybrid rail - then a
-   re-mint on an AMX box at the served lane count with the confirm; and the AMX class must never
-   inherit the vnni class's `bias128` perm (-15% on AMX). Both land as profile files the fat exe
-   picks up with no plumbing change; the AWS SPR AMI (`dasbox-spr-20260710`) is the AMX box.
+118. **A per-box profile for the M4/M5 - after dasllama-server ships and releases run.** A box
+   and a mint rather than fat-mode plumbing (`modules/dasLLVM/fat_mode_plan.md`, Later). The
+   shipped `arm-i8mm` profile is one mint for M2 through M5, and on the M4 Pro its picks lose
+   ~5% to the `arm-neon` baseline on the CPU (562 vs 593 tok/s pp512 E2B q8, 3 reps); M4 and M5
+   carry SME and M2/M3 do not, so an `arm-sme` class is the boundary - one `sme` line in
+   `das_cpu_supports` (darwin sysctl `hw.optional.arm.FEAT_SME`), one `JIT_CPU_CLASSES` row, one
+   mint. It lands as a profile file the fat exe picks up with no plumbing change.
 
 119. **The bundle's second exe carries its own runtime.** The watchdog ships as a standalone
    exe (18-31 MB per platform) because `bin/watchdog` links the runtime statically, while the
@@ -1472,17 +1458,20 @@
     on the K-quant path (the f32 dequant `read_linear` hands `linear_take_kq`, released per tensor
     but sized by the largest). The instrument is the resident set sampled per half second with the
     `--limit` one and two forms, and the das leak profiler on the run.
-132. **The format recipe's test ladders.** `tests/test_kquant.das` builds fixtures, transcodes,
-    dequants, dots, repacks and calls the stubs through the same `fmt == 4/5/6/40` chains in five
-    gates (28 arms for one format) and raises `_cyclomatic_complexity` / `_function_length` per
-    format; `harness/gen_tune_probe.das` repeats the shape (9 arms) and its test mode gates a hand
-    list of families separate from the tune-mode family array. Unquirked: per-format dispatch
-    helpers in one `_kq_fixtures.das` shared by the test and the harness (`kq_transcode_sb`,
-    `kq_dequant_sb`, `kq_dot`, `kq_repack`, `kq_gemv_gen`, `kq_tile_gen`), each a single ladder,
-    and one family array both probe modes walk. The Metal test ladders are the same shape as
-    nested ternaries (`kq_gemv_gate`, `kq_mvb_gate`, `kq_mulmm_gate` and the fixtures pick MSL
-    sources, entries, fastmath and tgmem names per format, an `else` that means k6): one
-    per-format record per kernel family, indexed by format.
+132. **The format recipe's remaining ladders.** `harness/gen_tune_probe.das` packs its synthetic
+    disk blocks through `pack_kq_disk_block`, a twelve-arm `fmt ==` chain beside the stamped
+    walks `tests/_kq_dot.das` already runs per `KqFmt`, and `synth_block`
+    (`tests/_kq_fixtures.das`) picks a format's synthetic block through a twelve-deep ternary
+    whose `else` means k6. The Metal gates still pick per format
+    by chain: in `tests/test_metal_gemv_kernels.das` `kq_gemv_gate` maps its variant to a format
+    id through a twelve-deep ternary whose `else` means k5, and `kq_gemv_stamp` /
+    `kq_mvb2_stamp` / `kq_mvb4_stamp` / `kq_mvb8_stamp` are `if` chains whose fallthrough is k6;
+    in `tests/test_metal_gemm_kernels.das` `kq_mm_stamp`, `kq_mm_th128_kernel` and
+    `kq_mm_tensor_kernel` are the same chains, `kq_dbuf_gate`'s `thdb128` twin and
+    `moe_mulmm_kq_gate`'s k4/k5/k6 trio are ternaries and `kq_dq_split` is a format list. A
+    format missing from a chain tests another format's kernel under its own tag. Unquirked: the
+    disk-block pack and the synthetic block a stamp over the format, and each Metal kernel pick a per-format record
+    indexed by format that reds on a format with no row.
 134. **The tune sidecar's identity lacks the generator hash.** A sidecar minted while a family's
     generator stubs declined records `"<fmt>q8_tile_gen" : "reference"`; staleness keys on the
     binary's mtime and the emitter is `.das`, so landing the emitter arm invalidates nothing and
@@ -1819,6 +1808,80 @@
     candidate-list sampler's `PERF_LEDGER.md` entry reads its rates off `dasllama-cli`'s stats
     line. Done = `--temp/--top-k/--top-p` on the tg row, a `tg128@sampled` cell beside `tg128`,
     and the ledger entry re-minted from it.
+
+172. **The n-gram hash table as a mapped view.** Qwen3.8-Flash-Next's `per_layer_token_embd` is
+    28.8 GB of gather-only rows the load copies into `Model.ngram_tab`; every other read of a
+    model file leaves the mapping when the load ends. Done = the table stays a borrowed view over
+    a mapping the Model owns (the `.dlim` plane borrow is the precedent: `image_map` plus the
+    finalizer's release), so a cold start pays no copy and the pages the OS evicts come back
+    from the file. The image-mapped table is where the gather's cost shows: on the M5 Max the
+    CPU gather of a 512-row window reads 51 ms with the pages warm (the `ple_gather` bucket, 11%
+    of a 447 ms Metal pp512 window, the only host bucket) and seconds with them cold - the two
+    pp512 runs after the image mint read 518 +/- 121 and 666 +/- 290 tok/s against 1293 +/- 31 warm,
+    the 16 random 90-byte rows a token touches each faulting a 16 KB page from disk. The lever
+    beyond the view is the gather on the device (the table as a Metal plane, the rows read where
+    the key/value GEMMs consume them) or the table pinned resident where the box has the room.
+
+173. **The CPU decode of Qwen3.8-Flash-Next is compute-bound in the IQ3_S expert GEMVs.** On the
+    M5 Max at 18 threads the token reads 57 ms (17.5 tok/s in the profile window, 19.0 +/- 0.2 on
+    the tg128 row; llama.cpp 19.9 +/- 0.4). The forward buckets per token: the gate/up expert
+    GEMVs (`mm_moe`, IQ3_S) 22 ms for 14 MB of planes - 0.6 GB/s, a decode cost, not a
+    bandwidth one; the attention block 18 ms (`mm_qkv` 8.8, `mm_wo` 3.4, `attn` 2.9); the
+    hyper-connection mixes 5.4 ms; the down expert GEMVs (`mm_moe_dn`, iq4nl32 on the gen family)
+    3.9 ms; the head 2.7 ms. The IQ3_S rail gathers each superblock's grid rows into a byte panel
+    before its dots (`emit_iq3s_gather`), and that gather is the token's largest cost. The lever
+    landed as the `iq3s4` served form (`ARCHITECTURE_ENGINE_FORMATS.md#served-form`, the
+    `DASLLAMA_IQ3S_SERVE` knob): on the same binary and box, warm passes, grid 134.1 +/- 2.0 pp512 /
+    18.98 +/- 0.13 tg128 against lut 140.6 +/- 0.7 / 26.9 +/- 0.5 (llama.cpp 107.8 / 19.9); the decode
+    profile 59.5 -> 40.3 ms a token, `mm_moe` 25.1 -> 6.7 ms, every other bucket unchanged (the
+    attention block 20 ms, the hc mixes 6, `mm_moe_dn` 3.5-5, the head 2.9); the planar image
+    98.1 -> 105.5 GB. Still open: the grid form's emitter path - a dword read of the qs column in
+    the row-group form (`ARCHITECTURE_CPU_KERNELS.md#grid-decode-forms` says it did not pay on the panel
+    form's box; unmeasured on the M5) buys at most 1.3-1.5x on a bucket the codebook form beats 3.7x,
+    so it is a GPU-rail question (Vulkan serves the `iq3s4` arithmetic form under `DASLLAMA_IQ3S_SERVE=auto`, Metal keeps the grid) more than a CPU one; the attention block
+    (`mm_qkv` 8.8, `mm_wo` 3.4, `attn` 2.9 ms) is the CPU token's largest bucket now, and the
+    Flash-Next CPU tg128 board row is not re-minted yet.
+
+175. **A cold image costs its first tokens, not its map.** The Flash-Next planar image maps in 81 ms
+    on a purged page cache and 65 ms warm; the decode profile's 128-token window (`decode_prof -n 128
+    -t 18`, the lut image with the head) reads 99.8 ms a token cold against 39.5 warm, and the whole
+    gap sits in the routed expert stacks - `mm_moe` 5.75 s against 0.85 s, `mm_moe_dn` 2.91 s
+    against 0.45 s - while the attention block, the mixers and the head read the same in both
+    windows, since every token touches their planes and the first fault warms them. Ten of 512
+    experts a token fault their pages in one by one over the window. The mint pass itself is 57 s
+    (planes write 44 s at 2.1 GB/s). `prefetch_map` (madvise WILLNEED / PrefetchVirtualMemory) on
+    the image map is SYNCHRONOUS on macOS: behind a purge it reads the 103 GB in 15.0 s at the map
+    and the window then runs warm (40.2 ms a token), so the cold process wall stays 41 s either way,
+    and a WARM map pays 2.5 s for the page walk in place of 65 ms - so it rides its own knob,
+    `DASLLAMA_PREFETCH_IMAGE`, off by default. Open = whether the server arms it (a process that runs
+    for hours pays 2.5 s once), and a pool-side sequential touch of the routed experts' stacks alone
+    (not the gather-only PLE table, not the planes the first token warms) as the arm that moves the
+    total: the window's random 4 KiB faults read a fraction of the image slower than a sequential
+    pass reads the stacks.
+
+176. **The `yarn_log_multiplier` YaRN arm.** The loader refuses a file whose
+    `rope.scaling.yarn_log_multiplier` is not 0 (the DeepSeek-2 lineage replaces the 0.1 in the
+    `1 + 0.1 ln(s)` magnitude with it, and the cancel-and-reapply the reference does around the
+    stored `attn_factor` is unwritten). Done = the arm, on a DeepSeek-class carrier that ships the key.
+
+177. **The CPU verify writes every row's n-gram ring slot, and the ring is exactly the conv
+    window.** `ple_apply_row` lands row p's conv input at slot `(pos + p) % rows` before its own conv
+    reads, in row order, so within one batch no row reads a later row's slot; but slot `pos + p`
+    aliases position `pos + p - rows`, the oldest tap of the conv at `pos + p - 1`. At depth 1 the
+    rejected row's slot is one no later conv reads; at depth 2 and past, a rejected row `p >= a + 2`
+    clobbers a slot the conv at the next real token (`pos + a + 1`) still reads, and
+    `mtp_state_snapshot` saves the window (`ple_prev`) but not the ring rows. The Metal verify takes
+    the prefill's panel form and commits the accepted rows alone (`commit_ple_rows`). Done = the CPU
+    round snapshots the k ring rows its verify overwrites and restores them on a reject (k x hc_dim
+    floats, `mtp_snap_ple` beside the window), or takes the panel form; a depth-2 forced-reject
+    leg on the Flash-Next counting fixture in `test_mtp.das` (the depth-1 leg cannot see it).
+
+178. **A CPU verify of two rows costs two decode steps on Flash-Next.** `ffn_moe_prefill` takes the
+    per-position GEMV route under `ATTN_NARROW_NPOS`, which took the verify from 77 to 67 ms, and the
+    rest of the 2x is the dense sites' q8q8 tile padding two rows to a four-token tile - the
+    speculative round on the CPU rail is slower than plain decode on this model (CPU tg128 with MTP
+    is a loss at 75% accept). Done = a two-token tile or a GEMV-pair route for the narrow verify's
+    dense sites, measured as the CPU `--mtp-ab` row.
 168. **`harness/tune_kernels.das`'s validation re-times CPU benches after the backend pin.**
    `run_validation` re-runs the changed CPU benches after `dot_q8q8_laneq4x4` has pinned one
    matmul backend for the rest of the process, so a re-timed bench runs against the pinned
@@ -1842,3 +1905,187 @@
    cells stand against it until the rig fetches jfk (it is whisper.cpp's sample) and the gemma4a
    clip is replaced by a traceable one or built by the test. Done = both clips come from the rig
    or the repository and the cells' expectations are re-pinned on them.
+
+181. **`test_vision_chat.das`'s deepstack cell is SIGKILLed on the pod under its 62 GB cgroup cap.**
+   `test_vision_chat_deepstack` (Qwen3-VL 4B, the 300-row mrope image quantum declined to the CPU
+   prefill loop - "the `vulkan` override does not rope from per-row tables") dies with "Killed"
+   (exit 137) in every stocked run on the RTX PRO 4500 pod since 09-24, on master's code, while
+   the container's `memory.max` reads 62 GB against the box's 251 GB (`memory.events` counts 18
+   kills); the file's earlier cells pass, so a `--changed` run on the pod reads one red it did not
+   cause. Measured alone (the cell under a 2 s sampler of the cgroup and the process): the daslang
+   process itself reaches 60.7 GB resident before the kill, page cache aside - a 4B model and a
+   300-row quantum have no business there. The suspect is the session's K/V at the file's full
+   context on the CPU rails (a Qwen3-VL 4B session at 262144 positions in f32 is ~77 GB of cache,
+   and the CPU loop the mrope quantum falls to is the one path that touches it row by row), so
+   the fix is the cell's session sized to its turn (or the cache grown lazily on that path), never
+   a documented pod cap.
+
+182. **`test_scheduler_media_splice`'s span control reads vacuous on the Zen2 box.** The cell's
+   "the span moves the stream (the flag is load-bearing here)" assert - eight greedy SmolLM2 tokens
+   under the non-causal span `[1, np)` must differ from the causal stream's - fails on Boris's box
+   (Windows, the x64-gen JIT backend, `DASLLAMA_GPU` armed or not, single-threaded or not) with the
+   two streams equal, on master's code (the arc base 20981ff0b reads the same), while the pod's
+   Linux runs pass it; a near-tie the box's kernels round the other way, so the control cannot tell
+   a working flag from a dropped one here. Done = a control that reads on both boxes - a logits
+   witness of the span rows against the causal rows, or a prompt whose top-1 the span moves on
+   every backend.
+
+183. **`test_gpu_resident_hybrid_kq_q8out`'s one-window cell misses its bar on the RTX 5060 Ti.**
+   The mixed twin (Qwen3.5-0.8B-Q4_K_M-q8out: K-quant qkv/z, a Q8_0 out plane) at step 4 (fed
+   2212) reads `logits: resident within 0.7384794 of the CPU chain (maxdiff 0.9107542)` under
+   coopmat mode 4, the same figures on three runs and on the arc base 20981ff0b, while the pure
+   K-quant twin's cells and every other step pass; the bar was read on the pod. Done = the drift's
+   cause named (the o feed's Q8_0 requant rounding beside the x feed's f16 rows is the suspect, the
+   `_resident_regions` census witness the instrument) or the bar re-read on this box with the
+   one-step-off control still past it.
+
+184. **The fp16 tiles are unwritten.** The fp16 tiles of Granite Rapids (`amx-fp16`, probed,
+   gating nothing) are a perm variant of the bf16 emitter with `TDPFP16PS` and an f16 panel - the
+   same panel companions with an f16 convert in place of the bf16 one, an f16 activation widen,
+   and one more decline rail. Done = the variant raced against the bf16 crown on an AMX box.
+185. **The confirm arm reads an empty stamp from its child.** `confirm_winner` in
+   `harness/gen_tune_probe.das` logs `arm expected stamp '<seat>' but the child stamped '' -
+   scoring 0` for both arms and then scores them anyway (the mint on `i-02a87cabc8fcd2e4c`
+   confirmed the q8 bf16 crown on those scores). Done = the child's stamp line reaches the parser,
+   or the check is dropped as the dead code it is.
+186. **A Q4_1 tensor refuses the load.** bartowski's `Llama-3.2-1B-Instruct-Q4_0.gguf` keeps
+   `ffn_down` at Q4_1 (GGUF type 3), and the loader stops at `type 3 not supported`; the reference
+   build's Q4_0 carriers routinely mix one. Done = Q4_1 decoded to the q51-style per-32 (d, m) plane, or the
+   loader names the tensor and the format it wants re-quantized to.
+188. **The bf16 panel scatter is written three times.** The
+   folds left unapplied: the int8 walk inside `kq_batch_cell_gen` onto `bf16_walk` (the same
+   control flow at one group and the tile's four tokens, and since the walk's `tile4` arm the
+   same walk `kq_batch_cell_bf16` runs on a range shorter than the tile - it needs its own
+   before/after pair);
+   `q8q8_bias_sums` onto `b32g_fill_bsums` under a scale argument (the folded prologue emits
+   different IR, so it needs a before/after race too);
+   `q8q8_panel_gen` and its s16 twin over one row scatter shared with `kq_panel_rows_bf16` (a
+   shared reference body is left out of line in the panel stubs' clones - a race too). Done = each fold applied and the
+   x64 emission rail and the AMX TEST gate green, or the fold refused in an architecture section.
+189. **A superblock family's bf16 crown passes no end-to-end confirm.** `confirm_winner` runs for
+   the q8 family alone, so a k/iq family's `amx_bf16` crown is the one-lane race's verdict; on
+   Granite Rapids the carriers confirm it by hand (`PERF_LEDGER.md`, the AMX bf16 tile arc), and
+   Sapphire Rapids - the same `x86-amx` class - is unmeasured. Done = the confirm races one
+   superblock carrier (`DASLLAMA_CONFIRM_MODEL`'s K-quant twin), or a Sapphire Rapids carrier row
+   in the ledger.
+190. **The bf16 walk's token block is one number for every shape and every lane count.**
+   `bf16_token_block` answers 512 in whole tiles, and a kernel race splits on the weight's
+   output width and on the lanes a core carries. The race [debug-jit]: Granite Rapids
+   `c8i.4xlarge` (8 cores), `DASLLAMA_ALLOW_UNTUNED=1 DAS_JOBQUE_THREADS=<lanes> bin/daslang -jit
+   -no-module-cache modules/dasLLAMA/harness/token_block_race.das` (the `x86-amx` class profile,
+   `DAS_TUNE_POLICY` unset), k4 on the `x64-gen` backend at tile form 2 and ntok 512, the second
+   of two passes a lane count; best ms (cv %) at a block of 128 / 256 / 384 / 512. K 8192 x 2048
+   rows: 4.169 (0.3) / 3.648 (0.4) / 3.673 (0.4) / 3.415 (0.4) at 16 lanes, 4.525 (2.6) / 4.028
+   (1.8) / 4.016 (1.3) / 3.782 (2.6) at 8. K 2560 x 9728 rows: 4.774 (1.0) / 4.107 (0.9) / 4.513
+   (1.5) / 4.269 (2.8) at 16 lanes, 4.498 (1.0) / 3.562 (2.9) / 4.165 (1.0) / 5.148 (2.1) at 8.
+   K 2048 x 8192 rows: 3.489 (1.0) / 2.822 (1.6) / 2.871 (1.1) / 3.079 (1.4) at 16 lanes, 3.114
+   (2.7) / 2.547 (2.6) / 2.592 (1.9) / 2.830 (2.0) at 8. Done = the block a tuner knob raced per
+   lanes-per-core regime, confirmed end to end on the 1B and 4B carriers.
+191. **The generated tier branches on format ids as literals.** The emitter reads `te.kq == 33`
+   and the runtime ladders `fmt == 4` (`kq_layout_of`), and the bf16 panel code follows them
+   (`kq_is_grid`, `panel_scales`, `panel_quads`, `panel_ioff`, the panel stubs' ids, and
+   `kq_ref_row_dot`'s
+   ladder, which spells the id set of `kq_reads_packed_planes`), with `256l` and `32l`
+   for the superblock and block widths; `REVIEW_KQ_FORMATS.md` wants the id resolved through
+   `kq_fmt_of_id` and the widths by name. Done = the generated tier's ladders over `KqFmt`
+   members, old and new in one pass, the x64 emission rail and the AMX TEST gate green.
+193. **The cells the kernel-unit definition reaches through a helper are unaudited.** A cell
+   that runs a kernel through a helper in its file or a `_*.das` module (`_kq_dot.das`,
+   `_metal_kernel_common.das`) is a kernel-unit cell (`tests/REVIEW_KERNEL_CELLS.md`), and owes
+   the CPU-oracle compare, the sentinel fill, the control and the logged largest difference; no
+   pass has read those cells against the rules. Done = each such cell read, fixed or recorded.
+194. **No gate holds a class profile to the scope's kernel census.** A
+   `performance/defaults/<class>.tune-defaults.json` that lacks a kernel the `dasllama` scope
+   demands reads incomplete on every box that adopts it, and the box re-runs the tuner at each
+   start; `performance/REVIEW.das` checks the provenance and not the kernel set. Done = the gate
+   compares each profile's kernel names with the scope's `[tune]` / `[tuned]` census and reds a
+   missing or an unknown name.
+195. **Sixteen loops that ask to vectorize do not, on arm64, and nothing names them.** A cold
+   `-jit` compile of `utils/dasllama-server/cli.das` (repo root) on an Apple M5 Max,
+   `DAS_TUNE_POLICY` unset, prints sixteen `loop not vectorized` warnings, each beside a remark
+   with its reason - fourteen `instruction return type cannot be vectorized`, two `call
+   instruction cannot be vectorized` - and each at `<unknown>`, so the loop and its module are
+   unread. Done = each loop named (the emitter attaches a location to a loop it hints), then
+   vectorized or its hint dropped.
+196. **Test and harness fixtures are written more than once.** The K-quant planes with their
+   Q8_K activations: `build_planes` (`harness/token_block_race.das`), `build_pool` and the
+   activation block under it (`harness/moe_kq_probe.das`), `build_kq_fixture`
+   (`harness/gen_tune_probe.das`), beside `build_kq_region` (`tests/_kq_fixtures.das`). The
+   bf16 envelope, 1e-2 of the image's largest magnitude: `BF16_ENVELOPE_REL` with
+   `bf16_envelope` (`harness/_gen_probe_fixture.das`), the `BF16_ENVELOPE` bar
+   (`tests/test_prefill_cpu_kernels.das`), `held_bf16` (`tests/test_q8q8_family.das`). The
+   two-thread race: `walk_thread` with `walk_two_contexts` beside `plane_thread` with
+   `xbf16_two_contexts` (`tests/test_prefill_cpu_kernels.das`), one start barrier, round loop and
+   assert set under two round bodies. The server rig: `with_mtp_server`
+   (`utils/dasllama-server/test_openai_server_mtp.das`, repo root) spells the Metal mode as a
+   `bool` where `with_llama_server` takes a `MetalMode`, and the ready poll is written in every
+   `with_*_server` rig of that folder. Elapsed seconds off `get_time_usec`:
+   `tests/fio/popen_timeout_tree.das`, `seconds_since` (`utils/internal/preflight/main.das`),
+   `now_seconds` (`utils/watchdog/watchdog.das`), all repo root. Done = one fixture module the
+   tests and the harness both require for the planes and the envelope, one two-thread helper
+   taking the round's body, the rigs' boot and ready poll in `_server_rig.das`, and an elapsed
+   seconds builtin beside `get_time_usec` - each with the suites that read it green, or the fold
+   refused by name.
+197. **The `tile4` companion's shape is three constants no tuner races.** `tile4_perm`
+   (`dasllama/dasllama_gemm_gen.das`) stamps an amx perm's 4-token vector tile at kstep 4,
+   nrsplit 4 and a 2048-byte prefetch distance, for every family and every shape, off one race
+   on Granite Rapids over q8 planes (`harness/tile4_race.das`; `PERF_LEDGER.md`, the AMX
+   short-batch arc); a superblock family's prefetch distance and Sapphire Rapids are unraced.
+   Done = the `tile4` a tuner seat raced per family at ntok 4, or the race run over a superblock
+   plane and on Sapphire Rapids.
+198. **The reference-build tool applies its patch on a shallow clone and fails late.**
+   `benchmarks/setup_lcpp_ref.das` lays `mtmd-timing.patch` by three-way merge, which needs the
+   blob of the commit the patch was cut at; on a shallow `--src` the apply stops at git's own
+   `repository lacks the necessary blob` after the worktree is made, and `BRINGUP.md` carries the
+   trap as prose. Done = the tool reads `git rev-parse --is-shallow-repository` before it makes
+   the worktree and refuses a shallow `--src` by name with the `fetch --unshallow` line, and the
+   `BRINGUP.md` paragraph goes.
+199. **The 4-row decode step on the `x86-amx` class is unread past the weight GEMMs.** The
+   `tile4` walk covers the FFN and the projections' tiles; the per-row attention, the classifier
+   and the per-layer embedding at four rows have no reading on the landed walk. Done =
+   `benchmarks/decode_prof.das` at 1 and 4 rows on a q8 carrier, the largest bucket that grows
+   faster than the rows fixed or named here.
+200. **The q8q8 grid's prefetch row prefetches nothing.** The `[tune_perm]` row `dot =
+   "vpdpbusd", width = 512, mr = 16, kstep = 2, gkstep = 2, bias = 128, prefetch = 2048`
+   (`dasllama/dasllama_math_gen.das`) spells the distance `prefetch`, and the generators read `pf`
+   (`parse_perm`, `dasllama/dasllama_gemm_gen.das`): the row emits the crown beside it, the tuner
+   races one kernel twice, and the GEMV's weight stream has no raced prefetch on any class - the
+   stream a one-row decode step reads, as the four-row step reads its tile4's. Done = the row
+   spelled `pf`, its GEMV prefetch in the x64 emission rail and raced on an avx512 box (the class
+   profiles re-exported where a crown moves), or the row deleted.
+201. **Checklist defects the AMX short-batch audit round named.** `REVIEW_HOT_PATH.md`'s
+   `[cold_path]`-on-rig-functions rule needs a call-graph walk per changed function and is broken
+   across the rig folders unnoticed - a `REVIEW.das` gate. Instruments `benchmarks/REVIEW.md`'s
+   report-line, `tune_gate` and `ATTRIBUTION SWEEP` rules name and the code never met:
+   `tune_kernels`' and `gen_tune_probe`'s report lines print no reference verdict or bound,
+   `kq_kernel_bench` and `gemm_1core_probe` call no `tune_gate`, and `gemm_1core_probe`'s focus
+   mode carries no `ATTRIBUTION SWEEP` line. Done = the gate lands, and each named instrument meets
+   the rule or the rule is refused by name.
+202. **The NaN-safe compare rule has no gate.** `tests/REVIEW.md` binds a float compare against
+   a bar a diff adds or changes to read a NaN as outside it; nothing mechanical checks it, and the shape - a
+   bar test spelled `d > bar`, or a largest difference kept with `max(m, d)` - recurs across the
+   folder's files that predate the rule. Done = a `REVIEW.das` gate over `tests/` that fails on the
+   NaN-blind shapes in a compare against a bar, with a fixture of both spellings, and each file it
+   finds converted, or listed in this row with the reason.
+203. **`dot_q8q8_laneq4x4` rejects every variant on the M5 Max.** `harness/tune_kernels.das` races
+   its seven variants and all seven fail the tolerance gate, so the kernel is never tuned on that
+   box and keeps its default. Done = the failing element and its relative error read from one
+   run, and the variant or the gate fixed so at least one variant passes, or the kernel's race
+   dropped on arm64 with the reason here.
+204. **`daslib/clargs` skips an argument no flag matches.** A `[CommandLineArgs]` tool given a
+   mistyped or single-dash flag (`kq_kernel_bench.das -n 256`, where only `--n` exists) runs on
+   its defaults and says nothing. The same bench takes `--base-offset -64` and crashes on an
+   array index. Done = the generated parser rejects an unknown argument with the tool's usage
+   and a non-zero exit code (every in-tree `[CommandLineArgs]` tool re-checked for arguments it
+   passes through), and the bench refuses a negative base offset.
+206. **Lint skips every module whose name reads as a lint fixture.** `daslib/lint_config.das`'s
+   `is_lint_fixture_name` treats an underscore-led file name holding `fixture` as a lint-rule
+   fixture, so `tests/_kq_fixtures.das`, `tests/_vk_kq_fixtures.das` and the harness's
+   `_*_fixture.das` modules are never linted by the lanes; `--lint-fixtures` reaches them by hand.
+   Done = the fixture convention narrowed to the lint rules' own fixture folders, and those
+   modules linted clean in the lanes.
+207. **The server measures the chunk for a stall limit.** `--chunk` is a token count, so the
+   stall a decoding stream waits out while another prompt prefills is the model's and the box's:
+   64 tokens is 50 ms on a 0.8B and 460 ms on a 7B (`PERF_LEDGER.md`, the CPU chunk entry). Done =
+   a measure action on the server (the control page and a route) that times the loaded model's
+   prefill at a few chunk sizes and sets the largest chunk whose stall fits a limit the user gives.

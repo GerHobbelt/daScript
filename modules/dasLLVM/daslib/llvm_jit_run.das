@@ -38,12 +38,14 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 
 // Read by tests-cpp/small/test_jit_emitter_pin.cpp: FNV-1a64 of the emitter sources
 // (normalized to LF; file list in the test)
-let LLVM_JIT_EMITTER_HASH : uint64 = 0x462f14b19ca32cc7ul
+let LLVM_JIT_EMITTER_HASH : uint64 = 0x55e4062e26f33ad4ul
 
+[arch(at = "../ARCHITECTURE_FAST_MATH.md#never-fast-math")]
 def private apply_fast_math_to_module(m : LLVMOpaqueModule?) {
     var fn = LLVMGetFirstFunction(m)
     while (fn != null) {
-        var bb = LLVMGetFirstBasicBlock(fn)
+        let never_fast_math = LLVMGetStringAttributeAtIndex(fn, 0xFFFFFFFFu, JIT_NEVER_FAST_MATH_ATTR, uint(length(JIT_NEVER_FAST_MATH_ATTR))) != null
+        var bb = never_fast_math ? null : LLVMGetFirstBasicBlock(fn)
         while (bb != null) {
             var inst = LLVMGetFirstInstruction(bb)
             while (inst != null) {
@@ -69,7 +71,7 @@ def private reopen_and_gc_dll(var dll : DLLHandle?&; output_path : string; funcs
     dll = get_dll_by_path(output_path)
     // linked ok but unloadable = eaten between the two; the panic text carries the diagnosis
     if (dll.handle == null) {
-        panic("LLVM JIT: {output_path}.dll linked but cannot be loaded back - the file is missing or unreadable. On Windows check antivirus quarantine and exclude the .jitted_scripts directory from real-time scanning.\n")
+        panic("LLVM JIT: {output_path}.dll linked but cannot be loaded back - the file is missing or unreadable. On Windows check antivirus quarantine and exclude the .cache/daslang directory from real-time scanning.\n")
     }
     let (missing, disabling) = get_dll_missing(funcs, disabled, dll, uids)
     if (!(missing |> empty()) || !(disabling |> empty())) {
@@ -234,8 +236,8 @@ def private dump_module_ir(dump_to : string; mod : LLVMOpaqueModule?) {
 // post-irgen tail: optimize, optional IR dump, whole-module verify
 [macro_function]
 def private optimize_and_verify_module(opt_level, size_level : int; use_host_cpu, dump_ir : bool;
-                                       dump_to : string; funcs : array<FunctionPtr>) {
-    optimize_llvm_module(opt_level |> uint(), size_level |> uint(), LLVM_INLINE_THRESHOLD, use_host_cpu)
+                                       dump_to : string; funcs : array<FunctionPtr>; sanitize : JitSanitize) {
+    optimize_llvm_module(opt_level |> uint(), size_level |> uint(), LLVM_INLINE_THRESHOLD, use_host_cpu, sanitize)
     if (dump_ir) {
         dump_module_ir(dump_to, g_mod)
     }
@@ -254,7 +256,8 @@ struct private JitSplitPart {
     tag : string
 }
 
-def private publish_link_set(tmp_base, final_base : string) {
+[arch(at = "../ARCHITECTURE_JIT_ENTRY.md#artifact-publish")]
+def private publish_link_set(tmp_base, final_base : string; replace : bool) {
     let d = dir_name(tmp_base)
     let tmp_prefix = "{base_name(tmp_base)}."
     let final_name = base_name(final_base)
@@ -266,16 +269,20 @@ def private publish_link_set(tmp_base, final_base : string) {
     }
     for (fname in produced) {
         let suffix = slice(fname, length(tmp_prefix), length(fname))
-        publish_object("{d}/{fname}", "{d}/{final_name}.{suffix}")
+        publish_object("{d}/{fname}", "{d}/{final_name}.{suffix}", replace)
     }
 }
 
 var g_published_names : table<string>
 
-def private publish_object(tmp, final : string) {
+[arch(at = "../ARCHITECTURE_JIT_ENTRY.md#artifact-publish")]
+def private publish_object(tmp, final : string; replace : bool) {
     if (tmp == final || !stat(tmp).is_valid) return
+    var err : string
+    if (replace && stat(final).is_valid) {
+        remove(final, err)
+    }
     if (!rename(tmp, final)) {
-        var err : string
         remove(tmp, err)
         if (!stat(final).is_valid) {
             to_log(LOG_WARNING, "LLVM JIT: could not publish {tmp} as {final}\n")
@@ -332,7 +339,7 @@ def private run_split_codegen(prog : Program?; ctx : Context?; funcs : array<Fun
                               var uids : UidNodes?; jit_flags : LlvmJitFlags;
                               opt_level, size_level, split_threads : int; use_host_cpu : bool;
                               debug_info, dump_ir, obj_cache : bool; dump_to : string; target_triple : string;
-                              output_path : string; log_jit_time : bool;
+                              output_path : string; log_jit_time : bool; sanitize : JitSanitize;
                               target : SplitTarget) : tuple<objs : array<string>; t_irgen : int; t_optemit : int; link_whole_lib : bool; main_ok : bool; partitions : int; cached : int> {
     var n_partitions = 0
     var n_cached = 0
@@ -355,10 +362,10 @@ def private run_split_codegen(prog : Program?; ctx : Context?; funcs : array<Fun
     jit_par_emit_begin()
     g_split_parts |> reserve(length(order))
     // empty pipeline = pool skips optimization (the LLVM_ENABLE_OPT_PASS / LLVM_DEBUG_EVERYTHING rail)
-    let pipeline = LLVM_ENABLE_OPT_PASS ? opt_pipeline_string(opt_level |> uint, size_level |> uint) : ""
-    // obj cache key = env salt + the RUNNING chained fold of module hashes: positional invalidation (ARCHITECTURE.md §2.1); probe = file existence on key-named objs
+    let pipeline = LLVM_ENABLE_OPT_PASS ? opt_pipeline_string(opt_level |> uint, size_level |> uint, sanitize) : ""
+    // obj cache key = env salt + the RUNNING chained fold of module hashes: positional invalidation (ARCHITECTURE_CODEGEN_IDENTITY.md §2.1); probe = file existence on key-named objs
     var chain = LLVM_JIT_CODEGEN_VERSION
-    let env_salt = jit_env_salt(opt_level, size_level, jit_flags.emit_prologue, debug_info, target_triple, true, use_host_cpu)
+    let env_salt = jit_env_salt(opt_level, size_level, jit_flags.emit_prologue, debug_info, target_triple, true, use_host_cpu, sanitize)
     // DAS_JIT_DUMP_HASHES: per-function fold forensics - diff two runs to locate a key divergence
     let dump_hashes = g_env_jit.jit_dump_hashes
     var objs : array<string>
@@ -480,6 +487,10 @@ def private run_split_codegen(prog : Program?; ctx : Context?; funcs : array<Fun
     let lto_run = main_ok && (target.lto || (g_env_jit.jit_probe_lto && !target.gen_exe))   //! the probe is the DLL rail's: an exe's link takes its LTO flags from --jit-lto alone
     if (main_ok) {
         for (p in g_split_parts) {
+            stamp_module_target(p.mod, p.tm)
+            if (sanitize.address) {
+                mark_sanitize_address(p.mod)
+            }
             jit_par_emit_add(p.mod, p.tm, p.pbo, pipeline, lto_run ? "" : p.obj)   // an LTO partition leaves as bitcode: the pool optimizes it and emits no object
         }
     }
@@ -512,7 +523,7 @@ def private run_split_codegen(prog : Program?; ctx : Context?; funcs : array<Fun
             panic("LLVM JIT: split parallel optimize+emit failed")
         }
         for (p in g_split_parts) {
-            publish_object(p.obj, p.obj_final)
+            publish_object(p.obj, p.obj_final, !obj_cache)
         }
     }
     // phase C - the opt-in IR dump only (workers verified each module post-optimize, pre-emit; cached partitions have no live IR)
@@ -588,6 +599,10 @@ def public run_jit(prog : Program?; var ctx : Context?; cli_opts : JitCliOptions
     let totalTime = ref_time_ticks()
     var phase_tm = ref_time_ticks()
     var plan <- make_jit_plan(prog, ctx, false, cli_opts)
+    if (report_collect_errors(plan)) {
+        run.ok = false
+        return run
+    }
     assume aot_host = plan.aot_host
     assume jit_all_functions = plan.jit_all_functions
     assume debug_info = plan.debug_info
@@ -736,7 +751,7 @@ def public run_jit(prog : Program?; var ctx : Context?; cli_opts : JitCliOptions
         var split_parts = 0
         if (recompile_prog && jit_split) {
             let sres <- run_split_codegen(prog, ctx, funcs, uids, jit_flags, opt_level, size_level,
-                split_modules, use_host_cpu, debug_info, dump_ir, obj_cache, plan.dump_ir_path, target_triple, output_path, log_jit_time,
+                split_modules, use_host_cpu, debug_info, dump_ir, obj_cache, plan.dump_ir_path, target_triple, output_path, log_jit_time, plan.sanitize,
                 SplitTarget(gen_exe = gen_exe, exe_main = exe_main, exe_strict = exe_strict, register_all_modules = register_all_modules, lto = jit_lto))
             let link_base = "{output_path}.{ref_time_ticks()}"
             t_irgen = sres.t_irgen
@@ -752,6 +767,8 @@ def public run_jit(prog : Program?; var ctx : Context?; cli_opts : JitCliOptions
                 if (!sres.main_ok) {
                     reset_codegen_accumulators()
                     finalize_jit(use_dll, gen_exe, g_dynamic_lib_handle)
+                    to_log(LOG_ERROR, "LLVM EXE: no executable written for {output_path}\n")
+                    run.ok = false
                     return run
                 }
                 LINK_WHOLE_LIB = sres.link_whole_lib
@@ -772,7 +789,7 @@ def public run_jit(prog : Program?; var ctx : Context?; cli_opts : JitCliOptions
                 panic("LLVM JIT: split link failed for {output_path} - cached partition objects dropped, the next run re-emits them")
             }
             if (!gen_exe) {
-                publish_link_set(link_base, output_path)
+                publish_link_set(link_base, output_path, empty(dll_hash_basename))
                 // partition objects are named by partition key, not the dll hash - the GC keep-set
                 // preserves exactly the current link set. The LTO probe's artifact set is one-off:
                 // skip its GC so a probe run cannot evict the normal cache generation.
@@ -802,8 +819,8 @@ def public run_jit(prog : Program?; var ctx : Context?; cli_opts : JitCliOptions
                     di_finalize()
                     reset_codegen_accumulators()
                     finalize_jit(use_dll, gen_exe, g_dynamic_lib_handle)
-                    // JIT failed. Couldn't create executable.
-                    // Still return true, codegen ran correctly.
+                    to_log(LOG_ERROR, "LLVM EXE: no executable written for {output_path}\n")
+                    run.ok = false
                     return run
                 }
             }
@@ -816,9 +833,14 @@ def public run_jit(prog : Program?; var ctx : Context?; cli_opts : JitCliOptions
                 var pair = build_llvm_aot_ctors(g_ctx, g_mod, g_prim_t, funcs, uids, prog)
                 aot_ctor = pair._0
                 aot_dtor = pair._1
+                emit_aot_pull_anchor(g_mod, g_prim_t, base_name(output_path))
             }
             generate_global_ctors_dtors(g_prim_t, emit_aot_object ? false : !(use_dll || gen_exe), aot_ctor, aot_dtor)
             if (emit_aot_object) {
+                let plat = get_platform_name()
+                if (plat == "linux" || plat == "android") {
+                    move_global_ctors_to_init_array(g_mod, g_prim_t, base_name(output_path))
+                }
                 // before optimization: the folding this catches also deletes the evidence
                 let unresolved = collect_unresolved_address_globals(g_mod)
                 if (!(unresolved |> empty())) {
@@ -834,7 +856,7 @@ def public run_jit(prog : Program?; var ctx : Context?; cli_opts : JitCliOptions
             }
             t_irgen = get_time_usec(phase_tm)
             phase_tm = ref_time_ticks()
-            optimize_and_verify_module(opt_level, size_level, use_host_cpu, dump_ir, plan.dump_ir_path, funcs)
+            optimize_and_verify_module(opt_level, size_level, use_host_cpu, dump_ir, plan.dump_ir_path, funcs, plan.sanitize)
             // optimize covers the passes plus the opt-in IR dump and the post-opt verify
             t_opt = get_time_usec(phase_tm)
             phase_tm = ref_time_ticks()

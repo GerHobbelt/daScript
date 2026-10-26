@@ -15,7 +15,6 @@ require vulkan
 require vulkan/vulkan_boost
 require dasllama/dasllama_math
 require dasllama/dasllama_gpu_tier
-require dasllama/dasllama_env
 require dasllama/dasllama_config
 require dasllama/dasllama_kqformat
 
@@ -47,7 +46,7 @@ def private vk_dlim_wants_fill(var v : DlimVulkanConfig) {
     v.dense = gpu_want_dense()
     v.dense_attn = gpu_want_dense_attn()
     v.dense_shexp = gpu_want_dense_shexp()
-    v.trim = g_env_vulkan.trim
+    v.trim = vulkan_trim()
     v.split = gpu_want_moe_split()
     v.dn_native = gpu_want_dn_native()
 }
@@ -318,8 +317,9 @@ def private vk_caps_fill(phys : VkPhysicalDevice; var v : DlimVulkanConfig) {
 // so "auto" hid device-derived byte differences and a moving heap budget).
 def private vk_dlim_source(var v : DlimVulkanConfig) : bool {
     if (g_vk_dry_want) {
-        // an offline bake IS its config — echo it, never probe (there may be no device at all)
+        // an offline bake IS its config — echo it, never probe (there may be no device at all); the trim is the load's lever on every tier
         v = g_vk_dry_cfg
+        v.trim = vulkan_trim()
         return true
     }
     if (!vulkan_moe_gpu_arm()) {
@@ -379,8 +379,15 @@ def dasllama_math_vulkan_register() {
         @@vk_rdec_sync_kv, @@vk_rdec_read_kv, @@vk_rdec_read_kv_bulk)
     install_moe_gpu_resident_regions(@@vk_rdec_select_region)
     install_moe_gpu_resident_batch(@@vk_rdec_token_n, @@vk_rdec_token_n_rows)
+    install_rdec_carry(@@vk_rdec_land_carry)
+    install_rdec_draft(@@vk_rdec_set_head, @@vk_rdec_draft)
+    install_rdec_verify(@@vk_rdec_verify, @@vk_rdec_verify_rows, @@vk_rdec_verify_landed_logits)
+    install_rdec_rollback(@@vk_rdec_rollback)
+    install_rdec_head_warm(@@vk_rdec_head_warm_ask, @@vk_rdec_head_warm_rows, @@vk_rdec_head_sync_rows, @@vk_rdec_head_read_rows)
     install_moe_gpu_resident_dn(@@vk_rdec_set_dn_layer, @@vk_rdec_upload_dn_ba, @@vk_rdec_dn_own, @@vk_rdec_prefill_dn_own)
     install_moe_gpu_resident_moe(@@vk_rdec_moe_ok, @@vk_rdec_prepare_moe, @@vk_rdec_set_moe_layer, @@vk_rdec_set_moe_experts)
+    install_moe_gpu_resident_hc(@@vk_rdec_set_hc, @@vk_rdec_set_ngram, @@vk_rdec_set_host_experts, @@vk_rdec_token_split, @@vk_rdec_ngram_ring, @@vk_rdec_prefill_hc)
+    install_moe_gpu_resident_hot(@@vk_rdec_hot_layer, @@vk_rdec_hot_upload, @@vk_rdec_hot_submit, @@vk_rdec_hot_submit_rows)
     set_moe_gpu_dn_state_hooks(@@vk_dn_step_flush, @@vk_dn_step_invalidate, @@vk_dn_step_release)
     set_moe_gpu_heat_hooks(@@vk_moe_heat_query, @@vk_moe_heat_advise, @@vk_moe_ffn_begin, @@vk_moe_ffn_join)
     set_moe_gpu_qkv_hook(@@vk_moe_qkv)

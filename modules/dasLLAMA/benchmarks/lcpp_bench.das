@@ -13,7 +13,7 @@ require dasllama/dasllama   // --npl: set_gpu_resident_regions before the load, 
 require ?vulkan dasllama/dasllama_vulkan_decode   // nolint:STYLE030,LINT019 — DASLLAMA_VK_NROW_BISECT: the N-row command's bisect knob, read in the vulkan half
 require ?vulkan dasllama/dasllama_vulkan_tower   // nolint:STYLE030,LINT019 — the image cell's engage witness, read in the vulkan half
 require ?vulkan dasllama/dasllama_vulkan_asr_dec   // nolint:STYLE030,LINT019 — the --asr rows' decoder-half witness, read in the vulkan half
-require dasllama/dasllama_math   // setup_dasllama_jobque_ + apply_box_profile_runtime (engine-level, not re-exported)
+require dasllama/dasllama_math   // with_dasllama_jobque_ + apply_box_profile_runtime (engine-level, not re-exported)
 require dasllama/dasllama_image   // load_model_cached — the .dlim rail the rows load on
 require dasllama/dasllama_load   // --parity: load_model_ — the planar rail the parity fixtures were frozen on
 require dasllama/dasllama_tokenizer   // the tg-real row needs REAL tokens (see Lever.real)
@@ -54,6 +54,9 @@ require dasllama/dasllama_env
 // `-o json` emits public bench records (schema: METHODOLOGY.md "The record") on stdout — progress goes to
 // stderr then, like llama-bench itself. `--ngl` != 0 is the whole graph on Metal
 // (MetalMode.required — a CPU fallback fails the run, never silently mismeasures).
+// ATTRIBUTION SWEEP: --mtp-ab times its off and on arms (the plain step against the speculative round) without
+// comparing their outputs - the arms attribute the round's draft, verify and acceptance cost, not an adoption; the
+// round's output invariance is tests/test_mtp.das's.
 
 enum private OutFmt {
     txt
@@ -472,8 +475,7 @@ def private asr_cell_main(model, json_path : string; reps, threads : int; gpu, a
     var found = false
     var all_ok = true
     var jsonModels : array<BenchModel>
-    with_job_que() {
-        setup_dasllama_jobque_()
+    with_dasllama_jobque_() {
         //! the regime line printed by main is the INTENT; this is the que that actually spawned
         print("live: {get_dispatch_lanes()} dispatch lanes ({get_total_hw_jobs()} workers)\n")
         for (spec in asr_catalog()) {
@@ -608,8 +610,7 @@ def private image_cell_main(model, mmproj, image, prompt, json_path : string; re
     }
     let ask = empty(prompt) ? image_turn_prompt() : prompt
     var jsonModels : array<BenchModel>
-    with_job_que() {
-        setup_dasllama_jobque_()
+    with_dasllama_jobque_() {
         //! the regime line printed by main is the INTENT; this is the que that actually spawned
         print("live: {get_dispatch_lanes()} dispatch lanes ({get_total_hw_jobs()} workers)\n")
         var m <- load_model_cached(model, QuantMode.q8)
@@ -1133,8 +1134,12 @@ def private corpus_ids(t : Model; tk : Tokenizer; tx : string; chat : bool) : ar
     return <- ids
 }
 
-// Greedy pick over the last logits — the tg-real row's sampler. Runs INSIDE the timed window, but
-// both A/B arms pay it identically so it cancels for judging.
+//! the reasons that fired, in the words a status page prints, for a refusal line
+def private cpu_pass_words() : string {
+    var inscope passes <- gpu_cpu_passes()
+    return join([for (p in passes); "{p.words} x{p.count}"], "; ")
+}
+
 def private argmax_logit(s : Session; vocab : int64) : int64 {
     var best = 0l
     var bv = s.logits[0]
@@ -1204,8 +1209,7 @@ def parity_check(model : string; spec : ModelSpec) : bool {
     let prev_dn = get_deltanet_prefill_mode()
     set_deltanet_prefill_mode(DnPrefillMode.recurrent)
     var ok = false
-    with_job_que() {
-        setup_dasllama_jobque_()
+    with_dasllama_jobque_() {
         // text-form evidence encodes through the loaded model's own tokenizer (load_model_
         // carries it), the same flags the test loop uses (add_special on, parse_special off)
         var prompt <- (empty(spec.parity.prompt_text) ? clone_to_move(spec.parity.prompt)
@@ -1280,23 +1284,6 @@ def private bench_fixture_gate(var t : Model; spec : ModelSpec; fmt : OutFmt) : 
 //! the table's own spec and a deliberately wrong one.
 def fixture_gate_check(var t : Model; spec : ModelSpec) : bool {
     return bench_fixture_gate(t, spec, OutFmt.txt)
-}
-
-// Prompt corpus: segments separated by lines of two percent signs, '#' segments skipped.
-def private load_corpus(path : string) : array<string> {
-    var texts : array<string>
-    fopen(path, "rb") $(f) {
-        if (f == null) {
-            panic("lcpp_bench: can't open prompt corpus {path}")
-        }
-        for (p in split(fread(f), "%%")) {
-            let tp = strip(p)
-            if (!empty(tp) && !starts_with(tp, "#")) {
-                texts |> push(clone_string(tp))
-            }
-        }
-    }
-    return <- texts
 }
 
 // progress line — stdout in txt mode, stderr when stdout carries the md table / json records
@@ -1584,8 +1571,7 @@ def main() : int {
     var mdRows : array<array<string>>
     var jsonModels : array<BenchModel>
     var no_rows = false   // a model that produced no row ends the run non-zero, below the que scope
-    with_job_que() {
-        setup_dasllama_jobque_()
+    with_dasllama_jobque_() {
         //! the regime line above prints the INTENT; this is the que that actually spawned
         say(fmt, "live: {get_dispatch_lanes()} dispatch lanes ({get_total_hw_jobs()} workers)\n")
         for (mpath in model_list) {
@@ -1689,7 +1675,7 @@ def main() : int {
             }
             if (real_row) {
                 // REAL greedy continuation: fresh session per prompt (no KV/recurrent bleed),
-                // prefill untimed as llama-bench excludes the prompt, argmax inside the timed loop
+                // prefill untimed as llama-bench excludes the prompt, the sample inside the timed loop
                 // (both arms pay it, so it cancels). NOT comparable to the synthetic tg row.
                 let mtp_on = cfg.mtp_ab && arm != 0
                 var drafted = 0l
@@ -1705,9 +1691,13 @@ def main() : int {
                 pp_dr |> resize(length(toks))
                 pp_ac |> resize(length(toks))
                 var sp = SamplingParams(temp = cfg.mtp_temp)
-                for (_rep in range(reps)) {
+                let ask = sampler_is_argmax(sp)
+                var refused = ""   // one rep with no figure, or one served off the row's backend stamp, drops the whole row
+                let vk_stamp = !gpu && moe_gpu_tier_installed()   // the row records the armed Vulkan tier as its backend: a call the driver passed to the CPU rails ran off it
+                for (rep in range(reps)) {
                     var total_us = 0l
                     var rep_gen = 0l
+                    let passes0 = cpu_pass_total()
                     for (pi in range(length(toks))) {
                         var rs <- make_run_state(c, KVDtype.f16, KVDtype.f16)
                         let pl = long_length(toks[pi])
@@ -1716,24 +1706,25 @@ def main() : int {
                             set_seed_(rs, 4242)
                             rs.spec_params = unsafe(addr(sp))
                         }
+                        rs.pick_asked = ask
                         let t0 = ref_time_ticks()
                         var p_gen = ngen
                         if (mtp_on) {
                             rs.n_past = pl   // forward_prefill leaves n_past alone; the round drives it
-                            var tok = sp.temp > 0.0 ? sample_(rs, sp) : argmax_logit(rs, c.vocab_size)
+                            var tok = sample_(rs, sp)
                             var gen = 0l
                             while (gen < ngen) {
                                 gen += 1l + mtp_spec_round(t, rs, tok)   // tok + the accepted drafts; only the advance is timed
                                 if (rs.mtp_pre_drawn) {
                                     parked++
                                 }
-                                tok = sp.temp > 0.0 ? sample_(rs, sp) : argmax_logit(rs, c.vocab_size)
+                                tok = sample_(rs, sp)
                             }
                             p_gen = gen   // a trailing accept may overshoot by 1 — count what ran
                         } else {
                             var pos = pl
                             for (_g in range64(ngen)) {
-                                forward(t, rs, sp.temp > 0.0 ? sample_(rs, sp) : argmax_logit(rs, c.vocab_size), pos)
+                                forward(t, rs, sample_(rs, sp), pos)
                                 pos++
                             }
                         }
@@ -1748,7 +1739,27 @@ def main() : int {
                         pp_ac[pi] += rs.mtp_accepted
                         delete rs
                     }
+                    if (rep_gen <= 0l || total_us <= 0l) {
+                        refused = "rep {rep} produced no figure ({rep_gen} tokens in {total_us} us)"
+                        break
+                    }
+                    let passed = cpu_pass_total() - passes0
+                    if (vk_stamp && passed > 0l) {
+                        let words = cpu_pass_words()
+                        refused = "rep {rep} ran off the row's vulkan backend: the resident driver passed {passed} call(s) to the CPU rails ({words})"
+                        break
+                    }
                     tps |> push(double(rep_gen) * 1.0e6lf / double(total_us))
+                }
+                if (!empty(refused)) {
+                    say(fmt, "REFUSED tg-real{ngen}{dtag} - {refused}\n")
+                    g_refused_rows++
+                    delete tps
+                    delete pp_us
+                    delete pp_gen
+                    delete pp_dr
+                    delete pp_ac
+                    continue
                 }
                 if (mtp_on && sp.temp > 0.0 && parked == 0l) {
                     panic("lcpp_bench: --mtp-temp {sp.temp} is set but the accept walk never parked a draw - the lever did not engage")
@@ -1804,18 +1815,19 @@ def main() : int {
                         set_seed_(ps, 4242)
                         ps.spec_params = unsafe(addr(sp))
                     }
+                    ps.pick_asked = ask
                     if (mtp_on) {
                         ps.n_past = pl0
-                        var ptok = sp.temp > 0.0 ? sample_(ps, sp) : argmax_logit(ps, c.vocab_size)
+                        var ptok = sample_(ps, sp)
                         var pgen = 0l
                         while (pgen < ngen) {
                             pgen += 1l + mtp_spec_round(t, ps, ptok)
-                            ptok = sp.temp > 0.0 ? sample_(ps, sp) : argmax_logit(ps, c.vocab_size)
+                            ptok = sample_(ps, sp)
                         }
                     } else {
                         var ppos = pl0
                         for (_g in range64(ngen)) {
-                            forward(t, ps, sp.temp > 0.0 ? sample_(ps, sp) : argmax_logit(ps, c.vocab_size), ppos)
+                            forward(t, ps, sample_(ps, sp), ppos)
                             ppos++
                         }
                     }

@@ -11,6 +11,7 @@ module model_specs shared public
 
 require dasllama/dasllama_lint public
 require strings public
+require daslib/fio   // base_name - spec_by_file's split-shard rows
 require dasllama/dasllama_common public   // QuantMode
 
 // ===== Row types =====
@@ -243,11 +244,14 @@ def private ev_gemma3_4b() : ParityEvidence {
 
 //! "1, 2, …, N," — the counting prompt the long text-form fixtures encode in-model (byte-identical
 //! to the oracle run's input).
-def counting_prompt(n : int) : string {
+def counting_prompt(n : int) : string => counting_prompt(1, n)
+
+//! "start, start+1, …, last," — the kernel-robust confident prompt family the parity suites encode
+def counting_prompt(start, last : int) : string {
     return build_string() $(var w) {
-        for (i in range(1, n + 1)) {
+        for (i in range(start, last + 1)) {
             w |> write(i)
-            w |> write(i < n ? ", " : ",")
+            w |> write(i < last ? ", " : ",")
         }
     }
 }
@@ -643,12 +647,12 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             bytes = 10756586464l, sha256 = "2e8f5f705355c56311432d0a8a5d14a696dbb7e4b197d05c75ba805fc1857bef",
             parity <- ev_qwen_count([dn_chunked = true, moe_reference = true])),
         ModelSpec(file = "Qwen3.8-27B-Q4_K_M.gguf", display = "Qwen3.8-27B", quant_label = "q4_k_m", official = true,
-            url = "{HF}/ggml-org/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_K_M.gguf",
+            url = "{HF}/ggml-org/Qwen3.8-27B-GGUF/resolve/0669b98607d47046c7c2b3f801011d54a08cfccf/Qwen3.8-27B-Q4_K_M.gguf",
             bytes = 18973870432l, sha256 = "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34",
             // the split NextN head rides as a companion: the mtp suite's 3.8-27b fixture and the ruler load it as the trunk's last shard
             companions <- [
                 ProvEntry(name = "mtp-Qwen3.8-27B-Q8_0.gguf", root = "llm",
-                    url = "{HF}/ggml-org/Qwen3.8-27B-GGUF/resolve/main/mtp-Qwen3.8-27B-Q8_0.gguf",
+                    url = "{HF}/ggml-org/Qwen3.8-27B-GGUF/resolve/0669b98607d47046c7c2b3f801011d54a08cfccf/mtp-Qwen3.8-27B-Q8_0.gguf",
                     bytes = 3164006688l, sha256 = "cbf60a0c48b431bb61f1d49b8948dc88ac29c398d6dbdbbb2e6e89ef77eacc9a")],
             // the qwen35 hybrid dense at scale, native K-quant planes
             parity <- ev_qwen_count([dn_chunked = true])),
@@ -675,6 +679,17 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             // arch qwen3next: the FILE layout differs from qwen35 (fused Q4_K ssm_ba, HF
             // grouped v-head order) — this fixture proves the loader's grouped->tiled permutes
             parity <- ev_qwen_count([dn_chunked = true])),
+        // arch qwen4exp (Qwen3.8-Flash-Next, 125B-A6B): the qwen35moe hybrid inside hyper-connections
+        // + the n-gram PLE side input; a 3-shard file named by its first shard (the split-shard walk
+        // maps the rest). No board row yet: the 640-wide expert down rows demote to q8 (followup 168)
+        ModelSpec(file = "Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
+            display = "Qwen3.8-Flash-Next-iq4xs", quant_label = "iq4_xs",
+            // the split NextN head (`shared`: its own Q8_0 routed experts inside) rides as a companion: the hc cells pin it as the trunk's head
+            companions <- [
+                ProvEntry(name = "Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", root = "llm",
+                    url = "{HF}/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+                    bytes = 2786568256l, sha256 = "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6")],
+            parity <- ev_qwen_count([dn_chunked = true, moe_reference = true])),
         // the Metal sweep's Qwen quant matrix - every Qwen text file the M5 box stocks that the
         // rows above do not name; no board row, no provenance, the counting fixture as the
         // correctness gate
@@ -938,14 +953,13 @@ def bench_image_fixture() : string {
     return "coco-val2017-000000039769.jpg"
 }
 
-//! The spec row keyed `file` (empty `file` field back = no such spec) — a fresh copy off the
-//! table, so a caller (a test run-lambda, the bench parity pregate) holds no reference into an
-//! iterated table.
+//! The spec row keyed `file` - its models-dir path or its base name (a split-shard row sits in a subfolder, the
+//! pregate holds the base name); an empty `file` back = no such spec. A fresh copy, never a reference into the table.
 def spec_by_file(file : string) : ModelSpec {
     var all <- model_specs()
     var out <- ModelSpec()
     for (s in all) {
-        if (s.file == file) {
+        if (s.file == file || base_name(s.file) == file) {
             out <- s
             break
         }

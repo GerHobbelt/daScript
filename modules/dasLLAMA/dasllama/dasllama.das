@@ -14,6 +14,7 @@ options _dasllama_internal = true
 //! in ``with_job_que()`` from ``daslib/jobque_boost`` so the kernels can thread. Call
 //! ``setup_dasllama_jobque()`` inside it, before the first ``load_model``, ``generate`` or ``eval``:
 //! the engine panics on a queue nobody configured, because a bare queue runs ~200x slower.
+//! ``with_dasllama_jobque()`` does both in one call.
 //! Declare ``options stack = 524288``: the forward chain outgrows the 16K default, and a required
 //! module cannot raise the program's stack for you. See ``examples/dasLLAMA/run.das`` and
 //! ``chat.das`` for the canonical shape.
@@ -52,6 +53,12 @@ def setup_dasllama_jobque() {
     //! Call INSIDE ``with_job_que()``, before the first ``generate``/``eval``. The fork-context pool is PER CONTEXT:
     //! a ``new_thread`` body that runs inference calls this again, or every parallel kernel clones the whole program (90x slower).
     setup_dasllama_jobque_()
+}
+
+def with_dasllama_jobque(blk : block<void>) {
+    //! Run ``blk`` inside a fresh ``with_job_que()`` that ``setup_dasllama_jobque()`` has configured — the one-call form of the pair.
+    //! The queue lives for the block only; a program that keeps its own queue calls ``setup_dasllama_jobque()`` inside it instead.
+    with_dasllama_jobque_(blk)
 }
 
 def load_model(path : string; mode : QuantMode = QuantMode.fp32) : Model {
@@ -96,11 +103,18 @@ def release_kv_pages(var session : Session) {
     release_kv_pages_(session)
 }
 
-def create_prefix_cache(max_groups : int64 = 0l) : PrefixCache {
-    //! Create a prefix cache for the paged sessions of one ``create_kv_pool`` pool: finished
-    //! streams donate KV pages (``prefix_insert``), later requests with the same prefix attach them
-    //! (``prefix_attach``) instead of re-prefilling. ``max_groups`` caps retained groups (0 = unbounded).
-    return <- create_prefix_cache_(max_groups)
+def create_prefix_cache(max_groups : int64 = 0l; max_states : int64 = DEFAULT_PREFIX_STATES) : PrefixCache {
+    //! Create a prefix cache for the paged sessions of one ``create_kv_pool`` pool: streams donate KV pages
+    //! (``prefix_insert``), later requests with the same prefix attach them (``prefix_attach``). ``max_groups`` caps
+    //! retained groups (0 = unbounded); a recurrent model keeps at most ``max_states`` whole checkpoints instead.
+    return <- create_prefix_cache_(max_groups, max_states)
+}
+
+def prefix_checkpoint_at(cache : PrefixCache; pool : KVPool; session : Session; prompt : array<int64>; matched : int64; stable_at : int64 = 0l) : int64 {
+    //! Where a recurrent ``session``'s prefill of ``prompt`` should stop for a ``prefix_insert``, after ``prefix_attach``
+    //! matched ``matched`` tokens: ``stable_at`` (``render_turn_marked``'s opening) when the caller knows it, else the
+    //! longest opening an earlier checkpoint shares. 0 = nowhere - always on a model with no recurrent state.
+    return prefix_checkpoint_at_(cache, pool, session, prompt, matched, stable_at)
 }
 
 def prefix_attach(var cache : PrefixCache; var pool : KVPool; var session : Session; prompt : array<int64>) : int64 {
@@ -110,10 +124,10 @@ def prefix_attach(var cache : PrefixCache; var pool : KVPool; var session : Sess
     return prefix_attach_(cache, pool, session, prompt)
 }
 
-def prefix_insert(var cache : PrefixCache; var pool : KVPool; session : Session; tokens : array<int64>; preview : string = "") {
-    //! Donate a finished session's KV pages to the cache. ``tokens`` is the session's full EVALED
-    //! history (only the first ``n_past`` rows exist); every full page not already cached survives
-    //! ``release_kv_pages``. ``preview`` labels the chain on the ``prefix_chain_list`` surface.
+def prefix_insert(var cache : PrefixCache; var pool : KVPool; var session : Session; tokens : array<int64>; preview : string = "") {
+    //! Donate a session's KV pages to the cache. ``tokens`` is its EVALED history (the first ``n_past`` rows exist);
+    //! every full page not already cached survives ``release_kv_pages``, ``preview`` labels the chain. On a
+    //! recurrent model the donation is one checkpoint at ``n_past``, and may be taken between two prefill calls.
     prefix_insert_(cache, pool, session, tokens, preview)
 }
 
@@ -357,6 +371,12 @@ def render_turn(model : Model; chat : ChatSession) : array<int64> {
     return <- render_turn_(model, chat)
 }
 
+def render_turn_marked(model : Model; chat : ChatSession) : RenderedTurn {
+    //! ``render_turn`` with its opening marked: ``opening`` leading tokens - BOS, prelude and the system turn of a
+    //! conversation's first turn - are the same for any user text, so a prefix cache can checkpoint there.
+    return <- render_turn_marked_(model, chat)
+}
+
 def render_turn_image(model : Model; chat : ChatSession; var head : array<int64>; var tail : array<int64>) {
     //! ``render_turn``'s IMAGE twin: the turn's prefill as the two token spans that bracket the
     //! image soft-token splice — ``head`` before the rows, ``tail`` after. Render-only (no KV, no
@@ -507,16 +527,16 @@ def gpu_model_marks_init() : dasllama_gpu_resident::GpuModelMarks {
 }
 
 def dlim_inventory(gguf_path : string) : array<dasllama_image::DlimImageInfo> {
-    //! List the prepared images (``.dlim``) minted beside ``gguf_path`` — per image: file, bytes,
-    //! image version, identity, and a verdict (``CURRENT`` loads; ``STALE vN`` is an older image
-    //! version; ``OTHER`` a different bake configuration or box; ``FOREIGN`` a different flavor).
+    //! List the prepared images (``.dlim``) minted beside ``gguf_path`` — per image: file, lane (the file name's
+    //! ``metal`` / ``cpu-<class>`` / ``vulkan`` / family segment, "" for a hash-named legacy image), bytes, version,
+    //! identity, verdict (``CURRENT`` loads; ``STALE vN`` an older version; ``OTHER`` another bake config or box; ``FOREIGN`` another flavor).
     return <- dlim_inventory_(gguf_path)
 }
 
 def dlim_clean(gguf_path : string; apply : bool; keep_other : bool = false) : tuple<total : int; stale : int; removed : int; freed : int64> {
-    //! Garbage-collect ``STALE`` and ``OTHER`` images beside ``gguf_path`` (``FOREIGN``, another
-    //! flavor's, are always left alone): ``apply = false`` only reports, ``true`` removes;
-    //! ``keep_other`` spares ``OTHER``. Returns (total, stale, removed, freed bytes).
+    //! Garbage-collect ``STALE`` images beside ``gguf_path`` and hash-named legacy images of another identity; a
+    //! lane-named ``OTHER`` and every ``FOREIGN`` image stay (their own loads re-bake them in place). ``apply = false``
+    //! only reports, ``true`` removes; ``keep_other`` spares the legacy others too. Returns (total, stale, removed, freed bytes).
     return dlim_clean_(gguf_path, apply, keep_other)
 }
 
@@ -678,10 +698,30 @@ def set_gpu_ctx_max(n : int64) {
     set_gpu_ctx_max_(n)
 }
 
+def gpu_ctx_pins() : tuple<ctx_max : int64; strict : bool> {
+    //! The in-process context pins as set (``set_gpu_ctx_max``, ``set_gpu_ctx_strict``), apart from the
+    //! environment's knobs: a fixture reads them before it pins and puts them back after its load.
+    return gpu_ctx_pins_()
+}
+
+def set_gpu_ctx_strict(on : bool) {
+    //! The ``set_gpu_ctx_max`` pin is the context asked, not a cap, for the models loaded next: a K/V
+    //! mirror the card cannot hold at it declines the whole-model GPU driver instead of shortening the
+    //! context, and the per-op rails serve the asked context (DASLLAMA_GPU_CTX_STRICT in the environment).
+    set_gpu_ctx_strict_(on)
+}
+
 def gpu_resident_decline() : string {
     //! Why the whole-model GPU driver does not serve the model loaded last: its decline reason (with
     //! the remedy where one exists), or why it was never attempted. Empty when it serves.
     return gpu_resident_decline_()
+}
+
+def gpu_resident_experts_host() : bool {
+    //! Whether the whole-model driver serving the model loaded last sums some routed layers' experts
+    //! on the host (a hyper-connection MoE, or a plain MoE the card does not hold whole) - the form
+    //! whose speculative round does not pay, so a server slot leaves the round off unless asked.
+    return gpu_resident_experts_host_()
 }
 
 def gpu_device_sessions() : int64 {

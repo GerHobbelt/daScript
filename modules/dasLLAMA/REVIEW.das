@@ -17,10 +17,6 @@ let private FACADE_FILES = [FACADE, "modules/dasLLAMA/dasllama/dasllama_tts.das"
 let private TUTORIAL_DIR = "tutorials/dasLLAMA"
 let private RST_DIR = "doc/source/reference/tutorials"
 
-def private is_ident_byte(b : int) : bool {
-    return is_alnum(b) || b == '_'
-}
-
 // leading identifier run of `s` ("" when s starts with a non-ident byte)
 def private ident_prefix(s : string) : string {
     var n = 0
@@ -56,26 +52,6 @@ def private ident_suffix(s : string) : string {
     return slice(s, n)
 }
 
-// whole-word occurrence: `name` present with no identifier byte on either side
-def private contains_word(text : string; name : string) : bool {
-    var found = false
-    peek_data(text) $(d) {
-        let nl = length(name)
-        var from = 0
-        while (!found) {
-            let at = find(d, name, from)
-            if (at < 0) {
-                break
-            }
-            let okl = at == 0 || !is_ident_byte(int(d[at - 1]))
-            let okr = at + nl >= length(d) || !is_ident_byte(int(d[at + nl]))
-            found = okl && okr
-            from = at + 1
-        }
-    }
-    return found
-}
-
 def private word_in_any(texts : array<string>; name : string) : bool {
     for (t in texts) {
         if (contains_word(t, name)) {
@@ -101,25 +77,24 @@ def private read_rst(folder : string; prefix : string; var out : array<string>) 
     }
 }
 
-// `finalize` is the language's own teardown hook - the compiler calls it at `delete`, so no
-// tutorial calls it by name and it carries no floor duty.
-var private FLOOR_HOOKS <- {"finalize"}
+var private FACADE_DEFS_WITHOUT_TUTORIAL <- {"finalize", "tts_finish_styletts2"}   //! defs the runtime or a loader chain calls, never a user - `ARCHITECTURE_TTS.md#text-to-speech` lists them
 
+[arch(at = "ARCHITECTURE_TTS.md#text-to-speech")]
 def private check_floor_of(path : string; var seen : table<string>; tut_texts, rst_texts : array<string>) {
     var line_no = 0
     for (line in split(fread(path), "\n")) {
         line_no++
         continue if (!starts_with(line, "def ") || starts_with(line, "def private ") || starts_with(line, "def operator"))
         let name = ident_prefix(slice(line, 4))
-        continue if (empty(name) || key_exists(FLOOR_HOOKS, name) || key_exists(seen, name))
+        continue if (empty(name) || key_exists(FACADE_DEFS_WITHOUT_TUTORIAL, name) || key_exists(seen, name))
         seen |> insert(name)
         if (!word_in_any(tut_texts, name)) {
             gate_finding(path, line_no,
-                "facade def {name} appears in no {TUTORIAL_DIR}/*.das - the facade is the public API, and every facade def is demonstrated in a tutorial")
+                "facade def {name} appears in no {TUTORIAL_DIR}/*.das - the facade is the public API, and every facade def is demonstrated in a tutorial, or is a def the runtime or a loader chain calls, never a user, that ARCHITECTURE_TTS.md#text-to-speech lists")
         }
         if (!word_in_any(rst_texts, name)) {
             gate_finding(path, line_no,
-                "facade def {name} appears in no {RST_DIR}/dasLLAMA_*.rst - the tutorial pages narrate every facade def (they are hand-written, not includes)")
+                "facade def {name} appears in no {RST_DIR}/dasLLAMA_*.rst - the tutorial pages narrate every facade def (they are hand-written, not includes), or it is a def the runtime or a loader chain calls, never a user, that ARCHITECTURE_TTS.md#text-to-speech lists")
         }
     }
 }
@@ -277,7 +252,7 @@ def private check_fastmath_default {
         var line_no = 0
         for (line in split(fread(p), "\n")) {
             line_no++
-            continue if (find(line, "fastmath=false") < 0 && find(line, "fastmath = false") < 0)
+            continue if ((find(line, "fastmath=false") < 0 && find(line, "fastmath = false") < 0) || (strip(line) |> starts_with("//")))
             if (!key_exists(FASTMATH_OFF_EXEMPT, metal_kernel_name(line))) {
                 gate_finding(p, line_no,
                     "kernel declares fastmath=false without an exemption row naming the test that fails under fastmath - fastmath is the default; the opt-out ships its demonstrated breakage")
@@ -285,6 +260,147 @@ def private check_fastmath_default {
         }
     }
     delete files
+}
+
+//! the top-level ` + ` summands of an index expression (parentheses and brackets keep their sums whole)
+def private index_summands(idx : string) : array<string> {
+    var out : array<string>
+    peek_data(idx) $(d) {
+        var depth = 0
+        var from = 0
+        for (i in range(length(d))) {
+            let ch = int(d[i])
+            if (ch == '(' || ch == '[') {
+                depth++
+            } elif (ch == ')' || ch == ']') {
+                depth--
+            } elif (ch == '+' && depth == 0 && i > 0 && int(d[i - 1]) == ' ' && i + 1 < length(d) && int(d[i + 1]) == ' ') {
+                out |> push(strip(slice(d, from, i)))
+                from = i + 1
+            }
+        }
+        out |> push(strip(slice(d, from, length(d))))
+    }
+    return <- out
+}
+
+//! The index texts `line` READS `buf` at: every `buf[...]` that is not the target of an assignment.
+def private indexed_reads(line, buf : string) : array<string> {
+    var out : array<string>
+    peek_data(line) $(d) {
+        var at = find(d, "{buf}[")
+        while (at >= 0) {
+            let open = at + length(buf)
+            var close = open + 1
+            var depth = 1
+            while (close < length(d) && depth > 0) {
+                depth += int(d[close]) == '[' ? 1 : int(d[close]) == ']' ? -1 : 0
+                close++
+            }
+            var after = close
+            while (after < length(d) && int(d[after]) == ' ') {
+                after++
+            }
+            let eq = after < length(d) && int(d[after]) == '=' && !(after + 1 < length(d) && int(d[after + 1]) == '=')
+            let op_eq = after + 1 < length(d) && int(d[after + 1]) == '=' && find("+-*/|&^", slice(d, after, after + 1)) >= 0
+            let whole = at == 0 || !is_ident_byte(int(d[at - 1]))
+            if (whole && depth == 0 && !eq && !op_eq) {
+                out |> push(slice(d, open + 1, close - 1))
+            }
+            at = find(d, "{buf}[", close)
+        }
+    }
+    return <- out
+}
+
+//! How `term` reads once its loops are unrolled: 1 = a constant built from a loop variable (its every name a loop
+//! variable or an integer cast), 0 = a constant with no name at all, -1 = a run-time value.
+def private unrolled_kind(term : string; loop_vars : array<string>) : int {
+    var kind = 0
+    peek_data(term) $(d) {
+        var i = 0
+        while (i < length(d) && kind >= 0) {
+            if (!is_alpha(int(d[i])) && int(d[i]) != '_') {
+                i++
+                continue
+            }
+            let from = i
+            while (i < length(d) && is_ident_byte(int(d[i]))) {
+                i++
+            }
+            let lit_suffix = from > 0 && is_number(int(d[from - 1]))
+            let name = slice(d, from, i)
+            if (lit_suffix || name == "uint" || name == "int") {
+                continue
+            }
+            kind = find_index(loop_vars, name) >= 0 ? 1 : -1
+        }
+    }
+    return kind
+}
+
+//! true when `idx` sums a constant of a fully unrolled loop's variable with a run-time base
+def private sums_loop_var_with_base(idx : string; loop_vars : array<string>) : bool {
+    var inscope terms <- index_summands(idx)
+    var looped = false
+    var based = false
+    for (term in terms) {
+        let kind = unrolled_kind(term, loop_vars)
+        looped ||= kind > 0
+        based ||= kind < 0
+    }
+    return looped && based
+}
+
+//! ARCHITECTURE_GPU_PREFILL_WINDOW.md#kernel-load-addressing, per Metal kernel file: a fully unrolled loop reads a
+//! bound buffer through a pointer taken outside it, never through a sum of a run-time base and the loop variable.
+def private check_load_addressing_in(path : string) {
+    var inscope lines <- split(fread(path), "\n")
+    var inscope bufs : table<string>
+    for (line in lines) {
+        let colon = find(line, " : array<")
+        if (find(line, "@ssbo") >= 0 && colon >= 0) {
+            bufs |> insert(ident_suffix(slice(line, 0, colon)))
+        }
+    }
+    var inscope loop_indent : array<int>
+    var inscope loop_vars : array<string>
+    var line_no = 0
+    for (line in lines) {
+        line_no++
+        let body = strip(line)
+        continue if (empty(body) || starts_with(body, "//"))
+        let indent = find(line, body)
+        while (!empty(loop_indent) && loop_indent[length(loop_indent) - 1] >= indent) {
+            loop_indent |> pop()
+            loop_vars |> pop()
+        }
+        let header = find(body, "for [unroll_full] (")
+        if (header >= 0) {
+            let var_at = header + length("for [unroll_full] (")
+            loop_indent |> push(indent)
+            loop_vars |> push(ident_prefix(slice(body, var_at)))
+            continue
+        }
+        continue if (empty(loop_vars))
+        for (buf in keys(bufs)) {
+            var inscope reads <- indexed_reads(body, buf)
+            for (idx in reads) {
+                if (sums_loop_var_with_base(idx, loop_vars)) {
+                    gate_finding(path, line_no,
+                        "{buf}[{idx}] in a fully unrolled loop adds the loop variable to a run-time base a load - a 32-bit index sum does not fold into one address; take the address once outside the loop (`let p = unsafe(addr({buf}[<base>]))`) and read `unsafe(p[<offset>])` (ARCHITECTURE_GPU_PREFILL_WINDOW.md#kernel-load-addressing)")
+                }
+            }
+        }
+    }
+}
+
+def private check_metal_kernel_load_addressing {
+    dir("modules/dasLLAMA/dasllama") $(name) {
+        if (starts_with(name, "dasllama_metal_") && ends_with(name, ".das")) {
+            check_load_addressing_in("modules/dasLLAMA/dasllama/{name}")
+        }
+    }
 }
 
 def private check_gpu_role_partition {
@@ -645,16 +761,19 @@ let private TTS_BLOCKS_FILE = "modules/dasLLAMA/dasllama/dasllama_tts_blocks.das
 // the TTS block file's *_prepare mints, the layout helpers and the layout constants' declaration
 // lines, hashed in file order. A closure change with IMAGE_VERSION unmoved is red; the finding prints the
 // value to re-stamp with.
-let private IMAGE_LAYOUT_STAMP_VERSION = 39
-let private IMAGE_LAYOUT_STAMP_HASH = 0x5c8989fb70eb6c07ul
+let private IMAGE_LAYOUT_STAMP_VERSION = 44
+let private IMAGE_LAYOUT_STAMP_HASH = 0x4e64f128eb806584ul
 
 // The helpers that decide WHERE bytes land: the page pad, the plane and total sizing, the
-// writer's append / zero-fill / header patch, the header's scalar stores, and the lattice
-// plane's section name. Changing one moves every plane offset (or renames every lattice
-// section) while every serializer body reads the same.
+// writer's append / zero-fill / header patch, the header's scalar stores, the lattice
+// plane's section name, and the TTS blob's aligned append, its per-weight walk slot and the
+// conv's stacked-row gather the q8 mint quantizes. Changing one moves every plane offset (or
+// renames every lattice section) while every serializer body reads the same.
 var private LAYOUT_HELPERS <- {
     "pad_to_page", "plane_end", "image_total_bytes",
-    "w_append", "w_zeros", "w_header", "store_u32", "store_u64", "kq_plane_name"
+    "w_append", "w_zeros", "w_header", "store_u32", "store_u64", "kq_plane_name",
+    "blob_push", "weight_slot", "conv1d_weight_row",
+    "vk_mint_plane", "vk_mint_walk", "vk_mint_sink_append"
 }
 
 // The constants those helpers place bytes by, and the bands the two streaming writers stage
@@ -663,7 +782,7 @@ var private LAYOUT_HELPERS <- {
 // change that provably moves nothing re-stamps the hash alone.
 var private LAYOUT_CONSTANTS <- {
     "IMAGE_PAGE", "IMAGE_HEADER_BYTES", "SECTION_TABLE_SLACK",
-    "DWRITE_STAGING_BAND", "METAL_BAND_BLOCKS"
+    "DWRITE_STAGING_BAND", "METAL_BAND_BLOCKS", "BLOB_ALIGN_FLOATS"
 }
 
 def private is_archive_serializer(header : string) : bool {
@@ -833,7 +952,7 @@ def private check_image_layout_stamp {
     return if (h == IMAGE_LAYOUT_STAMP_HASH && version == IMAGE_LAYOUT_STAMP_VERSION)
     if (version == IMAGE_LAYOUT_STAMP_VERSION) {
         gate_finding(IMAGE_FILE,
-            "the image layout closure changed (every Archive serializer, build_image, parse_image, every *_prepare mint of dasllama_tts_blocks.das, the layout helpers pad_to_page/plane_end/image_total_bytes/w_append/w_zeros/w_header/store_u32/store_u64/kq_plane_name, and the layout constants IMAGE_PAGE/IMAGE_HEADER_BYTES/SECTION_TABLE_SLACK/DWRITE_STAGING_BAND/METAL_BAND_BLOCKS): re-stamp IMAGE_LAYOUT_STAMP_HASH = {h}ul in modules/dasLLAMA/REVIEW.das; bump IMAGE_VERSION (still {version}) and IMAGE_LAYOUT_STAMP_VERSION with it only if the bytes moved, because a stale image at an unchanged path stays structurally valid and serves different bytes")
+            "the image layout closure changed (every Archive serializer, build_image, parse_image, every *_prepare mint of dasllama_tts_blocks.das, the layout helpers pad_to_page/plane_end/image_total_bytes/w_append/w_zeros/w_header/store_u32/store_u64/kq_plane_name/blob_push/weight_slot/conv1d_weight_row, and the layout constants IMAGE_PAGE/IMAGE_HEADER_BYTES/SECTION_TABLE_SLACK/DWRITE_STAGING_BAND/METAL_BAND_BLOCKS/BLOB_ALIGN_FLOATS): re-stamp IMAGE_LAYOUT_STAMP_HASH = {h}ul in modules/dasLLAMA/REVIEW.das; bump IMAGE_VERSION (still {version}) and IMAGE_LAYOUT_STAMP_VERSION with it only if the bytes moved, because a stale image at an unchanged path stays structurally valid and serves different bytes")
     } else {
         gate_finding("modules/dasLLAMA/REVIEW.das",
             "the layout stamp is behind IMAGE_VERSION {version} - re-stamp: IMAGE_LAYOUT_STAMP_HASH = {h}ul, IMAGE_LAYOUT_STAMP_VERSION = {version}")
@@ -981,13 +1100,13 @@ def private cm2_template_chain_lines(name : string) : array<string> {
 //! one class ladder trio every format template on the cm2 base joins
 struct private LadderTrio {
     suffix : string     //! the stamp's class suffix: `<Fmt>` + suffix
-    tail : string       //! the dispatch name's tail: `kq_batch_<fmt>_` + tail; a per-32 format (q8, q51) spells `<fmt>_batch_` + tail
+    tail : string       //! the dispatch name's tail: `kq_batch_<fmt>_` + tail; a per-32 format (q8, q51, mx4, iq4nl32) spells `<fmt>_batch_` + tail
     ladder : string     //! the ladder functions' prefix: ladder + `ensure` / `set` / `enc`
     why : string        //! what a missing arm does at run time
 }
 
 def private cm2_dispatch_name(fmt, tail : string) : string {
-    return fmt == "q8" || fmt == "q51" || fmt == "mx4" ? "{fmt}_batch_{tail}" : "kq_batch_{fmt}_{tail}"
+    return fmt == "q8" || fmt == "q51" || fmt == "mx4" || fmt == "iq4nl32" ? "{fmt}_batch_{tail}" : "kq_batch_{fmt}_{tail}"
 }
 
 //! the words of `let KQ_CM2E_ALIASES_M = "..."` in the kqformat module: the formats whose e column the m stamp serves
@@ -1376,6 +1495,59 @@ def private check_no_hand_pipelines {
     delete files
 }
 
+let private RESIDENT_FILE = "modules/dasLLAMA/dasllama/dasllama_gpu_resident.das"
+
+//! the resident verify seat in call order: the gated entry, then the body it calls. Every decline in either - a `return`
+//! whose value is not `true` - sits above the call that moves the session's recurrent state to the device (`rdec_dn_own_all`),
+//! since a decline below it hands the CPU verify a session whose state the device holds
+//! (ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback)
+let private VERIFY_SEAT_BODIES <- ["vulkan_resident_verify_gated", "vulkan_resident_verify_go"]
+
+//! a line's `return` value where the line is a return statement (the `if` tail of a postfix form dropped), "" elsewhere
+def private return_value_of(line : string) : string {
+    let s = strip(line)
+    return "" if (!(s |> starts_with("return ")))
+    let expr = slice(s, length("return "))
+    let tail = find(expr, " if ")
+    return strip(tail >= 0 ? slice(expr, 0, tail) : expr)
+}
+
+def private check_verify_decline_before_state_move {
+    var inscope fns <- function_bodies(RESIDENT_FILE) $(header) {   // the bodies come comment-stripped: a `rdec_dn_own_all` or a `return` in a comment counts for nothing
+        for (name in VERIFY_SEAT_BODIES) {
+            return true if (header |> starts_with("def private {name}("))
+        }
+        return false
+    }
+    return if (empty(fns))   //! a tree without the seat bodies (the walker fixtures, a build without the Vulkan seats) has no decline to order
+    var moved = false
+    for (name in VERIFY_SEAT_BODIES) {
+        var seen = false
+        for (f in fns) {
+            continue if (!(f.body |> starts_with("def private {name}(")))
+            seen = true
+            var line_no = f.line - 1
+            for (line in split(f.body, "\n")) {
+                line_no++
+                if (find(line, "rdec_dn_own_all(") >= 0) {
+                    moved = true
+                    continue
+                }
+                let ret = return_value_of(line)
+                if (moved && !empty(ret) && ret != "true") {
+                    gate_finding(RESIDENT_FILE, line_no, "the resident verify seat declines (`return {ret}`) after rdec_dn_own_all moved the session's recurrent state to the device - the CPU verify then reads a session whose state the device holds; move the check above the call (ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback)")
+                }
+            }
+        }
+        if (!seen) {
+            gate_finding(RESIDENT_FILE, "no `def private {name}(` - the check that every verify-seat decline sits above the recurrent state's move to the device (ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback) has no seat body to walk; keep the spelling or move this check with it")
+        }
+    }
+    if (!moved) {
+        gate_finding(RESIDENT_FILE, "no `rdec_dn_own_all(` call inside the resident verify seat - the check that every verify-seat decline sits above the recurrent state's move to the device (ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback) has no state move to order against; keep the spelling or move this check with it")
+    }
+}
+
 // A `[test]` file that requires the engine lives in tests/ - unless it requires a file of its
 // own folder by bare same-dir name (a bench self-check beside its subject), which tests/REVIEW.md's
 // out-of-folder ledger owns instead.
@@ -1433,6 +1605,30 @@ def private check_unicode_tables_stamp {
     let h = fnv1a(slice(text, from, ws_end + 2), 0xcbf29ce484222325ul)
     if (h != UNICODE_TABLES_HASH) {
         gate_finding(UNICODE_FILE, "the RANGES / WS tables changed - a hand edit is a defect: regenerate them by retranscoding the reference checkout's unicode data, then re-stamp UNICODE_TABLES_HASH = {h}ul in modules/dasLLAMA/REVIEW.das")
+    }
+}
+
+let private GEMM_GEN_FILES = [
+    "modules/dasLLAMA/dasllama/dasllama_gemm_gen.das",
+    "modules/dasLLAMA/dasllama/dasllama_gemm_schema.das"
+]
+let private GEMM_GEN_STAMP_HASH = 0x81db69026507ad94ul
+
+[arch(at = "ARCHITECTURE_ENGINE_FORMATS.md#cpu-kernel-tiers")]
+def private check_gemm_gen_stamp {
+    var h = 0xcbf29ce484222325ul
+    for (path in GEMM_GEN_FILES) {
+        return if (!fexist(path))   //! a fixture tree without the generated tier has no generator to stamp
+        h = fnv1a("{base_name(path)}\n", h)
+        for (line in split(strip_line_comments(read_lf(path)), "\n")) {
+            let code = strip(line)
+            continue if (empty(code))   //! a comment line leaves an empty one behind, which is no code
+            h = fnv1a("{code}\n", h)
+        }
+    }
+    if (h != GEMM_GEN_STAMP_HASH) {
+        gate_finding(GEMM_GEN_FILES[0],
+            "the generated GEMM tier's generator sources changed (dasllama_gemm_gen.das, dasllama_gemm_schema.das - ARCHITECTURE_ENGINE_FORMATS.md#cpu-kernel-tiers): a generator's text is outside the JIT cache key, so `.cache/daslang` serves the kernels the old text emitted - bump LLVM_JIT_CODEGEN_VERSION in modules/dasLLVM/daslib/llvm_jit_plan.das unless the emitted code is the same for every perm (the bump moves LLVM_JIT_EMITTER_HASH, which tests-cpp/small/test_jit_emitter_pin.cpp prints), then re-stamp GEMM_GEN_STAMP_HASH = {h}ul in modules/dasLLAMA/REVIEW.das")
     }
 }
 
@@ -1686,6 +1882,7 @@ def main() : int {
     check_race_bind_numbers()
     check_gpu_role_partition()
     check_fastmath_default()
+    check_metal_kernel_load_addressing()
     check_image_backing_release()
     check_khr_stage16_abstract()
     check_ar_max_dim_triple()
@@ -1694,8 +1891,10 @@ def main() : int {
     check_kq_gemv_grid_literals()
     check_vk_extension_roster()
     check_no_hand_pipelines()
+    check_verify_decline_before_state_move()
     check_test_file_placement()
     check_unicode_tables_stamp()
+    check_gemm_gen_stamp()
     check_device_creation_sites()
     check_ple_gather_sites()
     check_arch_cites_by_name()

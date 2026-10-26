@@ -121,18 +121,15 @@ def cm2_splitk_env : int64 => g_cm2_splitk >= 0l ? g_cm2_splitk : g_env_vulkan.c
 [arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#khr-mm-kq-tile")]
 def khr_kq_tile_on : bool => g_gpu.has_coopmat && g_gpu.subgroup_size == 32l
 
-//! an f16 GEMM off a cm2-mode device takes the KHR tile (`f16_gemm_set`'s `khr`)
-def f16_gemm_khr : bool => g_gpu.coopmat_mode != COOPMAT_CM2
-
-//! the f16 GEMM tile serves on a cm2-mode device or where the KHR tile does; elsewhere an f16 GEMM route declines to the f32 tile
-def f16_gemm_on : bool => g_gpu.coopmat_mode == COOPMAT_CM2 || khr_kq_tile_on()
-
 //! the cm2 flash tiles serve where the device was created in cm2 mode AND the mode still reads cm2 - a test that forces the mode in-process moves the pick with it
 def cm2_fa_on : bool => g_gpu.has_coopmat2_fa && g_gpu.coopmat_mode == COOPMAT_CM2
 
 //! the KHR flash tile serves a head of 64, 128, 256 or 512 on an ungated model, the softcap at 256 alone (its cap stamps); the pre-flight and the window chain pick from this one predicate
 def fa_khr_serves(hs : int64; cap : float; gated : bool) : bool
     => (hs == 64l || hs == 128l || hs == 256l || hs == 512l) && !gated && (cap == 0.0 || hs == 256l)
+
+//! the per-32 formats that serve as routed expert planes only: their one cm2 column is the s tile
+def cm2_b32_routed(fmt : int) : bool => fmt == int(KqFmt.q51) || fmt == int(KqFmt.mx4) || fmt == int(KqFmt.iq4nl32)
 
 [arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default")]
 def cm2_tile_cols(d, cnt : int64) : int64 {
@@ -239,7 +236,7 @@ def cm2_gemm_pick(d, cnt, n : int64; sib_tiles : int64 = 0l; scratch_bytes : int
 // mode 4's f16-fed prefill GEMMs): only callers that STAGE f16 activations may pass it
 def batch_tile_edges(fmt : int; d, cnt : int64; cm2l : bool = false) : tuple<tile : int64; td : int64; tc : int64> {
     if (cm2l) {
-        return (tile = 128l, td = 128l, tc = cm2_tile_cols(d, cnt))
+        return (tile = 128l, td = 128l, tc = cm2_b32_routed(fmt) ? 32l : cm2_tile_cols(d, cnt))
     }
     let tile = fmt == 0 ? q8_batch_tile_for(d, cnt) : BATCH_TILE
     return (tile = tile, td = tile, tc = tile)
@@ -318,6 +315,7 @@ let TOK_META_BYTES = 32l   //! one TokMeta row (the kernels index the block by r
 // offset, so find_stack / fill_stack_sched_rows / the whole FFN GEMV rail run verbatim on them
 let HEAT_BASE = 1l << 42l
 let HEAT_STRIDE = 1l << 32l          // per pool-stack offset room (>> nslots * ege)
+let HOT_BASE = 1l << 45l             //! the resident driver's hot expert pools: their stacks' offsets, past every per-op pool's
 let HEAT_UPLOAD_CAP = 2              // steady-state expert uploads per advise call
 let HEAT_UPLOAD_CAP_FILL = 8         // while the pool is underfull (warmup fills fast)
 
@@ -807,8 +805,7 @@ def private note_device_address(b : Buffer) {
         "dasLLAMA vulkan tier: buffer device address query failed")
 }
 
-//! a buffer both the transfer and the compute queue touch, where the device has a transfer queue: CONCURRENT sharing across the two
-//! families dodges the ownership transfers
+//! CONCURRENT sharing across the transfer and compute families where the device has a transfer queue: no ownership transfers
 def private share_with_xfer(var bci : BufferCreateInfo) {
     if (g_gpu.xfer_fam >= 0) {
         bci.sharingMode = VkSharingMode.CONCURRENT
@@ -1207,7 +1204,7 @@ def public vk_ext_roster(phys : VkPhysicalDevice) : array<VkExtEntry> {
             rides = "the SM count the dense tile pick, split-k and the decode attention's partials plane read ({sm} here) - past four pieces the token command records a wide twin at eight; without it the l tile serves every dense GEMM, nothing splits k and the attention stays at four pieces"),
         VkExtEntry(name = "timelineSemaphore (Vulkan 1.2)", present = timeline_semaphore_supported(phys),
             knob = "DASLLAMA_VK_XFERQ", off = !g_env_vulkan.vk_xferq,
-            rides = "the transfer queue that overlaps streamed weight copies with compute and lands the resident token command's logits behind a compute-timeline wait; without it the copies ride the compute queue and the token command copies its own logits under its fence"),
+            rides = "the transfer queue that overlaps streamed weight copies with compute and lands the resident commands' rows behind a compute-timeline wait - the token command's logits and picks, the NextN draft's and the same-slab verify's, and the carry row every one of them lands beside; without it the copies ride the compute queue and each command copies its own landing under its fence"),
         VkExtEntry(name = "computeFullSubgroups (subgroupSizeControl, Vulkan 1.3)", present = compute_full_subgroups_supported(phys),
             knob = "DASLLAMA_VK_FULLSG", off = !g_env_vulkan.vk_fullsg,
             rides = "full subgroups on the one-dimensional workgroups, an A/B arm off by default"),
@@ -1223,7 +1220,7 @@ def public vk_ext_roster(phys : VkPhysicalDevice) : array<VkExtEntry> {
             knob = "DASLLAMA_VK_REBAR", off = !g_env_vulkan.vk_rebar,
             rides = "uploads write straight into VRAM; without it every upload stages through host memory"),
         VkExtEntry(name = "maxStorageBufferRange", present = props.limits.maxStorageBufferRange > 0u,
-            rides = "one side of the whole-model driver's K/V mirror binds as one range ({int(props.limits.maxStorageBufferRange >> 20u)} MiB here): every stream's region shares it, so the region count divides each stream's context; a mirror past it declines the driver and the per-op tier serves; the tower driver (the vision and audio towers) binds a tower's gathered weights, its largest scratch buffer and canary's rel table as one range each, and declines `shape` past it; the TTS seats bind each weight slab and each scratch slot as one range and decline a slot past it (the Pocket codec's column slots at a long chunk)"),
+            rides = "one side of the whole-model driver's K/V mirror binds as one range ({int(props.limits.maxStorageBufferRange >> 20u)} MiB here): every stream's region shares it, so the region count divides each stream's context; a mirror past it declines the driver and the per-op tier serves; a hyper-connection model's mixer inject rows and window panels bind as one range each and decline the seats past it, and a routed layer's hot expert pool binds each plane as one range and keeps its experts on the host past it; the tower driver (the vision and audio towers) binds a tower's gathered weights, its largest scratch buffer and canary's rel table as one range each, and declines `shape` past it; the TTS seats bind each weight slab and each scratch slot as one range and decline a slot past it (the Pocket codec's column slots at a long chunk)"),
         VkExtEntry(name = "maxComputeSharedMemorySize of 33024 B or more", present = props.limits.maxComputeSharedMemorySize >= 33024u,
             rides = "the 8192-float row slabs of the add+rms family and the prefill-attention prep ({int(props.limits.maxComputeSharedMemorySize)} B here); without them the deltanet and prefill-attention chains stay on the CPU rail"),
         VkExtEntry(name = "VK_NV_cooperative_vector", present = cooperative_vector_supported(phys),
@@ -1528,7 +1525,7 @@ def stack_plane_bytes(n, rows : int64; fmt : int) : tuple<wq : int64; ws : int64
 // ensure_gemv_scratch). Resident stacks pass their exact plane sizes; streaming pseudo-stacks
 // pass slot capacities and a base of -1 (re-based per layer).
 def make_stack_shell(base, elems : int64; fmt : int; wqcap, wscap : int64; xfer_shared : bool = false) : int {
-    let wswords = round_up(wscap, 4l)   //! whole words: a byte-scale plane (mx4) is read four blocks a word
+    let wswords = round_up(wscap, 4l)   // whole words: a byte-scale plane (mx4) is read four blocks a word
     var st = VkStack(base = base, elems = elems, fmt = fmt, wqbytes = wqcap,
                      wqbuf = g_gpu.dry ? 0ul : make_device_buf(wqcap, xfer_shared),
                      wsbuf = g_gpu.dry ? 0ul : make_device_buf(ws_floored(wswords), xfer_shared), wsbytes = wswords)
@@ -1539,7 +1536,6 @@ def make_stack_shell(base, elems : int64; fmt : int; wqcap, wscap : int64; xfer_
 //! a scale plane's buffer and its descriptor range floored at 64 bytes, so a scale-less stack's descriptor slot stays valid
 def ws_floored(bytes : int64) : int64 => max(bytes, 64l)
 
-// the descriptor range for a stack's ws binding — the floor of the shell above
 def ws_range(si : int) : int64 => ws_floored(g_gpu.stacks[si].wsbytes)
 
 // decode/GEMV scratch for one stack (per-stack host bufs + the written 6-binding set). Lazy:
@@ -1828,11 +1824,6 @@ struct VkDeclineCounter {
     said : table<string>
 }
 
-//! The words the Vulkan drivers' decline enums share: each driver keeps its own enum (one a driver) and says these where a reason means the same
-let VK_DECLINE_WORDS_TOWER_KNOB = "the tower knob is off (DASLLAMA_VK_TOWER=0 or set_vulkan_tower(false))"
-let VK_DECLINE_WORDS_DEVICE = "the tier has no device (DASLLAMA_GPU=1 arms it), or a class failed to build"
-let VK_DECLINE_WORDS_MEMORY = "a device allocation failed"
-
 //! Count `reason` for `who`, say it once in `words` (the reason name when empty); answers false so a decline site returns it.
 [cold_path]
 def note(var c : VkDeclineCounter; who, reason : string; words : string = "") : bool {
@@ -2057,23 +2048,12 @@ def arena_local_blk(blk : int64) : int64 => blk & ((1l << 32l) - 1l)
 
 // per-block plane strides — the block is 32 weights for q8 and a 256-weight superblock for kq.
 // Mirrors stack_plane_bytes: it computes the same totals as count * these strides.
-// the tier's stack fmt space is int(KqFmt) — bridge to the gemm_schema kq id space
+//! the tier's stack fmt space is int(KqFmt) - the bridge to the gemm_schema kq id space (`kq_schema_id`); a fmt no superblock format carries panics
 def vk_kq_schema_id(fmt : int) : int {
-    if (fmt == int(KqFmt.k4)) return 4
-    if (fmt == int(KqFmt.k5)) return 5
-    if (fmt == int(KqFmt.k6)) return 6
-    if (fmt == int(KqFmt.q40)) return 40
-    if (fmt == int(KqFmt.iq4xs)) return 44
-    if (fmt == int(KqFmt.k3)) return 3
-    if (fmt == int(KqFmt.iq3s)) return 33
-    if (fmt == int(KqFmt.iq3xxs)) return 34
-    if (fmt == int(KqFmt.iq4nl)) return 45
-    if (fmt == int(KqFmt.k2)) return 2
-    if (fmt == int(KqFmt.iq2s)) return 23
-    if (fmt == int(KqFmt.iq2xs)) return 24
-    if (fmt == int(KqFmt.iq2xxs)) return 25
-    panic("vk_kq_schema_id: not a kq stack fmt")
-    return 0
+    if (fmt < 0 || fmt >= KQ_FMT_COUNT) {
+        panic("vk_kq_schema_id: not a kq stack fmt ({fmt})")
+    }
+    return kq_schema_id(kq_fmt_of_slot(fmt))
 }
 
 
@@ -2087,6 +2067,9 @@ def arena_block_bytes(fmt : int) : tuple<wq : int64; ws : int64> {
     }
     if (fmt == int(KqFmt.mx4)) {
         return (wq = MX4_QB, ws = MX4_SB)   // 16 nibble bytes, one E8M0 byte: the CPU's mxq / mxs planes verbatim
+    }
+    if (fmt == int(KqFmt.iq4nl32)) {
+        return (wq = IQ4NL32_QB, ws = IQ4NL32_SB)   // 16 nibble bytes, one f16 d: the CPU's iq4nl32q / iq4nl32s planes verbatim
     }
     return (wq = kq_qsb(vk_kq_schema_id(fmt)), ws = kq_dev_ssb_i(fmt))
 }
@@ -2365,6 +2348,7 @@ struct RLayer {
     s_dnstep : VkDescriptorSet
     m_dnqkv, m_dnz, m_dnout, m_dnbeta, m_dnalpha : HostBuf
     dn : array<DnStep>
+    roll_off : int64                //! this layer's byte offset in a rollback scratch row (`RDec.roll_dev`): its slot state, then its ring pair
     // the prefill window chain's per-recurrent-layer sets (built by pf_setup; the smalls/state differ per layer)
     pf_dn_conv_set : VkDescriptorSet       // pf_dnqkv -> pf_dnconv, this layer's smalls (taps + hist)
     pf_dn_scan_set : VkDescriptorSet       // pf_dnconv + this layer's state + smalls -> the o rows (the sequential scan)
@@ -2405,10 +2389,32 @@ struct RLayer {
     pf_eact_set : VkDescriptorSet
     pf_arcomb_set, pf_arcomb_f16_set : VkDescriptorSet   //! the residual step with the combine folded in: the f32 and f16 normed-row forms
     moe_g4 : bool                   //! the gemma-4 form: the dense triple is a parallel shared expert, the routed feed and the router take their own norms of x, the combine norms both branches (`ClsArCombG4`)
+    experts_host : bool             //! the routed experts serve on the host: no expert planes, the router alone runs here and the token command ends its segment after it
 }
 
 //! the layer's dense FFN triple is placed: its own FFN, or an MoE layer's shared expert (an MoE layer without one has none)
 def has_dense_triple(L : RLayer) : bool => L.b1 >= 0l
+
+//! one hyper-connection mixer site's planes: the q8 down [low_rank x hc_dim] and up [hc_dim x low_rank] arena blocks, their GEMV sets and region metas
+struct HcSite {
+    bdown, bup : int64
+    s_down, s_up : VkDescriptorSet
+    m_down, m_up : HostBuf
+}
+
+//! a routed layer's hot expert pool: `RDec.hot_slots` slots of one expert's three planes each, in the planes' device layout,
+//! each plane a stack of the tier at a base of its own so the expert chain of a window finds it by offset
+struct RdHotLayer {
+    on : bool
+    f1, f3, f2 : int                    //! the gate, up and down planes' formats
+    blk1, blk3, blk2 : int64            //! an expert's weight blocks a plane: a slot's stride in the region records
+    xnb2 : int64                        //! the down feed's blocks a row
+    xnb1 : int64                        //! the gate and up feed's blocks a row: the rows chain's regions read their row's quantized feed
+    st1, st3, st2 : int                 //! the planes' stacks
+    s_gate, s_up, s_down : VkDescriptorSet
+    cmds : array<VkCommandBuffer>       //! the hit chain a region count, [nb x k + 1]: recorded on first use (a step's hits, or the verify rows' k-padded hits a row)
+    recorded : array<bool>
+}
 
 //! the N-row token command's kernel classes on this device: built once before a step commits to the command, or one declined
 enum NRail {
@@ -2455,6 +2461,7 @@ struct RDec {
     hybrid : bool
     dn_cd, dn_kd, dn_di, dn_nvh, dn_nkh, dn_ds, dn_dconv : int64
     dn_ba_f32 : bool              // beta/alpha rows come as f32 in the file (dn_ba_dev, f16 on the device) rather than q8 arena planes
+    dn_zsig : bool                //! the deltanet out-gate is sigmoid(z): the step kernel's `ZSIG` stamp serves (qwen4exp)
     dn_proj_dev : uint64          // [cd + di] floats: the fused qkv row, the z row at cd
     fused_sets_made : bool        //! the fused add+rms+requant sites' stamps and sets are picked once, at the first record
     rq_pro_stamp : RqStamp        //! the prologue site's: layer 0's feed form, the row stored where its head reads floats
@@ -2481,6 +2488,40 @@ struct RDec {
     xlog_pick_recorded : array<bool>
     pick_dev : uint64             //! the rows' argmax ids (`ClsArgmaxPart` then `ClsArgmaxFin`, after the epilogue), and their host landing
     pick_host : HostBuf
+    carry : bool                  //! the plan's carry, whatever the knob said at the load: the landing's planes exist, and the final site can store the rows' post-final-norm hidden in xb_dev and land it into hid_host beside the logits (a NextN-headed model whose tier installed the landing)
+    carry_live : bool             //! the carry as this step wants it - `carry` and the speculative round on; a flip re-records the commands whose last site stores or lands the row (`rd_carry_sync`)
+    hid_host : HostBuf            //! the landed carry rows: the token command's, or the window chain's last row at row 0
+    head_norm_base : int64        //! the NextN draft head's norm block in the norms plane (`rdec_head_norm_base`); 0 = prepared without the head
+    head_on : bool                //! the head is set (`vk_rdec_set_head`): the draft command serves
+    head : RLayer = RLayer()      //! the head's layer (index n_layers), kept out of `layers` and the token command's trunk walk
+    head_eh_blk : int64           //! the head's eh_proj plane's arena block and format
+    head_eh_fmt : int
+    head_m_eh : HostBuf
+    head_s_eh, head_s_cat_ar, head_s_cat_rq : VkDescriptorSet   //! the head's eh_proj GEMV, the embed and carry norms, the concatenated row's requant
+    head_cat_in_dev, head_cat_dev : uint64   //! the head's [embed ; carry] rows as the host uploads them, a row pair a head row (`nb` pairs), and their [enorm ; hnorm] image the eh_proj GEMV reads
+    head_cat_host : HostBuf
+    head_tok : HostBuf            //! the head rows' own TokMeta block and rope rows: the verify's head rows sit a position below its trunk rows
+    head_cos_dev : uint64
+    head_cos_host : HostBuf
+    head_s_hx_ar : VkDescriptorSet   //! the verify's head attention norm of the eh_proj rows into cat (`head_s_cat_rq` quantizes them): xb keeps the trunk rows the landing reads
+    pf_head_ask : bool            //! the next window chain warms the head's slab over the prompt rows it serves (`vk_rdec_head_warm_ask`)
+    pf_head_rows : int64          //! the head rows the last chain wrote
+    pf_head_ready : bool          //! the chain's head planes and sets are built (`pf_head_setup`)
+    pf_head_declined : bool       //! or the device declined them, said once
+    head_pf_wemb, head_pf_hsrc, head_pf_hcos : uint64   //! the chain's head planes: the window's unscaled embed rows; the trunk's post-norm rows a row down, the previous window's last at row 0; the head rows' rope rows
+    head_pf_cat, head_pf_catq, head_pf_cats, head_pf_catf : uint64   //! the chain's head rows' [enorm ; hnorm] image and its eh_proj feed (Q8_0 blocks, or halves on the f16 feed)
+    head_draft_cmd : array<VkCommandBuffer>   //! one recorded draft command per region: the head's mirror base rides its push, as the token command's does
+    head_draft_recorded : array<bool>
+    v_cmd : array<VkCommandBuffer>   //! the same-slab verify commands by row count (index 0 unused; `rd_v_idx`), region-free as the N-row command's on an attention model, a set a region on a hybrid (the rollback copies bake the region's slot), and their unsplit twins
+    v_cmd_unsplit : array<VkCommandBuffer>
+    v_recorded : array<bool>
+    v_rail : NRail = NRail.unasked   //! the verify's form on the armed model: the head, the N-row rail and the head planes' N-column leaves, decided once
+    verify_rows : int64           //! the rows one stream's verify steps at once: the round's depth plus one, within `nb` (0 = the head off or the verify uninstalled)
+    roll_dev : uint64             //! the verify's rollback scratch: a row per verify row the round can reject past (`roll_rows` = `verify_rows` - 1), each row every recurrent layer's slot state and ring pair in layer order (`RLayer.roll_off`); 0 = none
+    roll_rows : int64
+    roll_row_bytes : int64
+    roll_region : int64 = -1l     //! ... the region whose slots the last verify copied (-1 = none to roll back), and that verify's rows
+    roll_vrows : int64
     pick_part_max_dev, pick_part_id_dev : uint64   //! the first pass's partials: a (max, id) a (row, chunk)
     s_pick_part, s_pick_fin : VkDescriptorSet
     kv_readback : HostBuf         // per-layer K/V row -> CPU cache writeback
@@ -2498,6 +2539,7 @@ struct RDec {
     comb_sets_made : bool   //! the MoE layers' combine form is decided and its quantizing sets built (`rd_ensure_comb_sets`; both commands ask)
     n_rail : NRail = NRail.unasked   //! the N-row command's kernel classes on this device; declined = the command answers 0 rows
     n_decline_said : bool            //! the N-row command's decline reason logged for this model, once
+    v_rows_said : bool               //! the verify's row-count mismatch logged for this model, once
     s_quant_final : VkDescriptorSet
     dummy : uint64                // filler for unused bindings
     cls_fmt_marker : int
@@ -2510,7 +2552,7 @@ struct RDec {
     cmd_wide : array<VkCommandBuffer>   //! the wide twin: the same chain with the attention at RD_SPLIT_WIDE_PIECES, submitted from RD_WIDE_POS, recorded on first use
     wide_on : bool                //! ... exists: the device's split count reaches past the split form's pieces
     tok_wide_recorded : array<bool>
-    nb : int64 = 1l               //! the rows the per-row planes hold: the N-row token command's most, one per region to RD_NB_MAX
+    nb : int64 = 1l               //! the rows the per-row planes hold: one per region, or the speculative verify's rows where it asks more, to RD_NB_MAX
     cmd_n : array<VkCommandBuffer>   //! the N-row token commands by row count (index 0 unused): every row reads its own TokMeta entry, so one command serves any region mix
     cmd_n_unsplit : array<VkCommandBuffer>   //! ... and their unsplit attention twins, submitted while every row sits under RD_UNSPLIT_POS; the rows take no wide form (ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split)
     tok_n_recorded : array<bool>
@@ -2591,6 +2633,7 @@ struct RDec {
     moe_gub_bytes, moe_db_bytes : int64
     moe_eidx_dev : uint64         //! the decode's k picks' experts (the biased act and combine's row map)
     moe_ident_dev : uint64        //! 0..MAX_ROUTED_SLOTS-1: the decode combine's identity slot map
+    ones_dev : uint64             //! MAX_ROUTED_SLOTS ones: the host-summed row's weight in a host layer's combine (one slot, the identity map)
     moe_dlog_dev : uint64         //! the decode's logits row (ner floats)
     moe_dw_dev : uint64           //! the decode's k routing weights
     moe_meta1_dev, moe_meta3_dev, moe_meta2_dev : uint64   //! the decode GEMVs' slot regions, written by the top-k
@@ -2605,6 +2648,94 @@ struct RDec {
     pf_my1, pf_my2 : uint64       //! [nk x nfe] the gate / up rows
     pf_mhf : uint64               //! [nk + slack x nfe] the hidden rows, f16
     pf_mdn : uint64               //! [nk x dim] the routed down rows
+    //! the hyper-connection form (qwen4exp): the wide residual and the mixer seams every block reads through (`vk_rdec_set_hc`)
+    hc : bool
+    hc_n, hc_lr : int64           //! the streams, the mixer's low-rank width
+    hcres_dev : uint64            //! the wide residual [hc x dim], the token's one copy
+    hcxn_dev : uint64             //! the grouped-normed streams [hc x dim]
+    hcxnq_dev, hcxns_dev : uint64 //! ... their Q8_0 image, the down GEMV's feed
+    hclo_dev : uint64             //! the low-rank row [lr]
+    hcloq_dev, hclos_dev : uint64 //! ... activated and quantized, the up GEMV's feed
+    hcgate_dev : uint64           //! the up projection [hc x dim]
+    hcinj_dev : uint64            //! the site's scatter logits [hc]
+    hcn_dev, hcinjw_dev : uint64  //! the mixer weights: the norm rows [sites + 1 x hc x dim] (the trunk's head mixer's after the sites', then a NextN head's own and the carry's), the inject rows [sites x hc x hc_dim]
+    hcn_bytes, hcinjw_bytes : int64
+    hc_sites : array<HcSite>      //! a site a block seam (2 x layers, then 2 more for the NextN head's block where it rides), then the head mixer's, then the NextN head's own head mixer
+    hc_nextn : bool               //! the NextN head rides the chain: `hc_mtp_site` and `hc_hnorm_row` are set
+    hc_mtp_site, hc_hnorm_row : int64   //! the site index of the NextN head's own head mixer, and the row index of the carry's norm gammas in `hcn_dev`
+    hc_final_site : int64         //! the site index of the trunk's head mixer (past every block seam, the NextN head's included)
+    pf_hc_head_ready : bool       //! the window chain's hc head warm planes and sets are built (`pf_hc_head_setup`)
+    head_pf_hsrc_w : uint64       //! the shifted wide rows the head warm norms: row 0 the previous window's last wide row, rows 1.. this window's rows 0..wlen-2 [np x hc x dim]
+    head_pf_wsm : uint64          //! the head's wide residual rows as eh_proj lands them, stream-major [hc x np x dim]
+    head_pf_s_hnorm, head_pf_s_enorm : VkDescriptorSet   //! the carry rows' grouped norm (hsrc_w -> pf_hcxn), the embed rows' norm (pf_x -> pf_xb2)
+    hccarry_dev : uint64          //! the NextN head's carry, uploaded wide [hc x dim]: the prelude norms its streams into the cat rows
+    hc_draft_cmd : array<VkCommandBuffer>   //! the hc draft's second segment per region (the first is `head_draft_cmd`): the head's routed sum up, its head mixer, the classifier and the pick
+    s_hc_norm_carry : VkDescriptorSet   //! the carry's grouped norm: `hccarry_dev` in, `hcxn_dev` out
+    head_s_eh_hc : VkDescriptorSet      //! eh_proj with the cat rows as columns, into the head's wide residual
+    hcatq_dev, hcats_dev : uint64       //! the hc cat rows' Q8_0 image [nb x hc x 2 dim] and its scales: eh_proj's feed on the chain
+    hccarry_out_dev : uint64            //! the rows' wide residual before the head mixer, the carry's landing source [nb x hc x dim] (the wide panel is reused past it)
+    hcsrc_dev : uint64                  //! the verify warm's carry rows: the parked carry, then rows 0 .. n-2 of the rows' wide residual [nb x hc x dim]
+    hemb_dev : uint64                   //! the verify's head embed rows [nb x dim]
+    hemb_host : HostBuf
+    s_hc_norm_vsrc : VkDescriptorSet    //! the verify warm's carry norm: `hcsrc_dev` in, `hcxn_dev` out
+    head_s_emb_ar : VkDescriptorSet     //! the verify's embed rows normed under `mtp_enorm`: `hemb_dev` in, `xb2_dev` out
+    plepanel_dev : uint64               //! the verify rows' normed gated rows [nb x hc x dim]: the conv reads the rows inside the window off it, the ring past them
+    s_ple_commit : VkDescriptorSet      //! the panel's rows into the ring's slots after the rows
+    @exact_size hc_v_seg : array<VkCommandBuffer>   //! the hc verify's segments per region (`nseg` a region), recorded at the verify's row count
+    @exact_size hc_v_recorded : array<bool>
+    s_hc_norm, s_hc_inj, s_hc_xnrq, s_hc_lorq, s_hc_mix : VkDescriptorSet
+    s_hc_comb_a, s_hc_comb_f : VkDescriptorSet   //! the scatter after the attention head (the wo row) and after the FFN (the shared row plus the host's routed sum)
+    //! the n-gram side input before layer `ngram_layer`'s attention mixer (`vk_rdec_set_ngram`)
+    ngram : bool
+    ngram_layer, ngram_ind, ngram_nrows, ngram_kern, ngram_dil : int64
+    ple_emb_dev : uint64          //! the gathered heads row [ind], copied in-cmd from `ple_emb_host`
+    ple_emb_host : HostBuf
+    pleq_dev, ples_dev : uint64   //! ... its Q8_0 image, the key and value GEMVs' feed
+    plekey_dev, pleval_dev : uint64   //! the projections [hc x dim], [dim]
+    plegated_dev : uint64         //! the gated value rows [hc x dim]
+    plehist_dev : uint64          //! the conv ring [regions x nrows x hc x dim]
+    plew_dev : uint64             //! the side input's weights: the three norm rows, then the conv taps
+    plew_bytes : int64
+    ple_bkey, ple_bval : int64
+    s_ple_rq, s_ple_key, s_ple_val, s_ple_gate, s_ple_conv : VkDescriptorSet
+    m_ple_key, m_ple_val : HostBuf
+    //! some routed layers' experts on the host (`vk_rdec_set_host_experts`; a layer registered with no expert blocks): the token command splits at every such block
+    experts_host : bool
+    nseg : int64                  //! the segments a token takes: the host layers plus one
+    cmd_seg : array<VkCommandBuffer>   //! [regions x nseg], recorded once per region
+    seg_recorded : array<bool>
+    seg_layer : array<int64>      //! the routed layer a segment ends on (the last segment ends on none: -1)
+    hx_host : HostBuf             //! the landed FFN-mixed row [dim] a routed block's host sum reads
+    hlog_host : HostBuf           //! ... and the router logits row [ner]
+    hacc_host : HostBuf           //! the host's routed sum [dim], copied in-cmd into `hacc_dev`
+    hacc_dev : uint64             //! the routed sum the FFN seam's scatter reads [dim]: the host's sum, the pool's hit rows added on the device
+    //! the hot expert pool (`vk_rdec_hot_layer`): a routed layer's hot experts on the device, their chain run while the host sums the misses
+    hot_slots : int64             //! slots a routed layer (0 = no pool)
+    hot_layers : array<RdHotLayer>
+    hot_meta1, hot_meta3, hot_meta2 : HostBuf   //! the hit chain's region records, written by the host a step
+    hot_w : HostBuf               //! the hits' routing weights [k], zero past the hit count
+    hot_ident1_dev : uint64       //! 1 .. k: the combine's slot rows, one past the row index so its window starts past 0 and the sum accumulates
+    s_hot_rq, s_hot_act, s_hot_comb : VkDescriptorSet
+    hot_submits, hot_hits : int64 //! the hit chains submitted and the picks they served
+    //! the hyper-connection window chain (`vk_rdec_prefill_hc`): a window's wide rows and mixer panels, its segments cut at every
+    //! routed layer's router, the host's routed sums of the rows between them
+    pf_hc_ready : bool
+    pf_hcres, pf_hcxn : uint64        //! [np x hc x dim] the wide rows, the normed streams
+    pf_hcxq, pf_hcxs : uint64         //! ... the normed streams' Q8_0 image (the mixer's down GEMM feed; wider than the shared xq plane)
+    pf_hclo : uint64                  //! [np x lr] the low-rank rows (activated and quantized into the shared hq/hs)
+    pf_hcup : uint64                  //! [np x hc x dim] the up projection
+    pf_hcinj : uint64                 //! [np x hc] the site's scatter logits
+    pf_hcemb, pf_hcembq, pf_hcembs : uint64   //! [np x ind] the side rows and their Q8_0 image
+    pf_plekey, pf_pleval : uint64     //! [np x hc x dim], [np x dim] the side projections
+    pf_plegated, pf_hpanel : uint64   //! [np x hc x dim] the gated value rows, the normed gated rows the conv reads inside the window
+    pf_hacc_dev : uint64              //! [np x dim] the host's routed sums, copied in-cmd
+    pf_ident_dev, pf_ones_dev : uint64   //! [np] 0..np-1 and [np] ones: a host layer's combine reads its row at the identity map under a weight of one
+    pf_hx_host, pf_hlog_host, pf_hacc_host : HostBuf   //! the landings a routed layer's host step reads and writes: the FFN-mixed rows [np x dim], the router logits [np x ner], the sums [np x dim]
+    pf_seg : array<VkCommandBuffer>   //! the window's segments: the routed layers plus one
+    pf_hc_meta0 : int                 //! the first of the mixer GEMMs' meta slots in pf_meta: two a site (down, up), then the head's two, then the side key and value
+    pf_s_hc_init, pf_s_hc_norm, pf_s_hc_inj, pf_s_hc_xnrq, pf_s_hc_lorq, pf_s_hc_mix : VkDescriptorSet
+    pf_s_hc_comb_a, pf_s_hc_comb_f : VkDescriptorSet
+    pf_s_ple_rq, pf_s_ple_gate, pf_s_ple_conv : VkDescriptorSet
 }
 
 let PF_WINDOW = 512l   // prefill activation-buffer rows; longer prompts run as sequential windows
@@ -2630,15 +2761,24 @@ def rd_unmake_sets {
     g_rd.comb_sets_made = false
 }
 
-//! every region's token command re-records: the sets or planes it references were replaced
+//! every region's token and draft commands and the verify commands re-record: the sets or planes they reference were replaced
 def rd_invalidate_token {
     for (rec in g_rd.tok_recorded) {
+        rec = false
+    }
+    for (rec in g_rd.seg_recorded) {
         rec = false
     }
     for (rec in g_rd.tok_wide_recorded) {
         rec = false
     }
     for (rec in g_rd.tok_n_recorded) {
+        rec = false
+    }
+    for (rec in g_rd.head_draft_recorded) {
+        rec = false
+    }
+    for (rec in g_rd.v_recorded) {
         rec = false
     }
 }
@@ -2732,29 +2872,44 @@ def fill_gemv_regions_qkv(hb : HostBuf; blk_q, blk_k, blk_v : int64; qpieces, pi
 // BOTTOM_OF_PIPE stamps; results ride a same-submit copy, no extra fence. Overlapped hazard
 // levels put the whole level's cost on the LAST member's delta (earlier members read near-zero)
 
+//! a recorded form's stamp list: the recorder's names in stamp order (stamp 0 the anchor), its stamp count, and whether the pool overflowed
+struct RdqStamps {
+    names : array<string>
+    n : uint
+    overflow : bool
+}
+
+//! a form's ledger: the stamps' summed intervals by name over the commands sampled, and the host side of the same commands
+struct RdqLedger {
+    us_by_name : table<string; double>   //! a name repeated in a command sums: every layer's "q", both kv halves
+    print_order : array<string>          //! the names in first-seen order, the tables' print order
+    total : double                       //! the commands' device spans, first stamp to last, summed
+    count : int64                        //! the commands sampled
+    idle_us : double                     //! the device's idle between the command sampled before it (any form's) and this form's, summed
+    wall_us : double                     //! the host wall of the same commands, and its pieces:
+    memcpy_us : double                   //! the memcpys and meta
+    submit_us : double                   //! the submit
+    wait_us : double                     //! the wait
+    land_us : double                     //! the landing copy
+    host_experts_us : double             //! the host's routed sums between a split command's segments
+}
+
 // decode per-role accumulation across tokens (stamps overwrite each submit); printed every 32
 var g_rdq_n = 0u
-var g_rdq_count = 0l
-var g_rdq_total = 0.0lf
 var g_rdq_stamp_names : array<string>        //! the recorded token command's stamp names in stamp order, the recorder's own account of what each interval bills
-var g_rdq_names_unsplit : array<string>        //! ... the unsplit twin's, its stamp count and its overflow flag
-var g_rdq_n_unsplit = 0u
-var g_rdq_overflow_unsplit = false
-var g_rdq_names_wide : array<string>        //! ... and the wide twin's
-var g_rdq_n_wide = 0u
-var g_rdq_overflow_wide = false
+var g_rdq_unsplit : RdqStamps   //! the unsplit twin's list, stamp count and overflow flag
+var g_rdq_wide : RdqStamps      //! ... and the wide twin's
 var g_rdq_attn_form = RdForm.split   //! the attention form the last sampled token took: a switch restarts the averages
-var g_rdq_names_n : array<string>   //! the N-row command's stamp names, its stamp count and overflow flag, and its unsplit twin's
-var g_rdq_n_n = 0u
-var g_rdq_overflow_n = false
-var g_rdq_names_n_unsplit : array<string>
-var g_rdq_n_n_unsplit = 0u
-var g_rdq_overflow_n_unsplit = false
+var g_rdq_nrow : RdqStamps      //! the N-row command's, and its unsplit twin's
+var g_rdq_nrow_unsplit : RdqStamps
 var g_rdq_form_n = false   //! the last sampled submit was an N-row step: a switch between the one-row and N-row forms restarts the averages
-var g_rdq_us_by_name : table<string; double>   //! the stamps' summed intervals by name (a name repeated in a token sums: every layer's "q", both kv halves)
-var g_rdq_print_order : array<string>        //! the names in first-seen order, the tables' print order
-var g_rdq_wall_us = 0.0lf   // the host side of the same tokens: memcpys + submit + fence + logits copy
-var g_rdq_host_us : double[4]   //! ... split into its pieces: the memcpys and meta, the submit, the fence spin, the logits copy
+var g_rdq_verify : array<RdqStamps>   //! the same-slab verify commands' by row count (index 0 unused), and their unsplit twins'
+var g_rdq_verify_unsplit : array<RdqStamps>
+var g_rdq_draft : RdqStamps           //! the draft command's
+var g_rdq_hc_draft_tail : RdqStamps   //! the hyper-connection draft's second segment (the query pool holds the last segment's stamps)
+var g_rdq_token_ledger : RdqLedger    //! the token command's ledger: the one-row forms and the N-row command, a switch between them restarting it
+var g_rdq_verify_ledger : RdqLedger   //! the verify command's - its own, so the round's alternating commands never restart the token ledger
+var g_rdq_draft_ledger : RdqLedger    //! the draft command's
 var g_rdq_overflow = false   //! a stamp the query pool could not take (PFQ_CAP): the recorded names and the pool saturate together, so the sampler reads this instead
 
 //! the token command changed attention forms mid-run: say so and restart the ledger's averages (the recorded stamp names
@@ -2762,40 +2917,45 @@ var g_rdq_overflow = false   //! a stamp the query pool could not take (PFQ_CAP)
 [cold_path]
 def rdq_form_switch(form : RdForm; pos : int64) {
     to_log(LOG_INFO, "vk_rdec gpu: the token command takes its {form} form from position {pos} - the averages restart\n")
-    rdq_reset_averages()
+    rdq_reset_averages(g_rdq_token_ledger)
 }
 
-def rdq_reset_averages {
-    g_rdq_count = 0l
-    g_rdq_total = 0.0lf
-    g_rdq_wall_us = 0.0lf
-    for (i in range(4)) {
-        g_rdq_host_us[i] = 0.0lf
-    }
-    g_rdq_us_by_name |> clear()
-    g_rdq_print_order |> clear()
+def rdq_reset_averages(var led : RdqLedger) {
+    led.count = 0l
+    led.total = 0.0lf
+    led.idle_us = 0.0lf
+    led.wall_us = 0.0lf
+    led.memcpy_us = 0.0lf
+    led.submit_us = 0.0lf
+    led.wait_us = 0.0lf
+    led.land_us = 0.0lf
+    led.us_by_name |> clear()
+    led.print_order |> clear()
+}
+
+def private rdq_clear_stamps(var st : RdqStamps) {
+    st.names |> clear()
+    st.n = 0u
+    st.overflow = false
 }
 
 //! the decode profiler's accumulators back to zero: a model drop or a new resident model - averages never span models
 def rdq_reset {
-    rdq_reset_averages()
+    rdq_reset_averages(g_rdq_token_ledger)
+    rdq_reset_averages(g_rdq_verify_ledger)
+    rdq_reset_averages(g_rdq_draft_ledger)
     g_rdq_n = 0u
     g_rdq_overflow = false
     g_rdq_stamp_names |> clear()
-    g_rdq_names_unsplit |> clear()
-    g_rdq_n_unsplit = 0u
-    g_rdq_overflow_unsplit = false
-    g_rdq_names_wide |> clear()
-    g_rdq_n_wide = 0u
-    g_rdq_overflow_wide = false
+    rdq_clear_stamps(g_rdq_unsplit)
+    rdq_clear_stamps(g_rdq_wide)
     g_rdq_attn_form = RdForm.split
-    g_rdq_names_n |> clear()
-    g_rdq_n_n = 0u
-    g_rdq_overflow_n = false
-    g_rdq_names_n_unsplit |> clear()
-    g_rdq_n_n_unsplit = 0u
-    g_rdq_overflow_n_unsplit = false
+    rdq_clear_stamps(g_rdq_nrow)
+    rdq_clear_stamps(g_rdq_nrow_unsplit)
     g_rdq_form_n = false
+    delete g_rdq_verify
+    delete g_rdq_verify_unsplit
+    rdq_clear_stamps(g_rdq_draft)
 }
 
 let PFQ_CAP = 2048u
@@ -3243,9 +3403,18 @@ def private vkd_unregistered_panic(c : VkdClass; ord : int) {
     panic("dasLLAMA vulkan lens: dispatch through an unregistered pipeline - kernel slot {ord} of the class whose built slots read [{join(built, ", ")}] ({length(c.bindings)} bindings, a {c.push_bytes}-byte push, pipe epoch {c.pipe_epochs[ord]} of {g_vkd_pipe_epoch}): its ensure_ never ran, or ran before the model drop")
 }
 
+[cold_path]
+def private vkd_unbuilt_panic(c : VkdClass; ord : int) {
+    let built <- [for (p in c.pipes); g_pipe_names?[intptr(boost_value_to_vk(p))] ?? "-"]
+    panic("dasLLAMA vulkan lens: dispatch through a kernel slot the class never built - slot {ord} of a class with {length(c.pipes)} built slot(s) reading [{join(built, ", ")}] ({length(c.bindings)} bindings, a {c.push_bytes}-byte push): its ensure_* ran for fewer stamps than the dispatch asks (an N-column or row-count stamp past the ensured count)")
+}
+
 // the class twin of hz_dispatch: same masks/coverage/barrier rail, the CLASS pipeline layout;
 // ord picks the kernel's pipe slot
 def vkd_dispatch(raw : VkCommandBuffer; var h : VkHaz; c : VkdClass; var set_ : VkDescriptorSet; ord : int; groups : uint) {
+    if (ord >= length(c.pipes)) {
+        vkd_unbuilt_panic(c, ord)
+    }
     if (!key_exists(g_pipe_access, intptr(boost_value_to_vk(c.pipes[ord])))) {
         vkd_unregistered_panic(c, ord)
     }
@@ -3566,8 +3735,7 @@ def upload_zeros(dev : uint64; off, bytes : int64) {
     }
 }
 
-//! one command submitted on `queue` under `fence`: waiting `wsem` at `wval` at `wstage` where `wval` is past 0, signalling `ssem` at
-//! `sval` where `sval` is past 0 - the timelines' values start at 1
+//! one submit under `fence`: waits `wsem` at `wval` (`wstage`), signals `ssem` at `sval`, each only past 0 - timelines start at 1
 def private timeline_submit(queue : VkQueue; var raw : VkCommandBuffer; fence : VkFence; var wsem : VkSemaphore; wval : uint64;
                             wstage : VkPipelineStageFlags; var ssem : VkSemaphore; sval : uint64) {
     var submit = VkSubmitInfo()
@@ -3605,7 +3773,7 @@ def private submit_core(var raw : VkCommandBuffer; fence : VkFence; signal : boo
     var wstage : VkPipelineStageFlags
     wstage.transfer = true
     wstage.compute_shader = true
-    let sval = signal ? g_gpu.cmp_value + 1ul : 0ul   //! the compute timeline: the transfer queue's copy of this command's output waits for it
+    let sval = signal ? g_gpu.cmp_value + 1ul : 0ul   // the compute timeline: the transfer queue's copy of this command's output waits for it
     timeline_submit(g_gpu.queue, raw, fence, g_gpu.xfer_sem, wval, wstage, g_gpu.cmp_sem, sval)
     if (signal) {
         g_gpu.cmp_value = sval
@@ -3805,6 +3973,20 @@ def cmd_copy_range(raw : VkCommandBuffer; src : uint64; src_off : int64; dst : u
     var region = VkBufferCopy(srcOffset = uint64(src_off), dstOffset = uint64(dst_off), size = uint64(bytes))
     unsafe {
         vkCmdCopyBuffer(raw, reinterpret<VkBuffer>(src), reinterpret<VkBuffer>(dst), 1u, addr(region))
+    }
+}
+
+var @scratch g_copy_rows_regions : array<VkBufferCopy>
+
+//! `rows` copies of `bytes` in ONE copy command: row i from `src_off + i * src_stride` to `dst_off + i * dst_stride`
+def cmd_copy_rows(raw : VkCommandBuffer; src : uint64; src_off, src_stride : int64; dst : uint64; dst_off, dst_stride : int64; bytes, rows : int64) {
+    return if (rows <= 0l)
+    g_copy_rows_regions |> resize(rows)
+    for (i in range64(rows)) {
+        g_copy_rows_regions[i] = VkBufferCopy(srcOffset = uint64(src_off + i * src_stride), dstOffset = uint64(dst_off + i * dst_stride), size = uint64(bytes))
+    }
+    unsafe {
+        vkCmdCopyBuffer(raw, reinterpret<VkBuffer>(src), reinterpret<VkBuffer>(dst), uint(rows), addr(g_copy_rows_regions[0]))
     }
 }
 

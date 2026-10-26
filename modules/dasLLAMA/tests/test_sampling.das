@@ -28,10 +28,7 @@ let GEMMA2_GEN <- [235248l, 235321l, 235269l, 235248l, 235315l, 235269l, 235248l
 [test]
 def test_sampling_greedy_matches_oracle(t : T?) {
     t |> run("greedy sampling generate reproduces the gemma2 oracle") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
+        return if (!jit_only(t))
         let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> skip("{path} not present")
@@ -45,8 +42,7 @@ def test_sampling_greedy_matches_oracle(t : T?) {
         let pv = get_act_vec()
         set_act_vec(false)
         var got : array<int64>
-        with_job_que() {
-            setup_dasllama_jobque()
+        with_dasllama_jobque() {
             var s = create_session(m, KVDtype.f32)   // frozen f32 oracle — the facade default is f16
             generate(m, s, GEMMA2_PROMPT, SamplingParams(), long_length(GEMMA2_GEN)) $(id, piece) {
                 got |> push(id)
@@ -380,10 +376,7 @@ def test_fast_path_ties(t : T?) {
 [test]
 def test_sampling_deterministic(t : T?) {
     t |> run("same seed => identical sampled output") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
+        return if (!jit_only(t))
         let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> skip("{path} not present")
@@ -394,8 +387,7 @@ def test_sampling_deterministic(t : T?) {
         let n = 16l
         var a : array<int64>
         var b : array<int64>
-        with_job_que() {
-            setup_dasllama_jobque()
+        with_dasllama_jobque() {
             var s1 = create_session(m)
             set_seed(s1, 12345)
             generate(m, s1, GEMMA2_PROMPT, params, n) $(id, piece) {

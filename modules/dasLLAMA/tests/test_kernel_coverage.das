@@ -39,6 +39,8 @@ require daslib/fio  // the zoo paths
 require math  // nolint:STYLE030,LINT019 — used only inside the das_metal static_if half
 require strings
 require _model_tier
+require ../performance/model_specs.das   // nolint:STYLE030,LINT019 — counting_prompt, read only inside the das_metal and vulkan static_if halves
+require _gpu_knobs   // nolint:STYLE030,LINT019 — gpu_knobs: the vulkan census's knob record, read inside the vulkan half
 require dasllama/dasllama_env   // nolint:STYLE030,LINT019 — the read sites sit in the apple static_if half; the linux lint flavor sees the require as unused
 
 // The KERNEL COVERAGE census (REVIEW_GPU_KERNEL_CLASSES.md: a Metal kernel class is dispatched by a census row here or named in
@@ -73,9 +75,14 @@ let private CENSUS_NEVER_DISPATCHED <- [
     // the q5_1 MoE tensor twins, ALL stamps: no stocked carrier holds a Q5_1 expert plane
     // (the zoo's MoE carriers are Q8_0 / Q5_K_M / Q4_K_M / mxfp4; Q5_1 appears only when
     // expert_ffn % 256 != 0 forces the converter off K-quants). Their coverage is the
-    // bit-exact twin + tall-pair gate in test_metal_prefill_kernels.das (moe_mulmm_q51_gate)
+    // bit-exact twin + tall-pair gate in test_metal_prefill_kernels.das (moe_mulmm_b32_gate)
     "MetalMoeMulMmQ51T", "MetalMoeMulMmQ51TH",
     "MetalMoeMulMmQ51TH128", "MetalMoeMulMmQ51THR",
+    // the iq4nl32 MoE tensor twins, ALL stamps: the per-32 IQ4_NL expert planes ride only a
+    // carrier whose expert rows are off the 256 lattice (Qwen3.8-Flash-Next's 640-wide down
+    // stacks, far above the zoo's tier). Their coverage is the same gate's iq4nl32 arm
+    "MetalMoeMulMmIq4nl32T", "MetalMoeMulMmIq4nl32TH",
+    "MetalMoeMulMmIq4nl32TH128", "MetalMoeMulMmIq4nl32THR",
     // the dense tall in-kernel-dequant kq stamps: they engage only when a site's f16 panel
     // would reach TALLKQ_MIN_PANEL (96 MiB) - the zoo's small carriers top out far below it,
     // and the iq3 pair additionally wants a plane in a format the zoo does not stock.
@@ -173,27 +180,19 @@ let private CENSUS_NEVER_DISPATCHED <- [
     // lattice takes it, and every stocked StyleTTS2 and Pocket transposed conv sits on the lattice,
     // so the gathering CONV stamp serves. Its coverage is st2_im2col_gate(transposed = true) in
     // test_metal_prefill_kernels.das
-    "metal_st2_im2col_tr"
+    "metal_st2_im2col_tr",
+    // the hyper-connection mixer, its scatter, the n-gram side input and the σ(z) deltanet gate
+    // (qwen4exp): the one carrier is Qwen3.8-Flash-Next (94 GB, the large tier), which no census
+    // row loads. Their coverage is the hc_*/ple_* gates in test_metal_misc_kernels.das and the
+    // sigmoid leg of dn_chain_gate in test_metal_prefill_kernels.das
+    "metal_hc_norm", "MetalHcLo", "metal_hc_init", "metal_hc_mix", "metal_hc_combine", "metal_ple_gate", "metal_ple_conv",
+    "MetalDnGateSig",
+    // the device attention pair's 128-row stamps: they serve a window whose padded row count is a
+    // multiple of 128, and the census prompt pads to 608 rows, which the 32-row stamps take. Their
+    // coverage is attn_qk_dev_gate and attn_dev_pair_gate in test_metal_gemm_kernels.das and the
+    // attn-dev arm's 384-row continuation in test_metal_prefill_parity.das
+    "MetalAttnQKDev128", "MetalAttnAVDev128"
 ]
-
-def private counting_prompt(start, last : int) : string {
-    return build_string() $(var w) {
-        for (i in range(start, last + 1)) {
-            w |> write(i)
-            w |> write(i < last ? ", " : ",")
-        }
-    }
-}
-
-def private greedy_top(lg : array<float>; vocab : int64) : int64 {
-    var best = 0l
-    for (v in range64(1l, vocab)) {
-        if (lg[v] > lg[best]) {
-            best = v
-        }
-    }
-    return best
-}
 
 [unused_argument(t, path, family, kdts, nbs)]   // off-Apple the gated body is empty
 def private cov_model(t : T?; path, family : string; kdts : array<KVDtype>; nbs : array<int>) {
@@ -216,8 +215,7 @@ def private cov_model(t : T?; path, family : string; kdts : array<KVDtype>; nbs 
         let vocab = tr.config.vocab_size
         select_prefill_override("metal")
         select_decode_override("metal")
-        with_job_que() {
-            setup_dasllama_jobque()
+        with_dasllama_jobque() {
             for (kdt in kdts) {
                 var s = make_run_state(tr.config, kdt, kdt)
                 // >= 256 rows: the half-X convert (CVT_MIN_ROWS), the tall M-tile stamps and
@@ -225,12 +223,12 @@ def private cov_model(t : T?; path, family : string; kdts : array<KVDtype>; nbs 
                 // every one of those kernels undispatched and the census blind to them
                 let p <- encode(tr, counting_prompt(1, 140), true, false)
                 eval_(tr, s, p)
-                var cur = greedy_top(s.logits, vocab)
+                var cur = argmax_of(s.logits, vocab)
                 for (_i in range(2)) {
                     var one <- [cur]
                     eval_(tr, s, one)
                     delete one
-                    cur = greedy_top(s.logits, vocab)
+                    cur = argmax_of(s.logits, vocab)
                 }
                 // continuation prefill (start_pos > 0) — the pf window-landing utilities only
                 // serve when a second window lands on an already-warm cache
@@ -248,7 +246,7 @@ def private cov_model(t : T?; path, family : string; kdts : array<KVDtype>; nbs 
                         let pb <- encode(tr, counting_prompt(3 + i, 44 + i), true, false)
                         eval_(tr, ss[i], pb)
                         sess |> push(unsafe(addr(ss[i])))
-                        curs |> push(greedy_top(ss[i].logits, vocab))
+                        curs |> push(argmax_of(ss[i].logits, vocab))
                     }
                     var ws <- create_batch_workspace_(tr)
                     eval_batch_(tr, ws, sess, curs)
@@ -343,8 +341,7 @@ def private cov_tower_gemma3v(t : T?) {
             }
             var out : array<float>
             let prev_flash = get_metal_tower_flash()
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 gemma3v_encode(tw, st, planes, 896l, 896l, out)
                 set_metal_tower_flash(false)
                 var out2 : array<float>
@@ -369,8 +366,7 @@ def private cov_tower_gemma3v(t : T?) {
             reset_gemma3v_q8()
             var stt = Gemma3vState()
             var outt : array<float>
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 gemma3v_encode(twt, stt, planes, 896l, 896l, outt)
             }
             unpin_metal_tensor_crowns()
@@ -402,8 +398,7 @@ def private cov_tower_qwen25v(t : T?) {
                 planes[i] = sin(float(i) * 0.019) * 0.5 + 0.5
             }
             var out : array<float>
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 qwen25v_encode(tw, st, planes, 112l, 112l, out)
             }
             delete out
@@ -433,8 +428,7 @@ def private cov_tower_qwen3v(t : T?) {
                 planes[i] = sin(float(i) * 0.023) * 0.5 + 0.5
             }
             var out : array<float>
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 qwen3v_encode(tw, st, planes, 96l, 96l, out)
             }
             delete out
@@ -459,8 +453,7 @@ def private cov_tower_gemma4a(t : T?; samples : array<float>) {
             reset_gemma4a_q8()
             var gst = Gemma4aState()
             var grows : array<float>
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 gemma4a_encode_all(genc, gst, samples, grows)
             }
             delete grows
@@ -480,8 +473,7 @@ def private cov_tower_canary(t : T?; samples : array<float>) {
             var inscope cenc = CanaryEncoder()
             mint_canary_encoder(cstg, cenc)
             var cst = CanaryState()
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 canary_log_mel(cenc, samples, cst)
                 canary_encode(cenc, cst)
             }
@@ -500,8 +492,7 @@ def private cov_tower_parakeet(t : T?; samples : array<float>) {
             var inscope pm = ParakeetModel()
             mint_parakeet_model(pstg, pm, false)
             var pst = ParakeetState()
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 parakeet_log_mel(samples, pm, pst)
                 parakeet_encode(pm, pst)
             }
@@ -528,8 +519,7 @@ def private cov_tower_gemma4v(t : T?) {
                 planes[i] = sin(float(i) * 0.017) * 0.5 + 0.5
             }
             var out : array<float>
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 gemma4v_encode(tw, st, planes, 96l, 96l, out)
             }
             delete out
@@ -556,8 +546,7 @@ def private cov_tower(t : T?) {
             var inscope w = WhisperModel()
             var inscope stg <- stage_whisper_model(wpath, false, true)
             mint_whisper_model(stg, w, false, true)
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 var ws <- create_session(w)
                 transcribe(w, ws, samples) $(_seg) {
                     pass
@@ -575,8 +564,7 @@ def private cov_tower(t : T?) {
                 mel.data[i] = sin(float(i) * 0.0137) * 0.8
             }
             var aenc <- make_encoder_state(atw)
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 audio_encode(atw, aenc, mel)
             }
             delete aenc
@@ -591,8 +579,7 @@ def private cov_tower(t : T?) {
             var qenc <- make_encoder_state(qtw.core)
             var qcs = Qwen3aConvState()
             var qrows : array<float>
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 var qmel <- log_mel_qwen3a(samples, qtw.core.n_mel)
                 qwen3a_encode_all(qtw, qenc, qcs, qmel, qrows)
                 delete qmel
@@ -634,8 +621,7 @@ def private cov_tower_styletts2(t : T?) {
             var inscope noise = TtsNoise()
             var tm = TtsTimings()
             var inscope sc = St2Scratch()
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 styletts2_synthesize(m, ids, style, 1.0, noise, 0x5eedul, null, tm, sc)
             }
         }
@@ -657,8 +643,7 @@ def private cov_tower_pocket(t : T?) {
             }
             var inscope wave : array<float>
             var tm = TtsTimings()
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 pocket_decode_latents(m, lat, frames, sc, wave)
                 pocket_speak(m, "The census row speaks one short line.", m.default_voice, m.default_temperature, 1ul, tm, sc)
                 let kq = path_join(models_dir(), "pocket-tts-en-kq.gguf")   //! the small form: its head's q8 linears take the q8 stamps
@@ -686,8 +671,7 @@ def private cov_tower_gemma4uv(t : T?) {
                 planes[i] = sin(float(i) * 0.013) * 0.7
             }
             var out : array<float>
-            with_job_que() {
-                setup_dasllama_jobque()
+            with_dasllama_jobque() {
                 gemma4uv_encode(emb, st, planes, 96l, 96l, out)
             }
             delete out
@@ -698,10 +682,18 @@ def private cov_tower_gemma4uv(t : T?) {
 }
 
 //! Blind entries whose stamp compiles only behind a box crown, and the crown that reaches them:
-//! where the crown IS pinned a stocked carrier dispatches the stamp, so the drain assert would red
-//! on a correct box. `CENSUS_NEVER_DISPATCHED` has no vocabulary for "blind only off this crown",
-//! so the pair is named here.
-let private CENSUS_CROWN_CONDITIONAL : table<string; string> <- {"MetalKqMvB2K4R2" => "kq_mvb2_k4_r2"}
+//! where the crown IS pinned a stocked carrier may dispatch the stamp, and where it is NOT the stamp
+//! never compiled and the entry matches no census key - the drain assert would red on a correct box
+//! either way. `CENSUS_NEVER_DISPATCHED` has no vocabulary for "blind only off this crown", so the
+//! pair is named here.
+let private CENSUS_CROWN_CONDITIONAL : table<string; string> <- {
+    "MetalKqMvB2K4R2" => "kq_mvb2_k4_r2",
+    "metal_kq_gemv_iq3s_f4" => "kq_gemv_iq3s_f4",
+    "metal_kq_gemv_iq3xxs_f4" => "kq_gemv_iq3xxs_f4",
+    "MetalKqGemvIq2xxsF4" => "kq_gemv_iq2xxs_f4",
+    "MetalAttnQKDev128" => "attn_dev",
+    "MetalAttnAVDev128" => "attn_dev"
+}
 
 //! Did this run compile the GATED stamp families the blind list names? Two gates decide it, both
 //! read from the run itself rather than re-probed: the Metal-4 tensor toolchain - the prefill's PSO
@@ -740,6 +732,10 @@ def private metal_census_blind_drain(t : T?; cov : table<string; int64>) {
             continue
         }
         let crown = CENSUS_CROWN_CONDITIONAL?[blind] ?? ""
+        if (!named && !empty(crown) && !metal_tensor_crowned(crown)) {
+            t |> skip("{blind}: the {crown} crown is not pinned on this box, so its stamp never compiled and the entry matches no census key here")
+            continue
+        }
         if (hits > 0l && !empty(crown) && metal_tensor_crowned(crown)) {
             t |> skip("{blind}: the {crown} crown is pinned on this box, so a stocked carrier reaches it ({hits}) - the entry is blind only off that crown")
             continue
@@ -755,13 +751,7 @@ def private metal_census_blind_drain(t : T?; cov : table<string; int64>) {
 def test_metal_kernel_coverage(tst : T?) {
     tst |> run("Metal kernel coverage census: the small-model zoo across format/graph/batch/KV axes") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            if (!arm_on(t, "coverage")) {
-                return
-            }
-            if (!jit_enabled()) {
-                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-                return
-            }
+            return if (!arm_on(t, "coverage") || !jit_only(t))
             var dev = metal_create_system_default_device()
             if (dev == null) {
                 feint("no Metal device; kernel coverage census skipped\n")
@@ -814,9 +804,25 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // the mx4 expert rail (gpt-oss's native-MXFP4 routed stacks: a carrier above the zoo's tier) - its s and e stamps and
     // its decode GEMV; their coverage is test_vkd_mx4_cm2_batch and test_vkd_mx4_gemv
     "mx4_batch_cm2s_cls_spv", "mx4_batch_cm2e_cls_spv", "mx4_gemv_cls_spv",
+    // the iq4nl32 expert rail (the 32-block IQ4_NL down planes off the 256 lattice - Qwen3.8-Flash-Next, above the zoo's tier) -
+    // its s and e stamps and its decode GEMV; their coverage is test_vkd_iq4nl32_cm2_batch and test_vkd_iq4nl32_gemv
+    "iq4nl32_batch_cm2s_cls_spv", "iq4nl32_batch_cm2e_cls_spv", "iq4nl32_gemv_cls_spv",
+    // the iq3s4 rail (IQ3_S served as a nibble codebook plane: the same carrier's gate and up stacks) - its decode GEMV, its
+    // batch tile and its cm2 l/m/s and KHR stamps; their coverage is the iq3s4 rows of test_vkd_kq_gemv_family and
+    // test_vkd_kq_batch_family and test_vkd_iq3s4_cm2_batch
+    "kq_gemv_iq3s4_cls_spv", "kq_batch_iq3s4_cls_spv", "kq_batch_iq3s4_cm2l_cls_spv", "kq_batch_iq3s4_cm2m_cls_spv",
+    "kq_batch_iq3s4_cm2s_cls_spv", "kq_batch_iq3s4_khr_cls_spv",
+    // the hyper-connection chain (Qwen3.8-Flash-Next, the one qwen4exp carrier, above the zoo's tier): the mixer seams and the
+    // n-gram side input; their coverage is test_vkd_hc_seams, test_vkd_hc_rows and test_vkd_ple_side, the serving run
+    // test_gpu_resident_hc.das
+    "hc_init_cls_spv", "hc_norm_cls_spv", "hc_lo_rq_cls_spv", "hc_mix_cls_spv", "hc_comb_cls_spv", "ple_gate_cls_spv", "ple_conv_cls_spv", "ple_commit_cls_spv",
+    // ... and the deltanet out-gate's sigmoid stamps the same carrier's recurrent layers take; their coverage is the sigmoid
+    // arms of test_vkd_dn_family
+    "dn_step_sig_cls_spv", "dn_scan_p3_sig_cls_spv",
     // the per-32 expert rails' KHR arms (the expert schedule on a KHR-mode card: the 26B-A4B Q4_K_M's q51 down stacks, gpt-oss's
-    // mx4 stacks - carriers above the zoo's tier); their coverage is the KHR arm of test_vkd_q51_cm2_batch and test_vkd_mx4_cm2_batch
-    "q51_batch_khr_cls_spv", "mx4_batch_khr_cls_spv",
+    // mx4 stacks, Flash-Next's iq4nl32 stacks - carriers above the zoo's tier); their coverage is the KHR arm of
+    // test_vkd_q51_cm2_batch, test_vkd_mx4_cm2_batch and test_vkd_iq4nl32_cm2_batch
+    "q51_batch_khr_cls_spv", "mx4_batch_khr_cls_spv", "iq4nl32_batch_khr_cls_spv",
     // the mx4 experts' fused gate+up+act+requant GEMV (gpt-oss's token command, above the zoo's tier); its coverage is
     // test_vkd_mx4_gemv_gu in test_vulkan_kernels.das
     "mx4_gemv_gu_cls_spv",
@@ -944,7 +950,7 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // for iq3s, test_gpu_resident_regions_hybrid_q3kxl.das for the eight low-bit leaves
     "q8_gemv_n2_cls_spv", "q8_gemv_n4_cls_spv", "q8_gemv_n8_cls_spv",
     "q8_gemv_n2p_cls_spv", "q8_gemv_n4p_cls_spv", "q8_gemv_n8p_cls_spv",
-    "kq_gemv_k4_n_cls_spv", "kq_gemv_k5_n_cls_spv", "kq_gemv_k6_n_cls_spv", "kq_gemv_q40_n_cls_spv", "kq_gemv_iq4xs_n_cls_spv",
+    "kq_gemv_k4_n_cls_spv", "kq_gemv_k5_n_cls_spv", "kq_gemv_k6_n_cls_spv", "kq_gemv_q40_n_cls_spv", "kq_gemv_iq4xs_n_cls_spv", "kq_gemv_iq3s4_n_cls_spv",
     "kq_gemv_k3_n_cls_spv", "kq_gemv_k2_n_cls_spv", "kq_gemv_iq3s_n_cls_spv", "kq_gemv_iq3xxs_n_cls_spv", "kq_gemv_iq4nl_n_cls_spv",
     "kq_gemv_iq2s_n_cls_spv", "kq_gemv_iq2xs_n_cls_spv", "kq_gemv_iq2xxs_n_cls_spv",
     // the fused gate-up GEMV's N stamps serve only the N-row token command, which the zoo's one-region load never engages
@@ -967,19 +973,18 @@ def private vk_cov_model(t : T?; path, family : string; nbs : array<int>) {
         var tr <- load_model_(path, QuantMode.q8)
         tr.config.seq_len = min(tr.config.seq_len, 512l)
         let vocab = tr.config.vocab_size
-        with_job_que() {
-            setup_dasllama_jobque()
+        with_dasllama_jobque() {
             // an f32 session rides the per-op rails; an f16 one (the armed mirror codec) the whole-model driver
             for (kdt in [KVDtype.f32, KVDtype.f16]) {
                 var s = make_run_state(tr.config, kdt, kdt)
                 let p <- encode(tr, counting_prompt(1, 40), true, false)
                 eval_(tr, s, p)
-                var cur = greedy_top(s.logits, vocab)
+                var cur = argmax_of(s.logits, vocab)
                 for (_i in range(2)) {
                     var one <- [cur]
                     eval_(tr, s, one)
                     delete one
-                    cur = greedy_top(s.logits, vocab)
+                    cur = argmax_of(s.logits, vocab)
                 }
                 var p2 <- encode(tr, counting_prompt(50, 90), false, false)
                 eval_(tr, s, p2)
@@ -996,7 +1001,7 @@ def private vk_cov_model(t : T?; path, family : string; nbs : array<int>) {
                     let pb <- encode(tr, counting_prompt(3 + i, 44 + i), true, false)
                     eval_(tr, ss[i], pb)
                     sess |> push(unsafe(addr(ss[i])))
-                    curs |> push(greedy_top(ss[i].logits, vocab))
+                    curs |> push(argmax_of(ss[i].logits, vocab))
                 }
                 var ws <- create_batch_workspace_(tr)
                 eval_batch_(tr, ws, sess, curs)
@@ -1083,10 +1088,10 @@ def test_vulkan_kernel_coverage_serving(tst : T?) {
             vk_cov_model(t, path_join(models_dir(), "Qwen1.5-MoE-A2.7B-Chat-Q4_K_M-local.gguf"), "qwen2moe", none)
             // the UD-IQ2_XXS 30B: the resident MoE block's s and e stamps over iq2xxs expert planes, whole on a 16 GB card
             vk_cov_model(t, path_join(models_dir(), "Qwen3-30B-A3B-Instruct-2507-UD-IQ2_XXS.gguf"), "qwen3moe", none)
-            let tower_found = vulkan_tower_on()   //! the TTS rows serve on the tower knob: pinned on, restored after
+            let knobs = gpu_knobs()   // the TTS rows serve on the tower knob: pinned on, restored after
             set_vulkan_tower(true)
             defer() {
-                set_vulkan_tower(tower_found)
+                set_gpu_knobs(knobs)
             }
             cov_tower_styletts2(t)
             cov_tower_pocket(t)

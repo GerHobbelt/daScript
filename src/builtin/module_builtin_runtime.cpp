@@ -168,6 +168,29 @@ namespace das
         };
     };
 
+    struct UnsafeHeapCollectAnnotation : MarkFunctionAnnotation {
+        UnsafeHeapCollectAnnotation() : MarkFunctionAnnotation("unsafe_heap_collect") { }
+        virtual bool apply(const FunctionPtr &, ModuleGroup &, AnnotationArgumentList &, string &) override {
+            return true;
+        };
+        virtual bool apply(ExprBlock *, ModuleGroup &, AnnotationArgumentList &, string &) override {
+            return true;
+        };
+        virtual bool finalize(ExprBlock * block, ModuleGroup &, AnnotationArgumentList & args, const AnnotationArgumentList &, string &) override {
+            auto fn = block->inFunction;
+            if ( !fn || !fn->lambda ) return true;
+            for ( auto & ann : fn->annotations ) {
+                if ( ann->annotation == this ) return true;
+            }
+            auto decl = new AnnotationDeclaration();
+            decl->annotation = this;
+            decl->arguments = args;
+            decl->at = block->at;
+            fn->annotations.push_back(decl);
+            return true;
+        }
+    };
+
     // [arch(at="<doc>.md#<anchor>")] — binds this function to a section of an architecture
     // document; the LINT026 pass in utils/lint/main.das resolves the citation against the tree.
     // Same doctrine as the hot_path family above: a citation must not drag its checker into every
@@ -223,7 +246,7 @@ namespace das
         InlineFunctionAnnotation() : MarkFunctionAnnotation("inline") { }
         virtual bool apply(const FunctionPtr & func, ModuleGroup &, AnnotationArgumentList &, string & err) override {
             if ( func->neverInline ) {
-                err = "[inline] conflicts with [never_inline]";
+                err = "[inline] conflicts with [never_inline] or [never_fast_math]";
                 return false;
             }
             func->mustInline = true;
@@ -251,6 +274,18 @@ namespace das
         virtual bool apply(ExprBlock *, ModuleGroup &, AnnotationArgumentList &, string &) override {
             return true;
         }
+    };
+
+    struct NeverFastMathFunctionAnnotation : MarkFunctionAnnotation {
+        NeverFastMathFunctionAnnotation() : MarkFunctionAnnotation("never_fast_math") { }
+        virtual bool apply(const FunctionPtr & func, ModuleGroup &, AnnotationArgumentList &, string & err) override {
+            if ( func->mustInline ) {
+                err = "[never_fast_math] conflicts with [inline] - a splice moves the arithmetic into a caller the LLVM tiers stamp";
+                return false;
+            }
+            func->neverInline = true;
+            return true;
+        };
     };
 
     struct RequestNoDiscardFunctionAnnotation : MarkFunctionAnnotation {
@@ -1833,6 +1868,10 @@ namespace das
         str = bs ? bs : "";
     }
 
+    void set_das_string_bytes(string & str, const TArray<uint8_t> & bytes) {
+        str.assign((const char *)bytes.data, bytes.size);
+    }
+
     void set_string_das(char * & bs, const string & str, Context * ctx, LineInfoArg * at ) {
         bs = ctx->allocateString(str, at);
     }
@@ -2294,12 +2333,15 @@ namespace das
         if ( strcmp(feature, "avx512vl")==0 )   return os_zmm && (r7[1] & (1u<<31)) != 0;
         if ( strcmp(feature, "avx512vnni")==0 ) return os_zmm && (r7[2] & (1<<11)) != 0;
         if ( strcmp(feature, "avx512vbmi")==0 ) return os_zmm && (r7[2] & (1<<1)) != 0;
+        if ( strcmp(feature, "avx512bf16")==0 ) return os_zmm && (r71[0] & (1<<5)) != 0;
         // AMX names use the LLVM hyphen spelling so cpuid names == target-feature names
         // (DAS_JIT_X64_FORCE_FEATURES / llc -mattr pass them through verbatim). XCR0 tile
         // bits are kernel-boot truth; the per-process XTILEDATA grant (Linux arch_prctl)
         // is a separate, runtime step — the dasLLAMA amx witness does it, not this query.
         if ( strcmp(feature, "amx-tile")==0 )   return os_amx && (r7[3] & (1<<24)) != 0;
         if ( strcmp(feature, "amx-int8")==0 )   return os_amx && (r7[3] & (1<<24)) != 0 && (r7[3] & (1<<25)) != 0;
+        if ( strcmp(feature, "amx-bf16")==0 )   return os_amx && (r7[3] & (1<<24)) != 0 && (r7[3] & (1<<22)) != 0;
+        if ( strcmp(feature, "amx-fp16")==0 )   return os_amx && (r7[3] & (1<<24)) != 0 && (r71[0] & (1<<21)) != 0;
 #endif
         return false;
     }
@@ -2321,6 +2363,7 @@ namespace das
         addAnnotation(new MacroFnFunctionAnnotation());
         addAnnotation(new CloneFunctionAnnotation());
         addAnnotation(new HotPathFunctionAnnotation("hot_path"));
+        addAnnotation(new UnsafeHeapCollectAnnotation());
         addAnnotation(new HotPathFunctionAnnotation("no_alloc"));
         addAnnotation(new HotPathFunctionAnnotation("no_env"));
         addAnnotation(new HotPathFunctionAnnotation("no_io"));
@@ -2331,6 +2374,7 @@ namespace das
         addAnnotation(new RequestNoJitFunctionAnnotation());
         addAnnotation(new InlineFunctionAnnotation());
         addAnnotation(new NeverInlineFunctionAnnotation());
+        addAnnotation(new NeverFastMathFunctionAnnotation());
         addAnnotation(new RequestNoDiscardFunctionAnnotation());
         addAnnotation(new TempStringResultFunctionAnnotation());
         addAnnotation(new DeprecatedFunctionAnnotation());
@@ -2878,6 +2922,9 @@ namespace das
         addExternInline<DAS_BIND_FUN(set_das_string)>(*this, lib, "clone",
             SideEffects::modifyArgument,"set_das_string")
                 ->args({"target","src"});
+        addExternInline<DAS_BIND_FUN(set_das_string_bytes)>(*this, lib, "clone",
+            SideEffects::modifyArgument,"set_das_string_bytes")
+                ->args({"target","bytes"});
         addExternInline<DAS_BIND_FUN(set_string_das)>(*this, lib, "clone",
             SideEffects::modifyArgument,"set_string_das")
                 ->args({"target","src","context","at"});

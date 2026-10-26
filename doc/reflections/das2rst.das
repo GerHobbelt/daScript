@@ -120,6 +120,7 @@ require daslib/type_traits
 require daslib/typemacro_boost
 require daslib/validate_code
 require dashv/dashv_boost
+require crypto
 require openai/openai_common
 require openai/openai_chat
 require openai/openai_embeddings
@@ -229,7 +230,7 @@ def document_module_fio(_root : string) {
     var groups <- array<DocGroup>(
         hide_group(group_by_regex("Internal builtin functions", mod, %regex~builtin%%)),
         group_by_regex("Direct IO and mapping advice", mod, %regex~(dwrite_open|dwrite_append|dwrite_band|dwrite_commit|dwrite_stat|dwrite_close|prefetch_map)$%%),
-        group_by_regex("File manipulation", mod, %regex~(f|long_f|stat$|getchar|remove|rename|copy_file|file_size|equivalent|is_symlink|is_reparse_point|set_mtime)%%),
+        group_by_regex("File manipulation", mod, %regex~(try_fflush|f|long_f|stat$|getchar|remove|rename|copy_file|file_size|equivalent|is_symlink|is_reparse_point|set_mtime)%%),
         group_by_regex("Path manipulation", mod, %regex~(base_name|dir_name|get_full_file_name|extension|stem|replace_extension|path_join|normalize|to_generic_path|tilde_home|is_absolute|relative|relative_result|parent)$%%),
         group_by_regex("Directory manipulation", mod, %regex~(dir|dir_rec|mkdir|mkdir_rec|mkdir_result|rmdir|rmdir_rec|rmdir_rec_result|rmdir_result|chdir|getcwd)$%%),
         group_by_regex("Glob and pattern matching", mod, %regex~(match_glob|glob|glob_filtered|is_glob_pattern|expand_glob|parse_file_list)$%%),
@@ -269,6 +270,17 @@ def document_module_network(_root : string) {
     document("Network socket library", mod, "network.rst", groups)
 }
 
+def document_module_crypto(_root : string) {
+    var mod = get_module("crypto")
+    var groups <- array<DocGroup>(
+        group_by_regex("Randomness and comparison", mod, %regex~.*(crypto_random_bytes|crypto_equal)$%%),
+        group_by_regex("Message authentication", mod, %regex~.*crypto_hmac_.*%%),
+        group_by_regex("Authenticated encryption", mod, %regex~.*crypto_aes256_gcm_.*%%),
+        group_by_regex("Signature verification", mod, %regex~.*crypto_verify_rsa_sha256$%%)
+    )
+    document("Cryptographic primitives", mod, "crypto.rst", groups)
+}
+
 def document_module_dashv(_root : string) {
     var mod = get_module("dashv")
     var groups <- array<DocGroup>(
@@ -277,9 +289,9 @@ def document_module_dashv(_root : string) {
         group_by_regex("WebSocket channel send", mod, %regex~(send)$%%),
         group_by_regex("Handle operations", mod, %regex~(is_alive|==|!=)$%%),
         group_by_regex("HTTP route registration", mod, %regex~(GET|POST|PUT|DELETE|PATCH|HEAD|ANY|SSE|STREAM)$%%),
-        group_by_regex("HTTP server configuration", mod, %regex~(STATIC|allow_cors|set_document_root|set_home_page|set_index_of|set_error_page)$%%),
+        group_by_regex("HTTP server configuration", mod, %regex~(set_limits|set_access_log|WEBSOCKET_UPGRADE|accept_websocket|reject_websocket|STATIC|allow_cors|set_document_root|set_home_page|set_index_of|set_error_page)$%%),
         group_by_regex("HTTP response helpers", mod, %regex~(TEXT_PLAIN|JSON|REDIRECT|SERVE_FILE|DATA|set_header|set_content_type)$%%),
-        group_by_regex("HTTP client requests", mod, %regex~(request|request_cb|status_message)$%%),
+        group_by_regex("HTTP client requests", mod, %regex~(request|request_checked|request_cb|status_message)$%%),
         group_by_regex("Message and header access", mod, %regex~(get_header|each_header|client_ip|.*content_length)$%%),
         group_by_regex("Request configuration", mod, %regex~(set_basic_auth|set_bearer_token_auth|set_timeout|set_connect_timeout|allow_redirect|set_param|get_param|each_param)$%%),
         group_by_regex("Cookies", mod, %regex~(add_cookie|get_cookie|each_cookie)$%%),
@@ -330,19 +342,19 @@ def private dasllama_type_stanza(f : FILE const?; lab : string; tname : string; 
 def document_module_dasllama(_root : string) {
     var mod = find_module("dasllama")
     var groups <- array<DocGroup>(
-        group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_kv_pool|release_kv_pages|create_batch_workspace|setup_dasllama_jobque|caps)$%%),
-        group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_release|prefix_held_groups|prefix_chain_list)$%%),
+        group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_kv_pool|release_kv_pages|create_batch_workspace|setup_dasllama_jobque|with_dasllama_jobque|caps)$%%),
+        group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_checkpoint_at|prefix_release|prefix_held_groups|prefix_chain_list)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
         group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_embd_span|eval_embd_span_mrope|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
         group_by_regex("Vision and audio encoders", mod, %regex~(encode_image|encode_audio)$%%),
-        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_user_audio_rows|add_assistant|render_turn|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
+        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_user_audio_rows|add_assistant|render_turn|render_turn_marked|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
         group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids|turn_stop_ids|make_nothink_guard|nothink_stop_here)$%%),
         group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|set_jobque_spin_gpu_us|get_jobque_spin_gpu_us|get_jobque_spin_in_force|set_single_thread|get_single_thread|select_matmul_backend_for_load|kernel_backend_available)$%%),
         group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed)$%%),
-        group_by_regex("Operations: serving from the device", mod, %regex~(create_device_session|gpu_device_sessions|gpu_dn_room|gpu_device_prefill_continues|gpu_device_prefill_window|gpu_device_kv_park|gpu_device_kv_adopt|gpu_device_session_ctx|gpu_device_session_dtype|set_gpu_resident_regions|set_gpu_ctx_max|gpu_resident_decline|gpu_cpu_passes)$%%)
+        group_by_regex("Operations: serving from the device", mod, %regex~(create_device_session|gpu_device_sessions|gpu_dn_room|gpu_device_prefill_continues|gpu_device_prefill_window|gpu_device_kv_park|gpu_device_kv_adopt|gpu_device_session_ctx|gpu_device_session_dtype|set_gpu_resident_regions|set_gpu_ctx_max|set_gpu_ctx_strict|gpu_ctx_pins|gpu_resident_decline|gpu_resident_experts_host|gpu_cpu_passes)$%%)
     )
     var hook = DocsHook()
     hook.afterEnums <- @(var f : FILE const?; _was_enums : bool) {
@@ -413,7 +425,7 @@ def document_module_dasllama_tts(_root : string) {
     }
     var mod = [find_module("dasllama_tts"), find_module("dasllama_tts_types")]
     var groups <- array<DocGroup>(
-        group_by_regex("Loading and capabilities", mod, %regex~(load_tts_model|g2p_pack_path|caps|tts_voice_lang|tts_needs_packs|tts_has_phonemes|finalize)$%%),
+        group_by_regex("Loading and capabilities", mod, %regex~(load_tts_model|tts_finish_styletts2|g2p_pack_path|caps|tts_voice_lang|tts_needs_packs|tts_has_phonemes|finalize)$%%),
         group_by_regex("Voices", mod, %regex~(tts_register_voice|tts_prepare_voice_prompt|tts_voice_prompt_valid|tts_register_voice_prompt)$%%),
         group_by_regex("Text front end", mod, %regex~(tts_normalize|tts_phonemize|tts_chunks)$%%),
         group_by_regex("Synthesis", mod, %regex~(synthesize|synthesize_stream|tts_release_scratch|tts_set_chunk_chars)$%%),
@@ -519,6 +531,7 @@ def document_module_ast_boost(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Containers", mod, %regex~(emplace_new)%%),
         group_by_regex("Textual descriptions of the objects", mod, %regex~(describe.*|debug_expression)%%),
+        group_by_regex("Collect carriers", mod, %regex~(collect_carrier_violation)$%%),
         group_by_regex("Queries", mod, %regex~(is.*|find.*|get.*|peel_distinct|table_key_storage_base_type)%%),
         group_by_regex("Annotations", mod, %regex~(append.*|add.*)%%),
         group_by_regex("Expression generation", mod, %regex~(override_method|panic_expr_as|make_static_assert_false|convert_to_expression)%%),
@@ -591,7 +604,7 @@ def document_module_json(_root : string) {
     var mod = find_module("json")
     var groups <- array<DocGroup>(
         group_by_regex("Value conversion", mod, %regex~(JV|JVNull)$%%),
-        group_by_regex("Read and write", mod, %regex~(read_json|write_json|write_json_compact)$%%),
+        group_by_regex("Read and write", mod, %regex~(read_json|read_json_bounded|write_json|write_json_compact)$%%),
         group_by_regex("Memory management", mod, %regex~(delete_json|update|json_null_sentinel)$%%),
         group_by_regex("JSON properties", mod, %regex~(set_no_trailing_zeros|set_no_empty_arrays|set_allow_duplicate_keys)$%%),
         group_by_regex("Broken JSON", mod, %regex~(try_fixing_broken_json)$%%)
@@ -916,7 +929,8 @@ def document_module_math_boost(_root : string) {
         group_by_regex("Matrices", mod, %regex~(look_at_lh|look_at_rh|perspective_lh|perspective_rh|perspective_rh_opengl|perspective_rh_0_to_1|perspective_rh_minus1_to_1|ortho_rh|planar_shadow)$%%),
         group_by_regex("Plane", mod, %regex~(plane_dot|plane_normalize|plane_from_point_normal)$%%),
         group_by_regex("Color conversions", mod, %regex~(linear_to_SRGB)$%%),
-        group_by_regex("Color packing and unpacking", mod, %regex~(RGBA_TO_UCOLOR|UCOLOR_TO_RGBA|UCOLOR_TO_RGB)$%%)
+        group_by_regex("Color packing and unpacking", mod, %regex~(RGBA_TO_UCOLOR|UCOLOR_TO_RGBA|UCOLOR_TO_RGB)$%%),
+        group_by_regex("Integer rounding", mod, %regex~(round_up)$%%)
     )
     document("Boost package for math", mod, "math_boost.rst", groups)
 }
@@ -1447,7 +1461,7 @@ def document_module_logger(_root : string) {
         group_by_regex("Setup", mod, %regex~.*(logger_init|logger_init_tee|logger_set_name|logger_set_path|logger_get_path|logger_get_name)$%%),
         group_by_regex("Level filters", mod, %regex~.*(logger_set_min_level|logger_get_min_level|logger_set_category_level|logger_clear_category_levels)$%%),
         group_by_regex("Output control", mod, %regex~.*(logger_set_stderr_fallback|logger_set_tee|logger_set_echo_stderr|logger_flush|logger_close|logger_capture_diagnostics)$%%),
-        group_by_regex("Log calls", mod, %regex~.*(logger_log|logger_trace|logger_debug|logger_info|logger_warning|logger_error|logger_critical)$%%),
+        group_by_regex("Log calls", mod, %regex~.*(logger_log|logger_try_log|logger_trace|logger_debug|logger_info|logger_warning|logger_error|logger_critical)$%%),
         group_by_regex("Stdout hook", mod, %regex~.*(logger_install_hook)$%%)
     )
     document("Structured JSON Lines logger", mod, "logger.rst", groups)
@@ -1979,6 +1993,7 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_clipboard(root)
     document_module_stddlg(root)
     document_module_network(root)
+    document_module_crypto(root)
     document_module_dashv(root)
     document_module_openai(root)
     document_module_stbimage(root)

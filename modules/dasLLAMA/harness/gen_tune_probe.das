@@ -46,12 +46,15 @@ require llvm   // nolint:STYLE030 - the witness, unguarded on purpose: the `_var
 require llvm/daslib/llvm_tune
 require daslib/tune             // [tune_policy] - inert without dasLLVM
 require daslib/random
+require daslib/enum_trait   // for (kf in type<KqFmt>) - the kq family walk
 require daslib/json   // JsonValue — the null runtime arg of the deferred sidecar merge
 require daslib/json_boost   // JV over tuples — the per-variant race rows
 require daslib/fio   // fread/fopen — the probe's transcript capture
 require daslib/strings_boost   // split — the confirm pass parses child output
 require daslib/command_line    // get_das_exe — the confirm pass spawns daslang children
 require tuner_noise            // the noise gate, shared with tune_kernels
+require _gen_probe_fixture     // the q8 fixture, its oracle, the tile/gemv sweeps and the compare, shared with gen_parity_probe
+require ../tests/_kq_dot.das    // kq_grp_row_dot_rt - the kq fixture's reference body, the grp row dot on the run-time format
 require math
 require strings
 require dasllama/dasllama_env
@@ -62,12 +65,10 @@ require dasllama/dasllama_env
 let SCREEN_ROUNDS = 2
 let ROUNDS = 8
 let GEN_KEEP = 1.20lf
-let GEN_MARGIN_PCT = 3.0lf   // a new crown must beat the incumbent's best by this (or the probe floor, if higher)
 
-// the sticky margin as a factor: 3% or the highest probe cv seen so far - a noisier run
-// demands a wider win to move a seat
+// the sticky margin as a factor: a new crown must beat the incumbent's best by win_margin_pct()
 def private gen_margin() : double {
-    return 1.0lf + max(GEN_MARGIN_PCT, noise_floor_pct()) / 100.0lf
+    return 1.0lf + win_margin_pct() / 100.0lf
 }
 
 require tuner_cli              // the shared tuner CLI
@@ -94,10 +95,57 @@ def private gen_round_step(r : int; keep : array<bool>) {
     tune_progress_kernel_step(r + 1, r < SCREEN_ROUNDS ? "screening" : "best-of", live)
 }
 
+//! HOT_REPS back-to-back calls a sample keep the hot shape's weights cache-resident: the sample times compute, not first touch
+let HOT_REPS = 16
+
+//! one family race's best-of times per perm, in us: the batch tile, the streamed decode gemv, one hot decode gemv
+struct FamilyTimes {
+    best : array<double>
+    gbest : array<double>
+    hbest : array<double>
+}
+
+//! A family's interleaved best-of over `nv` perms, screened: ROUNDS rounds, each kept perm
+//! timing `tile(vi)`, then `gemv(vi)`, then HOT_REPS back-to-back `hot(vi)` calls in turn.
+def private race_family(nv : int; tile, gemv, hot : block<(vi : int) : void>) : FamilyTimes {
+    var ft : FamilyTimes
+    ft.best |> resize(nv)
+    ft.gbest |> resize(nv)
+    ft.hbest |> resize(nv)
+    var keep : array<bool>
+    keep |> resize(nv)
+    for (i in range(nv)) {
+        ft.best[i] = 1.0e30lf
+        ft.gbest[i] = 1.0e30lf
+        ft.hbest[i] = 1.0e30lf
+        keep[i] = true
+    }
+    for (r in range(ROUNDS)) {
+        gen_screen(r, ft.best, keep)
+        gen_round_step(r, keep)
+        for (vi in range(nv)) {
+            continue if (!keep[vi])
+            let t0 = ref_time_ticks()
+            invoke(tile, vi)
+            ft.best[vi] = min(ft.best[vi], double(get_time_usec(t0)))
+            let g0 = ref_time_ticks()
+            invoke(gemv, vi)
+            ft.gbest[vi] = min(ft.gbest[vi], double(get_time_usec(g0)))
+            let h0 = ref_time_ticks()
+            for (_h in range(HOT_REPS)) {
+                invoke(hot, vi)
+            }
+            ft.hbest[vi] = min(ft.hbest[vi], double(get_time_usec(h0)) / double(HOT_REPS))
+        }
+    }
+    delete keep
+    return <- ft
+}
+
 // the previous sidecar's seat for `entry`, read raw (a stale sidecar still names the seats) —
 // a re-mint's crown only moves when it beats the incumbent by gen_margin()
 var private g_incumbent : table<string; string>
-// the --tune-only filter matched no generator family here: exit 3, so the wrapper can tell a
+// the --tune-only filter matched no generator family here: exit TUNE_ONLY_NO_MATCH, so the wrapper can tell a
 // half-that-sat-out from a typo'd token (both halves reporting it fails the mint)
 var private g_tune_only_no_match = false
 var private g_incumbent_loaded = false
@@ -105,22 +153,8 @@ var private g_incumbent_loaded = false
 def private gen_incumbent(entry : string) : string {
     if (!g_incumbent_loaded) {
         g_incumbent_loaded = true
-        let text = fread(tune_manifest_path())
-        if (!empty(text)) {
-            var jerr = ""
-            var doc = read_json(text, jerr)
-            if (doc != null && doc is _object) {
-                var ks = doc?["kernels"]
-                if (ks != null && ks is _object) {
-                    for (k, v in keys(ks as _object), values(ks as _object)) {
-                        if (v != null && v is _string) {
-                            g_incumbent[k] = clone_string(v as _string)
-                        }
-                    }
-                }
-            }
-            delete_json(doc)
-        }
+        delete g_incumbent
+        g_incumbent <- read_incumbents(tune_manifest_path())
     }
     return g_incumbent?[entry] ?? ""
 }
@@ -142,203 +176,46 @@ def private gen_sticky(entry : string; names : array<string>; times : array<doub
     return winner
 }
 
-struct Fixture {
-    n, d, ntok, nb : int64
-    q : array<int8>       // row-major master — repacked per variant into a copy
-    s : array<float>
-    xq : array<int8>
-    xs : array<float>
-    xbs : array<int>      // −128·Σx per (token, block) — the bias128 tile's bsums plane
-    yref : array<float>
+//! suffix -> row of a [tune] `_variants()` registry: every companion is stamped in lockstep with
+//! its tile (same suffixes, same decline predicate), so one suffix keys one perm across them
+def by_suffix(vs : array<tuple<string; auto(FnT)>>) : table<string; FnT> {
+    var tab <- {for (v in vs); v._0 => v._1}
+    return <- tab
 }
 
-def build_fixture(n, d, ntok : int64) : Fixture {
-    var fx = Fixture(n = n, d = d, ntok = ntok, nb = n / 32l)
-    var w : array<float>
-    w |> resize(n * d)
-    for (i in range64(n * d)) {
-        w[i] = float(i % 17l) * 0.13 - 1.1
-    }
-    let qt <- quantize_q8_0(w, n * d)
-    fx.q |> resize(n * d)
-    fx.s |> resize(d * fx.nb)
-    for (i in range64(n * d)) {
-        fx.q[i] = qt.q[i]
-    }
-    for (i in range64(d * fx.nb)) {
-        fx.s[i] = qt.scales[i]
-    }
-
-    var xrow : array<float>
-    xrow |> resize(n)
-    fx.xq |> resize(ntok * n)
-    fx.xs |> resize(ntok * fx.nb)
-    for (tk in range64(ntok)) {
-        for (i in range64(n)) {
-            xrow[i] = float((i + tk * 7l) % 23l) * 0.07 - 0.8
-        }
-        quantize_q8_0_into(xrow, n, fx.xq, fx.xs, tk * n, tk * fx.nb)
-    }
-    fx.xbs |> resize(ntok * fx.nb)
-    for (tk in range64(ntok)) {
-        for (bi in range64(fx.nb)) {
-            var bsum = 0
-            for (j in range64(32l)) {
-                bsum += int(fx.xq[tk * n + bi * 32l + j])
-            }
-            fx.xbs[tk * fx.nb + bi] = -128 * bsum
-        }
-    }
-
-    // the oracle: hand laneq semantics off a grp4 copy — the per-block fold order is the same
-    // in every variant, so one oracle serves all layouts
-    fx.yref |> resize(ntok * d)
-    var q4 := fx.q
-    var s4 := fx.s
-    unsafe {
-        repack_q8q8_grp(addr(q4[0]), addr(s4[0]), n, d, 4l)
-        let wp = addr(q4[0])
-        let sp = addr(s4[0])
-        let xqp = addr(fx.xq[0])
-        let xsp = addr(fx.xs[0])
-        var yrp = addr(fx.yref[0])
-        for (g in range64(d / 4l)) {
-            let wgp = wp + g * 4l * n
-            let sgp = sp + g * 4l * fx.nb
-            for (tk in range64(ntok)) {
-                let f = dot_q8q8_laneq4(wgp, sgp, xqp + tk * n, xsp + tk * fx.nb, n)
-                yrp[tk * d + g * 4l + 0l] = f.x
-                yrp[tk * d + g * 4l + 1l] = f.y
-                yrp[tk * d + g * 4l + 2l] = f.z
-                yrp[tk * d + g * 4l + 3l] = f.w
-            }
-        }
-    }
-    delete q4
-    delete s4
-    return <- fx
+//! suffix -> value of an int companion (layout mr, wbias, kgroup, tokstep, tile form), keyed as by_suffix
+def forms_of(fvs : array<tuple<string; function<() : int>>>) : table<string; int> {
+    var forms <- {for (v in fvs); v._0 => invoke(v._1)}
+    return <- forms
 }
 
-// suffix -> repack interleave, off the layout companion's variants registry (lockstep with
-// the tile variants by construction — same suffixes, same decline predicate)
-def variant_mrs() : table<string; int> {
-    var mrs : table<string; int>
-    var lvs <- q8q8_layout_gen_variants()
-    for (v in lvs) {
-        mrs[v._0] = invoke(v._1)
-    }
-    delete lvs
-    return <- mrs
-}
+typedef Q8PanelFn = function<(wg : int8 const?; sg : float const?; mr : int64; nb : int64; n : int64; ngr : int64; var dst : uint16?) : void>
 
-// suffix -> weight-plane bias, off the wbias companion's variants registry (same lockstep)
-def variant_wbias() : table<string; int> {
-    var wbs : table<string; int>
-    var bvs <- q8q8_wbias_gen_variants()
-    for (v in bvs) {
-        wbs[v._0] = invoke(v._1)
-    }
-    delete bvs
-    return <- wbs
-}
-
-// suffix -> plane kgroup, off the kgroup companion's variants registry (same lockstep; 8 on
-// the smmla rows — the repack below must write the row-pair plane those tiles read)
-def variant_kgroups() : table<string; int> {
-    var kgs : table<string; int>
-    var kvs <- q8q8_kgroup_gen_variants()
-    for (v in kvs) {
-        kgs[v._0] = invoke(v._1)
-    }
-    delete kvs
-    return <- kgs
-}
-
-// suffix -> tokens per tile call, off the tokstep companion's variants registry (same
-// lockstep; 16/32 on the amx rows, whose macro also spans ts/16 row-groups — the walk below
-// must match the stamped shape)
-def variant_toksteps() : table<string; int> {
-    var tss : table<string; int>
-    var tvs <- q8q8_tokstep_gen_variants()
-    for (v in tvs) {
-        tss[v._0] = invoke(v._1)
-    }
-    delete tvs
-    return <- tss
-}
-
-// one full tile sweep: every (ts-token, gs-group) unit through `tile`, on the variant's own
-// repacked buffers (q/s); the fixture's bsums plane rides along (biased variants read it,
-// everything else ignores the parameter). Fixtures divide evenly (ntok % ts == 0, groups %
-// gs == 0) — production tails are the batch wrapper's job, not the tile's.
-def run_tile(tile, cfg; fx : Fixture; q : array<int8>; s : array<float>; mr, ts, gs : int64; var y : array<float>) {
+def run_tile_bf16(tile, cfg; panel : Q8PanelFn; fx : Fixture; q : array<int8>; s : array<float>; mr, form : int64; var y : array<float>) {
     let ng = fx.d / mr
-    verify(fx.ntok % ts == 0l && ng % gs == 0l)
-    invoke(cfg)     // latch rows: load the TMUL palette (the wrapper's per-chunk call)
+    verify(fx.ntok % 32l == 0l && ng % form == 0l)
+    invoke(cfg)
+    var pbuf : array<uint16>
+    pbuf |> resize(int(form * 16l * fx.n + 32l))
     unsafe {
         let wp = addr(q[0])
         let sp = addr(s[0])
         let xqp = addr(fx.xq[0])
         let xsp = addr(fx.xs[0])
-        let xbsp = addr(fx.xbs[0])
         var yp = addr(y[0])
-        for (u in range64(ng / gs)) {
-            let g = u * gs
-            let wgp = wp + g * mr * fx.n
-            let sgp = sp + g * mr * fx.nb
-            var t0 = 0l
-            while (t0 < fx.ntok) {
-                invoke(tile, yp, wgp, sgp, xqp, xsp, xbsp, fx.n, fx.d, g, t0)
-                t0 += ts
-            }
-        }
+        let xbp = reinterpret<int8 const?>(xbf16_build(xqp, xsp, fx.n, fx.ntok, 32l))
+        var pp = addr(pbuf[0])
+        pp = bf16_align64(pp)
+        bf16_walk(0l, ng, form, 0l, fx.ntok, fx.ntok, amx_bf16_tile_tokens(), $(g : int64) {
+            invoke(panel, wp + g * mr * fx.n, sp + g * mr * fx.nb, mr, fx.nb, fx.n, form, pp)
+        }, $(g, tk : int64) {
+            invoke(tile, yp, reinterpret<int8 const?>(pp), sp + g * mr * fx.nb, xbp, xsp, null, fx.n, fx.d, g, tk)
+        }, $(g, tk : int64) {
+            panic("run_tile_bf16: the fixture leaves a 4-token tail at group {g} token {tk}")
+        }, $(g, gn, tk : int64) {
+            panic("run_tile_bf16: the fixture leaves a tail at group {g} (+{gn}) token {tk}")
+        })
     }
-}
-
-// one gemv rows-core sweep over all group rows for token 0 (the group loop is inside the
-// generated function — one call, like a production dispatch chunk)
-def run_gemv(gemv; fx : Fixture; q : array<int8>; s : array<float>; mr : int64; var y : array<float>) {
-    unsafe {
-        invoke(gemv, addr(y[0]), addr(q[0]), addr(s[0]), addr(fx.xq[0]), addr(fx.xs[0]), fx.n, 0l, (fx.d / mr) * mr)
-    }
-}
-
-// suffix -> gemv rows-core variant, keyed like the tile registry (same perm rows by
-// construction)
-def gemv_variants_by_suffix() : table<string; MatmulQ8Q8RowsFn> {
-    var tab : table<string; MatmulQ8Q8RowsFn>
-    var gvs <- q8q8_gemv_gen_variants()
-    for (v in gvs) {
-        tab[v._0] = v._1
-    }
-    delete gvs
-    return <- tab
-}
-
-// suffix -> witness variant (the five-function stamp's availability bit), keyed like the
-// tile registry
-def witness_variants_by_suffix() : table<string; function<() : bool>> {
-    var tab : table<string; function<() : bool>>
-    var wvs <- q8q8_family_live_variants()
-    for (v in wvs) {
-        tab[v._0] = v._1
-    }
-    delete wvs
-    return <- tab
-}
-
-// suffix -> tile-config companion (slice K I1), keyed like the tile registry. This harness
-// invokes stamped tiles directly, so it mirrors the batch wrapper: cfg before every tile
-// sweep — an internal-substrate amx tile TILERELEASEs at exit, which would leave a following
-// latch (raw-tmm) tile with no palette. No-op for every non-latch row.
-def cfg_variants_by_suffix() : table<string; function<() : void>> {
-    var tab : table<string; function<() : void>>
-    var cvs <- q8q8_amx_cfg_gen_variants()
-    for (v in cvs) {
-        tab[v._0] = v._1
-    }
-    delete cvs
-    return <- tab
 }
 
 // the row's tile knobs: the suffix minus its gemv piece — rows carrying gkstep spell the
@@ -370,9 +247,7 @@ def build_mx4_fixture(n, d : int64) : Mx4Fixture {
     xrow |> resize(n)
     fx.xq |> resize(n)
     fx.xs |> resize(fx.nb)
-    for (i in range64(n)) {
-        xrow[i] = float(i % 23l) * 0.07 - 0.8
-    }
+    act_row(xrow, n, 0l)
     quantize_q8_0_into(xrow, n, fx.xq, fx.xs, 0l, 0l)
     // the oracle: hand interleaved-mx4 semantics off a grp4 plane copy (fold order is
     // layout-independent, like the Q8 oracle)
@@ -400,32 +275,6 @@ def build_mx4_fixture(n, d : int64) : Mx4Fixture {
     return <- fx
 }
 
-def mx4_variants_by_suffix() : table<string; Mx4RowsFn> {
-    var tab : table<string; Mx4RowsFn>
-    var gvs <- mx4q8_gemv_gen_variants()
-    for (v in gvs) {
-        tab[v._0] = v._1
-    }
-    delete gvs
-    return <- tab
-}
-
-def run_mx4_gemv(gemv; fx : Mx4Fixture; wn : array<uint8>; we : array<uint8>; mr : int64; var y : array<float>) {
-    unsafe {
-        invoke(gemv, addr(y[0]), addr(wn[0]), addr(we[0]), addr(fx.xq[0]), addr(fx.xs[0]), fx.n, 0l, (fx.d / mr) * mr)
-    }
-}
-
-def close_to_mx4_ref(fx : Mx4Fixture; y : array<float>; var maxdiff : float&) : bool {
-    var ok = true
-    for (i in range(length(y))) {
-        let d = abs(y[i] - fx.yref[i])
-        maxdiff = max(maxdiff, d)
-        ok &&= d <= max(CLOSE_ABS, CLOSE_REL * abs(fx.yref[i]))
-    }
-    return ok
-}
-
 // ===== the kq companions (kq stage 4/5 — k4/k5/k6 gemv + tile) =====
 
 typedef KqRowsFn = function<(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; rb : int64; re : int64) : void>
@@ -448,7 +297,7 @@ def kq_qsb(fmt : int64) : int64 => dasllama_gemm_schema::kq_qsb(int(fmt))
 def kq_ssb(fmt : int64) : int64 => dasllama_gemm_schema::kq_ssb(int(fmt))
 
 // the family's sidecar entry = its [tune] function name (the K-quants by bit width - k3 included - q40/iq4xs by tag)
-def kq_tile_entry(fmt : int64) : string => fmt == 40l ? "q40q8_tile_gen" : (fmt == 44l ? "iq4xsq8_tile_gen" : (fmt == 33l ? "iq3sq8_tile_gen" : (fmt == 34l ? "iq3xxsq8_tile_gen" : (fmt == 45l ? "iq4nlq8_tile_gen" : (fmt == 23l ? "iq2sq8_tile_gen" : (fmt == 24l ? "iq2xsq8_tile_gen" : (fmt == 25l ? "iq2xxsq8_tile_gen" : "k{fmt}q8_tile_gen")))))))
+def kq_tile_entry(fmt : int64) : string => "{kq_fmt_of_id(int(fmt), "kq_tile_entry")}q8_tile_gen"
 
 //! the gemv companion's own manifest entry: the tile's name with the tier swapped
 def kq_gemv_entry(fmt : int64) : string => replace(kq_tile_entry(fmt), "_tile_gen", "_gemv_gen")
@@ -531,7 +380,7 @@ def pack_kq_disk_block(fmt : int64; var blkb : array<uint8>; base : int) {   // 
         let dbits = f32_to_f16(0.002 + 0.0001 * float(base % 13))
         blkb[108] = uint8(dbits & 0xFF)
         blkb[109] = uint8(dbits >> 8u)
-    } elif (fmt == 33l) {
+    } elif (fmt == 33l || fmt == 35l) {
         // 110B IQ3_S disk block: f16 d, 64 grid-index qs, 8 qh, 32 signs, 4 packed 4-bit scales — every byte pattern is legal
         let dbits = f32_to_f16(0.002 + 0.0001 * float(base % 13))
         blkb[0] = uint8(dbits & 0xFF)
@@ -628,15 +477,15 @@ def repack_kq_grp_fmt(fmt : int64; var kq : uint8?; var ks : uint8?; n, d, mr : 
     repack_kq_grp(kq_fmt_of_id(int(fmt), "repack_kq_grp_fmt"), kq, ks, n, d, mr)
 }
 
-def build_kq_fixture(fmt : int64; n, d, ntok : int64) : KqFixture {   // nolint:STYLE037,STYLE038 — the flat per-format ladder (one arm per kq format) is the honest shape
+def build_kq_fixture(fmt : int64; n, d, ntok : int64) : KqFixture {
     var fx = KqFixture(fmt = fmt, n = n, d = d, ntok = ntok, nsb = n / 256l)
     let qsb = kq_qsb(fmt)
     let ssb = kq_ssb(fmt)
     fx.kq |> resize(d * fx.nsb * qsb)
     fx.ks |> resize(d * fx.nsb * ssb)
-    var blkb : array<uint8>
-    blkb |> resize(fmt == 2l ? 84l : (fmt == 23l ? 82l : (fmt == 24l ? 74l : (fmt == 25l ? 66l : (fmt == 4l || fmt == 40l || fmt == 45l ? 144l : (fmt == 5l ? 176l : (fmt == 44l ? 136l : (fmt == 3l || fmt == 33l ? 110l : (fmt == 34l ? 98l : 210l)))))))))
     let kf = kq_fmt_of_id(int(fmt), "build_kq_fixture")
+    var blkb : array<uint8>
+    blkb |> resize(kq_desc(kf).disk_bytes)
     for (r in range64(d)) {
         for (s in range64(fx.nsb)) {
             let base = int(r * 31l + s * 7l)
@@ -654,9 +503,7 @@ def build_kq_fixture(fmt : int64; n, d, ntok : int64) : KqFixture {   // nolint:
     fx.xs |> resize(ntok * (n / 256l))
     fx.xbs |> resize(ntok * (n / 16l))
     for (tk in range64(ntok)) {
-        for (i in range64(n)) {
-            xrow[i] = float((i + tk * 7l) % 23l) * 0.07 - 0.8
-        }
+        act_row(xrow, n, tk)
         quantize_q8_k_into(xrow, n, fx.xq, fx.xs, fx.xbs, tk * n, tk * (n / 256l), tk * (n / 16l))
     }
     delete xrow
@@ -671,38 +518,8 @@ def build_kq_fixture(fmt : int64; n, d, ntok : int64) : KqFixture {   // nolint:
             let ksg = addr(s4[0]) + g * 4l * fx.nsb * ssb
             for (tk in range64(ntok)) {
                 for (r in range64(4l)) {
-                    fx.yref[tk * d + g * 4l + r] = (fmt == 40l
-                        ? q40_grp_row_dot(kqg, ksg, r, 4l,
-                            addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
-                        : (fmt == 44l
-                            ? iq4xs_grp_row_dot(kqg, ksg, r, 4l,
-                                addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
-                            : (fmt == 3l
-                                ? k3_grp_row_dot(kqg, ksg, r, 4l,
-                                    addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
-                                : (fmt == 33l
-                                    ? iq3s_grp_row_dot(kqg, ksg, r, 4l,
-                                        addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
-                                    : (fmt == 34l
-                                        ? iq3xxs_grp_row_dot(kqg, ksg, r, 4l,
-                                            addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
-                                        : (fmt == 45l
-                                            ? iq4nl_grp_row_dot(kqg, ksg, r, 4l,
-                                                addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
-                                            : (fmt == 25l
-                                                ? iq2xxs_grp_row_dot(kqg, ksg, r, 4l,
-                                                    addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
-                                                : (fmt == 24l
-                                                ? iq2xs_grp_row_dot(kqg, ksg, r, 4l,
-                                                    addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
-                                                : (fmt == 23l
-                                                ? iq2s_grp_row_dot(kqg, ksg, r, 4l,
-                                                    addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
-                                                : (fmt == 2l
-                                                ? k2_grp_row_dot(kqg, ksg, r, 4l,
-                                                    addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
-                                                : kq_grp_row_dot(fmt, kqg, ksg, r, 4l,
-                                        addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)))))))))))
+                    fx.yref[tk * d + g * 4l + r] = kq_grp_row_dot_rt(kf, kqg, ksg, r, 4l,
+                        addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
                 }
             }
         }
@@ -712,222 +529,92 @@ def build_kq_fixture(fmt : int64; n, d, ntok : int64) : KqFixture {   // nolint:
     return <- fx
 }
 
-// each format is its own [tune] family since the per-format split — the fmt pickers below
-// keep the gate/bench loops family-generic
-def kq_tile_variants(fmt : int64) : array<tuple<string; KqTileFn>> {
-    if (fmt == 4l) {
-        return <- k4q8_tile_gen_variants()
+//! a kq format's [tune] family registries (the engine's kq_registries), for a caller holding the format as a schema id
+def kq_regs(fmt : int64) : KqRegistries {
+    var regs : KqRegistries
+    let kf = kq_fmt_of_id(int(fmt), "kq_regs")
+    kq_fmt_stamp(kf) $(F) {
+        regs <- kq_registries(F)
     }
-    if (fmt == 5l) {
-        return <- k5q8_tile_gen_variants()
-    }
-    if (fmt == 40l) {
-        return <- q40q8_tile_gen_variants()
-    }
-    if (fmt == 44l) {
-        return <- iq4xsq8_tile_gen_variants()
-    }
-    if (fmt == 3l) {
-        return <- k3q8_tile_gen_variants()
-    }
-    if (fmt == 33l) {
-        return <- iq3sq8_tile_gen_variants()
-    }
-    if (fmt == 34l) {
-        return <- iq3xxsq8_tile_gen_variants()
-    }
-    if (fmt == 45l) {
-        return <- iq4nlq8_tile_gen_variants()
-    }
-    if (fmt == 2l) {
-        return <- k2q8_tile_gen_variants()
-    }
-    if (fmt == 23l) {
-        return <- iq2sq8_tile_gen_variants()
-    }
-    if (fmt == 24l) {
-        return <- iq2xsq8_tile_gen_variants()
-    }
-    if (fmt == 25l) {
-        return <- iq2xxsq8_tile_gen_variants()
-    }
-    return <- k6q8_tile_gen_variants()
+    return <- regs
 }
 
-def kq_gemv_variants_by_suffix(fmt : int64) : table<string; KqRowsFn> {   // nolint:STYLE037,STYLE038 — the flat per-format ladder (one arm per kq format) is the honest shape
-    var tab : table<string; KqRowsFn>
-    if (fmt == 4l) {
-        var gvs <- k4q8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
+//! the schema ids of the formats that carry a kq [tune] family - those whose registries are non-empty - in KqFmt order
+def kq_family_ids() : array<int64> {
+    var ids : array<int64>
+    for (kf in type<KqFmt>) {
+        kq_fmt_stamp(kf) $(F) {
+            var regs <- kq_registries(F)
+            if (!empty(regs.tile)) {
+                ids |> push(int64(kq_desc(kf).schema_id))
+            }
+            delete regs
         }
-        delete gvs
-    } elif (fmt == 5l) {
-        var gvs <- k5q8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } elif (fmt == 40l) {
-        var gvs <- q40q8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } elif (fmt == 44l) {
-        var gvs <- iq4xsq8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } elif (fmt == 3l) {
-        var gvs <- k3q8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } elif (fmt == 33l) {
-        var gvs <- iq3sq8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } elif (fmt == 34l) {
-        var gvs <- iq3xxsq8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } elif (fmt == 45l) {
-        var gvs <- iq4nlq8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } elif (fmt == 24l) {
-        var gvs <- iq2xsq8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } elif (fmt == 25l) {
-        var gvs <- iq2xxsq8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } elif (fmt == 23l) {
-        var gvs <- iq2sq8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } elif (fmt == 2l) {
-        var gvs <- k2q8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
-    } else {
-        var gvs <- k6q8_gemv_gen_variants()
-        for (v in gvs) {
-            tab[v._0] = v._1
-        }
-        delete gvs
     }
-    return <- tab
+    return <- ids
 }
 
-// suffix -> plane interleave off the family's OWN layout companion registry (per-format
-// layouts since the family split — declined rows report the reference grp4)
-def kq_layout_mrs(fmt : int64) : table<string; int> {   // nolint:STYLE037,STYLE038 — the flat per-format ladder (one arm per kq format) is the honest shape
-    var mrs : table<string; int>
-    if (fmt == 4l) {
-        var lvs <- k4q8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
+//! a bf16 row's per-process arming: the suffix's witness (the XTILEDATA grant) then its tile-config companion
+def private arm_of(wvs : array<tuple<string; function<() : bool>>>; cvs : array<tuple<string; function<() : void>>>; suffix : string) {
+    for (v in wvs) {
+        if (v._0 == suffix) {
+            invoke(v._1)
         }
-        delete lvs
-    } elif (fmt == 5l) {
-        var lvs <- k5q8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } elif (fmt == 40l) {
-        var lvs <- q40q8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } elif (fmt == 44l) {
-        var lvs <- iq4xsq8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } elif (fmt == 3l) {
-        var lvs <- k3q8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } elif (fmt == 33l) {
-        var lvs <- iq3sq8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } elif (fmt == 34l) {
-        var lvs <- iq3xxsq8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } elif (fmt == 45l) {
-        var lvs <- iq4nlq8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } elif (fmt == 24l) {
-        var lvs <- iq2xsq8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } elif (fmt == 25l) {
-        var lvs <- iq2xxsq8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } elif (fmt == 23l) {
-        var lvs <- iq2sq8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } elif (fmt == 2l) {
-        var lvs <- k2q8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
-    } else {
-        var lvs <- k6q8_layout_gen_variants()
-        for (v in lvs) {
-            mrs[v._0] = invoke(v._1)
-        }
-        delete lvs
     }
-    return <- mrs
+    for (v in cvs) {
+        if (v._0 == suffix) {
+            invoke(v._1)
+        }
+    }
 }
 
-// one kq tile sweep: every (4-token, group) unit through `tile` on the variant's grp<mr>
-// planes — the kq tile contract is always 4 tokens per call (no amx tokstep: the kq planes
-// have no TMUL form, amx perms ride the busd lattice). k5/k6 tiles read the byte-expanded
-// panel unpacked per group (the batch cell's amortized shape — the bench cost is honest)
+typedef KqPanelFn = function<(kqg : uint8 const?; ksg : uint8 const?; mr : int64; nsb : int64; n : int64; ngr : int64; var dst : uint16?) : void>
+
+//! the suffix's panel companion; null when the registry has no such row
+def private panel_of(pvs : array<tuple<string; KqPanelFn>>; suffix : string) : KqPanelFn {
+    var fn : KqPanelFn
+    for (v in pvs) {
+        if (v._0 == suffix) {
+            fn = v._1
+        }
+    }
+    return fn
+}
+
+def run_kq_tile_bf16(tile; gemv; panel : KqPanelFn; fx : KqFixture; kq : array<uint8>; ks : array<uint8>; mr, form : int64; var y : array<float>) {
+    let ng = fx.d / mr
+    let qsb = kq_qsb(fx.fmt)
+    let ssb = kq_ssb(fx.fmt)
+    var pbuf : array<uint16>
+    pbuf |> resize(int(form * 16l * fx.n + 32l))
+    unsafe {
+        let kqp = addr(kq[0])
+        let ksp = addr(ks[0])
+        let xqp = addr(fx.xq[0])
+        let xsp = addr(fx.xs[0])
+        let xbsp = addr(fx.xbs[0])
+        var yp = addr(y[0])
+        let xbp = reinterpret<int8 const?>(xbf16_build(xqp, xsp, fx.n, fx.ntok, 256l))
+        var pp = addr(pbuf[0])
+        pp = bf16_align64(pp)
+        bf16_walk(0l, ng, form, 0l, fx.ntok, fx.ntok, amx_bf16_tile_tokens(), $(g : int64) {
+            let kqg = kqp + g * mr * fx.nsb * qsb
+            let ksg = ksp + g * mr * fx.nsb * ssb
+            if (panel != null) {
+                invoke(panel, kqg, ksg, mr, fx.nsb, fx.n, form, pp)
+            } else {
+                kq_panel_bf16(int(fx.fmt), kqg, ksg, mr, fx.nsb, fx.n, form, pp)
+            }
+        }, $(g, tk : int64) {
+            invoke(tile, yp, reinterpret<uint8 const?>(pp), ksp + g * mr * fx.nsb * ssb, xbp, xsp, xbsp, fx.n, fx.d, g, tk)
+        }, $(g, tk : int64) {
+            panic("run_kq_tile_bf16: the fixture leaves a 4-token tail at group {g} token {tk} - the gate holds tile4 on its own")
+        }, $(g, gn, tk : int64) {
+            invoke(gemv, yp + tk * fx.d, kqp, ksp, xqp + tk * fx.n, xsp + tk * fx.nsb, xbsp + tk * (fx.n / 16l), fx.n, g * mr, (g + gn) * mr)
+        })
+    }
+}
+
 def run_kq_tile(tile; fx : KqFixture; kq : array<uint8>; ks : array<uint8>; mr : int64; var y : array<float>) {
     let ng = fx.d / mr
     verify(fx.ntok % 4l == 0l)
@@ -958,14 +645,6 @@ def run_kq_tile(tile; fx : KqFixture; kq : array<uint8>; ks : array<uint8>; mr :
         }
     }
     delete panel
-}
-
-// one kq gemv rows-core sweep over all rows for token 0 (the group walk is inside the
-// generated function — one call, like a production dispatch chunk)
-def run_kq_gemv(gemv; fx : KqFixture; kq : array<uint8>; ks : array<uint8>; mr : int64; var y : array<float>) {
-    unsafe {
-        invoke(gemv, addr(y[0]), addr(kq[0]), addr(ks[0]), addr(fx.xq[0]), addr(fx.xs[0]), addr(fx.xbs[0]), fx.n, 0l, (fx.d / mr) * mr)
-    }
 }
 
 //! the streamed fixture's master planes repeated `times` over into a repack buffer: a DRAM-bound plane at the
@@ -1008,28 +687,31 @@ def run_kq_gemv_team(gemv; fx : KqFixture; kq : array<uint8>; ks : array<uint8>;
 // fixture's magnitude instead; a real generator bug (wrong stride/lane/scale) is orders louder
 // than fast-math fold-order noise
 def kq_tol(fx : KqFixture; count : int) : float {
-    var mag = 0.0
-    for (i in range(count)) {
-        mag = max(mag, abs(fx.yref[i]))
-    }
-    return max(CLOSE_ABS, CLOSE_REL * mag)
+    return close_tol(max_abs(fx.yref, count))
 }
 
-def close_to_kq_ref(fx : KqFixture; y : array<float>; var maxdiff : float&) : bool {
-    let tol = kq_tol(fx, length(y))
-    var ok = true
+def close_to_kq_ref(fx : KqFixture; y : array<float>; var maxdiff : float&; form : int64 = 0l) : bool {
+    let tol = max(kq_tol(fx, length(y)), bf16_envelope(fx.yref, length(y), form))
+    return close_within(y, fx.yref, length(y), maxdiff) $(_i : int) => tol
+}
+
+//! the first six elements of `y` outside `tol(i)` of `yref`, each as a DBG line naming `what`;
+//! `cols` > 0 names each element's token and column in a token-major image
+def private dump_mismatch(what : string; y, yref : array<float>; cols : int; tol : block<(i : int) : float>) {
+    var shown = 0
     for (i in range(length(y))) {
-        let d = abs(y[i] - fx.yref[i])
-        maxdiff = max(maxdiff, d)
-        ok &&= d <= tol
+        if (abs(y[i] - yref[i]) > invoke(tol, i) && shown < 6) {
+            let at = cols > 0 ? " (tok {i / cols} col {i % cols})" : ""
+            tune_detail("  DBG {what}: y[{i}]{at} = {y[i]} want {yref[i]}\n")
+            shown++
+        }
     }
-    return ok
 }
 
 // one variant's kq gate over a format's fixture set: repack per-variant copies at the
 // variant's mr, run tile + gemv (token 0), compare against the scalar oracle
-def kq_gate_variant(suffix : string; tile : KqTileFn; gemv : KqRowsFn;
-                    kfxs : array<KqFixture>; mr : int64; var maxdiff : float&) : bool {
+def kq_gate_variant(suffix : string; tile : KqTileFn; gemv : KqRowsFn; tile4 : KqTileFn; panel : KqPanelFn;
+                    kfxs : array<KqFixture>; mr : int64; var maxdiff : float&; form : int64 = 0l) : bool {
     var ok = true
     for (kfx in kfxs) {
         var kqv := kfx.kq
@@ -1039,61 +721,69 @@ def kq_gate_variant(suffix : string; tile : KqTileFn; gemv : KqRowsFn;
         }
         var yk : array<float>
         yk |> resize(kfx.ntok * kfx.d)
-        run_kq_tile(tile, kfx, kqv, ksv, mr, yk)
-        let tok = close_to_kq_ref(kfx, yk, maxdiff)
+        if (form > 0l) {
+            run_kq_tile_bf16(tile, gemv, panel, kfx, kqv, ksv, mr, form, yk)
+        } else {
+            run_kq_tile(tile, kfx, kqv, ksv, mr, yk)
+        }
+        let tok = close_to_kq_ref(kfx, yk, maxdiff, form)
         if (!tok) {
             let tol = kq_tol(kfx, length(yk))
-            var shown = 0
-            for (i in range(length(yk))) {
-                if (abs(yk[i] - kfx.yref[i]) > tol && shown < 6) {
-                    tune_detail("  DBG k{kfx.fmt} tile {suffix} n={kfx.n}: y[{i}] (tok {i / int(kfx.d)} col {i % int(kfx.d)}) = {yk[i]} want {kfx.yref[i]}\n")
-                    shown++
-                }
-            }
+            dump_mismatch("k{kfx.fmt} tile {suffix} n={kfx.n}", yk, kfx.yref, int(kfx.d)) $(_i : int) => tol
         }
         ok = ok && tok
         var ykg : array<float>
         ykg |> resize(kfx.d)
-        run_kq_gemv(gemv, kfx, kqv, ksv, mr, ykg)
+        run_gemv_sums(gemv, kfx, kqv, ksv, mr, ykg)
         let gok = close_to_kq_ref(kfx, ykg, maxdiff)
         if (!gok) {
             let tol = kq_tol(kfx, length(ykg))
-            var shown = 0
-            for (i in range(length(ykg))) {
-                if (abs(ykg[i] - kfx.yref[i]) > tol && shown < 6) {
-                    tune_detail("  DBG k{kfx.fmt} gemv {suffix} n={kfx.n}: y[{i}] = {ykg[i]} want {kfx.yref[i]}\n")
-                    shown++
-                }
-            }
+            dump_mismatch("k{kfx.fmt} gemv {suffix} n={kfx.n}", ykg, kfx.yref, 0) $(_i : int) => tol
         }
         ok = ok && gok
+        var yk4 : array<float>
+        yk4 |> resize(kfx.ntok * kfx.d)
+        run_kq_tile(tile4, kfx, kqv, ksv, mr, yk4)
+        let t4ok = close_to_kq_ref(kfx, yk4, maxdiff)
+        if (!t4ok) {
+            let tol = kq_tol(kfx, length(yk4))
+            dump_mismatch("k{kfx.fmt} tile4 {suffix} n={kfx.n}", yk4, kfx.yref, int(kfx.d)) $(_i : int) => tol
+        }
+        ok = ok && t4ok
         delete yk
         delete ykg
+        delete yk4
         delete kqv
         delete ksv
     }
     return ok
 }
 
-// one kq family's test pass: every variant of the format's OWN grid against the scalar oracle
-// ===== the q51 GEMV family (self-anchored, sdot-only grid) =====
+// ===== the per-32 GEMV families (q51, iq4nl32: self-anchored grids off the kq lattice) =====
 
-struct Q51Fixture {
+struct B32Fixture {
+    fmt : KqFmt
     n, d : int64
     nb : int64
-    qq : array<uint8>       // disk-order 20B/block quant plane
-    qs : array<uint8>       // disk-order 4B/block f16 (d, m) scale plane
+    qb, sb : int64          // the format's quant / scale bytes a block (kq_desc's strides)
+    qq : array<uint8>       // disk-order quant plane
+    qs : array<uint8>       // disk-order f16 scale plane (q51: d, m; iq4nl32: d)
     xq : array<int8>
     xs : array<float>
-    xbs : array<int>        // per-32 activation sums (the q51 gemv contract)
+    xbs : array<int>        // per-32 activation sums (the per-32 gemv contract; the q51 fold reads them)
     yref : array<float>
 }
 
-def build_q51_fixture(n, d : int64) : Q51Fixture {
-    var fx = Q51Fixture(n = n, d = d, nb = n / 32l)
-    fx.qq |> resize(d * fx.nb * 20l)
-    fx.qs |> resize(d * fx.nb * 4l)
-    // valid small f16 scale bit patterns (d, m) cycled per block; quant/qh bytes an LCG walk
+//! the format's scalar disk-order dot - the oracle every per-32 variant is held to
+def b32_scalar_dot(fmt : KqFmt; wq : uint8 const?; ws : uint8 const?; xq : int8 const?; xs : float const?; n : int64) : float {
+    return fmt == KqFmt.q51 ? dot_q51q8_scalar(wq, ws, xq, xs, n) : dot_iq4nl32q8_scalar(wq, ws, xq, xs, n)
+}
+
+def build_b32_fixture(fmt : KqFmt; n, d : int64) : B32Fixture {
+    var fx = B32Fixture(fmt = fmt, n = n, d = d, nb = n / 32l, qb = kq_qsb(fmt), sb = kq_ssb(fmt))
+    fx.qq |> resize(d * fx.nb * fx.qb)
+    fx.qs |> resize(d * fx.nb * fx.sb)
+    // valid small f16 scale bit patterns (d, then m where the row holds one) cycled per block; quant bytes an LCG walk
     let f16s = fixed_array(0x2E66, 0x3266, 0xB18F, 0x2C00, 0x3000, 0xB266, 0x2A8F, 0x3400)
     var seed = 0x12345
     for (i in range64(length(fx.qq))) {
@@ -1102,13 +792,15 @@ def build_q51_fixture(n, d : int64) : Q51Fixture {
     }
     for (r in range64(d)) {
         for (bi in range64(fx.nb)) {
-            let sb = (r * fx.nb + bi) * 4l
+            let sb = (r * fx.nb + bi) * fx.sb
             let dv = f16s[int(r * 3l + bi) % 8]
-            let mv = f16s[int(r * 5l + bi * 7l + 3l) % 8]
             fx.qs[sb] = uint8(dv & 255)
             fx.qs[sb + 1l] = uint8(dv >> 8)
-            fx.qs[sb + 2l] = uint8(mv & 255)
-            fx.qs[sb + 3l] = uint8(mv >> 8)
+            if (fx.sb >= 4l) {
+                let mv = f16s[int(r * 5l + bi * 7l + 3l) % 8]
+                fx.qs[sb + 2l] = uint8(mv & 255)
+                fx.qs[sb + 3l] = uint8(mv >> 8)
+            }
         }
     }
     var xrow : array<float>
@@ -1131,41 +823,25 @@ def build_q51_fixture(n, d : int64) : Q51Fixture {
     fx.yref |> resize(d)
     unsafe {
         for (r in range64(d)) {
-            fx.yref[r] = dot_q51q8_scalar(addr(fx.qq[0]) + r * fx.nb * 20l, addr(fx.qs[0]) + r * fx.nb * 4l,
-                                          addr(fx.xq[0]), addr(fx.xs[0]), n)
+            fx.yref[r] = b32_scalar_dot(fmt, addr(fx.qq[0]) + r * fx.nb * fx.qb, addr(fx.qs[0]) + r * fx.nb * fx.sb,
+                                        addr(fx.xq[0]), addr(fx.xs[0]), n)
         }
     }
     return <- fx
 }
 
-def run_q51_gemv(gemv; fx : Q51Fixture; qq : array<uint8>; qs : array<uint8>; mr : int64; var y : array<float>) {
-    unsafe {
-        invoke(gemv, addr(y[0]), addr(qq[0]), addr(qs[0]), addr(fx.xq[0]), addr(fx.xs[0]), addr(fx.xbs[0]), fx.n, 0l, (fx.d / mr) * mr)
-    }
-}
-
-def close_to_q51_ref(fx : Q51Fixture; y : array<float>; mr : int64; var maxdiff : float&) : bool {
-    var mag = 0.0
+def close_to_b32_ref(fx : B32Fixture; y : array<float>; mr : int64; var maxdiff : float&) : bool {
     let rows = int((fx.d / mr) * mr)
-    for (i in range(rows)) {
-        mag = max(mag, abs(fx.yref[i]))
-    }
-    let tol = max(1.0e-3, mag * 5.0e-5)
-    var ok = true
-    for (i in range(rows)) {
-        let df = abs(y[i] - fx.yref[i])
-        maxdiff = max(maxdiff, df)
-        ok = ok && df <= tol
-    }
-    return ok
+    let tol = max(1.0e-3, max_abs(fx.yref, rows) * 5.0e-5)
+    return close_within(y, fx.yref, rows, maxdiff) $(_i : int) => tol
 }
 
 // per-variant plane interleave off the layout companion registry — declined perms report the
 // reference resolve (the lockstep rail). Trusting the SUFFIX instead repacks planes to a grp
 // the declined-to-reference kernel then walks at the companion mr — the zen2 maxdiff-120 trap.
-def private q51_layout_mrs() : table<string; int> {
+def private b32_layout_mrs(fmt : KqFmt) : table<string; int> {
     var mrs : table<string; int>
-    var lvs <- q51q8_layout_gen_variants()
+    var lvs <- fmt == KqFmt.q51 ? q51q8_layout_gen_variants() : iq4nl32q8_layout_gen_variants()
     for (v in lvs) {
         mrs[v._0] = invoke(v._1)
     }
@@ -1173,38 +849,46 @@ def private q51_layout_mrs() : table<string; int> {
     return <- mrs
 }
 
-// The q51 family tune pass: gate every variant against the scalar disk oracle on repacked
+//! the per-32 family's manifest key - the TILE stamp (the gemv and layout companions follow it)
+def b32_tile_entry(fmt : KqFmt) : string => fmt == KqFmt.q51 ? "q51q8_tile_gen" : "iq4nl32q8_tile_gen"
+
+// A per-32 family's tune pass: gate every variant against the scalar disk oracle on repacked
 // planes, iso-bench the streamed decode shape, return the best suffix ("" = a gate failed).
-def q51_tune_family(var rows_out : table<string; JsonValue?>) : string {
-    var sfx <- build_q51_fixture(704l, 32768l)   // streamed: the 26B expert-down K at DRAM scale
-    var hfx <- build_q51_fixture(704l, 2816l)    // hot: one expert's down stack
-    var tvs <- q51q8_gemv_gen_variants()
-    var mrs <- q51_layout_mrs()
+def b32_tune_family(fmt : KqFmt; var rows_out : table<string; JsonValue?>) : string {
+    let entry = b32_tile_entry(fmt)
+    let n = fmt == KqFmt.q51 ? 704l : 640l   //! the expert width each rail exists for: the 26B-A4B's q51 down, Flash-Next's iq4nl32 down
+    var sfx <- build_b32_fixture(fmt, n, 32768l)   // streamed: the expert-down K at DRAM scale
+    var hfx <- build_b32_fixture(fmt, n, 2816l)    // hot: one expert's down stack
+    var tvs <- fmt == KqFmt.q51 ? q51q8_gemv_gen_variants() : iq4nl32q8_gemv_gen_variants()
+    var mrs <- b32_layout_mrs(fmt)
+    let mr0 = fmt == KqFmt.q51 ? q51q8_layout_gen() : iq4nl32q8_layout_gen()
     var best = ""
     var bestDt = 2147483647
+    var names : array<string>
+    var times : array<double>
     var y : array<float>
     y |> resize(sfx.d)
     var yh : array<float>
     yh |> resize(hfx.d)
     for (v in tvs) {
-        let mr = int64(mrs?[v._0] ?? q51q8_layout_gen())
+        let mr = int64(mrs?[v._0] ?? mr0)
         var sq := sfx.qq
         var ss := sfx.qs
         var hq := hfx.qq
         var hs := hfx.qs
         unsafe {
-            repack_kq_grp(KqFmt.q51, addr(sq[0]), addr(ss[0]), sfx.n, sfx.d, mr)
-            repack_kq_grp(KqFmt.q51, addr(hq[0]), addr(hs[0]), hfx.n, hfx.d, mr)
+            repack_kq_grp(fmt, addr(sq[0]), addr(ss[0]), sfx.n, sfx.d, mr)
+            repack_kq_grp(fmt, addr(hq[0]), addr(hs[0]), hfx.n, hfx.d, mr)
         }
         var maxdiff = 0.0
-        run_q51_gemv(v._1, sfx, sq, ss, mr, y)
-        var ok = close_to_q51_ref(sfx, y, mr, maxdiff)
-        run_q51_gemv(v._1, hfx, hq, hs, mr, yh)
-        ok = close_to_q51_ref(hfx, yh, mr, maxdiff) && ok
+        run_gemv_sums(v._1, sfx, sq, ss, mr, y)
+        var ok = close_to_b32_ref(sfx, y, mr, maxdiff)
+        run_gemv_sums(v._1, hfx, hq, hs, mr, yh)
+        ok = close_to_b32_ref(hfx, yh, mr, maxdiff) && ok
         if (!ok) {
             // best = "" rejects the family; the shared cleanup past the loop frees everything
             // (deleting tvs HERE, mid-iteration, is the locked-array trap)
-            print("q51 {v._0} (mr={mr}): MISMATCH (maxdiff {maxdiff}) - aborting tune\n")
+            print("{fmt} {v._0} (mr={mr}): MISMATCH (maxdiff {maxdiff}) - aborting tune\n")
             delete sq; delete ss; delete hq; delete hs
             best = ""
             break
@@ -1212,30 +896,26 @@ def q51_tune_family(var rows_out : table<string; JsonValue?>) : string {
         var dt = 2147483647
         for (_rep in range(3)) {
             let t0 = ref_time_ticks()
-            run_q51_gemv(v._1, sfx, sq, ss, mr, y)
+            run_gemv_sums(v._1, sfx, sq, ss, mr, y)
             dt = min(dt, get_time_usec(t0))
         }
-        let gb = double(sfx.d * sfx.nb * 24l) / double(max(dt, 1)) / 1000.0lf
+        let gb = double(sfx.d * sfx.nb * (sfx.qb + sfx.sb)) / double(max(dt, 1)) / 1000.0lf
         rows_out[v._0] = JV((streamed_us = double(dt)))
-        tune_detail("q51 {v._0} (mr={mr}): ok (maxdiff {maxdiff}), streamed {dt} us ({gb:0.1f} GB/s)\n")
+        names |> push(v._0)
+        times |> push(double(dt))
+        tune_detail("{fmt} {v._0} (mr={mr}): ok (maxdiff {maxdiff}), streamed {dt} us ({gb:0.1f} GB/s)\n")
         if (dt < bestDt) {
             bestDt = dt
             best = v._0
         }
         delete sq; delete ss; delete hq; delete hs
     }
-    // the sticky seat, by the recorded times: the incumbent keeps the crown inside the margin
+    // the sticky seat, by the streamed times: the incumbent keeps the crown inside the margin
     if (!empty(best)) {
-        let inc = gen_incumbent("q51q8_tile_gen")
-        if (!empty(inc) && inc != best && key_exists(rows_out, inc)) {
-            var irow = rows_out[inc]
-            let it : double = irow?["streamed_us"] ?? -1.0lf
-            if (it > 0.0lf && double(bestDt) * gen_margin() > it) {
-                tune_detail("q51q8_tile_gen: {best} does not beat the incumbent {inc} by x{gen_margin():0.3f} - the seat stays\n")
-                best = inc
-            }
-        }
+        best = names[gen_sticky(entry, names, times, find_index(names, best))]
     }
+    delete names
+    delete times
     delete sfx
     delete hfx
     delete tvs
@@ -1246,21 +926,30 @@ def q51_tune_family(var rows_out : table<string; JsonValue?>) : string {
 }
 
 def kq_test_family(fmt : int64; kfxs : array<KqFixture>) : bool {
-    var tvs <- kq_tile_variants(fmt)
-    var gtab <- kq_gemv_variants_by_suffix(fmt)
-    var mrs <- kq_layout_mrs(fmt)
+    var regs <- kq_regs(fmt)
+    var gtab <- by_suffix(regs.gemv)
+    var t4tab <- by_suffix(regs.tile4)
+    var mrs <- forms_of(regs.layout)
+    var forms <- forms_of(regs.tileform)
     var allok = true
-    for (v in tvs) {
+    for (v in regs.tile) {
         let mr = int64(mrs?[v._0] ?? 4)
+        let form = int64(forms?[v._0] ?? 0)
         verify(gtab |> key_exists(v._0))
+        verify(t4tab |> key_exists(v._0))
+        if (form > 0l) {
+            arm_of(regs.witness, regs.amx_cfg, v._0)
+        }
         var maxdiff = 0.0
-        let ok = kq_gate_variant(v._0, v._1, gtab[v._0], kfxs, mr, maxdiff)
-        print("k{fmt} {v._0} (mr={mr}): {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff})\n")
+        let ok = kq_gate_variant(v._0, v._1, gtab[v._0], t4tab[v._0], panel_of(regs.panel, v._0), kfxs, mr, maxdiff, form)
+        print("k{fmt} {v._0} (mr={mr}{form > 0l ? ", bf16 tile" : ""}): {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff})\n")
         allok = allok && ok
     }
+    delete forms
     delete mrs
+    delete t4tab
     delete gtab
-    delete tvs
+    delete regs
     return allok
 }
 
@@ -1269,22 +958,33 @@ def kq_test_family(fmt : int64; kfxs : array<KqFixture>) : bool {
 // suffix ("" = a gate failed). The kq gemv is nrsplit-independent — same-mr rows share the
 // plane and the gemv shape — so the tile bench decides the family entry.
 [arch(at = "../ARCHITECTURE_MEASUREMENT_KERNEL_RACE.md#gemv-seat")]
-def kq_tune_family(fmt : int64; var rows_out : table<string; JsonValue?>; var gemv_out : string&) : string { // nolint:STYLE037,STYLE038 — one family race: shared repacked buffers couple gate, bench and the two picks
+def kq_tune_family(fmt : int64; var rows_out : table<string; JsonValue?>; var gemv_out : string&) : string { // nolint:STYLE038 — one family race: shared repacked buffers couple gate, bench and the two picks
     // batch shape: fat STREAMING ffn (weights > the L2 budget, multi-token-block walk) — the shape
     // class that carries ~90% of prefill time. The old 2048x512x64 kv-projection probe was L2-hot
     // and crowned hot-shape winners that lose double-digit % at model scale (mr4 vs mr8, M1).
     var kbfx <- build_kq_fixture(fmt, 2048l, 8192l, 256l)
     var kgfx <- build_kq_fixture(fmt, 2048l, 8192l, 1l)      // streamed decode shape (DRAM-bound ffn)
     var khfx <- build_kq_fixture(fmt, 2048l, 512l, 1l)       // hot decode shape (cache-resident)
-    var tvs <- kq_tile_variants(fmt)
-    var gtab <- kq_gemv_variants_by_suffix(fmt)
-    var mrs <- kq_layout_mrs(fmt)
+    var regs <- kq_regs(fmt)
+    var tvs <- regs.tile
+    var gtab <- by_suffix(regs.gemv)
+    var mrs <- forms_of(regs.layout)
+    var forms <- forms_of(regs.tileform)
     let nv = length(tvs)
     var vmr : array<int64>
     vmr |> resize(nv)
+    var vform : array<int64>   // the tile form per variant: a bf16 variant runs the panel walk and holds the bf16 bar
+    vform |> resize(nv)
+    var vpanel : array<KqPanelFn>
+    vpanel |> resize(nv)
     var kmrs : array<int64>   // kq planes depend only on (format, mr) — dedupe repacks by mr
     for (vi in range(nv)) {
         vmr[vi] = int64(mrs?[tvs[vi]._0] ?? 4)
+        vform[vi] = int64(forms?[tvs[vi]._0] ?? 0)
+        if (vform[vi] > 0l) {
+            arm_of(regs.witness, regs.amx_cfg, tvs[vi]._0)
+            vpanel[vi] = panel_of(regs.panel, tvs[vi]._0)
+        }
         var seen = false
         for (m in kmrs) {
             seen ||= m == vmr[vi]
@@ -1320,67 +1020,48 @@ def kq_tune_family(fmt : int64; var rows_out : table<string; JsonValue?>; var ge
     var kyh : array<float>
     kyh |> resize(khfx.d)
     // correctness first — a tune run must never crown a broken variant
+    var held : array<string>
+    held |> reserve(nv)
     for (vi in range(nv)) {
         verify(gtab |> key_exists(tvs[vi]._0))
-        let mi = kq_mr_index(kmrs, vmr[vi])
-        run_kq_tile(tvs[vi]._1, kbfx, bbuf[mi].q, bbuf[mi].s, vmr[vi], ky)
+        let mi = find_index(kmrs, vmr[vi])
+        if (vform[vi] > 0l) {
+            run_kq_tile_bf16(tvs[vi]._1, gtab[tvs[vi]._0], vpanel[vi], kbfx, bbuf[mi].q, bbuf[mi].s, vmr[vi], vform[vi], ky)
+        } else {
+            run_kq_tile(tvs[vi]._1, kbfx, bbuf[mi].q, bbuf[mi].s, vmr[vi], ky)
+        }
         var maxdiff = 0.0
-        if (!close_to_kq_ref(kbfx, ky, maxdiff)) {
+        if (!close_to_kq_ref(kbfx, ky, maxdiff, vform[vi])) {
             print("k{fmt} {tvs[vi]._0}: tile MISMATCH (maxdiff {maxdiff}) - aborting tune\n")
             return ""
         }
-        run_kq_gemv(gtab[tvs[vi]._0], khfx, hbuf[mi].q, hbuf[mi].s, vmr[vi], kyh)
+        held |> push(vform[vi] > 0l ? ", tile maxdiff {maxdiff} within the bf16 envelope {bf16_envelope(kbfx.yref, length(ky), vform[vi])}" : "")
+        run_gemv_sums(gtab[tvs[vi]._0], khfx, hbuf[mi].q, hbuf[mi].s, vmr[vi], kyh)
         var gmaxdiff = 0.0
         if (!close_to_kq_ref(khfx, kyh, gmaxdiff)) {
             print("k{fmt} {tvs[vi]._0}: gemv MISMATCH (maxdiff {gmaxdiff}) - aborting tune\n")
             return ""
         }
     }
-    var best : array<double>
-    var gbest : array<double>
-    var hbest : array<double>
-    best |> resize(nv)
-    gbest |> resize(nv)
-    hbest |> resize(nv)
-    for (i in range(nv)) {
-        best[i] = 1.0e30lf
-        gbest[i] = 1.0e30lf
-        hbest[i] = 1.0e30lf
-    }
-    let HOT_REPS = 16
-    var keep : array<bool>
-    keep |> resize(nv)
-    for (i in range(nv)) {
-        keep[i] = true
-    }
-    for (r in range(ROUNDS)) {   // interleaved best-of within the family, screened (twin: the q8q8 loop in tune_mode_run)
-        gen_screen(r, best, keep)
-        gen_round_step(r, keep)
-        for (vi in range(nv)) {
-            continue if (!keep[vi])
-            let mi = kq_mr_index(kmrs, vmr[vi])
-            let t0 = ref_time_ticks()
+    var vmi <- [for (m in vmr); find_index(kmrs, m)]
+    var times <- race_family(nv, $(vi : int) {
+        let mi = vmi[vi]
+        if (vform[vi] > 0l) {
+            run_kq_tile_bf16(tvs[vi]._1, gtab[tvs[vi]._0], vpanel[vi], kbfx, bbuf[mi].q, bbuf[mi].s, vmr[vi], vform[vi], ky)
+        } else {
             run_kq_tile(tvs[vi]._1, kbfx, bbuf[mi].q, bbuf[mi].s, vmr[vi], ky)
-            let us = double(get_time_usec(t0))
-            if (us < best[vi]) {
-                best[vi] = us
-            }
-            let g0 = ref_time_ticks()
-            run_kq_gemv(gtab[tvs[vi]._0], kgfx, gbuf[mi].q, gbuf[mi].s, vmr[vi], kyg)
-            let gus = double(get_time_usec(g0))
-            if (gus < gbest[vi]) {
-                gbest[vi] = gus
-            }
-            let h0 = ref_time_ticks()
-            for (_h in range(HOT_REPS)) {
-                run_kq_gemv(gtab[tvs[vi]._0], khfx, hbuf[mi].q, hbuf[mi].s, vmr[vi], kyh)
-            }
-            let hus = double(get_time_usec(h0)) / double(HOT_REPS)
-            if (hus < hbest[vi]) {
-                hbest[vi] = hus
-            }
         }
-    }
+    }, $(vi : int) {
+        let mi = vmi[vi]
+        run_gemv_sums(gtab[tvs[vi]._0], kgfx, gbuf[mi].q, gbuf[mi].s, vmr[vi], kyg)
+    }, $(vi : int) {
+        let mi = vmi[vi]
+        run_gemv_sums(gtab[tvs[vi]._0], khfx, hbuf[mi].q, hbuf[mi].s, vmr[vi], kyh)
+    })
+    delete vmi
+    var best <- times.best
+    var gbest <- times.gbest
+    var hbest <- times.hbest
     let macs = double(kbfx.n * kbfx.d * kbfx.ntok)
     let gmacs = double(kgfx.n * kgfx.d)
     let hmacs = double(khfx.n * khfx.d)
@@ -1391,7 +1072,7 @@ def kq_tune_family(fmt : int64; var rows_out : table<string; JsonValue?>; var ge
             winner = vi
         }
         rows_out[tvs[vi]._0] = JV((tile_us = best[vi], gemv_us = gbest[vi], hot_us = hbest[vi]))
-        tune_detail("k{fmt} {tvs[vi]._0} (mr={vmr[vi]}): tile {macs / best[vi] / 1000.0lf} GMAC/s, gemv stream {gmacs / gbest[vi] / 1000.0lf} GMAC/s ({gwbytes / gbest[vi] / 1000.0lf} GB/s w), hot {hmacs / hbest[vi] / 1000.0lf} GMAC/s (best of {ROUNDS})\n")
+        tune_detail("k{fmt} {tvs[vi]._0} (mr={vmr[vi]}): tile {macs / best[vi] / 1000.0lf} GMAC/s, gemv stream {gmacs / gbest[vi] / 1000.0lf} GMAC/s ({gwbytes / gbest[vi] / 1000.0lf} GB/s w), hot {hmacs / hbest[vi] / 1000.0lf} GMAC/s (best of {ROUNDS}){held[vi]}\n")
     }
     var tnames <- [for (t in tvs); t._0]
     winner = gen_sticky(kq_tile_entry(fmt), tnames, best, winner)
@@ -1400,8 +1081,7 @@ def kq_tune_family(fmt : int64; var rows_out : table<string; JsonValue?>; var ge
     for (i in range(nv)) {
         tbest[i] = gbest[i]
     }
-    with_job_que() {   // the lane count and the team dispatch both need the live jobque
-        setup_dasllama_jobque_()
+    with_dasllama_jobque_() {   // the lane count and the team dispatch both need the live jobque
         if (get_total_hw_jobs() > 1) {
             var kefx <- build_kq_fixture(fmt, 14336l, 512l, 1l)
             let TILES = 320l
@@ -1457,7 +1137,6 @@ def kq_tune_family(fmt : int64; var rows_out : table<string; JsonValue?>; var ge
     delete tbest
     delete tnames
     let wname = tvs[winner]._0
-    delete keep
     delete ky
     delete kyg
     delete kyh
@@ -1469,31 +1148,22 @@ def kq_tune_family(fmt : int64; var rows_out : table<string; JsonValue?>; var ge
     delete hbuf
     delete kmrs
     delete vmr
+    delete vform
+    delete vpanel
+    delete forms
     delete mrs
     delete gtab
     delete tvs
+    delete regs
     delete kbfx
     delete kgfx
     delete khfx
     return wname
 }
 
-let CLOSE_REL = 1e-4
-let CLOSE_ABS = 1e-5
-
 // family entry -> rows object for the sidecar "race" section, filled as each family races and
 // flushed with the winners — margins must be answerable from the file, not the scrollback
 var private g_rows : table<string; JsonValue?>
-
-def close_to_ref(fx : Fixture; y : array<float>; var maxdiff : float&) : bool {
-    var ok = true
-    for (i in range(length(y))) {
-        let d = abs(y[i] - fx.yref[i])
-        maxdiff = max(maxdiff, d)
-        ok &&= d <= max(CLOSE_ABS, CLOSE_REL * abs(fx.yref[i]))
-    }
-    return ok
-}
 
 def test_mode : bool { // nolint:STYLE037,STYLE038 — flat per-variant correctness ladder; each desync check is one arm
     // nb=2 (even main loop), nb=3 (remainder path), production-ish slice — d divides every
@@ -1501,30 +1171,19 @@ def test_mode : bool { // nolint:STYLE037,STYLE038 — flat per-variant correctn
     // 2×2 macro (and divides the 4/16-token steps of every other row)
     var fxs <- [ <- build_fixture(64l, 32l, 32l), <- build_fixture(96l, 32l, 32l), <- build_fixture(2048l, 64l, 32l)]
     var mfxs <- [ <- build_mx4_fixture(96l, 32l), <- build_mx4_fixture(2048l, 64l)]
-    // kq shapes: nsb=1 (single superblock), nsb=3 (odd walk), production-ish; d divides every
-    // grid mr, ntok covers two 4-token tile calls
-    var kfxs4 <- [ <- build_kq_fixture(4l, 256l, 32l, 8l), <- build_kq_fixture(4l, 768l, 32l, 8l), <- build_kq_fixture(4l, 2048l, 32l, 8l)]
-    var kfxs5 <- [ <- build_kq_fixture(5l, 256l, 32l, 8l), <- build_kq_fixture(5l, 768l, 32l, 8l), <- build_kq_fixture(5l, 2048l, 32l, 8l)]
-    var kfxs6 <- [ <- build_kq_fixture(6l, 256l, 32l, 8l), <- build_kq_fixture(6l, 768l, 32l, 8l), <- build_kq_fixture(6l, 2048l, 32l, 8l)]
-    var kfxs40 <- [ <- build_kq_fixture(40l, 256l, 32l, 8l), <- build_kq_fixture(40l, 768l, 32l, 8l), <- build_kq_fixture(40l, 2048l, 32l, 8l)]
-    var kfxs44 <- [ <- build_kq_fixture(44l, 256l, 32l, 8l), <- build_kq_fixture(44l, 768l, 32l, 8l), <- build_kq_fixture(44l, 2048l, 32l, 8l)]
-    var kfxs3 <- [ <- build_kq_fixture(3l, 256l, 32l, 8l), <- build_kq_fixture(3l, 768l, 32l, 8l), <- build_kq_fixture(3l, 2048l, 32l, 8l)]
-    var kfxs33 <- [ <- build_kq_fixture(33l, 256l, 32l, 8l), <- build_kq_fixture(33l, 768l, 32l, 8l), <- build_kq_fixture(33l, 2048l, 32l, 8l)]
-    var kfxs34 <- [ <- build_kq_fixture(34l, 256l, 32l, 8l), <- build_kq_fixture(34l, 768l, 32l, 8l), <- build_kq_fixture(34l, 2048l, 32l, 8l)]
-    var kfxs45 <- [ <- build_kq_fixture(45l, 256l, 32l, 8l), <- build_kq_fixture(45l, 768l, 32l, 8l), <- build_kq_fixture(45l, 2048l, 32l, 8l)]
-    var kfxs2 <- [ <- build_kq_fixture(2l, 256l, 32l, 8l), <- build_kq_fixture(2l, 768l, 32l, 8l), <- build_kq_fixture(2l, 2048l, 32l, 8l)]
-    var kfxs23 <- [ <- build_kq_fixture(23l, 256l, 32l, 8l), <- build_kq_fixture(23l, 768l, 32l, 8l), <- build_kq_fixture(23l, 2048l, 32l, 8l)]
-    var kfxs24 <- [ <- build_kq_fixture(24l, 256l, 32l, 8l), <- build_kq_fixture(24l, 768l, 32l, 8l), <- build_kq_fixture(24l, 2048l, 32l, 8l)]
-    var kfxs25 <- [ <- build_kq_fixture(25l, 256l, 32l, 8l), <- build_kq_fixture(25l, 768l, 32l, 8l), <- build_kq_fixture(25l, 2048l, 32l, 8l)]
     var vs <- q8q8_tile_gen_variants()
-    var mrs <- variant_mrs()
-    var wbs <- variant_wbias()
-    var kgs <- variant_kgroups()
-    var tss <- variant_toksteps()
-    var gtab <- gemv_variants_by_suffix()
-    var mtab <- mx4_variants_by_suffix()
-    var wtab <- witness_variants_by_suffix()
-    var ctab <- cfg_variants_by_suffix()
+    var mrs <- forms_of(q8q8_layout_gen_variants())
+    var wbs <- forms_of(q8q8_wbias_gen_variants())
+    var kgs <- forms_of(q8q8_kgroup_gen_variants())
+    var tss <- forms_of(q8q8_tokstep_gen_variants())
+    var forms <- forms_of(q8q8_tileform_gen_variants())
+    var gtab <- by_suffix(q8q8_gemv_gen_variants())
+    var t4tab <- by_suffix(q8q8_tile4_gen_variants())
+    var mtab <- by_suffix(mx4q8_gemv_gen_variants())
+    var wtab <- by_suffix(q8q8_family_live_variants())
+    // cfg before every tile sweep, as the batch wrapper does: an internal-substrate amx tile's exit TILERELEASE leaves a latch tile no palette
+    var ctab <- by_suffix(q8q8_amx_cfg_gen_variants())
+    var ptab <- by_suffix(q8q8_panel_gen_variants())
     var allok = true
     for (v in vs) {
         let mr = int64(mrs?[v._0] ?? 4)
@@ -1532,7 +1191,9 @@ def test_mode : bool { // nolint:STYLE037,STYLE038 — flat per-variant correctn
         let kgv = int64(kgs?[v._0] ?? 4)
         let tsv = int64(tss?[v._0] ?? 4)
         let gsv = max(tsv / 16l, 1l)
+        let formv = int64(forms?[v._0] ?? 0)
         verify(gtab |> key_exists(v._0))
+        verify(t4tab |> key_exists(v._0))
         verify(mtab |> key_exists(v._0))
         verify(wtab |> key_exists(v._0))
         verify(ctab |> key_exists(v._0))
@@ -1559,10 +1220,16 @@ def test_mode : bool { // nolint:STYLE037,STYLE038 — flat per-variant correctn
             print("  TOKSTEP DESYNC {v._0}: tokstep={tsv} but witness says not live\n")
             allok = false
         }
+        if (formv != 0l && !live) {
+            print("  TILEFORM DESYNC {v._0}: tileform={formv} but witness says not live\n")
+            allok = false
+        }
         var ok = true
         var gok = true
+        var t4ok = true
         var maxdiff = 0.0
         var gmaxdiff = 0.0
+        var t4maxdiff = 0.0
         for (fx in fxs) {
             var qv := fx.q
             var sv := fx.s
@@ -1571,16 +1238,14 @@ def test_mode : bool { // nolint:STYLE037,STYLE038 — flat per-variant correctn
             }
             var y : array<float>
             y |> resize(fx.ntok * fx.d)
-            run_tile(v._1, ctab[v._0], fx, qv, sv, mr, tsv, gsv, y)
-            let fxok = close_to_ref(fx, y, maxdiff)
+            if (formv > 0l) {
+                run_tile_bf16(v._1, ctab[v._0], ptab[v._0], fx, qv, sv, mr, formv, y)
+            } else {
+                run_tile(v._1, ctab[v._0], fx, qv, sv, mr, tsv, gsv, y)
+            }
+            let fxok = close_to_ref(fx, y, maxdiff, formv)
             if (!fxok) {
-                var shown = 0
-                for (i in range(length(y))) {
-                    if (abs(y[i] - fx.yref[i]) > max(CLOSE_ABS, CLOSE_REL * abs(fx.yref[i])) && shown < 6) {
-                        tune_detail("  DBG {v._0} n={fx.n}: y[{i}] (tok {i / int(fx.d)} col {i % int(fx.d)}) = {y[i]} want {fx.yref[i]}\n")
-                        shown++
-                    }
-                }
+                dump_mismatch("{v._0} n={fx.n}", y, fx.yref, int(fx.d)) $(i : int) => close_tol(fx.yref[i])
             }
             ok = ok && fxok
             // the gemv rows core on the same buffers: token 0's row of the oracle
@@ -1589,17 +1254,20 @@ def test_mode : bool { // nolint:STYLE037,STYLE038 — flat per-variant correctn
             run_gemv(gtab[v._0], fx, qv, sv, mr, yg)
             let gfxok = close_to_ref(fx, yg, gmaxdiff)
             if (!gfxok) {
-                var shown = 0
-                for (i in range(length(yg))) {
-                    if (abs(yg[i] - fx.yref[i]) > max(CLOSE_ABS, CLOSE_REL * abs(fx.yref[i])) && shown < 6) {
-                        tune_detail("  DBG gemv {v._0} n={fx.n}: y[{i}] = {yg[i]} want {fx.yref[i]}\n")
-                        shown++
-                    }
-                }
+                dump_mismatch("gemv {v._0} n={fx.n}", yg, fx.yref, 0) $(i : int) => close_tol(fx.yref[i])
             }
             gok = gok && gfxok
+            var y4 : array<float>
+            y4 |> resize(fx.ntok * fx.d)
+            run_tile(t4tab[v._0], ctab[v._0], fx, qv, sv, mr, 4l, 1l, y4)
+            let t4fxok = close_to_ref(fx, y4, t4maxdiff)
+            if (!t4fxok) {
+                dump_mismatch("tile4 {v._0} n={fx.n}", y4, fx.yref, int(fx.d)) $(i : int) => close_tol(fx.yref[i])
+            }
+            t4ok = t4ok && t4fxok
             delete y
             delete yg
+            delete y4
             delete qv
             delete sv
         }
@@ -1614,16 +1282,10 @@ def test_mode : bool { // nolint:STYLE037,STYLE038 — flat per-variant correctn
             }
             var ym : array<float>
             ym |> resize(mfx.d)
-            run_mx4_gemv(mtab[v._0], mfx, nv, ev, mr, ym)
-            let mfxok = close_to_mx4_ref(mfx, ym, mmaxdiff)
+            run_gemv(mtab[v._0], mfx, nv, ev, mr, ym)
+            let mfxok = close_to_ref(mfx, ym, mmaxdiff)
             if (!mfxok) {
-                var shown = 0
-                for (i in range(length(ym))) {
-                    if (abs(ym[i] - mfx.yref[i]) > max(CLOSE_ABS, CLOSE_REL * abs(mfx.yref[i])) && shown < 6) {
-                        tune_detail("  DBG mx4 {v._0} n={mfx.n}: y[{i}] = {ym[i]} want {mfx.yref[i]}\n")
-                        shown++
-                    }
-                }
+                dump_mismatch("mx4 {v._0} n={mfx.n}", ym, mfx.yref, 0) $(i : int) => close_tol(mfx.yref[i])
             }
             mok = mok && mfxok
             delete ym
@@ -1632,47 +1294,33 @@ def test_mode : bool { // nolint:STYLE037,STYLE038 — flat per-variant correctn
         }
         let biasTag = wbias != 0l ? " bias{wbias}" : ""
         let kgTag = kgv != 4l ? " kg{kgv}" : ""
-        print("{v._0} (mr={mr}{biasTag}{kgTag}, {live ? "live" : "ref"}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff}), mx4 {mok ? "ok" : "MISMATCH"} (maxdiff {mmaxdiff})\n")
-        allok = allok && ok && gok && mok
+        print("{v._0} (mr={mr}{biasTag}{kgTag}, {live ? "live" : "ref"}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff}), tile4 {t4ok ? "ok" : "MISMATCH"} (maxdiff {t4maxdiff}), mx4 {mok ? "ok" : "MISMATCH"} (maxdiff {mmaxdiff})\n")
+        allok = allok && ok && gok && t4ok && mok
     }
-    // the kq families gate their OWN grids (per-format [tune] entries since the family split)
-    allok = kq_test_family(4l, kfxs4) && allok
-    allok = kq_test_family(5l, kfxs5) && allok
-    allok = kq_test_family(6l, kfxs6) && allok
-    allok = kq_test_family(40l, kfxs40) && allok
-    allok = kq_test_family(44l, kfxs44) && allok
-    allok = kq_test_family(3l, kfxs3) && allok
-    allok = kq_test_family(33l, kfxs33) && allok
-    allok = kq_test_family(34l, kfxs34) && allok
-    allok = kq_test_family(45l, kfxs45) && allok
-    allok = kq_test_family(2l, kfxs2) && allok
-    allok = kq_test_family(23l, kfxs23) && allok
-    allok = kq_test_family(24l, kfxs24) && allok
-    allok = kq_test_family(25l, kfxs25) && allok
+    // the kq families gate their OWN grids (per-format [tune] entries);
+    // kq shapes: nsb=1 (single superblock), nsb=3 (odd walk), production-ish; d divides every
+    // grid mr, ntok=32 is one whole bf16 tile - a shorter fixture walks a bf16 row's rows core alone and never its tile
+    var kids <- kq_family_ids()
+    for (fmt in kids) {
+        var kfxs <- [ <- build_kq_fixture(fmt, 256l, 32l, 32l), <- build_kq_fixture(fmt, 768l, 32l, 32l), <- build_kq_fixture(fmt, 2048l, 32l, 32l)]
+        allok = kq_test_family(fmt, kfxs) && allok
+        delete kfxs
+    }
+    delete kids
     delete wtab
     delete mtab
     delete gtab
+    delete t4tab
     delete ctab
+    delete ptab
     delete tss
+    delete forms
     delete kgs
     delete wbs
     delete mrs
     delete vs
     delete mfxs
     delete fxs
-    delete kfxs4
-    delete kfxs5
-    delete kfxs6
-    delete kfxs40
-    delete kfxs44
-    delete kfxs3
-    delete kfxs33
-    delete kfxs34
-    delete kfxs45
-    delete kfxs2
-    delete kfxs23
-    delete kfxs24
-    delete kfxs25
     return allok
 }
 
@@ -1684,15 +1332,6 @@ struct VBuf {
 struct KqBuf {
     q : array<uint8>
     s : array<uint8>
-}
-
-def kq_mr_index(kmrs : array<int64>; mr : int64) : int {
-    for (i in range(length(kmrs))) {
-        if (kmrs[i] == mr) {
-            return i
-        }
-    }
-    return 0
 }
 
 // ===== the e2e confirm pass (the SPR amx lesson: a 1-core crown must prove itself) =====
@@ -1742,29 +1381,7 @@ def private run_child(cmd : string) : string {
 
 def private harness_dir() : string => "{get_das_root()}/modules/dasLLAMA/harness"
 
-def private parse_stamp_suffix(outp : string) : string {
-    let tag = "llvm_tune: q8q8_tile_gen <- "
-    for (ln in split(outp, "\n")) {
-        let ix = find(ln, tag)
-        if (ix >= 0) {
-            let rest = slice(ln, ix + length(tag))
-            let sp = find(rest, " ")
-            return sp > 0 ? slice(rest, 0, sp) : rest
-        }
-    }
-    return ""
-}
-
-def private parse_confirm_pp(outp : string) : double {
-    let tag = "CONFIRM_PP: "
-    for (ln in split(outp, "\n")) {
-        let ix = find(ln, tag)
-        if (ix >= 0) {
-            return double(to_float(slice(ln, ix + length(tag))))
-        }
-    }
-    return 0.0lf
-}
+def private parse_stamp_suffix(outp : string) : string => value_after(outp, "llvm_tune: q8q8_tile_gen <- ")
 
 def private compile_fallback(fname : string) : string {
     for (entry in split(g_env_core.tune_compile_fallbacks, ";")) {
@@ -1809,15 +1426,10 @@ def private confirm_pp_run(model, manifest_path, expected : string) : double {
         print("confirm: arm expected stamp '{expected}' but the child stamped '{stamped}' - scoring 0\n")
         return 0.0lf
     }
-    let pp = parse_confirm_pp(outp)
+    let pp = double(to_float(value_after(outp, "CONFIRM_PP: ")))
     if (pp <= 0.0lf) {   // surface WHY (a swallowed 'cannot open gguf' once cost a debug round)
-        var lns <- split(outp, "\n")
-        let n = length(lns)
         print("confirm: arm '{expected}' produced no CONFIRM_PP - child output tail:\n")
-        for (i in range(max(0, n - 6), n)) {
-            if (!empty(lns[i])) print("confirm:   | {lns[i]}\n")
-        }
-        delete lns
+        print_child_tail(outp, 6)
     }
     return pp
 }
@@ -1912,18 +1524,20 @@ def private q8q8_tune_family : string { // nolint:STYLE037,STYLE038 - the q8q8 r
     var hfx <- build_fixture(2048l, 512l, 1l)      // hot decode shape (cache-resident — the
                                                    // only regime where gemv knobs can show)
     var vs <- q8q8_tile_gen_variants()
-    var mrs <- variant_mrs()
-    var wbs <- variant_wbias()
-    var kgs <- variant_kgroups()
-    var tss <- variant_toksteps()
-    var gtab <- gemv_variants_by_suffix()
-    var ctab <- cfg_variants_by_suffix()
+    var mrs <- forms_of(q8q8_layout_gen_variants())
+    var wbs <- forms_of(q8q8_wbias_gen_variants())
+    var kgs <- forms_of(q8q8_kgroup_gen_variants())
+    var tss <- forms_of(q8q8_tokstep_gen_variants())
+    var forms <- forms_of(q8q8_tileform_gen_variants())
+    var gtab <- by_suffix(q8q8_gemv_gen_variants())
+    var ctab <- by_suffix(q8q8_amx_cfg_gen_variants())
+    var ptab <- by_suffix(q8q8_panel_gen_variants())
     // TMUL executes only after the per-process XTILEDATA grant — the witness IS the enable
     // (slice I), and this harness invokes stamped tiles directly (production consults the
     // witness at backend selection), so consume every row's witness up front like test_mode
     // does. One grant covers the whole process. Found the hard way: first-ever amx tune run
     // SIGILL'd on the first tdpbssd while the test grid (which checks witnesses) was green.
-    var wtab <- witness_variants_by_suffix()
+    var wtab <- by_suffix(q8q8_family_live_variants())
     for (v in vs) {
         verify(wtab |> key_exists(v._0))
         invoke(wtab[v._0])
@@ -1972,13 +1586,16 @@ def private q8q8_tune_family : string { // nolint:STYLE037,STYLE038 - the q8q8 r
     var vmr : array<int64>
     var vts : array<int64>
     var vgs : array<int64>
+    var vform : array<int64>   // the tile form per variant: a bf16 variant runs the panel walk and holds the bf16 bar
     vmr |> resize(nv)
     vts |> resize(nv)
     vgs |> resize(nv)
+    vform |> resize(nv)
     for (vi in range(nv)) {
         vmr[vi] = int64(mrs?[vs[vi]._0] ?? 4)
         vts[vi] = int64(tss?[vs[vi]._0] ?? 4)
         vgs[vi] = max(vts[vi] / 16l, 1l)
+        vform[vi] = int64(forms?[vs[vi]._0] ?? 0)
         let wb = int64(wbs?[vs[vi]._0] ?? 0)
         let kgv = int64(kgs?[vs[vi]._0] ?? 4)
         verify(gtab |> key_exists(vs[vi]._0))
@@ -1995,17 +1612,6 @@ def private q8q8_tune_family : string { // nolint:STYLE037,STYLE038 - the q8q8 r
             repack_q8q8_grp(addr(hbufs[vi].q[0]), addr(hbufs[vi].s[0]), hfx.n, hfx.d, vmr[vi], wb, kgv)
         }
     }
-    var best : array<double>
-    var gbest : array<double>
-    var hbest : array<double>
-    best |> resize(nv)
-    gbest |> resize(nv)
-    hbest |> resize(nv)
-    for (i in range(nv)) {
-        best[i] = 1.0e30lf
-        gbest[i] = 1.0e30lf
-        hbest[i] = 1.0e30lf
-    }
     var y : array<float>
     y |> resize(fx.ntok * fx.d)
     var yg : array<float>
@@ -2013,13 +1619,20 @@ def private q8q8_tune_family : string { // nolint:STYLE037,STYLE038 - the q8q8 r
     var yh : array<float>
     yh |> resize(hfx.d)
     // correctness first — a tune run must never crown a broken variant
+    var held : array<string>
+    held |> reserve(nv)
     for (vi in range(nv)) {
-        run_tile(vs[vi]._1, ctab[vs[vi]._0], fx, bufs[vi].q, bufs[vi].s, vmr[vi], vts[vi], vgs[vi], y)
+        if (vform[vi] > 0l) {
+            run_tile_bf16(vs[vi]._1, ctab[vs[vi]._0], ptab[vs[vi]._0], fx, bufs[vi].q, bufs[vi].s, vmr[vi], vform[vi], y)
+        } else {
+            run_tile(vs[vi]._1, ctab[vs[vi]._0], fx, bufs[vi].q, bufs[vi].s, vmr[vi], vts[vi], vgs[vi], y)
+        }
         var maxdiff = 0.0
-        if (!close_to_ref(fx, y, maxdiff)) {
+        if (!close_to_ref(fx, y, maxdiff, vform[vi])) {
             print("{vs[vi]._0}: tile MISMATCH (maxdiff {maxdiff}) - aborting tune\n")
             return ""
         }
+        held |> push(vform[vi] > 0l ? ", tile maxdiff {maxdiff} within the bf16 envelope {bf16_envelope(fx.yref, length(y), vform[vi])}" : "")
         run_gemv(gtab[vs[vi]._0], gfx, gbufs[vi].q, gbufs[vi].s, vmr[vi], yg)
         var gmaxdiff = 0.0
         if (!close_to_ref(gfx, yg, gmaxdiff)) {
@@ -2027,41 +1640,20 @@ def private q8q8_tune_family : string { // nolint:STYLE037,STYLE038 - the q8q8 r
             return ""
         }
     }
-    // the hot shape runs HOT_REPS back-to-back per timing sample: 1MB of weights stays
-    // cache-resident, so the sample measures compute, not the first-touch stream
-    let HOT_REPS = 16
-    var keep : array<bool>
-    keep |> resize(nv)
-    for (i in range(nv)) {
-        keep[i] = true
-    }
-    for (r in range(ROUNDS)) {   // interleaved best-of, screened (twin: the kq family loop)
-        gen_screen(r, best, keep)
-        gen_round_step(r, keep)
-        for (vi in range(nv)) {
-            continue if (!keep[vi])
-            let t0 = ref_time_ticks()
+    var times <- race_family(nv, $(vi : int) {
+        if (vform[vi] > 0l) {
+            run_tile_bf16(vs[vi]._1, ctab[vs[vi]._0], ptab[vs[vi]._0], fx, bufs[vi].q, bufs[vi].s, vmr[vi], vform[vi], y)
+        } else {
             run_tile(vs[vi]._1, ctab[vs[vi]._0], fx, bufs[vi].q, bufs[vi].s, vmr[vi], vts[vi], vgs[vi], y)
-            let us = double(get_time_usec(t0))
-            if (us < best[vi]) {
-                best[vi] = us
-            }
-            let g0 = ref_time_ticks()
-            run_gemv(gtab[vs[vi]._0], gfx, gbufs[vi].q, gbufs[vi].s, vmr[vi], yg)
-            let gus = double(get_time_usec(g0))
-            if (gus < gbest[vi]) {
-                gbest[vi] = gus
-            }
-            let h0 = ref_time_ticks()
-            for (_h in range(HOT_REPS)) {
-                run_gemv(gtab[vs[vi]._0], hfx, hbufs[vi].q, hbufs[vi].s, vmr[vi], yh)
-            }
-            let hus = double(get_time_usec(h0)) / double(HOT_REPS)
-            if (hus < hbest[vi]) {
-                hbest[vi] = hus
-            }
         }
-    }
+    }, $(vi : int) {
+        run_gemv(gtab[vs[vi]._0], gfx, gbufs[vi].q, gbufs[vi].s, vmr[vi], yg)
+    }, $(vi : int) {
+        run_gemv(gtab[vs[vi]._0], hfx, hbufs[vi].q, hbufs[vi].s, vmr[vi], yh)
+    })
+    var best <- times.best
+    var gbest <- times.gbest
+    var hbest <- times.hbest
     let macs = double(fx.n * fx.d * fx.ntok)
     let gmacs = double(gfx.n * gfx.d)
     let hmacs = double(hfx.n * hfx.d)
@@ -2072,7 +1664,7 @@ def private q8q8_tune_family : string { // nolint:STYLE037,STYLE038 - the q8q8 r
             winner = vi
         }
         q8rows[vs[vi]._0] = JV((tile_us = best[vi], gemv_us = gbest[vi], hot_us = hbest[vi]))
-        tune_detail("{vs[vi]._0} (mr={vmr[vi]}): tile {macs / best[vi] / 1000.0lf} GMAC/s, gemv stream {gmacs / gbest[vi] / 1000.0lf} / hot {hmacs / hbest[vi] / 1000.0lf} GMAC/s (best of {ROUNDS})\n")
+        tune_detail("{vs[vi]._0} (mr={vmr[vi]}): tile {macs / best[vi] / 1000.0lf} GMAC/s, gemv stream {gmacs / gbest[vi] / 1000.0lf} / hot {hmacs / hbest[vi] / 1000.0lf} GMAC/s (best of {ROUNDS}){held[vi]}\n")
     }
     g_rows["q8q8_tile_gen"] = JV(q8rows)
     // the merged winner: the batch bench picks the tile knobs (and with them the layout);
@@ -2096,7 +1688,6 @@ def private q8q8_tune_family : string { // nolint:STYLE037,STYLE038 - the q8q8 r
     let incSameTile = !empty(q8inc) && tile_key(q8inc) == wkey
     merged = gen_sticky("q8q8_tile_gen", vnames, incSameTile ? hbest : best, merged)
     delete vnames
-    delete keep
     let w = vs[merged]._0
     delete y
     delete yg
@@ -2107,12 +1698,15 @@ def private q8q8_tune_family : string { // nolint:STYLE037,STYLE038 - the q8q8 r
     delete vmr
     delete vts
     delete vgs
+    delete vform
     delete best
     delete gbest
     delete hbest
     delete gtab
     delete ctab
+    delete ptab
     delete tss
+    delete forms
     delete kgs
     delete wbs
     delete mrs
@@ -2128,18 +1722,23 @@ def tune_mode_run : bool { // nolint:STYLE037,STYLE038 — flat family-by-family
     // the --tune-only re-mint filter: only matching families race (q8q8 brings its e2e
     // confirm along); a skipped family writes no entry, so its previous seat survives the
     // upsert - a one-family re-mint after landing a format is seconds, not the full walk
-    var kqSel <- [for (fmt in fixed_array(4l, 5l, 6l, 40l, 44l, 3l, 33l, 34l, 45l, 2l, 23l, 24l, 25l)); fmt; where tune_family_selected(kq_tile_entry(fmt))]
+    var kids <- kq_family_ids()
+    var kqSel <- [for (fmt in kids); fmt; where tune_family_selected(kq_tile_entry(fmt))]
     let wantQ8 = tune_family_selected("q8q8_tile_gen")
-    let wantQ51 = tune_family_selected("q51q8_tile_gen")
-    let planTotal = (wantQ8 ? 2 : 0) + length(kqSel) + (wantQ51 ? 1 : 0)
+    let b32All = fixed_array(KqFmt.q51, KqFmt.iq4nl32)
+    var b32Sel <- [for (f in b32All); f; where tune_family_selected(b32_tile_entry(f))]
+    let familyTotal = 1 + length(kids) + length(b32All)   // q8q8, the kq families, the per-32 families
+    delete kids
+    let planTotal = (wantQ8 ? 2 : 0) + length(kqSel) + length(b32Sel)
     if (planTotal == 0) {
         print("tune-only '{tune_only_filter()}': no generator family matches - half skipped, sidecar untouched\n")
         delete kqSel
+        delete b32Sel
         g_tune_only_no_match = true
         return true
     }
     if (!empty(tune_only_filter())) {
-        tune_detail("tune-only '{tune_only_filter()}': racing {planTotal - (wantQ8 ? 1 : 0)} of 15 generator families\n")
+        tune_detail("tune-only '{tune_only_filter()}': racing {planTotal - (wantQ8 ? 1 : 0)} of {familyTotal} generator families\n")
     }
     // refuse before burning minutes measuring noise; every winner below queues into `pending`
     // and nothing reaches the sidecar until the end-of-run gate passes
@@ -2194,21 +1793,23 @@ def tune_mode_run : bool { // nolint:STYLE037,STYLE038 — flat family-by-family
         print("aborting mid-run - no sidecar written\n")
         return false
     }
-    if (wantQ51) {
-        interrupt_gate("q51q8_tile_gen")
-        let q51_t0 = ref_time_ticks()
+    for (bf in b32Sel) {
+        let entry = b32_tile_entry(bf)
+        interrupt_gate(entry)
+        let b32_t0 = ref_time_ticks()
         // the manifest key must match the [tune] fn (the TILE) or the stamp misses its own crown;
         // the race still benches the gemv shape
-        tune_progress_kernel_begin("q51q8_tile_gen", ROUNDS)
+        tune_progress_kernel_begin(entry, ROUNDS)
         var qrows : table<string; JsonValue?>
-        let qw = q51_tune_family(qrows)
-        tune_detail("TUNE_GEN_TIME q51_family {get_time_usec(q51_t0) / 1000} ms\n")
-        tune_progress_kernel_end("q51q8_tile_gen", qw, empty(qw) ? "rejected" : "beats")
+        let qw = b32_tune_family(bf, qrows)
+        tune_detail("TUNE_GEN_TIME {bf}_family {get_time_usec(b32_t0) / 1000} ms\n")
+        tune_progress_kernel_end(entry, qw, empty(qw) ? "rejected" : "beats")
         // same gate-failure fallback as the kq loop: complete the scope on the reference body
-        pending["q51q8_tile_gen"] = empty(qw) ? "reference" : qw
-        g_rows["q51q8_tile_gen"] = JV(qrows)
-        print("q51q8_tile_gen winner: {empty(qw) ? "reference (gate-failure fallback)" : qw}\n")
+        pending[entry] = empty(qw) ? "reference" : qw
+        g_rows[entry] = JV(qrows)
+        print("{entry} winner: {empty(qw) ? "reference (gate-failure fallback)" : qw}\n")
     }
+    delete b32Sel
     var ok = true
     if (wantQ8) {
         interrupt_gate("confirm_e2e_prefill")
@@ -2243,8 +1844,7 @@ def tune_mode_run : bool { // nolint:STYLE037,STYLE038 — flat family-by-family
         }
         g_rows |> clear()   // pointees transferred into race (clear does not finalize)
         ok = tune_sidecar_section_merge("race", race) && ok
-        print(ok ? "wrote {length(pending)} generator entries -> {tune_manifest_path()}\n"
-            : "FAILED to write {tune_manifest_path()} - if the app dir is read-only, set DAS_TUNE_MANIFEST to a writable path\n")
+        print(ok ? "wrote {length(pending)} generator entries -> {tune_manifest_path()}\n" : mint_write_failure(tune_manifest_path()))
     }
     delete pending
     tune_detail("TUNE_GEN_TIME total {get_time_usec(tune_total_t0) / 1000} ms\n")
@@ -2266,7 +1866,7 @@ def main : int {
     // pre-i8mm mint rail (the slice J no-linker-on-target recipe): the JIT has already
     // linked + installed the full grid DLL by the time main runs — this gate skips
     // EXECUTION only (forced smmla variants would SIGILL on a dotprod-only host). Ship
-    // .jitted_scripts to the i8mm box and run there with the same env minus this one —
+    // .cache/daslang to the i8mm box and run there with the same env minus this one —
     // the cache key matches, dlopen, no linker needed on the target.
     if (g_env_harness.gen_tune_compile_only) {
         var vs <- q8q8_tile_gen_variants()
@@ -2277,10 +1877,8 @@ def main : int {
     // select the gen backend where it exists (arm64) — test/tune drive the variant
     // registries directly, so an x64 box runs fine with no gen backend registered
     // (slice F: the x64 grid rows light per cpuid; x64-gen registration is queued)
-    for (nm in kernel_backend_names()) {
-        if (nm == "arm64-gen") {
-            select_kernel_backend("arm64-gen")
-        }
+    if (kernel_backend_available_("arm64-gen")) {
+        select_kernel_backend("arm64-gen")
     }
     let mode = tune_mode()
     if (mode == "test") {
@@ -2291,7 +1889,7 @@ def main : int {
     if (mode == "tune") {
         let rok = tune_mode_run()
         print(rok ? "GEN TUNE RUN OK\n" : "GEN TUNE RUN FAIL\n")
-        return rok ? (g_tune_only_no_match ? 3 : 0) : 1
+        return rok ? (g_tune_only_no_match ? TUNE_ONLY_NO_MATCH : 0) : 1
     }
     print("set DAS_TUNE_MODE=test or =tune (compile-time env: it stamps the variant grid)\n")
     return 1

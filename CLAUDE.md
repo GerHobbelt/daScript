@@ -94,7 +94,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | Skill file | Read BEFORE... |
 |---|---|
 | `skills/project_overview.md` | First significant task - design philosophy, three execution tiers, macros-as-design-lens |
-| `skills/internal/build_and_debug.md` | Build flags, AOT build commands, exit-code/crash diagnosis, `options log_infer_passes`, the front-end AST module cache (`.jitted_scripts/module_cache/`, `-no-module-cache`) |
+| `skills/internal/build_and_debug.md` | Build flags, AOT build commands, exit-code/crash diagnosis, `options log_infer_passes`, the front-end AST module cache (`.cache/daslang/module_cache/`, `-no-module-cache`) |
 | `skills/mcp_tools.md` | Full MCP tool table + live-API reference; writing or following an `[arch(at=...)]` citation |
 | `skills/das_formatting.md` | Creating or modifying any `.das` file |
 | `skills/comment_style_hygiene.md` | Writing or reviewing comments, names, or local code shape in ANY language |
@@ -328,7 +328,7 @@ everywhere and reports a by-value out-parameter whose write nobody can read.
 
 **Minimize `unsafe`:** most `unsafe(reinterpret<T?>)` in macro code exists to strip `const` from raw-pointer field access - fix the root cause by making the function parameter `var`, so field access returns non-const pointers. Reserve `unsafe` for genuinely unsafe operations (pointer arithmetic, `reinterpret` across unrelated types).
 
-**`print` is for user-facing scripts only.** In `tests/`, `daslib/`, `utils/` use `to_log(LOG_INFO|LOG_WARNING|LOG_ERROR)` - same stdout, but level-tagged and filterable. Canonical example: `utils/detect-dupe/main.das`.
+**`print` is for user-facing scripts only.** In `tests/`, `daslib/`, `utils/` use `to_log(LOG_INFO|LOG_WARNING|LOG_ERROR)` - level-tagged and filtered by `DAS_LOG_LEVEL` (default `warning`, so `LOG_INFO` lines print only under `DAS_LOG_LEVEL=info`). Canonical example: `utils/detect-dupe/main.das`.
 
 **Complexity/length lint (STYLE037/STYLE038): new code meets both limits from the start.** On a hit in existing code, the suppress-vs-split resolution policy is `skills/style_lint.md` - never force a split on an honest shape.
 

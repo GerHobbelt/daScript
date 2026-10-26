@@ -9,7 +9,7 @@ require dasllama/dasllama_unicode   // cpt_to_utf8: building a phoneme the vocab
 require dasllama/dasllama_tts
 require dasllama/dasllama_tts_types
 require dasllama/dasllama_styletts2   // the model driven straight from a phoneme string, to hold a synthesis against
-require dasllama/dasllama_math   // setup_dasllama_jobque_
+require dasllama/dasllama_math   // with_dasllama_jobque_
 require daslib/jobque_boost
 require daslib/fio
 require strings
@@ -41,7 +41,6 @@ def private kokoro_ids_of(ps : string) : array<int> {
     return <- kokoro_token_ids(g_family, ps)
 }
 
-//! the speech-sanity read of one synthesis: every sample finite (asserted), the peak returned for the cell's own bar
 // The samples the model speaks for one phoneme string in one voice - the facade's chunk path with
 // its dialect pick taken out, so a synthesis can be held against the string it should have read.
 // Noise never moves the length, so the seed here need not be the facade's.
@@ -145,15 +144,8 @@ def test_kokoro_synthesis_metal(t : T?) {
 [test]
 def test_kokoro_facade(t : T?) {
     t |> run("text in, speech out") @(t : T?) {
-        if (tts_data_missing(t, gguf_path())) {
-            return
-        }
-        with_job_que() {
-            setup_dasllama_jobque_()
-            var inscope m <- load_tts_model(gguf_path())
-            var inscope c <- caps(m)
-            t |> equal(c.sample_rate, 24000)
-            t |> equal(length(c.voices), 28)   // the American and British packs; the other languages wait for their front end
+        // the American and British packs: the front end phonemizes no other language
+        facade_smoke(t, gguf_path(), true, 28) $(var m : TtsModel; c : TtsCaps) {
             t |> success(length(c.langs) == 2 && c.langs[0] == "en-us" && c.langs[1] == "en-gb",
                 "{length(c.langs)} language(s), first '{c.langs[0]}'")
             t |> equal(length(c.voice_langs), length(c.voices), "one language per listed voice")
@@ -170,9 +162,10 @@ def test_kokoro_facade(t : T?) {
             var inscope audio <- synthesize(m, "The quick brown fox jumps over the lazy dog, twice.", "af_heart")
             t |> equal(audio.sample_rate, 24000)
             t |> success(length(audio.pcm) > 24000 && length(audio.pcm) < 240000, "{length(audio.pcm)} samples")
-            let peak = speech_peak(t, audio)
-            t |> success(peak > 0.05, "peak {peak}: the model spoke")
-            to_log(LOG_INFO, "kokoro facade: {length(audio.pcm)} samples, peak {peak}; {timings_line(audio.timings, audio.sample_rate)}\n")
+            let lv = speech_level(audio.pcm)
+            t |> success(lv.finite, "every sample finite")
+            t |> success(lv.peak > 0.05, "peak {lv.peak}: the model spoke")
+            to_log(LOG_INFO, "kokoro facade: {length(audio.pcm)} samples, peak {lv.peak}; {timings_line(audio.timings, audio.sample_rate)}\n")
         }
     }
 }
@@ -183,8 +176,7 @@ def test_kokoro_dialects(t : T?) {
         if (tts_data_missing(t, gguf_path())) {
             return
         }
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             var inscope m <- load_tts_model(gguf_path())
             let line = "The doctor barked orders at the water tower."
             let ps_us = strip(tts_phonemize(m, line, "en-us"))
@@ -204,8 +196,9 @@ def test_kokoro_dialects(t : T?) {
             }
             t |> success(!same_tokens, "the two dialects feed the model different tokens")
             var inscope audio <- synthesize(m, line, "bf_emma")
-            let peak = speech_peak(t, audio)
-            t |> success(peak > 0.05 && length(audio.pcm) > 24000, "bf_emma spoke {length(audio.pcm)} samples, peak {peak}")
+            let lv = speech_level(audio.pcm)
+            t |> success(lv.finite, "every sample finite")
+            t |> success(lv.peak > 0.05 && length(audio.pcm) > 24000, "bf_emma spoke {length(audio.pcm)} samples, peak {lv.peak}")
             // and the dialect the VOICE pins is the one the synthesis read: the two inventories
             // predict different durations, so the sample count says which string reached the model
             let spoken = strip(tts_normalize(line))
@@ -233,8 +226,7 @@ def test_kokoro_voice_refusals(t : T?) {
         if (tts_data_missing(t, gguf_path())) {
             return
         }
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             var inscope m <- load_tts_model(gguf_path())
             var inscope c <- caps(m)
             t |> success(find_index(m.model.voice_names, "jf_alpha") >= 0, "the model carries the Japanese pack")

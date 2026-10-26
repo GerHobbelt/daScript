@@ -22,6 +22,11 @@ PARAMETER (the parameterized race helpers) - those the check cannot resolve text
 stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
 `race_envelope_ok` fails closed - the twin silently loses its crown.
 
+The perf lint's PERF032 checks only `@exact_size` arrays: it flags a `resize` with no `reserve`
+or `ensure_capacity` earlier in the function, and never compares the two counts. A buffer that
+grows with a model dimension but is not declared `@exact_size` gets no lint at all, which is why
+the module declares every such buffer `@exact_size` and sizes it through a reserve first.
+
 ### Engine core
 
 - **`dasllama.das`** - the public API facade and nothing else: `load_model` -> `create_session` ->
@@ -62,7 +67,8 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
   hub with no hook.
 - **`dasllama_moe.das`** - MoE expert routing and dispatch: the top-k router, per-expert FFN
   accumulation, the shared expert, and the decode instruments. The block kernels reach it only
-  through `moe_ffn_core`.
+  through `moe_ffn_core`; the whole-model driver's host-served experts reach it through
+  `moe_routed_sum_k` and the pick tape's rows helpers.
 - **`dasllama_attn_prefill.das`** - prefill attention, threaded over heads. `prefill_attention`
   is the only entry; the classic/flash head kernels and their KV-codec ladders are its
   implementation.
@@ -116,14 +122,48 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
 - **`dasllama_par.das`** - `maybe_parallel_for` plus the dispatch counters its arms call at RUN
   time, so the module AOTs, and the single-thread gate those arms read (`set_single_thread_`, `ARCHITECTURE_RUNTIME.md#single-thread`). Threading policy (job counts, thresholds) belongs to the caller.
 
+### RoPE scaling is folded at the load {#rope-scaling-bake}
+
+The gguf loader folds a file's `rope.scaling.*` keys into two `Model` fields once: `linear`
+scales the position (`Config.rope_freq_scale`), `yarn` synthesizes the per-pair `rope_freqs`
+divisors over the NTK-by-parts band (`yarn_rope_freqs`) and multiplies the `1 + 0.1 ln(s)`
+magnitude into `Config.rope_mscale`. Every rope consumer - the CPU leaves, the cos/sin tables
+the GPU drivers read - takes those fields and never the metadata, and both run over the ROTATED
+span, so a partial-rotary head (`rope_dim` under `head_size`) takes the band and the factors
+like a full one. A serving override (`set_rope_scaling_override`, seeded from
+`DASLLAMA_ROPE_SCALING` / `ROPE_SCALE` / `YARN_ORIG_CTX`, the tools' `--rope-scaling` flags and
+the server's config keys) replaces the file's keys at the same fold, because the Qwen files ship
+none and enable YaRN as a setting. The fold is image BYTES, so `DlimCpuConfig.rope_override`
+carries the override in the identity and `image_lane_name` as a lane suffix: an image minted
+under it and one without coexist, and a load under the other never reinterprets either. A file
+that ships per-pair `rope_freqs` (Llama-3.1) refuses the override - two factor sets on one pair
+have no defined product.
+
 ### Architecture registrations {#architecture-registrations}
 
-Thirteen files registering eighteen names:
-`dasllama_arch_llama.das` * `dasllama_arch_phi3.das` * `dasllama_arch_qwen2.das` * `dasllama_arch_qwen2moe.das` * `dasllama_arch_qwen3.das` * `dasllama_arch_qwen3moe.das` * `dasllama_arch_qwen35.das` * `dasllama_arch_gemma2.das` * `dasllama_arch_gemma3.das` * `dasllama_arch_gemma4.das` * `dasllama_arch_glm4moe.das` * `dasllama_arch_gptoss.das` * `dasllama_arch_mistral3.das`. They are DECLARATIVE: an arch
+Fourteen files registering nineteen names:
+`dasllama_arch_llama.das` * `dasllama_arch_phi3.das` * `dasllama_arch_qwen2.das` * `dasllama_arch_qwen2moe.das` * `dasllama_arch_qwen3.das` * `dasllama_arch_qwen3moe.das` * `dasllama_arch_qwen35.das` * `dasllama_arch_qwen4exp.das` * `dasllama_arch_gemma2.das` * `dasllama_arch_gemma3.das` * `dasllama_arch_gemma4.das` * `dasllama_arch_glm4moe.das` * `dasllama_arch_gptoss.das` * `dasllama_arch_mistral3.das`. They are DECLARATIVE: an arch
 file builds an `ArchDesc` (name * `configure` * the `ArchBlocks` fn-ptr set - `attn_decode`,
-`ffn_decode`, `attn_prefill`, `ffn_prefill`, and the optional `attn_batch` a non-standard graph
-names * `ChatTemplate` * `LlmCaps`) and calls `register_arch` at `[init]`. Adding an arch touches no
+`ffn_decode`, `attn_prefill`, `ffn_prefill`, the optional `attn_batch` a non-standard graph
+names, and the optional residual-shape seams `pre_stack_decode` / `pre_stack_prefill` (after the
+embedding, before the layer loop) and `final_norm` (in place of the output_norm rmsnorm) * `ChatTemplate` * `LlmCaps`) and calls `register_arch` at `[init]`. Adding an arch touches no
 forward loop.
+
+`dasllama_arch_qwen4exp.das` (Qwen3.8-Flash-Next, the Qwen4 preview) is the qwen35moe hybrid
+inside hyper-connections: the residual is `hc_count` parallel streams (`Session.hc_res` /
+`hc_res_b`), every block reads the mixer's collapsed row from `xb` and scatters its output back
+through the `block_in` / `block_resid` seams every block kernel routes its norm and residual add
+through (`dasllama_common`, the hyper-connection section: `hc_mix_row`, `hc_combine_row`); the
+head mixer stands where `output_norm` would. The prefill forms (`hc_mix_b`, the scatter in
+`block_resid_b`) split their per-row passes - the grouped norm, the mixer's tail, the scatter -
+over positions, each row the row form's code (`hc_mix_tail`, `hc_combine`), so a lane count moves
+no bit; on one lane the passes are a quarter of the Flash-Next CPU prefill window. The n-gram PLE side input hashes the token and its
+predecessors into rows of `Model.ngram_tab` (the disk block form, gathered per token, never a
+plane) and adds a gated value plus a dilated causal conv into the wide residual before layer
+`ple_layer`'s attention mixer; its window and conv ring are session state that resets at position 0
+with the deltanet's. The deltanet out-gate is `sigmoid(z)` (`Config.dn_z_sigmoid`). The QSA
+indexer's projections load (`Model.idx_*_offs`) and attention runs dense - bit-identical to the
+reference below the indexer's `indexer_top_k` budget.
 
 ### Instrumentation and support {#instrumentation-and-support}
 
@@ -207,6 +247,29 @@ forward loop.
 names `dasllama.io`: the exchange module is the sidecar exchange host's one client, and a harness
 tool reaches it through `dasllama/dasllama_exchange`. It licenses no names.
 
+### The decode pick tape {#moe-pick-tape}
+
+`dasllama_moe.das`'s `moe_pick_tape` pins one arm's routing on another for a forced-feed parity
+compare. Recording, every decode `moe_select` appends its k picks in call order; replaying, the
+select masks every expert the tape does not carry to -1e30 before the same top-k, so the picks are
+the tape's and the weights are the picked experts' own (exact under a top-k renorm: the masked
+experts cancel out of the ratio), and it counts the row's own top-k picks the tape did not carry.
+The prefill's grouped selects take the rows form: `moe_pick_tape_rows_begin` hands the replaying lanes
+the rows' taped picks (the lanes run in their own contexts and read the tape through that pointer
+alone), `moe_pick_tape_mask_row` masks each row to its picks before its own select, and
+`moe_pick_tape_rows_done` advances past the rows, or appends their picks when recording; a rows
+replay counts no misses. `moe_select`'s own grouped path (`off > 0`) never touches the tape. The
+arming is `MoePickTape.record`, the replay `MoePickTape.replay`, `MoePickTape.off` stops. A rows-form
+tape is row-major a layer (row 0's select, row 1's, ...), and a one-row chain replays one of its rows
+as a lane (`moe_pick_tape_lane`: the replay starts at select `first` and advances `stride` selects a
+select), so the verify's device rows compare against the split command's own one-row steps on the
+picks the rows made. A 512-expert top-10 router over
+mixed residual streams flips a near-tie on kernel-order noise alone, and one flipped expert of ten
+moves the whole row past any logits bar: on Qwen3.8-Flash-Next the CPU chain on its reference
+kernel bodies parts from the tuned chain by 3-7 logits with argmax flips on three rows of seven,
+so a compare of two arms reads the seams only with the routing pinned
+(`tests/test_gpu_resident_hc.das`; the arms' own picks off the tape are logged, never asserted).
+
 ### Serving {#scheduler-step}
 
 - **`dasllama_scheduler.das`** - the continuous-batching scheduler, the serving layer over the
@@ -214,11 +277,19 @@ tool reaches it through `dasllama/dasllama_exchange`. It licenses no names.
   `scheduler_step` admits queued requests, runs one `eval_batch` decode step over every
   decoding stream (a self-speculative scheduler instead ticks every stream's round through
   `mtp_spec_eval_batch`, one joint verify where a driver seats one, and counts the tick as a
-  batched step only when every stream's rows rode it), then at most one prefill chunk FCFS; paged serving donates finished streams'
+  batched step only when every stream's rows rode it), then at most one prefill chunk FCFS - `chunk_tokens` while
+  a stream decodes, since the chunk is the stall every decoding stream waits out, and at least `idle_chunk_tokens`
+  while none does, since a prefill window's cost is mostly fixed and nothing waits on it; `chunk_defaults` names
+  both sizes per serving backend (the chunk 512 where a GPU prefills and 64 on the CPU, whose chunk costs its token count, so the stall follows it down; idle 512,
+  2048 on Metal, where four windows in one call run within a few percent of the whole prompt's rate); paged serving donates finished streams'
   KV pages to the prefix cache, device mode parks their regions. Results flow out as `SchedEvent`s - no HTTP here.
   `utils/dasllama-server` owns the writers; `tutorials/dasLLAMA/13_serving.das` is the
   teaching consumer; `tests/test_scheduler.das` gates it against `generate()` references.
   The step clears its gather arrays (`batch_rows`, `batch_toks`, `batch_idx`) before it reaps
   finished streams: `batch_rows` holds borrowed pointers into the sessions the reap deletes,
   and a validating heap collect between steps walks every pointer the array still holds.
+
+### The prefix cache on a recurrent model {#prefix-recurrent-checkpoints}
+
+A deltanet hybrid's K/V pages continue nothing alone: its recurrent state exists at one position only, so `dasllama_prefix.das` caches a CHECKPOINT (`PrefixState`) - the evaled tokens, their page groups, and a `DnSnapshot` (`dn_snapshot_take`: the state brought to the host through `dn_state_to_host`, where a device driver registers its mirror's copy-down; the n-gram ring; the draft head's carry). A prompt attaches the deepest checkpoint whose every token opens it: the pages below the last row's are shared, the last row's page is copied even when whole (the draft head rewrites row n - 1 for the token that follows), the snapshot is restored. Because the position is exact, the scheduler STOPS a prefill there (`prefix_checkpoint_at`): at the caller's stable opening (`PendingReq.stable_at`, the server's `render_turn_marked` - every earlier turn plus the first turn's system block), else at the longest opening an earlier checkpoint shares; a checkpoint within a chunk and a half ends the chunk, so the stop adds no window. A finished turn leaves one more past its close tokens, which the conversation's next turn attaches. `max_states` (4) bounds them, the one used longest ago dropped first.
 

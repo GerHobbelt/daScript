@@ -862,17 +862,6 @@ namespace das {
         return *this;
     }
 
-    static uint32_t aliasCacheFlagsMask () {
-        static const uint32_t mask = [] {
-            TypeDecl probe;
-            probe.flags = 0;
-            probe.aliasCacheValid = true;
-            probe.aliasCacheHasAlias = true;
-            return probe.flags;
-        }();
-        return mask;
-    }
-
     static bool typeTableable ( const TypeDecl * t ) {
         if ( t->fixedDimExpr || !t->typeMacroExpr.empty() ) return false;
         if ( t->firstType && !typeTableable(t->firstType) ) return false;
@@ -888,7 +877,7 @@ namespace das {
         uint64_t h = 14695981039346656037ull;
         auto mix = [&h]( uint64_t v ) { h = (h ^ v) * 1099511628211ull; };
         mix(uint32_t(t->baseType));
-        mix(t->flags & ~aliasCacheFlagsMask());
+        mix(t->flags & ~TypeDecl::aliasCacheFlags());
         mix(uint32_t(t->fixedDim));
         mix(uintptr_t(t->structType) >> 4);
         mix(uintptr_t(t->enumType) >> 4);
@@ -907,7 +896,7 @@ namespace das {
     static bool sameTypeContent ( const TypeDecl * a, const TypeDecl * b ) {
         if ( a == b ) return true;
         if ( a->baseType != b->baseType ) return false;
-        if ( ((a->flags ^ b->flags) & ~aliasCacheFlagsMask()) != 0 ) return false;
+        if ( ((a->flags ^ b->flags) & ~TypeDecl::aliasCacheFlags()) != 0 ) return false;
         if ( a->fixedDim != b->fixedDim ) return false;
         if ( a->structType != b->structType || a->enumType != b->enumType || a->annotation != b->annotation || a->module != b->module ) return false;
         if ( a->alias != b->alias ) return false;
@@ -1197,7 +1186,7 @@ namespace das {
                 default: SERIALIZER_VERIFYF(false, "Unreachable");
             }
             info->serialize(*this);
-            if ( fileAccess && !info->name.empty() ) {
+            if ( fileAccess && !info->name.empty() && !isCppBindingAt(LineInfo(info, 0, 0, 0, 0)) ) {
                 if ( FileInfo * live = fileAccess->getFileInfo(info->name) ) {
                     info = live;
                 }
@@ -1743,7 +1732,7 @@ namespace das {
         ser << typeMacroExpr;
 
         if ( ser.writing ) {
-            uint32_t streamed = flags & ~aliasCacheFlagsMask();
+            uint32_t streamed = flags & ~TypeDecl::aliasCacheFlags();
             ser << streamed;
         } else {
             ser << flags;
@@ -3199,10 +3188,11 @@ namespace das {
             return das::move(sorted);
         }
 
-        vector<Module*> getDependecyOrdered() {
+        vector<Module*> getDependecyOrderedEndingWith(Module * last) {
             for ( auto mod : input ) {
-                visit(mod);
+                if ( mod != last ) visit(mod);
             }
+            visit(last);
             return das::move(sorted);
         }
 
@@ -3330,8 +3320,15 @@ namespace das {
         if ( writing ) buffer->flush();
     }
 
+    struct SerializerRecordScope {
+        AstSerializer & ser;
+        SerializerRecordScope ( AstSerializer & s ) : ser(s) { ser.recordDepth ++; }
+        ~SerializerRecordScope () { ser.recordDepth --; }
+    };
+
     void AstSerializer::serializeProgramImpl ( ProgramPtr program, ModuleGroup & libGroup ) {
         auto & ser = *this;
+        SerializerRecordScope record(ser);
         // version gate — the module-cache path (trySerializeProgramModule) checks only the
         // file name and content stamp before this; a cache written by a different serializer version must
         // fail cleanly here (the caller falls back to a full parse on ser.failed), not misparse
@@ -3580,6 +3577,7 @@ namespace das {
 
     // Used in daNetGame currently
     void Program::serialize ( AstSerializer & ser ) {
+        SerializerRecordScope record(ser);
         // version gate: any layout change shifts every subsequent field, so a stale stream must
         // fail cleanly here — not misparse into a patch() throw thousands of fields later
         uint32_t version = AstSerializer::getVersion();
@@ -3606,7 +3604,7 @@ namespace das {
         if ( ser.writing ) {
             ser.moduleLibrary = &library;
             TopSort ts(library.modules);
-            auto modules = ts.getDependecyOrdered();
+            auto modules = ts.getDependecyOrderedEndingWith(thisModule.get());
 
             vector<Module*> builtinModules;
             for ( auto m : modules ) {
@@ -3765,7 +3763,7 @@ namespace das {
 #endif
 
 #if !DAS_NO_FILEIO
-    static const char * MODULE_CACHE_DEFAULT_DIR = ".jitted_scripts/module_cache/";
+    static const char * MODULE_CACHE_DEFAULT_DIR = ".cache/daslang/module_cache/";
 
     // DAS_MODULE_CACHE_LIMIT, megabytes: 4096 unless set, 0 = no eviction; garbage keeps the default
     static uint64_t moduleCacheLimitBytes () {
@@ -3877,7 +3875,7 @@ namespace das {
         }
         char hex[17];
         snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) hash_blockz64((const uint8_t *) key.c_str()));
-        return string(".jitted_scripts/module_cache/") + stem + "-" + string(hex, 8) + ".dascache";
+        return string(".cache/daslang/module_cache/") + stem + "-" + string(hex, 8) + ".dascache";
     }
 
     string ModuleFileCache::embeddedHostOptions ( const CodeOfPolicies & policies ) {

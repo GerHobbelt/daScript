@@ -11,6 +11,676 @@ what it costs today and what the fix would change.
 
 ## Entries
 
+- **MEASURED (2026-10-01) - a plain MoE the card does not hold whole, with its context asked whole
+  (`ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool`, `set_gpu_ctx_strict` / the server's `--ctx`): the first routed
+  layers' experts on the host through the split token command and the cut window chain, the mirror whole
+  - the form wins the long prompt by 5.7x and loses decode by a third to the per-op rails
+  (direction-grade), so it arms only where the context was asked.** zen2 (Ryzen 16 threads, RTX 5060 Ti 16 GB on a PCIe 4.0 x8 link, the
+  desktop holding 4.6 GB of the card), Qwen3-30B-A3B-Instruct-2507 Q4_K_M (17.3 GB, 48 routed layers of
+  128 experts, 8 picked; the plan puts the first 28 layers' experts on the host beside a 32768-position
+  f16 mirror, no pool fits), `bin/Release/daslang.exe -jit modules/dasLLAMA/benchmarks/lcpp_bench.das --
+  -m <file> --ngl 0 -p <P> -n <N> -r 1 -t 16 --for-debug-purposes` under `DASLLAMA_ALLOW_UNTUNED=1
+  DASLLAMA_GPU=1 DAS_JOBQUE_THREADS=16` (`DAS_TUNE_POLICY`, `DASLLAMA_COOPMAT` unset; the second row adds
+  `DASLLAMA_GPU_CTX_MAX=32768 DASLLAMA_GPU_CTX_STRICT=1`, the pin the form arms under, the first
+  `DASLLAMA_GPU_RESIDENT=0`), one rep, one process a row - a second load of a model in one process is barred,
+  so the two forms cannot race interleaved - direction-grade across the rows and in every sentence below
+  that sets one row against the other:
+
+  | form | pp512 | tg128 | pp8192 | tg64 after 8192 |
+  | :--- | ---: | ---: | ---: | ---: |
+  | the per-op rails (`DASLLAMA_GPU_RESIDENT=0`: master's shape for this file) | 398.14 | 64.03 | 93.39 | 64.52 |
+  | the whole-model driver, 28 of 48 layers' experts on the host, the mirror on device | 517.88 (290.36 with the first window's one-time cost inside the pass) | 41.81 | 533.97 | 47.79 |
+
+  The per-op rails' decode does not slow with the position (64.0 at 640, 64.5 at 8192, direction-grade); the
+  host-layer form's token is 24 ms against 15.6 (direction-grade) - the 28 fence round-trips a token, the cost
+  the hyper-connection carrier pays too - so it keeps the per-op rails' place for an unasked context and
+  takes the asked one, where an 8192-token prompt costs 15 s against 88 s (direction-grade). Its prefill is
+  flat with the length: a 512-row window records in 0.85-0.90 s and submits in 0.07-0.09 s whatever the
+  position (the same command and environment as the second row with `DASLLAMA_GPU_PROF=1` added, its
+  `vk_rdpf` lines; pp2048 reads 551.5 there), and the first window of a process pays 0.45 s once (the host
+  callback's scratch, the host combine's pipelines) - a pp512 pass that includes it reads 290. The form's
+  landings are small beside the planes: the decode's `hx_host`, `hacc_host` and `hacc_dev` hold `dim*4*nb`
+  bytes each and `hlog_host` `ner*4*nb` (2048 x 4 x 1 = 8 KB and 128 x 4 = 512 B here), the prefill's
+  `pf_hx_host`, `pf_hacc_host` and `pf_hacc_dev` `np*dim*4` each and `pf_hlog_host` `np*ner*4` (4 MB and
+  256 KB at the 512-row window), `pf_ident_dev` and `pf_ones_dev` `np*4` (2 KB), the decode's `ones_dev`
+  `MAX_ROUTED_SLOTS*4`; the pool over the host layers takes one slot's gate, up and down planes per hosted
+  layer per slot (`resident_hot_slot_bytes_host_layers`), none here. The same file on this card at the bench's shape
+  before this change: the whole-model driver declined (17.3 GB of weights past the room) and the per-op
+  rails served, which is the first row. Parity: `test_gpu_resident_moe.das`'s `test_gpu_resident_moe_host_layers`
+  (this file at 32768 asked whole, 27-28 layers hosted, one and two windows) and
+  `test_gpu_resident_moe_ctx_strict` (Qwen3.6-35B-A3B UD-IQ2_XXS at 131072 asked whole: 10 of 40 layers
+  hosted, the region 131072 positions, two windows) pass on this box, run as `bin/Release/daslang.exe -jit
+  dastest/dastest.das -- --test modules/dasLLAMA/tests/test_gpu_resident_moe.das` under `DASLLAMA_GPU=1
+  DASLLAMA_PARITY_FULL=1 DAS_JOBQUE_THREADS=8`; the file's one-window hybrid and no-shared-expert cells
+  red on the cm2e census floor on this card (117 of 120, 134 of 144) exactly as on master run through
+  this binary (`followup_vulkan.md` row 132's reading), unchanged by this entry.
+- **MEASURED (2026-10-01) - the server's ASR worker on the team beside a GPU-decoding LLM: a
+  64-second parakeet clip 281 -> 140 ms a transcription.** M5 Max, `dasllama-server` with the
+  Qwen3.6-35B-A3B on Metal (streams 1) and parakeet-tdt-0.6b-v3 f32, `POST
+  /v1/audio/transcriptions` seven times, medians, wall time at the client (out-of-process;
+  direction-grade across the rows: a server life a dispatch mode).
+
+  | ASR worker | LLM idle | while the LLM decodes 400 tokens | that decode, tok/s |
+  |---|---|---|---|
+  | inline (`hybrid` before) | 281 ms | 390 ms | 136 |
+  | team (`--team-dispatch team`, and `hybrid` now) | 140 ms | 178 ms | 138 |
+
+  A Metal-served decode publishes nothing to the team, so the worker's joint, predictor and mel
+  split across it at no cost to the stream. mlx-audio 0.5.7 reads 162 ms on the clip in its own
+  process (external: `model.generate(clip)` on `mlx-community/parakeet-tdt-0.6b-v3` loaded through
+  `mlx_audio.stt.utils.load_model`, the median of five calls after one warmup).
+- **MEASURED (2026-10-01) - the FastConformer block loop on the half tensor GEMM: 115 -> 63 ms for
+  a 64-second clip.** M5 Max, parakeet-tdt-0.6b-v3 f32, `harness/asr_stage_probe.das -r 5` on a
+  64 s clip; every before -> after pair of this entry is the probe on the tree before and after
+  the change (direction-grade), save where a sentence says one process. Per encode: 187 -> 133 ms, of which the CPU front stays 66 and the rel table 6. The
+  chain's weighted GEMMs ran the f16-staged simdgroup tile stamp (`enc_f32_mm`, ~4.8 T MAC/s over
+  the ~570 G MAC of 24 blocks); they read a device halfword twin of the blob through the half x
+  half tensor GEMM now. The encoder rows read 0.0042 rel-l2 from the CPU rail on the twin and
+  0.0039 on the tiles (jfk), the transcript the CPU's on both - every rel-l2 on jfk in this entry
+  is `test_parakeet_tower_metal`'s log (`tests/test_model_image.das`, `tests/run.das --suite image
+  --arm mtower`), the 64 s clip's the probe's.
+  - What the 63 ms holds, by leaving parts out (best of three, three rounds): the per-head
+    attention loop 25 (41 dispatches a block - a pack, three tile GEMMs and a softmax a head), the
+    weighted GEMMs 27 (~18 T MAC/s with their half converts), the norms, the depthwise conv and
+    the rest ~10.
+  - mlx-audio 0.5.7 on the same clip: 162 ms whole (external, the call of the entry above; its
+    encoder 64 and its decode loop 97 timed apart in the same process). Ours whole, team
+    dispatch: ~220 (front 66, blocks 63, rel table 6, mel 8, decode 80).
+  - **The subsample front on the device, the rel table kept a session: the encode 133 -> 66 ms,
+    the clip whole ~153.** The front's three convs, two 1x1 GEMMs and the pre-projection run ahead
+    of the blocks in the same command buffer (66 ms of CPU, team-dispatched, to under 5), and the
+    rel table is built once a frame count (6 ms an encode before). The same probe, per pass:
+    encode 66, decode 79 (the predictor 38, the joint 25, the pick 13, the encoder projection 2),
+    mel 8. Rows 0.0057 rel-l2 from the CPU rail (jfk), the transcript the CPU's.
+  - **The TDT joint as a column pass over its live inputs, the pick in one exp pass: decode 79 ->
+    61 ms, the clip whole ~133.** The joint row is a ReLU's output, so the joint net's weight laid
+    as input columns adds only the live ones (a transposed copy a session, 21 MB): the joint 25 ->
+    16 ms with the logits split across the team's lanes. One thread alone runs it 56 - the weight
+    streams from memory either way, and the row-dot it replaces had the team. The token mass is
+    the log-sum pass's partial sum: the pick 12.7 -> 6.9. Left: the predictor 31.5 (four 640 x
+    2560 GEMVs a token over 26 MB of f32).
+  - **Run inline - one thread, as the server's ASR worker does by default - the same clip reads
+    ~263 ms:** encode 69, decode 165 (the predictor 86, the joint 45, the encoder projection 23,
+    the pick 7), mel 29. It read 790 before the front and the twin.
+  - **The attention over every head at once on the device pair: the encode 57.0 -> 44.4 ms.** One
+    process, the two forms in turn, seven timed encodes a form after two dropped (per head 56.9 -
+    57.1, all heads 44.3 - 44.5), under the `attn_dev` crown. Five dispatches a block replace
+    forty-one: the half operands, the pair's QK twice (content, rel), the rel-shift softmax, the
+    pair's AV. Rows 0.0056 rel-l2 from the CPU rail on the clip against the per-head form's 0.0059
+    (jfk: 0.0042 against 0.0057), the transcript the CPU's. Not taken: the rel GEMM computes the
+    whole `mp x wwpad` slab though a row reads `npos` of its `2 npos - 1` columns - a band skip
+    halves its 31 G MAC and its slab's bytes.
+  - **The decode step as one team publish over half-precision weights: decode 61 -> 33 ms, team
+    dispatch (inline 165 -> 146).** `asr_stage_probe -r 5`, the 64 s clip, per pass. By change:
+    the predictor's weights read as halves, 31.5 -> 15.7 ms - twice the rate at half the bytes,
+    so a token's predictor is bound by the 26 MB it read; the joint's columns as halves, no change
+    (13.9) - its lanes read a column table in short runs a column apart; the predictor's stages
+    and the joint in one publish, the two together 29.6 -> 24.6; the joint table in 256-logit
+    blocks, a token step 88 -> 81 us and a blank step 50 -> 34 (a 512 block reads 107 and 48, a
+    128 block 82 and 30, with the inline joint 147 -> 159 us); the log-sum's cut and the max and
+    argmax in one pass, the pick 6.8 -> 3.1 ms. Now, per pass: a token step ~83 us x 260, a blank
+    step ~40 us x 42, the pick 3.1 ms, the encoder projection 2.6. A bare six-stage publish over
+    18 lanes measures 14 us and a one-stage one 5, so what is left is the step's bytes - 7.4 MB
+    of predictor halves and ~5 MB of live joint columns a token, about 150 GB/s. The transcripts
+    are the reference's token for token (jfk, v2 and v3).
+  - **What the routes hold, in bytes.** The device twin of the blob is half the blob: 1.25 GB for
+    the 2.51 GB 0.6B file, resident from the first encode to the weights drop. The all-heads score
+    slabs are `heads x mp x (nkp + wwpad) x 2` bytes - 33 MB at 64 s of audio and eight heads -
+    and the route stands down past 256 MB. A session's decode halves are `(8 layers + 1) x pd^2 x
+    2` bytes for the predictor (13.9 MB at two layers of 640) and `blocks x pd x 256 x 2` for the
+    joint table (10.8 MB at 8198 logits).
+- **MEASURED (2026-10-01) - the prefill chunk on the CPU: a prompt alone runs flat from 512 tokens
+  up, and a decoding stream waits one chunk's time a token while another prompt prefills.** M5 Max
+  CPU, `utils/dasllama-server/server_bench.das -b 1 -n 32 --long-prompt 2048 --chunks
+  64,128,256,512,1024,2048`, one process a model, paged sessions.
+
+  | chunk | 64 | 128 | 256 | 512 | 1024 | 2048 |
+  |---|---|---|---|---|---|---|
+  | Llama-3.2-3B Q4_K_M, lone prompt, tok/s | 357 | 388 | 401 | 410 | 413 | 402 |
+  | its decoding stream's gap, p95 ms | 204 | 378 | 736 | 1425 | 2733 | 5020 |
+  | Qwen3.5-0.8B Q8_0, lone prompt, tok/s | 1343 | 1658 | 1832 | 1892 | 1788 | 1991 |
+  | its decoding stream's gap, p95 ms | 50 | 92 | 153 | 283 | 547 | 1032 |
+
+  The idle quantum at 512 is right for the CPU - nothing past it. The chunk a decoding stream
+  waits out is a token count, so its stall is the model's: 512 tokens is 0.28 s on the 0.8B and
+  1.4 s on the 3B (its token gap is 14 ms with nothing prefilling).
+  - **The CPU's chunk beside a decoding stream defaults to 64.** The stall follows the chunk
+    down (50 ms on the 0.8B, 204 on the 3B, ~460 on Mistral-7B Q4_K_M) and the prefilling prompt
+    pays 13 - 29% of its rate, only while a stream decodes; under 32 tokens a batch leaves the
+    batched kernels (the 7B's 2048-token prompt read 19 s against 11). A GPU's chunk stays one
+    window. Measured and not taken: sizing the chunk to a 250 ms stall from the last chunk's
+    rate - on the 3B and the 7B it lands on 64 anyway (311 - 324 and 459 - 462 ms with a
+    64-token floor), and on the 0.8B it keeps 512 (268 - 283 ms); `--chunk` is the same knob.
+- **MEASURED (2026-10-01) - both engines held to what an M4 can run, on the M5 Max: prefill 1.3 -
+  1.4x mlx-lm's, decode level, the warm hit 20 - 30 ms behind.** The 35B through each server
+  (ours streams=1 with speculation; the series of the checkpoint entry below, medians of three,
+  two spaced lives an arm). Ours under the box's manifest with its `metal_tensor` list replaced by
+  the M4 Pro's (`records/m4.tune.2b2e79baf8ab.json`: `mulmm_bf16`, `kq_mvb2_k4_r2` and the
+  `kq_rows_*` forms - no routed, K-quant GEMM or attention tensor crown); mlx-lm 0.32.0 over MLX
+  0.32.3 built with a deployment target of 15.0, which compiles its Metal-4 kernels out
+  (`MLX_METAL_NO_NAX`; no `_nax` kernel in its metallib, 6322 in the stock one). The mlx-lm columns
+  are external - `mlx_lm.server --model mlx-community/Qwen3.6-35B-A3B-4bit --chat-template-args
+  '{"enable_thinking":false}' --max-tokens 4096 --prompt-cache-size 32 --prompt-cache-bytes
+  8589934592`, the same client series - and every column is direction-grade: a server life an arm.
+
+  | | ours, M4 crowns | mlx-lm, no Metal-4 kernels | ours, M5 crowns | mlx-lm, stock |
+  |---|---|---|---|---|
+  | cold 3k, tok/s (TTFT) | 2773 / 2794 (1.07 s) | 1980 (1.50 s) | 4959 (0.60 s) | 4480 (0.66 s) |
+  | cold 9k, tok/s (TTFT) | 2517 / 2534 (3.6 s) | 1892 (4.82 s) | 4603 (1.98 s) | 4217 (2.16 s) |
+  | warm TTFT, 3k / 9k | 0.09 / 0.10 s | 0.06 / 0.08 s | 0.05 / 0.08 s | 0.06 - 0.08 s |
+  | decode, 3k / 9k, tok/s | 121 / 103 | 113 - 120 / 106 - 111 | 139 / 114 | 110 / 105 |
+
+  - The warm hit's short window takes the in-kernel gather K4 form without the routed tensor
+    crown: 64 ms of GPU for 20 tokens against 43 on the M5's crowns.
+  - The numbers are the M5 Max's GPU on the M4's forms, not an M4's: the ratio between the engines
+    is what reads across, and the M4's own race predates the device attention pair and the half
+    scan.
+  - **A life run inside 14 minutes of back-to-back GPU load reads 1.5 - 1.8x slow with no thermal
+    warning from the OS.** Ours: cold 3k 1568 tok/s, decode 91 / 85, a 2945-token window 950 ->
+    1740 ms of GPU; five minutes idle and four between lives put it back (2773, 2794). mlx-lm's
+    lives in the same heat read 1705 and 1524 against 1980 cool. A series is read from spaced lives.
+- **MEASURED (2026-10-01) - pointer loads in every fully unrolled Metal kernel loop: 3% of a dense
+  K-quant window, nothing on the 35B's served path.** 88 loads over the K-quant, IQ and Q4_0 GEMV
+  and staging kernels, the legacy routed stamps, the deltanet norm and gate and the staged
+  attention moved from `buf[base + k]` to a pointer taken outside the loop
+  (`ARCHITECTURE_GPU_PREFILL_WINDOW.md#kernel-load-addressing`). M5 Max, Mistral-7B Q4_K_M,
+  `p0_ko_probe -n 512 --kprof --text skills/design_philosophy.md`, the indexed tree then the
+  pointer tree (direction-grade): the dense K4 stage 69.7 -> 66.6 ms and 19.8 -> 19.3, K6 20.3 -> 20.4, the window
+  as it serves 149.7 -> 145.4 ms. The 35B through the server reads as before the sweep (cold 3k
+  0.62 s, 9k 2.02 s, decode 139 / 114 tok/s) - its expert stamps and its scan took the form
+  already. Decode on the dense model is not read: `lcpp_bench -n 128 -r 12` as a `-jit` script
+  spreads 20% a row (78 - 86 +- 13 - 18 tok/s), past any difference the loads could make.
+- **MEASURED (2026-10-01) - a reused prompt on a deltanet hybrid attaches a checkpoint; warm time
+  to first token 0.6 s -> 0.05 s at 3k, 2.1 s -> 0.08 s at 9k.** M5 Max, the 35B, the server at
+  streams=1 with speculation, a client script outside the tree (`bench_llm.py <server url> <model>
+  <tag>`: a fixed system prompt cut from `skills/design_philosophy.md`, a primed request, three
+  more with other user turns over `/v1/chat/completions`; client side, medians of three;
+  out-of-process, and direction-grade against the tree before the change): warm 3k 0.05 s (server
+  side 48 / 48 / 60 ms), warm 9k 0.08 s (57 / 58 / 71 ms), every request after the prime a hit;
+  mlx-lm 0.32.0's server on the same series reads 0.06 - 0.08 s (external, the `mlx_lm.server`
+  command of the entry above). Cold is where it was: 3k 0.60 s (4959 tok/s), 9k 1.98 s
+  (4603), decode 139 / 114 tok/s. A hit's time is one short window: 17 - 21 tokens read 43 ms at no
+  depth and 45 ms of GPU at 9k, plus 6 - 10 ms of setup.
+  - **The short window was 59 ms: the routed gate and up took the in-kernel gather form below 256
+    tokens.** `p0_ko_probe -n 17 --kprof --depth 9108`: `metal_moe_mulmm_k4` 38.8 of 74 ms. The
+    gathered half panel at every window (`--gather-min 256,1`, three interleaved rounds each):
+    17 tokens 58.9 -> 42.7 ms, 64 80.3 -> 56.0, 128 95.4 -> 65.8, 224 119.2 -> 83.5; the logits
+    move 0.16 - 0.67 of a largest 20 - 25, the half twin against the integer form.
+  - **What is left in a short window is the weight stream.** 17 tokens pick 136 expert rows over
+    77 experts, each a 32-row tile: the K4 pair 17.2 ms and the K5 down 7.0 at 0.2 ms a dispatch,
+    which is 590 KB an expert plane at ~137 GB/s - a decode step's 7.3 ms plus 4.3 us an expert
+    plane past its eight. A shorter tile does not buy it back (an 8-row tile costs 0.62 of a
+    32-row one).
+  - **Stopping a prefill at the checkpoint costs one window, so the chunk ends there.** With the
+    chunk left at its quantum the cold 3k prompt ran 2048 + 897 + 20 tokens, 0.65 s (4556 tok/s);
+    a checkpoint within a chunk and a half ending the chunk runs 2945 + 20, 0.60 s (4959).
+  - Open: the seam row of the draft head declines at the first window of every attached prompt
+    (a quality-only miss, 26 - 34 a series, as before the cache); the close tokens of a finished
+    turn eval as a 2 - 3 token window, 20 - 35 ms after the reply's last token.
+- **MEASURED (2026-10-01) - the job queue's workers spinning the CPU window through Metal work
+  are the box's "slow mode".** M5 Max, the 35B, `p0_ko_probe -n 2048 --depth 10240 --text
+  skills/design_philosophy.md --hold none`, four walks of five windows back to back. Under the
+  30 ms CPU spin window (`--cpu-spin`) the process holds 1086-1296% CPU while the GPU does the
+  work (a sample: the workers in the spin loop's clock read) and the walks read 366 / 388 / 417 /
+  421 / 475, then 361 / 379 / 400 / 417 / 439, then 363 / 389 / 426 / 466 / 512, then 430 / 458 /
+  481 / 504 / 521 ms - 19% slower from the third walk on. Under the GPU-served window (500 us;
+  13-16% CPU) the four walks read 365 / 388 / 415 / 421 / 468, 361 / 380 / 400 / 417 / 440, 359 /
+  379 / 399 / 418 / 438, 362 / 382 / 409 / 429 / 452. The Metal overrides now report a served
+  forward (`metal_note_served`). The server, cold prompts, one stream, MTP on, before -> after
+  (direction-grade, the client series of the checkpoint entry above): 3k 4820 -> 4959 tok/s, 9k
+  4224 -> 4574; decode 138 / 111 -> 137 / 113. mlx-lm 0.32.0's server on the same series: 4480 /
+  4217, decode 110 / 105 (external). A later request of a long series still creeps
+  (9k windows 431 / 460 / 482 / 506 against 362 / 380 / 400 / 418 in the probe) with the CPU idle:
+  that part is the GPU's own.
+  - **The largest gap this entry left on the reused-prompt case:** a deltanet hybrid attached
+    no prefix, so a repeated 9k system prompt cost its whole prefill again (TTFT 2.1 s) where
+    mlx-lm restores a checkpoint (0.06-0.08 s) - closed by the checkpoint entry above.
+
+- **MEASURED (2026-10-01) - a Metal prefill window by kernel, on both engines, and the three
+  forms the reading bought.** M5 Max, Qwen3.6-35B-A3B-MTP UD-Q4_K_M, the device attention pair
+  crowned. `p0_ko_probe --kprof` replays every captured dispatch in a command buffer of its own
+  (`metal_kernel_profile`), so a kernel's GPU time reads on the rows the window really computes:
+  the kernels sum to 436 ms where the window serves in 428, so nothing hides in overlap. mlx-lm
+  0.32.0 the same way (external: its model's `__call__` of every module class wrapped to force an
+  evaluation, a script outside the tree; 536 ms against 363 as it serves, about 0.15 ms of sync a
+  call, so its big modules read true and its small ones high). A 2048-token
+  window at depth 0, ours ms (mlx-lm instrumented, external): the recurrent scan 70 (41); the expert GEMMs
+  146 - K4 96, K5 47, K6 3 (gate 44 + up 53 + down 43); the router 27 (9); the dense half GEMMs
+  95 (in_proj_qkv 41, z 25, out 25, shared expert 31, attention projections ~38); reduce 12,
+  activation 11, gather 8, count 7, bucket 5; the attention trio 11.
+  - **The router as a half GEMM** (`pf_enc_router_mm`; `harness/router_race.das`, 2048 x 256 over
+    2048): the slab GEMV 0.647 ms, a tensor GEMM over f32 operands 0.087, over halves 0.048 -
+    x13.4. The f32-operand tensor form is no more exact than the half one (off the double dot by
+    2.9e-3 against 1.4e-3 of 4.2; the GEMV 8e-7): matmul2d rounds its operands either way. The
+    window 428 -> 402 ms.
+  - **The scan** (`harness/dn_scan_race.das`, a layer at 2048 tokens, thirty dispatches a command
+    buffer). mlx-lm's scan kernel raced beside ours on its own layout (external; an arm the harness
+    does not keep): 1.05 ms on half rows, 1.81 on f32. Ours as it stood:
+    2.25 on f32 rows with the gates in the walk, 1.77 on half rows with the gates prepared - the
+    same algorithm, 1.7x slower. The whole difference was addressing: `cv[cb + koff + i]` under a
+    uint index against a pointer and a constant offset
+    (`ARCHITECTURE_GPU_PREFILL_WINDOW.md#kernel-load-addressing`). With the pointer form: 1.48 on
+    f32 rows, 0.97 on half rows - under mlx-lm's. Two simdgroups a threadgroup read 10% under
+    four. Preparing the gates alone bought 9% (70 -> 64 ms a window); half rows without the
+    pointer form bought nothing net. The window 402 -> 368 ms; the scan 70 -> 29.
+  - **The K-quant expert stage on pointer loads**: K4 95.5 -> 88.4 ms, K5 46.7 -> 40.8; the window
+    368 -> 356.
+  - **The standing** (`--depth 10240 --text skills/design_philosophy.md`, the windows in turn):
+    362 / 380 / 400 / 418 / 445 ms; mlx-lm 0.32.0 on its synthetic ids 365 / 377 / 396 / 412 / 431
+    (external, direction-grade).
+- **MEASURED (2026-10-01) - what a routed tile costs, for the tile ladder.** One process each,
+  hand MSL over a 2048 x 2048 x 2048 half GEMM, device operands (scratch races, not kept):
+  - **A tile's live rows do not make it cheaper.** The A tensor's row extent set under the
+    descriptor's m: a 128-row tile reads flat from 128 live rows to 1 (0.280 -> 0.274 ms); a
+    32-row tile reads 0.330 at 32, 0.636 at 24, 0.414 at 16, 0.287 at 8 - a partial extent takes
+    an edge path that is slower, not faster. Padding is not avoided by telling the op the count.
+  - **A tile's cost is mostly fixed.** The whole GEMM by tile height: 8 rows 0.825 ms, 16 0.461,
+    32 0.332, 64 0.276, 128 0.281 - a tile of 16 costs 0.69 of a tile of 32, 8 costs 0.62, 64
+    costs 1.66, 128 costs 3.38. Fewer, taller tiles win; a remainder of 33..64 rows is one 64-row
+    tile at 1.66 against two 32-row tiles at 2.0, each also staging the plane again.
+  - **An idle threadgroup costs 0.68 ns** (the 128-row expert stamp over a grid no expert fills:
+    32768 threadgroups 0.022 ms, 131072 0.086). A window's idle launches total about 6 ms, most
+    of it the K5 stamps' 32-strip grid.
+  - **The synthetic probe ids route a MoE onto half its experts** (last routed layer: 127 of 256
+    idle, the busiest 1729 rows, 78% of the rows in 128-row tiles); a real prompt leaves 51 idle,
+    59% in 128-row tiles, and 6656 rows in 335 tiles of 32 padded to 10720. The 64-row rung read
+    level on the synthetic ids for that reason; it is owed a reading on text (`--text`).
+  - From the two expert stamps' times and those counts: the multiply runs 22.7 T multiply-adds a
+    second staged (30.7 device-direct at 128 rows), staging is 7% of a 128-row stamp and 23% of
+    the remainder stamp, and the remainder stamp's pad rows are 29% of it.
+
+- **MEASURED (2026-10-01) - a Metal prefill window's cost against the context behind it: the
+  attention is the whole growth, and the device pair
+  (`ARCHITECTURE_GPU_PREFILL_WINDOW.md#prefill-attn-device`) takes 2.8x off it.** M5 Max,
+  Qwen3.6-35B-A3B-MTP UD-Q4_K_M (10 attention layers of 40, 16 heads of 256 over 2 KV heads), the
+  box's own mint, `bin/daslang -jit modules/dasLLAMA/harness/p0_ko_probe.das -- -m <gguf> -n 2048
+  --depth 10240`: one session's 2048-token windows in turn, the staged trio and the device pair
+  alternating in one process. Staged, by the rows of context behind the window (0 / 2048 / 4096 /
+  6144 / 8192): 452 / 493 / 563 / 599 / 694 ms. The device pair: 427 / 440 / 466 / 483 / 521 -
+  the five windows 2800 -> 2318 ms, the deepest x1.33. mlx-lm 0.32.0 on the same box
+  (external, direction-grade: `mlx-community/Qwen3.6-35B-A3B-4bit`, its model called a window at a
+  time over one cache by a script outside the tree): 365 / 377 / 396 / 412 / 431. The kernels alone, one layer at 2048 queries on 8192 rows of context
+  (`harness/attn_depth_race.das`, GPU time, best of 3): staged 23.1 ms - QK 9.5, row stats 1.6, AV
+  12.0 - against 8.2 - the K/V twin pass 0.1, QK 3.0, the softmax write 2.3, AV 2.7; both within
+  7e-7 to 9e-4 of the attention computed in double from the f32 operands, the pair the closer of
+  the two at every score spread tried. The time does not move with the scores. The tune race
+  (`race_attn_dev`, 512 queries on 1536 rows, 8 heads of 128): 0.344 -> 0.191 ms.
+  - **The staged tensor AV twin gains nothing at depth** (`attn_avmm` force-crowned through a
+    manifest copy: 446 / 490 / 558 / 590 / 682): threadgroup staging is the cost, not the multiply.
+  - **Idea, not built: the softmax write reads the row twice.** A thread holds 80 scores of a
+    10240-key row; kept in registers between the max and the exp they save one of three slab
+    traversals.
+  - **Idea, not built: a continuation window gathers every prior K/V row from the session's host
+    cache into f32 panels** (`kv_load_row`, 335 MB at 8192 rows of context). The device pair reads
+    halves, so an f16 session's rows could land as halves directly.
+- **MEASURED (2026-10-01) - the knockout probe's shares are not additive on a routed model.**
+  Knocking a family out upstream of a router feeds the router stale rows, the picks collapse onto
+  few experts, and the expert GEMMs' padded tiles shrink: `act_cvt` read 28-45 ms of a 150 ms
+  window on the 35B, and removing two of its three convert passes a layer outright moved the window
+  151 -> 149 ms (512 tokens) and 446 -> 443 (2048), the logits bit for bit. `--census` counts the
+  dispatches instead (`metal_cvt_half` 120 -> 40 a window). On a routed model a family's cost is
+  read by replacing it with a form that keeps the rows valid, as `--depth` does for the attention.
+- **MEASURED (2026-10-01) - the gated delta scan packed eight state columns a simdgroup**
+  (`MetalDnScan`): the scan x1.5 from 64 tokens up at the 35B's geometry, level at one row; the
+  window 160 -> 150 ms at 512 tokens, 526 -> 475 at 2048. **The routed tall pair from a mean of 32
+  rows an expert** (`set_metal_moe_tall_avg`; `p0_ko_probe --tall-avg 32,64,128`, three interleaved
+  rounds, logits bit for bit): the 2048 window 474 -> 449 ms; a 64-row rung between the pair's
+  stamps read level (+2% at 512) and is not carried.
+
+- **MEASURED (2026-10-01) - the NextN head on the hyper-connection chain
+  (`ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head`, `#hc-verify-rows`): the round loses on this form while
+  the pool's hits sit near 40% on real text, and the real-text token is 45 ms against the synthetic
+  row's 34 - the hits, not the head, are the lever, and the routed pick trace with its offline pool
+  sim (`DASLLAMA_MOE_TRACE`, `harness/hot_pool_sim.das`) says where it goes.** zen2 (Ryzen 16 threads,
+  RTX 5060 Ti 16 GB on a PCIe 4.0 x8 link, 3.9-4.3 GB held by the desktop), Qwen3.8-Flash-Next
+  UD-IQ4_XS with its split head (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, `DASLLAMA_MTP_HEAD`),
+  `bin/Release/daslang.exe -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m <shard 1> --mtp-ab
+  --mtp-depth 1 -p 0 -r 1 -t 16 --for-debug-purposes` under `DASLLAMA_IMAGE=0 DASLLAMA_ALLOW_UNTUNED=1`,
+  eight real-text prompts of 128 tokens, one rep a prompt, one process a row. Acceptance on the CPU
+  rail (no `DASLLAMA_GPU`; the rail does not move it): 456 of 571 drafts accepted, 79.9% (per prompt
+  64.1-95.5%) - the same 456 of 571 under `--mtp-depth 2` and `3`, since the CPU round is one token
+  deep and the flag reaches the seated rounds alone - tg-real128 off 7.07 / on 7.08 tok/s (per prompt
+  off 7.0-7.1, on 5.8-8.6; 7.15 / 7.15 at depth 3), the CPU round flat. On the device (`DASLLAMA_GPU=1`,
+  the head resident, the pool at the plan's 32 slots serving the verify rows through the rows chain):
+  tg-real128 off 22.49 -> on 18.77 tok/s, x0.83 at 407 of 619 accepted, 65.8% (per prompt off 20.1-24.8,
+  on 16.0-21.7, x0.74-x0.94 at 47.1-77.8%); a second process 22.85 -> 18.99 at the same 65.8%
+  (direction-grade across the two); tg-real64 22.57 -> 18.57 and 22.61 -> 18.73 at 62.7%. The device
+  accepts 14 points under the CPU (65.8 against 79.9, the two rails' processes, direction-grade): the
+  device draft and the verify rows route their near-ties apart, as every arm pair on this model does
+  (`ARCHITECTURE_ENGINE.md#moe-pick-tape`). The round under
+  `DASLLAMA_GPU_PROF=1` (debug-jit): the draft 4 ms, the verify 81 ms of which the device 25 and the
+  host's sums of the two rows' misses 56, the pool serving 48-53% of the rows' picks; a plain real-text
+  token 45 ms = device 22 + the host's sums 22.7 at hits 31-45% a layer (the per-layer line of the
+  profile: hits, picks and swaps a routed layer) - the entry below's synthetic ids read 70-83% hits and
+  29.7 tok/s, a third over the 22.5 of real text (two runs, direction-grade). So a round costs 85 ms for
+  1.66 tokens (51 ms a token) against a plain token's 45. The trace (`DASLLAMA_MOE_TRACE=<file>` over the
+  same command: every host expert step's layer, rows, k ids and weights, a mark a prompt; 24.7 MB for
+  the eight prompts' two arms, 1084090 decode picks and 1927680 window rows) replayed through
+  `bin/Release/daslang.exe -jit modules/dasLLAMA/harness/hot_pool_sim.das -- <trace> --policy heat
+  --per-layer` reproduces the live run: 37.5% of the decode picks on the device against the profile's
+  31-45%, 2.38 placements a token, a token modeled at 45.7 ms (the device 22.0 + the misses 21.7 + the
+  placements 2.0, from the profile's costs: a miss 72 us, a placement 570 us of host gather + 270 us of
+  upload) against the 45 measured, and `--per-layer` matches the profile's line layer for layer - the
+  instrument is calibrated; the policies it ranks are `followup_vulkan.md` row 127's table, which owns
+  the lever. The round rides the same lift - its verify rows at 85% hits cost a token's misses, not
+  two - so `mtp_auto_arms` leaves it off where the resident driver sums the experts on the host
+  (`gpu_resident_experts_host`), and a slot's `mtp=1` arms it by hand. The new device planes the rows
+  form adds, at this model's shape (dim 2560, hc 4, the verify's nb 2): the wide rows, the carry's
+  source, the rows' carry source, the normed streams and the gated rows 80 KB each, the head's cat
+  planes 160 KB each (two), the embed rows 20 KB, the side panel 80 KB, the rest under 40 KB - 1.4 MB
+  a driver; the prompt's head warm at the 512-row window: the head's cat plane 42 MB (its f16 twin 21,
+  its Q8 image 10.5 + 1.3), the wide-residual source and the stream-major scratch 21 MB each - 117 MB
+  a driver. Parity (the CPU chain is the reference; the split command's own one-row steps are a
+  rounding control, not parity): `test_gpu_resident_hc.das`'s draft cell (the device draft against the
+  CPU `forward_mtp` on one token, wide carry and row, `LOGIT_BAR_REL` 0.20 and `CARRY_BAR_REL` 0.05 of
+  the row's max: argmax 271 on both at 9.57 / 9.50, the logits row 0.22 within 1.91, the wide carry
+  0.06 within 1.10, the controls 3.00 and 3.50, the head's one select replayed) and its verify cell
+  (one round: the draft 271, verify row 0's argmax 12 rejecting it, one rollback; the two rows against
+  the CPU's one-row steps at `WIDE_BAR_REL` 0.35 and `WIDE_CARRY_BAR_REL` 0.25, the other row as each
+  row's control - rows 1.52 and 3.10 within 3.47 and 4.24, the carry rows 0.49 and 0.49 within 1.74 and
+  1.02, the controls 12.53 and 12.06, 4.86 and 4.81 - and the rounding control against the split
+  command's own one-row steps on the same picks at `SPLIT_BAR_REL` 0.12 and `SPLIT_CARRY_BAR_REL` 0.10 -
+  rows 0.42 and 0.82 within 1.14 and 1.52, the carry rows 0.07 and 0.30 within 0.73 and 0.39, the
+  controls 11.62 and 11.74, 5.10 and 5.12; 97 selects replayed, 2 of the CPU draft's own picks off the
+  device's); kernel
+  cell `test_vkd_ple_side`'s commit arm (the position off the token record, three rows committed to the ring).
+
+- **LANDED (2026-09-29) - the hot expert pool on the hyper-connection carrier
+  (`ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool`), the `iq3s4` device format under it, and the resident
+  plan sizing the pool with the mirror.** zen2 (Ryzen 16 threads, RTX 5060 Ti 16 GB, 3.9-4.3 GB held
+  by the desktop, NVIDIA driver 616.56), Qwen3.8-Flash-Next UD-IQ4_XS, `bin/Release/daslang.exe -jit
+  benchmarks/lcpp_bench.das -- --ngl 0 -p 512 -n 128 -r 6 -t 16 --for-debug-purposes` under
+  `DASLLAMA_GPU=1 DASLLAMA_IMAGE=0 DASLLAMA_ALLOW_UNTUNED=1` (`DAS_TUNE_POLICY` unset - the box's
+  sidecar; `DASLLAMA_COOPMAT` at its default, cm2 on this card; `DASLLAMA_IQ3S_SERVE=auto`, the `iq3s4`
+  form), one process a row, the rows of one day on one branch - direction-grade across the rows:
+
+  | pool | the window's hits | mirror | pp512 | tg128 |
+  | :--- | :--- | :--- | ---: | ---: |
+  | the plan's own: 32 slots (4025 MB) | on the device | 114518 positions (2684 MB) | 286.01 +/- 8.85 | 29.74 +/- 0.50 |
+  | 32 slots (`DASLLAMA_GPU_HEAT=32`) | on the device | 32768 (`DASLLAMA_GPU_CTX_MAX`, 768 MB) | 288.81 +/- 8.72 | 29.93 +/- 0.49 |
+  | the plan's own: 32 slots | the host's | 64413 (1509 MB) | 121.49 +/- 4.08 | 29.70 +/- 0.44 |
+  | 32 slots | the host's | 32768 (768 MB) | 128.39 +/- 0.72 | 30.04 +/- 0.41 |
+  | none (`DASLLAMA_GPU_HEAT=0`) | - | 32768 (768 MB) | 128.76 +/- 0.36 | 19.38 +/- 0.06 |
+  | none, the plan before this entry | - | 203419 (4767 MB) | 110.33 +/- 2.08 | 2.93 +/- 0.03 |
+
+  The reference rows (external): llama.cpp b10659 (`6c84c7d5d`, the qwen4exp commit), the Vulkan and
+  the CUDA 13.4 builds' `llama-bench -m <shard 1> -ngl 99 -ncmoe 48 -t 16 -p 512 -n 128 -r 3` with the
+  48 layers' experts on the CPU - Vulkan pp512 91.66 / tg128 13.07, CUDA 147.3 +/- 21 / 17.32
+  (`ARCHITECTURE_MEASUREMENT.md#host-experts-reference`). Decode is 1.55x the host-experts form (30.04
+  against 19.38) and 1.71x the CUDA row (29.74 against 17.32) - on the bench's synthetic ids, whose picks
+  the pool holds at 70-83%; real text reads 22.5 tok/s at 31-45% hits (the NextN entry above); the prompt's row is 2.24x the host-experts
+  form (288.81 against 128.76) and 1.96x the CUDA row (288.81 against 147.3) once the window's hits run
+  through the batch arm's chain beside the host (the middle rows: the pool serving decode alone leaves
+  the prompt's row where it was). Over four windows and 32 steps the pool placed 1656 experts - the 1536 of its fill and
+  120 swaps - for 0.9 s of gather and 0.45 s of upload, once a load. The bottom row is the box paging: the plan filled the card to 681 MB under its
+  room beside a 4.3 GB desktop, the driver's own warning fired (a decode token under 40 GB/s over the
+  resident weights), and the row this ledger's entry below reads at 110.13 / 19.66 was the same plan
+  on a quieter desktop - its prompt row already paid some of it. The token under
+  `DASLLAMA_GPU_PROF=1`, warm, 32 slots: 32.3 ms, of it the host's sums of the misses 8.6 ms (29.5 with
+  every pick on the host), the segments and the hit chains 22 ms, the last segment's wait 1.5 ms; the
+  device serves 70-83% of the picks on the bench's synthetic ids, 74.6% in the parity cell's steps.
+  Research before the kernels (`bin/Release/daslang.exe -jit harness/vk_gemv_probe.das -- 2560 672`,
+  the expert gate shape, this card): `iq3s4` decodes at 418 GB/s streaming and 7.2 us a cold plane of
+  0.9 MB (iq4xs 294-352 GB/s, 9.2 us; iq3s 400 GB/s, 8.3 us; k4 402 GB/s, 8.1 us; q8 418 GB/s, 11.1
+  us), the host's chain 61 us an expert (the `DASLLAMA_GPU_PROF=1` token report: the host's routed sums
+  over the picks it summed) - the device is six to ten times the host on a hit. Placing an expert in a
+  slot (the same report's pool line, the gather and upload clocks summed over the placements): the
+  gather of its three planes 0.57 ms and the upload of 2.6 MiB 0.27 ms (the gather parallel over rows;
+  it read 1.85 ms while one expert's rows ran on one lane), so a pool of 32 x 48 slots fills in 1.3 s,
+  once a model load, at the first window's host steps; a full pool swapped 6-20 experts over 32 tokens.
+  The pool's bytes are `slots x routed layers x (the three expert planes' slot bytes)`: 32 x 48 x 2.6
+  MiB = 4025 MB, and 64 slots would be 8050 MB, which the plan yields only beside the whole mirror. A
+  decode that starts with no prompt fills two slots a layer a step and reads 14-21 tok/s over its first
+  128 tokens (a tg128 row run with no prompt row before it in the process). Parity: `test_gpu_resident_hc.das` run directly through dastest (`bin/Release/daslang.exe -jit
+  dastest/dastest.das -- --test modules/dasLLAMA/tests/test_gpu_resident_hc.das` under `DASLLAMA_GPU=1
+  DASLLAMA_PARITY_FULL=1`) with the pool armed, a 48-token prompt through the window chain (its hits on
+  the device) and six fed steps - the prompt's row 0.46 against 2.00, the steps 0.37-0.68 against bars
+  1.70-2.56, the one-step-off control 5.15-11.98, argmax equal on all seven rows, 1536 experts
+  uploaded, 18793 of 23040 window slot rows and 2359 of 2880 decode picks on the device, 36 of the CPU's
+  own picks off the tape; the bench's frozen pinned-greedy fixture (`lcpp_bench`'s fixture gate)
+  reproduces its opening tokens with the pool serving. Kernel cells:
+  `test_vkd_hot_combine`, the `iq3s4` stamps' fourteen cells, `test_resident_hot_slots` and
+  `test_vk_coopmat_default_and_tile_pick`'s per-32 column arm (model-free).
+
+- **LANDED (2026-09-29) - the Vulkan whole-model driver on the hyper-connection carrier
+  (Qwen3.8-Flash-Next UD-IQ4_XS, 94 GB, 512 experts top-10): every plane but the routed expert stacks
+  resident, the token command and the prompt's windows recorded as 49 segments cut after each layer's
+  router, the host summing the routed experts between them
+  (`ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command`, `#hc-window-chain`).** zen2 (Ryzen 16 threads, RTX
+  5060 Ti 16 GB on a PCIe 4.0 x8 link, 4 GB held by the desktop), `bin/Release/daslang.exe -jit
+  benchmarks/lcpp_bench.das -- --ngl 0 -p 512 -n 128 -t 16 -r 3 --for-debug-purposes` under
+  `DASLLAMA_GPU=1 DASLLAMA_IQ3S_SERVE=lut DASLLAMA_IMAGE=0 DASLLAMA_ALLOW_UNTUNED=1`: tg128 19.66
+  +/- 0.19 / 18.07 +/- 0.25 / 18.93 +/- 0.11 tok/s over three processes (direction-grade; the CPU chain
+  6.89; the reference rows, external - llama.cpp b10659 `llama-bench -ngl 99 -ncmoe 48 -t 16 -p 512 -n
+  128 -r 3`, the experts on the CPU: Vulkan 13.07, CUDA 17.32), pp512 110.13 +/- 0.37 through the
+  window chain (63.18 +/- 0.80 with the prompt read on the CPU, the form before it; llama.cpp Vulkan
+  91.66, CUDA 147.3 +/- 21, external - both stream the 55.4 GiB of experts across the link per
+  512-token batch, `nvidia-smi dmon -s t` reading 10.5-12.0 GB/s under CUDA and 4.8-7.2 under Vulkan,
+  external). The token under `DASLLAMA_GPU_PROF=1`: 52.6 ms, of it the host's
+  routed sums 29.5 ms, the 49 segments' submits and waits the rest, the last segment's wait 1.6 ms.
+  Resident bytes: 4.98 GiB (deltanet 2.09, hc mixers 0.64 as 97 q8 down/up pairs of [10240 x 320], the
+  n-gram key [3840 x 10240] and value [3840 x 2560] planes 49 MB, token_embd 0.63, attention 0.59, head
+  0.49, router 0.23, shexp 0.23); the conv ring 10 rows x 10240 floats a region (400 KB), the token's
+  segment landings 10 KB + 2 KB + 10 KB host-visible, 49 command buffers a region; the window's panels
+  at 512 rows: five [512 x 10240] float planes of 21 MB each (the wide rows, the normed streams, the up
+  projection, the gated rows, the side panel), the key rows 21 MB, the streams' Q8_0 image 5.9 MB, the
+  side rows 7.9 MB + 2.2 MB, the landings 5.2 MB + 1.1 MB + 5.2 MB host-visible, 49 command buffers;
+  the 55.4 GiB of routed experts and the 26.8 GiB n-gram table stay on the host. Parity (the cell's
+  form before the hot pool; the entry above carries its 48-token form): `tests/run.das` cell
+  `test_gpu_resident_hc.das`, a 24-token prompt through the window chain and six fed steps, the
+  CPU arm routing as the device arm did through the decode pick tape
+  (`ARCHITECTURE_ENGINE.md#moe-pick-tape`) - every row within 0.20 x max|logit| (the prompt's row
+  0.88 against 2.55, the steps 0.62-0.86 against bars 2.00-2.48, argmax equal on all seven), the
+  one-step-off control 5.81-10.64, 1440 selects replayed, the CPU's own decode top-k off the tape 62
+  of 2880 picks; without the tape the arms read 1.8-4.1 with two argmax flips, and the CPU chain on
+  `DAS_TUNE_POLICY=reference` reads 3.4-7.0 against the tuned chain with three flips of seven rows - a
+  probe's reading, the model's own near-tie sensitivity. The bench's frozen pinned-greedy fixture
+  reproduces 8/8 opening tokens with decode on the device. Kernel cells: `test_vulkan_kernels.das`
+  `test_vkd_hc_seams` (four cells), `test_vkd_hc_rows` (the rows forms, four cells) and
+  `test_vkd_ple_side` (two positions and the window's panel form), the deltanet sigmoid stamps under
+  their silu controls.
+
+- **LANDED (2026-09-28) - the Metal batch rail's hyper-connection arm (Qwen3.8-Flash-Next tg128@4):
+  the batched step opens the rows' wide residual, runs the mixers through the shared layer body,
+  gathers each row's n-gram heads on its own session and writes each row's conv ring in place.**
+  M5 Max, `lcpp_bench --ngl 99 --npl 4 --npl-plen 512 -n 128 -r 5 --for-debug-purposes` under the
+  box's scratch manifest: tg128 56.86 +/- 0.05 tok/s, tg128@4 119.58 +/- 2.51 summed (2.10x; reps
+  124.0 / 118.5 / 117.9 / 118.9 / 118.6 - the first rep of every run reads 3-5% high, a 3-rep read
+  lands at cv 3-9%, five reps hold cv 2%). The step is device-bound: `--prof` reads the batched step
+  at setup 0.08 / encode 1.5 / wait 31.7 ms (gpu 30.7) against the single step's 1.0 / 1.4 / 19.8
+  (gpu 18.9), so four rows cost 1.63x one row's GPU time and the host is 5% of the wall. The MoE
+  siblings on this box read the same shape (Qwen3-30B-A3B 165 -> 314, 1.9x; Qwen3.6-35B-A3B 128 ->
+  269, 2.1x): four rows' top-10 of 512 experts barely overlap, so the expert traffic scales with the
+  rows and only the dense and attention passes amortize. Prediction on record before the run:
+  140-180 summed (2.5-3.2x) - missed on the expert-traffic term. Parity: the batch probe holds
+  B=2 and B=4 to 5e-4 logits against the single step over 16 steps (0 argmax flips), and
+  `mtp-dff-3.8fn` pins it in the suite.
+
+- **OPEN (2026-09-27) - the Vulkan resident driver's NextN prompt warm: the head's slab warmed on
+  the window chain, and what it costs a prompt.** Where the driver homes a NextN head and the
+  round is on (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-head-prompt-warm`) every window of a
+  resident prefill encodes one more layer's worth of rows after the trunk: the last layer's FFN
+  over the whole window instead of its last thirty-two rows, eh_proj [2dim -> dim] and the head's
+  k and v projections [dim -> kvd] over the window's rows, two norms, a feed requant, the head's
+  q/k norm and the rope store - on Qwen3.5-0.8B-MTP the eh_proj plane's 2,228,224 bytes and the k
+  and v planes' 557,056 each read once a window, the last layer's three FFN planes (3,899,392 each)
+  over 512 rows in place of 32. The chain's planes grow by the head's staging - the embed rows, the
+  shifted post-norm rows and the [enorm ; hnorm] image with its feed: `PF_WINDOW x (4 dim + 8 dim
+  + 2 dim + dim / 4) bytes` under a Q8_0 feed, `PF_WINDOW x (16 dim) bytes` under the f16 feed, plus
+  `PF_WINDOW x cos_elems x 4` for the rope rows - 512 x 14,592 = 7,471,104 bytes at dim 1024 on the
+  Q8_0 feed, 512 x 16,384 = 8,388,608 on the f16 feed, and 131,072 of rope rows at a 64-wide plane;
+  the head rows' readback moves `(npos - 1) x kvd x 2 sides x 2` bytes a prompt (1 MB a 512-row
+  prompt on the 0.8B's f16 rows). Owed from the pod: pp512 of `Qwen3.5-0.8B-MTP-Q8_0.gguf` under
+  `DASLLAMA_GPU=1` with `set_mtp_spec` on against off (`lcpp_bench --mtp-ab -p 512` with the
+  `DASLLAMA_GPU_PROF=1` window profile: the `vk_rdpf` submit wall per window with the warm against
+  without), and the round's acceptance on the SpecBench chat corpus against the CPU round's on the
+  same box - the reading the warm exists for.
+
+- **OPEN (2026-09-27) - the Vulkan resident driver's same-slab speculative verify: its row
+  buffers and its round against the CPU verify.** Where the driver homes a NextN head
+  (`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`) the per-row planes hold
+  max(regions, depth + 1) rows, eight at most, so a one-region load gains `depth` rows.
+  A row is 2 x vocab x 4 bytes of logits (the device plane and its host landing) beside the
+  activation rows: 4 dim + 2 hid + 2 qd + 2 kvd (+ 2 qd under a gated q) floats, the quant
+  rows' wide + wide / 8 + qd + qd / 8 bytes, the attention partials' n_heads x (splits x (hs + 2)
+  + 1) floats, the host x, carry, rope and TokMeta rows, the picks' 520 bytes, on a hybrid the deltanet projection (cd + di floats)
+  and o rows (the step's fixed 8,192 + 1,024 + 32,768 bytes), and under the head its three cat
+  rows (6 dim floats), its TokMeta row and two rope rows. On Qwen3.5-0.8B-MTP (vocab 248,320,
+  dim 1024, hid 3584, qd 2048, kvd 512, gated q, cd 6144, di 2048, 8 heads of 256, a 64-wide rope
+  row) that is 1,986,560 bytes of logits and 197,384 of the rest, 2,183,944 a row, plus the
+  partials' 8 x (splits x 1,032) + 32 (132,128 at 16 splits): one region gains 2,316,072 bytes at
+  depth 1 (nb 1 -> 2) and 16,212,504 at depth 7 (nb 8), both at 16 splits. The plan's scratch
+  term counts the same rows. Owed from the pod: `lcpp_bench --mtp-ab` on the 0.8B-MTP under
+  `DASLLAMA_GPU=1` with `--prof` and `JOBQUE_PROFILING=1` - the `mtp.verify` section against a
+  one-row step's wall and against the CPU verify's on the same box; the reject's `mtp.rollback`
+  section against the `mtp.snapshot` + `mtp.replay` the CPU restore paid (the recurrent state's
+  round trip, about 20 MB down and up on the 0.8B, retired: the verify command copies each
+  recurrent layer's slot state and ring pair after every row but its last into a rollback scratch
+  of `depth x n_rec x (nvh x ds x ds + 2 x cd x (dconv - 1)) x 4` bytes, and the reject copies one
+  row back - on Qwen3.5-0.8B-MTP (18 recurrent layers, 16 heads of 128, cd 6144, dconv 4)
+  21,528,576 bytes at depth 1 and 150,700,032 at depth 7, counted in the plan's scratch term,
+  `ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`); the verify command's own
+  `DASLLAMA_GPU_PROF=1` ledger (`vk_rdec gpu avg/verify` with its `dn avg/verify` line and
+  `vk_rdec host wall/verify`, `ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`) against the
+  one-row `vk_rdec gpu avg/token` line of the same run's off arm, role by role - under the greedy
+  `--mtp-ab` arms' pick ask the verify lands the picks and two hidden rows alone (the
+  2 x vocab x 4-byte logits plane, its host copy, the four row copies and both host argmaxes gone
+  from the round), the re-warm runs no q GEMV and the store pass over the k heads alone
+  (`warm_q` gone from the ledger, `warm_qknrope` smaller), and no head row is read back (the `kv
+  readback` piece gone from `host wall/verify`). The on/off rate with the drafts' acceptance, as
+  measured: `benchmarks/lcpp_bench.das --mtp-ab -n 64 -r 2` (`-r 4` on the 0.8B) as the `-jit`
+  script (debug-jit) under `DASLLAMA_GPU=1 DASLLAMA_ALLOW_UNTUNED=1 DAS_JOBQUE_THREADS=16`,
+  `DAS_TUNE_POLICY` unset (the box profile), the resident driver at cm2 coopmat mode, on the
+  RTX PRO 4500 pod, tok/s off / on, the off arm the plain tg64: Qwen3.5-0.8B-MTP-Q8_0 444.7
+  +/- 9.5 / 574.9 +/- 14.3 (x1.29, acceptance 81.9%); Qwen3.5-4B-MTP-Q8_0 138.0 / 202.5 (x1.47,
+  82.6%); Qwen3.5-9B-MTP UD-Q5_K_XL 103.8 / 149.3 (x1.44, 82.7%); Qwen3.8-27B-Q4_K_M with its
+  Q8_0 head, the image rail off, 37.1 / 54.3 (x1.46, 69.9%) - direction-grade, the on and off
+  arms in one process per row. The stamped ledgers at 66b143122 on the 0.8B under the same
+  command with `DASLLAMA_GPU_PROF=1`, microseconds: the verify's host wall 2917 (GPU 2870), the
+  draft's 491 (GPU 449), against a one-row step's 2571 (GPU 2357). Measured on the RTX PRO 4500
+  pod - `benchmarks/lcpp_bench.das --model Qwen3.5-0.8B-MTP-Q8_0.gguf --mtp-ab -n 96 -r 1
+  --for-debug-purposes` as the `-jit` script (debug-jit) under `DASLLAMA_GPU=1
+  DASLLAMA_ALLOW_UNTUNED=1 DAS_JOBQUE_THREADS=16 DAS_LOG_LEVEL=info DASLLAMA_GPU_PROF=1`,
+  `DAS_TUNE_POLICY` unset (the box profile), the resident driver at cm2 coopmat mode,
+  microseconds a round from the `DASLLAMA_GPU_PROF=1` ledger: the two-row verify's `dn_seq`
+  reads 421 against the one-row `step` 243 and the rollback copies (`roll`) 74 - a recurrent
+  layer's row costs its dispatch latency (16 workgroups, one a head), not the state's reload. A
+  form that looped the rows inside one dispatch a layer with the scratch stored in-kernel and the
+  final ring pair written by a last-arriving workgroup was bit for bit the chained steps and read
+  `dn_seq` 721 under the same command and environment at its own commit (direction-grade, two
+  commits): the loop serializes the rows a workgroup already ran back to back, and the epilogue's
+  barrier and staged copy add to every layer - the per-row dispatch stays. What moves `dn_seq` is
+  more workgroups a head (the ds x ds state split across workgroups), a step-kernel change the
+  one-row decode shares.
+
+- **LANDED (2026-09-28) - the head K-row bar of `tests/test_gpu_resident_hybrid.das`
+  (`HEAD_K_BAR_REL = 0.08`, twice the deltanet bar): the prompt warm's K rows against the CPU
+  warm's.** The cell `test_gpu_resident_hybrid_mtp_head_warm`, through `tests/run.das` under
+  `-jit`, `DASLLAMA_GPU=1 DASLLAMA_ALLOW_UNTUNED=1 DAS_JOBQUE_THREADS=16`, `DAS_TUNE_POLICY` unset
+  (the box profile), the resident driver at cm2 coopmat mode, on the RTX PRO 4500 pod, on
+  Qwen3.5-0.8B-MTP-Q8_0 over the 40-token prompt: the widest miss reads 0.05 of the CPU row's max
+  under both codecs - f16 mirrors 0.357 at row 38 on a 0.577 bar, f32 mirrors
+  (`DASLLAMA_VK_KV32=1`) 0.278 at row 2 - and the one-down control lands 7.3 to 7.6 bars away.
+  The bar is twice the deltanet bar because the row is the f16-stored projection of a hidden row
+  already held within the deltanet bar; the control is tightened to two bars from it.
+
+- **OPEN (2026-09-27) - the Vulkan resident driver's NextN draft head: its plane and slot bytes,
+  and the device draft against the CPU draft.** Where the driver takes a model's head
+  (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`) the plan grows by the head's eight
+  planes and one K/V slot a region; a headless model plans what it did. The planes are
+  (2 dim x dim + dim x qrows + 2 dim x kvd + qd x dim + 3 dim x hid) weights at their formats' block
+  bytes - Qwen3.5-0.8B-MTP-Q8_0 (dim 1024, the gated q's 4096 rows, kvd 512, qd 2048, hid 3584,
+  every head plane Q8_0 at 34 bytes a 32-weight block): eh_proj 2,228,224 bytes, q 4,456,448, k and
+  v 557,056 each, o 2,228,224, gate, up and down 3,899,392 each, 21,725,184 in all. The slot is
+  regions x seq_cap x kvd x 2 sides x 2 bytes (f16), regions x seq_cap x 2,048 bytes on the 0.8B:
+  8,388,608 at one region of 4096 positions, 67,108,864 at four regions of 8192. The norms plane
+  gains (5 dim + 2 head_size) x 4 bytes (22,528 on the 0.8B) and the draft's staging 3 x 2 dim x 4
+  bytes a row of the per-row planes (24,576 a row at dim 1024, 122,880 at dim 5120; the next entry
+  prices the rows). Owed from the pod: the 0.8B-MTP's `resident image`
+  and `NextN draft head in the arena` load lines (the bytes read, not computed); the draft's wall
+  against the CPU `forward_mtp` - `lcpp_bench --mtp-ab` under `DASLLAMA_GPU=1` with `--prof` and
+  `JOBQUE_PROFILING=1`, the `mtp.draft` section against the CPU draft's on the same box - including
+  the hydrate's upload where one runs, a submit of its own beside the draft's (the drafted row
+  stays on the device, so no readback follows the command, and the greedy round takes the pick the
+  seat answers, the vocab x 4-byte logits row neither landing nor re-read by a host argmax); the
+  draft command's own `DASLLAMA_GPU_PROF=1` ledger (`vk_rdec gpu avg/draft` and `vk_rdec host
+  wall/draft`, `ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`), the classifier's share of it
+  against the one-row `cls` role; and the acceptance the
+  device draft reads off the head's slab the window chain warmed (the entry above) - the pod
+  measures.
+
+- **OPEN (2026-09-27) - the Vulkan resident driver's speculative carry: its landing plane and its
+  step cost on a NextN-headed model.** The landing plane (`RDec.hid_host`, host-visible, allocated
+  only where the driver is prepared with `carry`) is dim x 4 x nb bytes, nb the per-row planes'
+  rows (a row a region, or the speculative verify's rows where more, eight at most):
+  Qwen3.5-0.8B-MTP (dim 1024) 4,096 bytes a row, 32,768 at eight. Each step moves
+  dim x 4 bytes a row over the logits' path (4 KB a token on the 0.8B), and the last layer's
+  residual step leaves the q8 down GEMV's epilogue for the row-storing stamp, one dispatch more a
+  token - while the speculative knob is on; with it off the step pays none of this and keeps the
+  fused forms (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-spec-knob-gate`). Owed from the pod:
+  tg128 of `Qwen3.5-0.8B-MTP-Q8_0.gguf` with `set_mtp_spec` on against `Qwen3.5-0.8B-Q8_0.gguf`
+  (the same trunk, no carry) under `DASLLAMA_GPU=1`, with the `DASLLAMA_GPU_PROF=1` token profile
+  of each, so the step's delta is read rather than estimated.
+
+- **LANDED (2026-09-27) - the Metal speculative round on the hyper-connection model
+  (Qwen3.8-Flash-Next + its split shared head): the verify's rows carry the wide residual into the
+  draft head, the n-gram side input takes the panel form with the accepted rows committed after the
+  walk, and every row form picks the deltanet z activation through `enc_dn_zgate`.** M5 Max,
+  `lcpp_bench --ngl 99 --mtp-ab -r 3 --for-debug-purposes` under the box's scratch manifest, tg-real128
+  over eight prompts, greedy, depth 1: off 55.32 +/- 0.49 tok/s, on 59.97 +/- 0.96 (1.08x), 1323 of 1716
+  drafts accepted (77.1%; per prompt 55.6% to 98.4%, x0.94 to x1.23 - the round loses at 56%
+  accept and wins from ~68%). The counting probe is token-exact at depth 1, 2 and 4 (100% accept,
+  spec 2x plain wall) and the prose probe at depth 1 (77%, 0 flips). The same shape as the 9B's
+  round (`followup_metal.md` row 26): an accept rate this high buys 1.77 tokens a round and the
+  round returns a tenth of it, so the verify's two rows cost most of a plain step here too - the
+  stage split (`harness/mtp_ruler.das`) is the next lever. The CPU round on this model is a loss
+  (`followup_general.md` row 178).
+
+- **LANDED (2026-09-27) - IQ3_S served as a 16-entry codebook plane on the CPU rail (`iq3s4`,
+  `ARCHITECTURE_ENGINE_FORMATS.md#served-form`, `DASLLAMA_IQ3S_SERVE=auto|grid|lut`): every IQ3_S weight
+  is a signed odd 1..15 times its block scale, so grid entry, qh bit and sign fold at transcode into
+  one nibble over `-15, -13, .., 15`, decoded by the iq4xs LUT kernels - one `tbl` per 16 nibbles
+  in place of a 2 KB grid gather, one load per 4 weights.** Qwen3.8-Flash-Next UD-IQ4_XS (gate/up
+  experts IQ3_S) on the M5 Max, 18 threads, `lcpp_bench --for-debug-purposes -p 512 -n 128 -r 3`
+  under the box's scratch manifest, one binary, warm passes (the pass after a mint is void: cv 7%):
+  grid pp512 134.1 +/- 2.0 / tg128 18.98 +/- 0.13, lut 140.6 +/- 0.7 / 26.9 +/- 0.5, llama.cpp at 2b129ccfa
+  107.8 +/- 3.5 / 19.9 +/- 0.4. `decode_prof -n 128 -t 18` under `JOBQUE_PROFILING=1`: 59.5 -> 40.3 ms a
+  token; `mm_moe` 25.1 -> 6.7 ms, the attention block 19.5 / 20.0, the hc mixes 5.8 / 6.0,
+  `mm_moe_dn` 5.0 / 3.5, the head 2.9 / 2.9. Predictions on record before the run: `mm_moe` ~7 ms,
+  the token ~42 ms, tg128 ~25 - all three held. Cost: the planar image 98.1 -> 105.5 GB (+23% on
+  the IQ3_S planes, the scale rows unchanged); the dequant is bit-identical to the grid form's
+  (`test_kquant`). The GPU tiers keep the grid form - their gather is a device read. Provenance:
+  the four bench logs and two profile logs of the 2026-09-27 session, `followup_general.md` 170.
+
+- **LANDED (2026-09-27) - the Vulkan TTS dedup pass: the Pocket row GEMV (`TtsPkGemvT`) folds
+  its own subgroup reduction onto the shared `WgReduceBase`, and the pass's bench rows against
+  master's.** Box: the pod - the RunPod RTX PRO 4500 Blackwell, Linux, the Vulkan backend - one
+  process at a time.
+
+  The reduction fold's ground is the bits, not a race: the folded stamp writes the same output
+  as the shipped one (max abs diff 0 over both served frame-loop shapes, ln_qkv 1024 -> 3072 and
+  ln_gelu 1024 -> 4096), its workgroup memory is 16912 bytes under the device's 49152-byte cap,
+  and the served Pocket row below reads the same on the folded tree as on master. The one-off
+  probe that timed the two forms did not land, so its figures are not this ledger's.
+
+  The bench rows, `direction-grade`, the same instrument on the same box at two named commits,
+  one process a run: `./bin/daslang -jit modules/dasLLAMA/harness/tts_synth.das -- --model
+  <file> --voice <voice> --out <dir> --limit 20` with `kitten-nano.gguf` and `kitten-mini.gguf`
+  on `Bella`, `kokoro-82m.gguf` on `af_heart`, `pocket-tts-en-q8.gguf` on `alba`, under
+  `DASLLAMA_GPU=1 DASLLAMA_ALLOW_UNTUNED=1 DAS_JOBQUE_THREADS=16 DAS_LOG_LEVEL=info`,
+  `DAS_TUNE_POLICY` and `DASLLAMA_COOPMAT` unset, no other overrides; the mean generation wall
+  (`gen_ms`) a sentence over the 20 sentences, with its min and max. At the dedup tree
+  7e06befab against master 45277047d: kitten-nano 45 ms (16-431) against 44 (15-369), kitten-mini
+  94 (36-653) against 91 (36-688), kokoro 87 (37-641) against 86 (37-654), Pocket q8 128 (60-634)
+  against 133 (63-654) - within noise. The Metal row of the same instrument on the M5 is owed.
+
+  The reflect pad's two `TtsPkRows` copies (the last generator stage's one `TtsReflect1` dispatch
+  became two), on the device clock (`pfq_*`, 200 submits after a warm-up, `debug-jit`, the probe
+  a one-run harness file that did not land) over t2 rows of c2 channels, both copies a submit:
+  c2 8: 4.8 us at t2 2 through 4096, 6.5 at 65536, 12.0 at 262144; c2 24: 4.8 through 4096, 10.6
+  at 65536, 24.9 at 262144; c2 64: 4.8 through 256, 6.4 at 4096, 18.6 at 65536, 173.7 at 262144.
+  The pair costs a dispatch's floor at every row count a sentence produces, so the path ships no
+  gate on the row count.
 - **LANDED (2026-09-26) - the StyleTTS2 and Pocket seats ride the Vulkan TTS driver
   (`ARCHITECTURE_GPU_TOWER_VULKAN_TTS.md#vk-tts-chain`): the kitten and kokoro families' seven
   seats and the Pocket codec and frames seats on the Vulkan tower's knob, the front end on the
@@ -3273,3 +3943,256 @@ other overrides alike.
   `DAS_TUNE_POLICY` unset; the box is the pod on its cm2 arm unless the sentence names the 5060 Ti
   (Boris's box, RTX 5060 Ti 16 GB, driver 616.56, cm2 arm). A distance is the cell's own logged
   rel_l2 over one run of the cell; the cells log the reading on green and assert the 1.5x bar.
+
+### From the vulkan-lane mint arc (2026-09-29)
+
+The instrument: Boris's box (RTX 5060 Ti 16 GB, driver 616.56, cm2 arm, the Zen2 CPU),
+`bin/Release/daslang.exe -jit -module-cache .jitted_scripts/module_cache/dastest.dascache
+dastest/dastest.das -- --test modules/dasLLAMA/tests/test_vulkan_mint.das --test-names
+test_vulkan_mint_lanes` from the repo root under `DASLLAMA_GPU=1 DAS_LOG_LEVEL=info
+DAS_JOBQUE_THREADS=8 DASLLAMA_MODELS_DIR=D:/Work/llama.cpp/models`, `DASLLAMA_COOPMAT` and
+`DAS_TUNE_POLICY` unset [debug-jit - the cell's own log lines, one run]. A save wall is the
+`prepared image streamed in N ms` line (the whole streaming save: the walk's uploads, the twin
+streamed to the writer, every planar family transcoded off the gguf mapping), a twin's size and
+mint time the `plane vkblob N MB minted off the gguf in N ms` line, the warm wall the `prepared
+vulkan image mapped in N ms` line. The peak footprint is the dastest process's peak working set
+(`PeakWorkingSet64`, sampled every 500 ms from a wrapper) over the whole file - three loads of the
+MTP carrier, two of its K-quant twin, and the cells' generations - so it bounds the cold mint from
+above and is not the mint's own peak.
+
+- **Qwen3.5-0.8B-MTP-Q8_0, the vulkan lane minted off the gguf inside the streaming save:** the
+  untrimmed lane's twin **782 MB, 195 entries, minted in 4319 ms**, the whole save **6364 ms**; the
+  trimmed lane's twin the same 782 MB in 4284 ms, its save **5446 ms** (no planar family written);
+  the trimmed lane mapped back warm in **2508 ms**. Peak working set of the file's process
+  **6558 MB**.
+- **The reserve the sizing pass hands the writer for the twin** (`vk_mint_extra_bytes`): the quant
+  planes' bytes, both halves, plus an eighth for the entry pads, plus the packed emb region where
+  the lane is trimmed, plus 64 MB; the twin never outgrows its planar source (a device scale row is
+  the disk row's f16 half or narrower), so the surplus is the pads and the window. The file sink
+  truncates it at close; the in-memory sink holds it for the model's lifetime, which is the
+  `DASLLAMA_IMAGE_SAVE=0` cost of the lane.
+- **The lane files** (read in the arc's first run on this box, the same design before the review
+  batch; the batch moved the twin's section, not a plane's bytes - `test_vulkan_inline_bake` holds
+  the minted twin to the eager bake's byte for byte): one file of **1.92 GB** (1.10 GB trimmed)
+  where the planar image and its twin summed 3.03 GB.
+
+### From the AMX bf16 tile arc (2026-09-29, Granite Rapids `c8i.4xlarge` `i-02a87cabc8fcd2e4c`, 16 lanes)
+
+The race and the carriers are from one box and one mint: `daspkg release --root
+modules/dasLLAMA/benchmarks` with `DASLLAMA_CONFIRM_MODEL` on the 1B Q8_0 and no other
+environment override (noise probes cv 0.08 / 0.03 / 0.06 / 0.12 %, validation drift 1.89 %, 66
+kernels), the profile it exported in force. The token-block readings are from an earlier mint
+of the same day on the same box, the same winners on every family. The reference build is
+`HOW_TO_GET_SIDECAR.md` section 3's (`6c84c7d5d`, `clean-cpu`).
+
+- **The bf16 tile runs every family at the matrix unit's rate: 7.4-8.7 ms a tile, where the
+  best vector seat takes 20-48.** The mint's race (`harness/gen_tune_probe.das`,
+  `DAS_TUNE_MODE=tune`, `-jit`), one lane, one process, the arms interleaved, best of 8 rounds
+  (an arm screened out after 2), the 2048x8192x256 streaming fixture; the sidecar's `race`
+  rows, tile ms, the `amx_bf16` two-group arm against the best other arm (busd512 mr16; the
+  grid formats' `grid_vbmi`; q8's bias128): k4 7.44 vs 34.50, k5 7.98 vs 23.20, k6 7.42 vs
+  32.44, q40 7.43 vs 24.40, iq4xs 7.49 vs 36.72, iq4nl 7.46 vs 36.95, iq3s4 7.46 vs 37.53, k3
+  7.38 vs 47.91, iq3s 8.72 vs 36.80, iq3xxs 8.50 vs 36.32, k2 7.44 vs 45.29, iq2s 8.46 vs
+  39.58, iq2xs 8.18 vs 39.06, iq2xxs 8.16 vs 35.63, q8 7.43 vs 20.18. The mint crowns the bf16
+  arm on all fifteen families, and the q8 crown passed the end-to-end confirm. The int8 tile
+  (`amx_int8`) stores and folds its sum at every 32-weight block - the traffic the bf16 leg has
+  none of.
+- **End to end the minted exe holds 1.27-1.41x the reference build on the mainstream carriers,
+  5.9x and 21.5x on the two low-bit ones, tg ahead on all seven.** The released `lcpp_bench`
+  that mint built, `dasllama-bench.exe -m <gguf> -p 512 -n 16 -r 3 -t 16 --ref <llama-bench>
+  --ref-flavor clean-cpu --ref-no-affinity`; the rig runs the reference in its own process, so
+  each pair below is `direction-grade`. pp512 / tg16 tok/s, ours (the spread over 3 reps) vs the
+  reference: Llama-3.2-1B Q8_0 1971.7 +- 9.7 / 82.4 +- 0.3 vs 1394.7 / 78.3; Q4_K_M 1943.8 +-
+  9.4 / 108.0 +- 0.5 vs 1453.1 / 87.1; IQ4_XS 1954.0 +- 3.9 / 116.5 +- 0.8 vs 1501.1 / 85.1;
+  Q3_K_L 1932.1 +- 3.9 / 103.4 +- 0.4 vs 329.5 / 80.6; IQ3_M 1952.0 +- 10.4 / 115.1 +- 2.4 vs
+  90.6 / 53.4; Qwen3-4B Q4_K_M 491.1 +- 0.6 / 34.0 +- 0.1 vs 385.5 / 27.8; Qwen3-4B Q8_0 483.4
+  +- 1.4 / 25.0 +- 0.06 vs 374.5 / 22.3. The grid carrier (IQ3_M) sits level with the k4 one:
+  the gather-fed panel is not the bill.
+- **The fat exe takes the same leg.** `daspkg release --fat x86-avx2 --root
+  utils/dasllama-server` - the x86-avx2 baseline with the class clones beside it - picks the
+  `x86-amx` clone on this box: `dasllama-bench.exe -m <gguf> -p 512 -n 16 -r 3 -t 16` on the
+  Llama-3.2-1B Q4_K_M reads 1915.1 +- 6.9 pp512 and 107.7 +- 0.6 tg16 tok/s.
+- **The walk's token block: 512 holds end to end; per kernel the best block splits by K
+  length.** The kernel race, one process, one script, the candidates interleaved, 9 rounds
+  after 2 dropped, the job queue at its default width, `matmul_kq_batch` on k4 through the
+  `x64-gen` backend with the walk's floor set to 1 for the race, median ms (cv %): at n=2048 d=2048 ntok=2048 a block of
+  128 3.635 (1.5), 256 3.187 (2.7), 512 3.532 (1.5), 1024 3.965 (0.7), 2048 3.877 (0.3); at
+  n=8192 d=2048 ntok=2048 128 18.515 (0.5), 256 17.005 (0.5), 512 15.658 (0.4) - 512 is that
+  shape's L2 clamp. End to end (`lcpp_bench.das` as the `-jit` script, `--for-debug-purposes`,
+  `DAS_TUNE_MANIFEST` on the mint's sidecar with `runtime.q8_token_block` set, the floor at 1,
+  `-p 512 -n 16 -r 3 -t 16`; one process a reading, two alternated passes, `direction-grade`),
+  pp512 tok/s at 128 / 256 / 512: Llama-3.2-1B Q4_K_M 1724.8 +- 2.3 and 1730.2 +- 6.6 / 1921.3
+  +- 2.7 and 1944.4 +- 2.4 / 1963.3 +- 4.2 and 1968.4 +- 4.0; Q8_0 1732.2 +- 1.7 and 1724.7 +-
+  6.8 / 1949.3 +- 4.0 and 1930.4 +- 3.9 / 1970.2 +- 9.6 and 1979.4 +- 4.7. The per-shape block
+  is `followup_general.md` row 190.
+- **What the bf16 leg allocates.** The bf16 activation plane, once per batch call:
+  2 x (ntok x n + 32) bytes - 8,388,672 at ntok 512, n 8192 (the 1B's FFN down), 9,961,536 at
+  n 9728 (the 4B's). The panel, one per dispatch chunk: 2 x (form x 16 x n + 32) bytes - 524,352
+  and 622,656 a lane at form 2, 8,389,632 and 9,962,496 over 16 lanes. The row-dequant panel's
+  row buffer, off the emitted panels only: 4 x n bytes, 32,768 and 38,912.
+
+### From the AMX bf16 walk follow-up (2026-09-29, Granite Rapids `c8i.4xlarge` `i-02a87cabc8fcd2e4c`, 8 cores, 16 lanes)
+
+Every rate below is `benchmarks/lcpp_bench.das` as the `-jit` script with `--for-debug-purposes`
+under `-no-module-cache`, `DAS_TUNE_POLICY` unset, served on the `x64-gen` backend, one process
+a reading, the arms alternated; an arm is a copy of `dasllama/dasllama_math_gen.das` put in place
+before its process starts. Each pair compares across processes and is `direction-grade`.
+
+- **The bf16 walk's block in whole tiles under no L2 clamp: 1.065x the clamped arm's pp512 on
+  the 4B carriers, the 1B level.** The clamped arm is the walk of the AMX bf16 tile arc (the 512
+  floor under `effective_token_block`, 431 tokens at K 9728); the other is `bf16_token_block` -
+  512, a multiple of the 32-token tile. No environment override, the sidecar beside the script
+  in force (the box's mint), `-p 512 -n 16 -r 3 -t 16`, three alternated passes, pp512 tok/s
+  (the spread over 3 reps), clamped then whole-tile: Qwen3-4B Q4_K_M 486.94 +- 1.19, 486.23 +-
+  0.61, 488.05 +- 1.45 against 518.70 +- 1.37, 523.30 +- 0.51, 517.21 +- 0.42; Qwen3-4B Q8_0
+  491.48 +- 0.46, 494.14 +- 1.13, 492.13 +- 1.60 against 524.42 +- 0.79, 522.26 +- 0.85 (the
+  third pass, 511.75 +- 18.91, is past the 3% spread and void); Llama-3.2-1B Q4_K_M 1912.78 +-
+  1.69, 1905.51 +- 14.95, 1900.51 +- 3.15 against 1919.13 +- 6.08, 1916.96 +- 4.10, 1911.24 +-
+  9.05.
+- **The race that picked the block: 512 leads every block the L2 clamp would hand the walk.** Not
+  a rate of `lcpp_bench`: `DASLLAMA_ALLOW_UNTUNED=1 DAS_JOBQUE_THREADS=<lanes> bin/daslang -jit
+  -no-module-cache modules/dasLLAMA/harness/token_block_race.das` (the `x86-amx` class profile
+  stamps the kernels, no sidecar; `DAS_TUNE_POLICY` unset), k4 on the `x64-gen` backend at tile
+  form 2 and ntok 512, the candidates interleaved in one process, 11 rounds after 2 dropped, the
+  second of two passes a lane count; best ms (cv %), every arm's sampled output equal to the 512
+  arm's and the 512 arm's within the bf16 envelope of the disk-order dots. The clamp's 4 MB cuts
+  the block to 431 tokens at K 9728 - 416 in whole tiles - and to 256 at K 16384. K 9728 x 2560
+  rows, a block of 256 / 384 / 416 / 512: 4.839 (0.2) / 4.804 (1.5) / 4.828 (0.4) / 4.478 (0.5)
+  at 16 lanes, 5.323 (1.4) / 5.359 (1.1) / 5.299 (0.8) / 5.139 (0.5) at 8. K 16384 x 4096 rows,
+  256 / 384 / 512: 25.561 (0.1) / 25.630 (0.2) / 24.667 (0.1) at 16 lanes, 17.977 (0.8) /
+  18.950 (0.3) / 17.190 (0.2) at 8.
+- **What the walk scratch holds.** The panels, one allocation a calling context: stride x slots
+  + 64 bytes, the stride a panel rounded up to a cache line plus a line, the slots
+  `get_dispatch_slot_bound()` - 8 under this box's default job queue. A bf16 panel is form x 16
+  x n x 2 bytes, 524,288 at form 2 and n 8192 (the 1B's FFN down) and 622,592 at n 9728 (the
+  4B's), so the scratch at 8 slots is 4,194,880 and 4,981,312 bytes; a byte panel is mr x n
+  bytes, 4,096 at mr 8 and n 512. The q8
+  walk's bias sums, where the stamped plane carries a bias: 4 x ntok x n / 32 bytes, 524,288 and
+  622,592 at ntok 512. Each figure is its formula's value at the named shape
+  (`walk_panels`, `q8q8_bias_sums`, `kq_walk_panel_bytes` in `dasllama/dasllama_math_gen.das`).
+- **The walk scratch costs no rate and saves no bytes.** The arms are the walk that allocates a
+  panel per dispatch chunk (the file of master `640826d79`) and the walk on one scratch panel
+  per dispatch slot. `DASLLAMA_ALLOW_UNTUNED=1` (the `x86-amx` class profile stamps the kernels,
+  no sidecar), `-p 512 -n 16 -r 5 -t 16`, four passes a model in alternating order; pp512 tok/s (the spread
+  over 5 reps) and the process's peak resident set read by `/usr/bin/time -v` (`out-of-process`),
+  per-chunk then scratch. Llama-3.2-1B Q4_K_M: 1806.67 +- 11.73, 1856.04 +- 4.35, 1832.40 +-
+  9.71, 1804.75 +- 22.14 against 1865.93 +- 6.94, 1878.12 +- 16.26, 1834.13 +- 37.13 (one pass
+  void at 1798.04 +- 193.89); peak 1,976,720 / 1,976,804 / 1,976,868 kB (the box's first process
+  read 2,885,920) against 1,990,836 / 1,980,220 / 1,980,472 / 1,980,224. Llama-3.2-1B Q8_0:
+  1836.54 +- 2.94, 1837.14 +- 14.53, 1853.00 +- 10.72, 1860.91 +- 12.28 against 1909.45 +- 7.58,
+  1863.06 +- 13.23, 1838.20 +- 27.82, 1849.83 +- 24.48; peak 2,473,812-2,474,228 kB against
+  2,477,580-2,484,108. The scratch stays mapped where the per-chunk panels were freed - 3.4 to
+  14 MB more at the peak - and the rates sit inside the spread between two processes of one arm.
+- **One walk behind the cells reads the rate of the two it replaced.** The arms are the q8 and
+  superblock cells each with its own walk and the cells on `bf16_walk`; the flags and override
+  of the entry above, Llama-3.2-1B Q8_0, four passes in alternating order, pp512 tok/s, two walks
+  then one: 1901.34 +- 28.39, 1924.55 +- 14.96, 1913.96 +- 9.64, 1845.53 +- 48.54 against
+  1952.21 +- 6.37, 1859.75 +- 6.32, 1887.56 +- 22.77, 1900.56 +- 7.18.
+
+### The CPU self-speculation entry (2026-09-29, Apple M5 Max, 18 lanes, decode on the 6 fast ones)
+
+Every pair below is one process of `benchmarks/lcpp_bench.das` as the `-jit` script, master
+`640826d79`: `lcpp_bench.das -- -m <gguf> --ngl 0 --mtp-ab --chat-prompts --prompts
+modules/dasLLAMA/benchmarks/data/specbench4_prompts.txt --for-debug-purposes` (`--ngl 99` for
+the Metal pair), `DAS_TUNE_POLICY` unset, `DASLLAMA_ALLOW_UNTUNED=1` (the `arm-i8mm` class
+profile stamps the kernels, no sidecar), depth 1, served on the `arm64-gen` backend (`portable`
+under Metal). The off and on arms run in that one process; tg-real128 tok/s (the spread over 5
+reps, 4 prompts), off then on, with the drafts accepted.
+
+- **Self-speculation on the CPU loses on every carrier; on Metal it gains.** CPU:
+  Qwen3.5-0.8B-MTP Q8_0 189.56 +- 3.13 / 139.41 +- 3.71 (on is 0.74x off), 1005 of 1560;
+  Qwen3.5-4B-MTP Q8_0 52.17 +- 1.15 / 45.65 +- 0.53 (0.88x), 1110 of 1455; Qwen3.5-9B-MTP Q8_0
+  29.66 +- 0.50 / 26.50 +- 0.49 (0.89x), 1100 of 1470; Ornith-1.5-35B-A3B Q4_K_M 58.75 +- 1.05 /
+  40.44 +- 0.74 (0.69x), 1095 of 1475. Metal: Ornith-1.5-35B-A3B Q4_K_M 132.53 +- 1.69 / 143.37
+  +- 0.85 (on is 1.08x off), 1080 of 1470. The server's default arms the round on a one-stream
+  GPU slot and leaves it off on the CPU.
+
+### From the AMX short-batch arc (2026-09-30, Granite Rapids `c8i.4xlarge` `i-02a87cabc8fcd2e4c`, 8 cores, 8 lanes)
+
+The race: `DASLLAMA_ALLOW_UNTUNED=1 DAS_JOBQUE_THREADS=8 bin/daslang -jit -no-module-cache
+modules/dasLLAMA/harness/tile4_race.das` at commit `60beeec07` (the `x86-amx` class profile stamps
+the kernels, no sidecar; `DAS_TUNE_POLICY` unset), one process a run, two runs. A four-token step
+over 1536 MB of q8 planes a shape, walked plane after plane so every weight group streams from
+DRAM; every arm timed once a round in turn, 31 rounds after 3 dropped. An arm is the stamped
+GEMV a token, the stamped tile4, or the vector tile at a kstep (`k`), nrsplit (`n`) and prefetch
+distance in bytes (`pf`); each figure is the median ms of a pass over all the planes (cv %), run a
+/ run b. Every tile arm's output is bit for bit the GEMV arm's, the stamped tile4's the `k4 n4
+pf2048` arm's.
+
+- **The tile4's shape - kstep 4, nrsplit 4, a 2048-byte prefetch - leads every candidate on
+  every shape, 1.45x to 1.58x the GEMV a token.**
+  K 1536 x 6144 rows, 170 planes: gemv a token 28.57 (1.4) / 28.46 (1.1); tile4 (stamped) 19.70
+  (1.8) / 19.58 (1.2); k1 n4 pf0 24.01 (2.5) / 23.93 (2.0); k2 n2 pf0 25.07 (1.9) / 25.08 (1.9);
+  k2 n4 pf0 24.54 (2.0) / 24.48 (2.3); k4 n4 pf0 21.68 (1.9) / 21.68 (2.2); k2 n4 pf1024 21.39
+  (1.8) / 21.43 (2.0); k2 n4 pf2048 20.19 (1.7) / 20.32 (1.4); k2 n4 pf4096 20.12 (1.6) / 20.13
+  (1.2); k1 n4 pf2048 20.20 (1.8) / 20.11 (1.8); k2 n2 pf2048 22.11 (1.2) / 21.94 (1.0); k4 n4
+  pf2048 19.59 (1.4) / 19.54 (1.1); k4 n4 pf4096 19.76 (1.4) / 19.74 (1.2).
+  K 6144 x 1536 rows, 170 planes: gemv a token 28.42 (1.4) / 28.42 (1.1); tile4 (stamped) 19.66
+  (1.2) / 19.66 (1.1); k1 n4 pf0 24.21 (2.3) / 24.38 (1.9); k2 n2 pf0 25.86 (2.0) / 25.76 (2.0);
+  k2 n4 pf0 24.91 (3.2) / 24.70 (2.7); k4 n4 pf0 22.42 (2.7) / 22.23 (1.9); k2 n4 pf1024 22.73
+  (5.3) / 21.84 (4.8), past the 3% spread and void; k2 n4 pf2048 20.52 (2.4) / 20.52 (1.7); k2 n4
+  pf4096 20.45 (2.0) / 20.55 (1.6); k1 n4 pf2048 20.56 (1.7) / 20.51 (1.6); k2 n2 pf2048 22.53
+  (1.2) / 22.54 (1.2); k4 n4 pf2048 19.64 (1.3) / 19.60 (1.2); k4 n4 pf4096 20.07 (1.4) / 20.05
+  (1.5).
+  K 2560 x 9728 rows, 64 planes: gemv a token 29.37 (1.5) / 29.71 (1.3); tile4 (stamped) 18.70
+  (1.1) / 18.95 (1.0); k1 n4 pf0 23.51 (2.4) / 23.91 (2.0); k2 n2 pf0 24.61 (2.4) / 25.10 (2.1);
+  k2 n4 pf0 24.00 (2.8) / 24.16 (3.2); k4 n4 pf0 21.47 (2.2) / 21.77 (2.7); k2 n4 pf1024 20.76
+  (3.9) / 21.60 (4.9), void; k2 n4 pf2048 19.61 (1.6) / 19.59 (1.5); k2 n4 pf4096 19.71 (1.5) /
+  19.73 (1.5); k1 n4 pf2048 19.48 (1.5) / 19.59 (1.3); k2 n2 pf2048 21.36 (1.1) / 21.52 (1.0); k4
+  n4 pf2048 18.68 (1.1) / 18.89 (0.9); k4 n4 pf4096 19.09 (1.4) / 19.42 (1.6).
+  K 9728 x 2560 rows, 64 planes: gemv a token 29.57 (1.9) / 29.16 (1.6); tile4 (stamped) 18.71
+  (1.2) / 18.55 (1.2); k1 n4 pf0 23.76 (2.6) / 23.60 (2.1); k2 n2 pf0 25.21 (2.5) / 25.09 (2.1);
+  k2 n4 pf0 24.30 (2.6) / 24.09 (2.2); k4 n4 pf0 21.77 (2.4) / 21.47 (2.4); k2 n4 pf1024 21.32
+  (5.5) / 20.76 (5.4), void; k2 n4 pf2048 19.52 (1.8) / 19.39 (2.0); k2 n4 pf4096 19.67 (1.6) /
+  19.52 (1.7); k1 n4 pf2048 19.39 (1.3) / 19.31 (1.6); k2 n2 pf2048 21.63 (1.2) / 21.62 (1.1); k4
+  n4 pf2048 18.66 (0.8) / 18.54 (1.0); k4 n4 pf4096 18.98 (1.5) / 18.95 (1.4).
+  The prefetch is worth 1.11x to 1.17x at kstep 4 (the `k4 n4 pf0` arm against `k4 n4 pf2048`),
+  and that tile with no prefetch is already 1.27x to 1.37x the GEMV a token.
+
+The served turn: `benchmarks/lcpp_bench.das` as the `-jit` script under `-no-module-cache`,
+`lcpp_bench.das -- -m <gguf> -p 64 -n 128 -r 3 --npl 4 -t 8 --for-debug-purposes`,
+`DAS_TUNE_POLICY` unset, the box's sidecar beside the script (its mint at master `202427bd2`),
+served on the `x64-gen` backend, one process a reading, `.jitted_scripts` removed before each
+process. An arm is the tree's `dasllama/` sources put in place before its process starts, and
+the tile4 of these readings is the `k2 n4 pf2048` arm of the race - they were taken before it.
+Each pair compares across processes and is `direction-grade`; rates are tok/s (the spread over 3
+reps), tg128@4 summed over the 4 streams. The released reading of the landed shape is the
+board's (`performance/records/gnr.json`).
+
+- **A batch shorter than the amx tile's 32 tokens on the 4-token vector tile: 1.35x master's
+  tg128@4 on gemma-4-E2B Q8_0, tg128 unmoved.** Master walks such a batch one GEMV pass a token
+  (`bf16_walk` runs no tile below the token step); the arm hands it to the stamped perm's
+  `tile4` companion, with no activation plane and no panel built. Master then the arm, tg128@4 /
+  tg128: gemma-4-E2B Q8_0 76.46 +- 0.41 / 32.50 +- 0.38 against 103.05 +- 0.56 / 32.24 +- 0.40
+  (a second master process read 81.36 +- 0.37 / 32.80 +- 0.04); Qwen3VL-4B Q8_0 49.91 +- 0.09 /
+  18.97 +- 0.21 against 65.32 +- 0.42 / 19.30 +- 0.03; Qwen2.5-Omni-3B Q8_0 65.45 +- 0.34 /
+  24.93 +- 0.34 against 86.08 +- 0.29 / 24.89 +- 0.19; gemma-4-E4B Q8_0 41.98 +- 0.43 / 16.22 +-
+  0.07 against 55.27 +- 0.05 / 16.20 +- 0.04.
+- **In the served turn the prefetch is most of the gain.** The arms are `tile4_perm`'s three
+  constants edited in `dasllama/dasllama_gemm_gen.das`, gemma-4-E2B Q8_0, tg128@4 at kstep /
+  nrsplit / prefetch distance: 2 / 4 / 0 80.35 +- 0.40; 1 / 4 / 0 74.32 +- 0.12; 2 / 2 / 0 78.73
+  +- 0.22; 4 / 4 / 0 83.73 +- 1.26; 2 / 4 / 2048 101.87 +- 0.88; 2 / 4 / 4096 103.63 +- 0.32.
+  With no prefetch the vector tile reads master's rate here, where the race's planes give it
+  1.27x and more: a whole step streams every layer's groups, and four dots a line leave too few
+  lines in flight.
+- **The batch below the tile step skipping the bf16 walk reads 1.14x the walk's tile4 tail.**
+  The arms are the kernels with the `below_amx_step` test forced false at its two q8 sites (the
+  batch takes `bf16_walk`, whose tail below a tile runs `tile4`, after the activation plane and
+  the panel scratch are built for nothing) and the kernels as they are, gemma-4-E2B Q8_0,
+  tg128@4: 90.94 +- 0.19 against 103.99 +- 0.87. The predicate is structural - a batch below the
+  step runs no tile, so the plane and the panel are dead work - and this pair is its reading,
+  taken in two processes.
+- **The superblock families gain less: their step is less bound by the weight stream.** Master,
+  then the `tile4` with no prefetch in the superblock block emitters, then with the packed
+  planes' prefetch, tg128@4: gemma-4-12B Q4_K_M 22.30 +- 0.13 / 22.51 +- 0.13 / 23.33 +- 0.03;
+  Qwen3.8-27B IQ4_XS 8.64 +- 0.02 / 9.71 +- 0.01 / 10.29 +- 0.02. Qwen3-30B-A3B Q4_K_M read
+  40.15 +- 0.71 on the no-prefetch arm; its master reading, 37.90 +- 2.09, is past the 3% spread
+  and void.
+- **Refuted: an `amx_bf16` perm over the bias-128 plane.** The vnni512 class's bias-128 `vpdpbusd`
+  lattice reads ahead of the amx class's at tg128@4, so the arm stamped the amx perm with
+  `bias=128` (the panel un-biasing the plane, the GEMV and `tile4` riding the biased lattice).
+  gemma-4-E2B Q8_0, two alternated passes, unbiased then biased, tg128@4 / tg128: 103.08 +- 0.59
+  / 31.53 +- 0.13 and 103.26 +- 0.69 / 32.16 +- 0.33 against 98.00 +- 0.40 / 29.97 +- 0.20 and
+  99.02 +- 0.50 / 30.29 +- 0.48 - the biased arm is 0.95x on both legs. `.jitted_scripts` was
+  kept across these four processes; the perm's `bias` argument keys the biased arm's kernels
+  apart.

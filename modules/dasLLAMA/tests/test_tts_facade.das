@@ -11,7 +11,7 @@ require dasllama/dasllama_kitten   // kitten_token_ids: the symbol table's drop 
 require dasllama/dasllama_styletts2   // the voices table: a hand-built model whose pack names no language; the source's stream
 require dasllama/dasllama_tts_blocks   // TtsRng, TtsLinear, SineSourceCfg: the source's noise stream held to its own layout
 require dasllama/dasllama_unicode   // the chunker counts codepoints, so the cells do too
-require dasllama/dasllama_math   // setup_dasllama_jobque_ + the batch lane cap
+require dasllama/dasllama_math   // with_dasllama_jobque_ + the batch lane cap
 require daslib/jobque_boost
 require daslib/defer
 require daslib/fio
@@ -20,6 +20,7 @@ require daslib/strings_boost
 require math
 require _model_tier
 require _tts_corpus   // the 200-sentence front-end fixture: the phonemes arm E was scored against
+require _tts_oracle   // captured_noise: the source's noise stream in the reference's draw order
 
 // The TTS facade above the families. Model-free: the sentence chunker (the reference driver's
 // boundary rule - abbreviations, decimals, a.m./p.m. - the 400-CODEPOINT cap, the hard split of
@@ -243,8 +244,7 @@ def test_facade_phonemizer(t : T?) {
     t |> run("the facade phonemizes into the front end's own inventory, on the corpus rail") @(t : T?) {
         let gguf = path_join(models_dir(), "kitten-nano.gguf")
         return if (tts_data_missing(t, gguf, false))
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             var inscope m <- load_tts_model(gguf)
             var inscope rows <- load_tts_corpus()
             var seen = 0
@@ -260,8 +260,7 @@ def test_facade_phonemizer(t : T?) {
     t |> run("the language form answers for a language the model declares and panics for one it does not") @(t : T?) {
         let gguf = path_join(models_dir(), "kitten-nano.gguf")
         return if (tts_data_missing(t, gguf, false))
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             var inscope m <- load_tts_model(gguf)
             var inscope c <- caps(m)
             var inscope rows <- load_tts_corpus()
@@ -293,8 +292,7 @@ def test_chunker_model_rule(t : T?) {
     t |> run("a Kitten model's chunks gain the driver's comma") @(t : T?) {
         let gguf = path_join(models_dir(), "kitten-nano.gguf")
         return if (tts_data_missing(t, gguf, false))
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             var inscope m <- load_tts_model(gguf)
             var inscope bare <- tts_chunks(m, "hello how are you")
             t |> equal(length(bare), 1)
@@ -312,8 +310,7 @@ def test_streaming(t : T?) {
     t |> run("chunks concatenate to the buffered synthesis, at a different worker count") @(t : T?) {
         let gguf = path_join(models_dir(), "kitten-nano.gguf")
         return if (tts_data_missing(t, gguf, false))
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             let cap0 = get_batch_lane_cap()
             defer() {
                 set_batch_lane_cap(cap0)
@@ -386,23 +383,6 @@ def test_chunk_cap_knob(t : T?) {
     }
 }
 
-// the source's noise is one stream the reference draws in one order - the harmonics' initial
-// phases, then the normals row by row - split between styletts2_draw_noise and the source
-def private captured_stream(cfg : SineSourceCfg; n : int64; seed : uint64) : TtsNoise {
-    var r = TtsRng()
-    rng_seed(r, seed)
-    var inscope noise = TtsNoise(captured = true)
-    noise.uniform |> resize(cfg.n_harm)
-    for (h in range64(cfg.n_harm)) {
-        noise.uniform[h] = rng_uniform(r)
-    }
-    noise.normal |> resize(n * cfg.n_harm)
-    for (i in range64(n * cfg.n_harm)) {
-        noise.normal[i] = rng_normal(r)
-    }
-    return <- noise
-}
-
 def private source_from(d : St2Decoder; cfg : SineSourceCfg; f0 : array<float>; frames : int64; noise : TtsNoise; seed : uint64;
                         var har : array<float>; var sc : St2Scratch) {
     styletts2_source(d, cfg, f0, frames, noise, seed, har, sc)
@@ -443,7 +423,7 @@ def test_source_stream_contract(t : T?) {
             f0[i] = i % 13l == 0l ? 0.0 : 120.0 + 200.0 * rng_uniform(r)
         }
         let seed = 77ul
-        var inscope captured <- captured_stream(cfg, n, seed)
+        var inscope captured <- captured_noise(cfg.n_harm, n, seed)
         var inscope sc_c = St2Scratch()
         var inscope har_c : array<float>
         source_from(d, cfg, f0, frames, captured, 0ul, har_c, sc_c)
@@ -489,8 +469,7 @@ def test_release_and_cap_on_a_model(t : T?) {
     t |> run("the release empties the carrier and the next synthesis speaks the same samples; a cap makes more chunks") @(t : T?) {
         let gguf = path_join(models_dir(), "kitten-nano.gguf")
         return if (tts_data_missing(t, gguf, false))
-        with_job_que() {
-            setup_dasllama_jobque_()
+        with_dasllama_jobque_() {
             // the source window is process state: the cell establishes the default it claims against and puts back what it found
             let win0 = styletts2_source_window()
             defer() {

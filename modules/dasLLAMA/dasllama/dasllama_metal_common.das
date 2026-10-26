@@ -232,6 +232,7 @@ var g_pso_moe_wscale : MetalComputePipeline?   // gemma4 per-expert down-scale f
 var g_pso_swiglu_oai : MetalComputePipeline?   // gpt-oss clamped swiglu (stage 4)
 var g_pso_moe_gemv_mx4 : MetalComputePipeline?  // gpt-oss MXFP4 expert GEMV
 var g_pso_moe_gemv_q51 : MetalComputePipeline?  // Q5_1 expert GEMV (per-32 planes)
+var g_pso_moe_gemv_iq4nl32 : MetalComputePipeline?  // IQ4_NL per-32 expert GEMV
 var g_mx4_vtab : MetalBuffer?                   // [16] signed doubled-e2m1 values
 var g_pso_dn_conv : MetalComputePipeline?      // deltanet (Wave D): causal conv + SiLU
 var g_pso_dn_hist : MetalComputePipeline?      // conv-history advance
@@ -283,8 +284,18 @@ var g_pso_pk_gemv_q8_add_silu : MetalComputePipeline?
 var g_pso_pk_gemv_q8_tail : MetalComputePipeline?
 var g_pso_dn_l2 : MetalComputePipeline?        // q/k per-head L2 norm + q pre-scale
 var g_pso_dn_scan : MetalComputePipeline?      // the fused sequential delta rule
+var g_pso_dn_scan_h : MetalComputePipeline?    // its stamp over half rows and prepared gates
+var g_pso_dn_prep : MetalComputePipeline?      // the gates' prepare pass
 var g_pso_dn_gate : MetalComputePipeline?      // z-gated out-norm
+var g_pso_dn_gate_sig : MetalComputePipeline?  // ... its σ(z) twin (qwen4exp)
 var g_pso_dn_deint : MetalComputePipeline?     // 2x-wide [q|gate] deinterleave
+var g_pso_hc_norm : MetalComputePipeline?      // hyper-connections: the grouped stream norm
+var g_pso_hc_lo : MetalComputePipeline?        // ... silu(lo / hc) on the low-rank row
+var g_pso_hc_init : MetalComputePipeline?      // ... the wide residual rows as hc copies of the embed rows
+var g_pso_hc_mix : MetalComputePipeline?       // ... the sigmoid-gated stream mean
+var g_pso_hc_combine : MetalComputePipeline?   // ... the scatter of a block output into the streams
+var g_pso_ple_gate : MetalComputePipeline?     // the n-gram side input's per-stream gate + conv-input row
+var g_pso_ple_conv : MetalComputePipeline?     // ... its dilated causal conv + residual add
 var g_pso_sigmul : MetalComputePipeline?       // x ⊙ σ(g) — the gated-attention out-gate
 var g_pso_axpy_sig : MetalComputePipeline?     // y += x ⊙ σ(g[row]) — the shexp combine (stage 3)
 var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
@@ -597,6 +608,19 @@ def zero_rows(var buf : MetalBuffer?; from, to, width : int64) {
 def upload_rows_padded(var buf : MetalBuffer?; src : void?; rows, mp, width : int64) {
     unsafe(memcpy(metal_buffer_contents(buf), src, rows * width * 4l))
     zero_rows(buf, rows, mp, width)
+}
+
+//! `rows` rows of `width` floats from `src` laid in `buf` at the row stride `stride`, each row's tail past `width` zeroed.
+def upload_rows_strided(var buf : MetalBuffer?; src : float const?; rows, width, stride : int64) {
+    unsafe {
+        var dp = reinterpret<float?>(metal_buffer_contents(buf))
+        for (r in range64(rows)) {
+            memcpy(dp + r * stride, src + r * width, width * 4l)
+            for (k in range64(width, stride)) {
+                dp[r * stride + k] = 0.0
+            }
+        }
+    }
 }
 
 //! One mirror row of layer `l` - K and V - copied from the arena back into the session's CPU KV.
@@ -1023,14 +1047,24 @@ def kq_scales_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tupl
     var kq : array<uint8> const?
     var ks : array<uint8> const?
     kq_planes_of(t, fmt, kq, ks)
+    let plane_sb = long_length(*ks) / (16l + kq_scale_d_tail(fmt))
+    return (buf = plane_buffer(dev, unsafe(addr<void?>((*ks)[0])), uint64(long_length(*ks)), t.image_map != null),
+            soff = uint64(sb0 * 16l),
+            doff = uint64(kq_scale_doff(fmt, plane_sb, sb0)))
+}
+
+//! A superblock's packed d-tail bytes in a kq format's split scale plane: 0 for the compact formats (k4/k5/q40/iq4nl -
+//! one 16B block, no tail), 4 for k2 (d and dmin), 2 for every other format.
+def private kq_scale_d_tail(fmt : KqFmt) : int64 {
     let compact = fmt == KqFmt.k4 || fmt == KqFmt.k5 || fmt == KqFmt.q40 || fmt == KqFmt.iq4nl
-    let tail = compact ? 0l : (fmt == KqFmt.k2 ? 4l : 2l)
-    unsafe {
-        let plane_sb = long_length(*ks) / (16l + tail)
-        return (buf = plane_buffer(dev, addr<void?>((*ks)[0]), uint64(long_length(*ks)), t.image_map != null),
-                soff = uint64(sb0 * 16l),
-                doff = compact ? 0ul : uint64(plane_sb * 16l + sb0 * tail))
-    }
+    return compact ? 0l : (fmt == KqFmt.k2 ? 4l : 2l)
+}
+
+//! The d-tail bind offset of superblock `sb0` in a split scale plane of `nsb_total` superblocks - 0 for the compact formats.
+[arch(at = "../ARCHITECTURE_GPU_QUANT_PLANES.md#metal-kq-split-scale-plane")]
+def kq_scale_doff(fmt : KqFmt; nsb_total, sb0 : int64) : int64 {
+    let tail = kq_scale_d_tail(fmt)
+    return tail == 0l ? 0l : nsb_total * 16l + sb0 * tail
 }
 
 //! One q51 tensor's plane pair bind: quant plane (20B/block, uint-viewable) at (off/32)*20 and
@@ -1044,6 +1078,19 @@ def q51_planes_of(dev : MetalDevice?; t : Model; off : int64) : tuple<qbuf : Met
                 qoff = uint64(b0 * 20l),
                 sbuf = plane_buffer(dev, addr < void? >(t.q51s[0]), uint64(long_length(t.q51s)), t.image_map != null),
                 soff = uint64(b0 * 4l))
+    }
+}
+
+//! One iq4nl32 tensor's plane pair bind: nibble plane (16B/block, uint-viewable) at (off/32)*16 and
+//! the f16 d plane at (off/32)*2 — verbatim disk splits, never rebaked. off % 256 keeps both binds 16B-aligned.
+def iq4nl32_planes_of(dev : MetalDevice?; t : Model; off : int64) : tuple<qbuf : MetalBuffer?; qoff : uint64; sbuf : MetalBuffer?; soff : uint64> {
+    assert(t.metal_blob)
+    let b0 = off / 32l
+    unsafe {
+        return (qbuf = plane_buffer(dev, addr < void? >(t.iq4nl32q[0]), uint64(long_length(t.iq4nl32q)), t.image_map != null),
+                qoff = uint64(b0 * IQ4NL32_QB),
+                sbuf = plane_buffer(dev, addr < void? >(t.iq4nl32s[0]), uint64(long_length(t.iq4nl32s)), t.image_map != null),
+                soff = uint64(b0 * IQ4NL32_SB))
     }
 }
 
@@ -1318,13 +1365,17 @@ def dn_mirror_release(mr : DnMirror) {
     }
 }
 
-def dn_mirror_prepare(var s : Session; pos : int64; regions : int64) : tuple<ok : bool; buf : MetalBuffer?; state_off : uint64; conv_off : uint64; state_alt : uint64; conv_alt : uint64> {
+//! A region is [state planes][conv planes]; the n-gram PLE conv ring sits ONCE past every region - it rides
+//! the recurrent mirror because it is the same kind of state (forward-only, per session, synced from the CPU
+//! prefix), but the verify's shadow flip must never retire it: its rows land only for committed positions
+def dn_mirror_prepare(var s : Session; pos : int64; regions : int64) : tuple<ok : bool; buf : MetalBuffer?; state_off : uint64; conv_off : uint64; state_alt : uint64; conv_alt : uint64; ple_off : uint64> {
     let sbytes = uint64(long_length(s.dn_state)) * 4ul
     let cbytes = uint64(long_length(s.dn_conv_state)) * 4ul
+    let pbytes = uint64(long_length(s.ple_conv_hist)) * 4ul
     let rb = sbytes + cbytes
-    let total = rb * uint64(regions)
+    let total = rb * uint64(regions) + pbytes
     if (sbytes == 0ul) {
-        return (ok = false, buf = null, state_off = 0ul, conv_off = 0ul, state_alt = 0ul, conv_alt = 0ul)
+        return (ok = false, buf = null, state_off = 0ul, conv_off = 0ul, state_alt = 0ul, conv_alt = 0ul, ple_off = 0ul)
     }
     if (key_exists(g_dn_mirrors, s.uid) && g_dn_mirrors[s.uid].bytes != total) {
         dn_mirror_release(g_dn_mirrors[s.uid])
@@ -1333,7 +1384,7 @@ def dn_mirror_prepare(var s : Session; pos : int64; regions : int64) : tuple<ok 
     let have = key_exists(g_dn_mirrors, s.uid)
     let cpu_prefix = s.dn_pos == pos
     if (!have && pos != 0l && !cpu_prefix) {
-        return (ok = false, buf = null, state_off = 0ul, conv_off = 0ul, state_alt = 0ul, conv_alt = 0ul)
+        return (ok = false, buf = null, state_off = 0ul, conv_off = 0ul, state_alt = 0ul, conv_alt = 0ul, ple_off = 0ul)
     }
     if (!have) {
         while (long_length(g_dn_mirrors) >= g_dn_mirrors_max) {
@@ -1354,13 +1405,16 @@ def dn_mirror_prepare(var s : Session; pos : int64; regions : int64) : tuple<ok 
         g_dn_mirrors[s.uid].pos = 0l
     } elif (g_dn_mirrors[s.uid].pos != pos) {
         if (!cpu_prefix) {
-            return (ok = false, buf = null, state_off = 0ul, conv_off = 0ul, state_alt = 0ul, conv_alt = 0ul)
+            return (ok = false, buf = null, state_off = 0ul, conv_off = 0ul, state_alt = 0ul, conv_alt = 0ul, ple_off = 0ul)
         }
         // the CPU ran positions [0, pos) — its state is the source of truth; sync it into region 0
         unsafe {
             var dst = reinterpret<uint8?>(metal_buffer_contents(g_dn_mirrors[s.uid].buf))
             memcpy(reinterpret<void?>(dst), addr<void?>(s.dn_state[0]), sbytes)
             memcpy(reinterpret<void?>(dst + sbytes), addr<void?>(s.dn_conv_state[0]), cbytes)
+            if (pbytes > 0ul) {
+                memcpy(reinterpret<void?>(dst + rb * uint64(regions)), addr<void?>(s.ple_conv_hist[0]), pbytes)
+            }
         }
         g_dn_mirrors[s.uid].cur = 0l
         g_dn_mirrors[s.uid].pos = pos
@@ -1371,7 +1425,37 @@ def dn_mirror_prepare(var s : Session; pos : int64; regions : int64) : tuple<ok 
     let base = uint64(mr.cur) * mr.region_bytes
     let alt = mr.regions == 2l ? uint64(mr.cur ^ 1l) * mr.region_bytes : base
     return (ok = true, buf = mr.buf, state_off = base, conv_off = base + mr.conv_off,
-        state_alt = alt, conv_alt = alt + mr.conv_off)
+        state_alt = alt, conv_alt = alt + mr.conv_off, ple_off = mr.region_bytes * uint64(mr.regions))
+}
+
+//! the mirror's live region into the session's host arrays, `dn_pos` the mirror's position: the host
+//! copy is what a snapshot reads, and the Metal drivers leave it where the session started
+def private dn_mirror_to_host(var s : Session) {
+    if (!key_exists(g_dn_mirrors, s.uid)) {
+        return
+    }
+    let mr = g_dn_mirrors[s.uid]
+    if (mr.pos < 0l || mr.pos == s.dn_pos) {
+        return
+    }
+    let sbytes = uint64(long_length(s.dn_state)) * 4ul
+    let cbytes = uint64(long_length(s.dn_conv_state)) * 4ul
+    let pbytes = uint64(long_length(s.ple_conv_hist)) * 4ul
+    unsafe {
+        let src = reinterpret<uint8?>(metal_buffer_contents(mr.buf))
+        let base = uint64(mr.cur) * mr.region_bytes
+        memcpy(addr<void?>(s.dn_state[0]), reinterpret<void?>(src + base), sbytes)
+        memcpy(addr<void?>(s.dn_conv_state[0]), reinterpret<void?>(src + base + mr.conv_off), cbytes)
+        if (pbytes > 0ul) {
+            memcpy(addr<void?>(s.ple_conv_hist[0]), reinterpret<void?>(src + mr.region_bytes * uint64(mr.regions)), pbytes)
+        }
+    }
+    s.dn_pos = mr.pos
+}
+
+[init]
+def private dn_mirror_host_sync_register {
+    register_dn_host_sync(@@dn_mirror_to_host)
 }
 
 // the step served and its command buffer completed — the GPU state now holds position pos's update
@@ -1810,10 +1894,46 @@ def graph_flush_sched(enc : MetalComputeEncoder?) {
     graph_flush(enc, g_gr_scheds[h].order)
 }
 
+var private g_kprof_on = false
+var private @scratch g_kprof_ms : table<string; double>
+
+//! Time every captured dispatch alone (or stop): a flush then commits and waits a command buffer
+//! a node, so a kernel's GPU time reads on the rows the run really computes. The sum runs over
+//! the window's own GPU time, since dispatches that overlap in one encoder no longer do.
+def public metal_kernel_profile(on : bool) {
+    g_kprof_on = on
+    g_kprof_ms |> clear()
+}
+
+//! GPU ms since `metal_kernel_profile(true)`, by MSL entry name and dispatch grid - one kernel's
+//! sites of different shapes read apart.
+def public metal_kernel_profile_ms() : table<string; double> {
+    return <- clone_to_move(g_kprof_ms)
+}
+
+//! one captured node in a command buffer of its own on the driver's queue, committed and waited
+[cold_path]   // the profile replay only - a serving flush never reaches it
+def private gr_profile_node(n : KNode) {
+    var err = ""
+    var gpu_ms = 0.0lf
+    with_compute_encoder_timed(g_queue, err, gpu_ms) $(enc : MetalComputeEncoder?) {
+        gr_encode_node(enc, n)
+    }
+    let name = g_kcov_names?[intptr(n.pso)] ?? "pso"
+    g_kprof_ms["{name} {int(n.grid.x)}x{int(n.grid.y)}x{int(n.grid.z)}"] += gpu_ms
+}
+
 //! Replay the captured step graph onto `enc` in `order` (empty = capture order), the hz oracle
 //! deriving barriers per step — a schedule permutation can only change speed, never correctness.
 def graph_flush(enc : MetalComputeEncoder?; order : array<int>) {
     g_gr_on = false
+    if (g_kprof_on) {
+        //! capture order: every node waits for the one before it, so the order is any valid one
+        for (i in range(length(g_gr_nodes))) {   // nolint:PERF018 — no for-in lock, as below
+            gr_profile_node(g_gr_nodes[i])
+        }
+        return
+    }
     hz_arm(true)
     // index loops, not for-in: a strict-mode panic must be able to unwind without leaving the
     // node array LOCKED (a recovered test would then die on the next gr_arm's clear)
@@ -2170,6 +2290,24 @@ var private g_reload_preps : array<function<void>>
 //! shared quiesce+release so an in-flight speculative cb never sees released regions.
 def register_reload_prep(f : function<void>) {
     g_reload_preps |> push(f)
+}
+
+//! A Metal driver served a forward: the pool takes the GPU-served spin window, where it stays until
+//! the next weights load. Workers spinning the CPU window through a GPU window burn a core each.
+[arch(at="../ARCHITECTURE_RUNTIME.md#browser-workers-spin")]
+def metal_note_served {
+    if (!get_dispatch_gpu_served()) {
+        set_dispatch_gpu_served(true)
+    }
+}
+
+def private metal_spin_window_reset {
+    set_dispatch_gpu_served(false)
+}
+
+[init]
+def private metal_spin_window_register {
+    register_reload_prep(@@metal_spin_window_reset)
 }
 
 [init]

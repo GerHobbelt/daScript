@@ -268,19 +268,6 @@ if(DAS_LLVM_DISABLED)
     return()
 endif()
 
-# JIT-linked util.exe pulls in libDaScriptDyn_runtime.so. When daslang is built
-# with -fsanitize=*, the .so references sanitizer runtime helpers that the JIT
-# link cmd (c++ without -fsanitize) can't satisfy. Forward the flag via
-# --jit-linker-string so daslang's link cmd resolves the right runtime.
-set(DAS_JIT_LINKER_STRING "")
-if(DAS_USE_SANITIZER STREQUAL "address" OR DAS_USE_SANITIZER STREQUAL "asan")
-    set(DAS_JIT_LINKER_STRING "--jit-linker-string=-fsanitize=address")
-elseif(DAS_USE_SANITIZER STREQUAL "undefined" OR DAS_USE_SANITIZER STREQUAL "ubsan")
-    set(DAS_JIT_LINKER_STRING "--jit-linker-string=-fsanitize=undefined")
-elseif(DAS_USE_SANITIZER STREQUAL "thread" OR DAS_USE_SANITIZER STREQUAL "tsan")
-    set(DAS_JIT_LINKER_STRING "--jit-linker-string=-fsanitize=thread")
-endif()
-
 # Entries are paths relative to utils/; the exe/target name is the basename.
 # mcp/lsp never build as exe: their development runs interpreted under a supervisor
 # (the watchdog's --stdio and --lsp fronts), so an exe form would never be dogfooded.
@@ -397,7 +384,7 @@ add_custom_target(jit_cache_all_tests
     COMMAND ${UTIL_BIN_DIR}/jit.exe ${PROJECT_SOURCE_DIR}/tests --parallel 0 $<IF:$<CONFIG:Debug>,--jit-opt-level=0,--jit-opt-level=3> --exclude gc --exclude dasHV --exclude dasPUGIXML --exclude dasSQLITE --exclude sql_conformance --exclude stbimage --exclude dasGLTF --exclude live_host --exclude audio --exclude strudel --exclude strudel_device --exclude minfft
     DEPENDS jit_exe
     WORKING_DIRECTORY ${UTIL_BIN_DIR}
-    COMMENT "JIT-compiling tests/ into the .jitted_scripts cache"
+    COMMENT "JIT-compiling tests/ into the .cache/daslang folder"
 )
 
 SET(DAS_UTILS_TO_TEST

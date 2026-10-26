@@ -89,10 +89,12 @@ def private arm_rig(c : CommonArgs; cfg : CliConfig; sampler : SamplerArgs; defa
         note("gpu backend auto-detected: {gpu} (pass --gpu off | metal | vulkan to pin)")
     }
     let armed = apply_gpu_backend(knobs, gpu, TOOL)
+    apply_rope_scaling(c.rope_scaling, c.rope_scale, int64(c.yarn_orig_ctx))
     let ctx = int64(max(c.ctx, 0))
     if (armed) {
         set_gpu_resident_regions(1l)   // one conversation at a time: one device-home region
         set_gpu_ctx_max(ctx)
+        set_gpu_ctx_strict(gpu_ctx_asked_whole(ctx))   // the server's meaning: an explicit context is served whole
     }
     return Rig(gpu = gpu, vulkan_armed = armed, ctx = ctx,
                quant = pick_quant(c.quant, TOOL), kv = pick_kv_dtype(c.kv_dtype, TOOL),

@@ -7,8 +7,8 @@ leaves when it lands or is refuted.
 ## Entries
 
 - **The split obj cache shares nothing between programs.** A partition's key is the running
-  chain over every module before it (`ARCHITECTURE.md` sec.2.1) and its object sits in the
-  program's own `.jitted_scripts/<namespace>/`, so two programs over one engine share no
+  chain over every module before it (`ARCHITECTURE_CODEGEN_IDENTITY.md` sec.2.1) and its object sits in the
+  program's own `.cache/daslang/<namespace>/`, so two programs over one engine share no
   object: two dasLLAMA unit tests (`tests/test_batch_grid.das` and `tests/test_box_profile.das`,
   each a `-jit` child of `modules/dasLLAMA/tests/run.das -- --suite model-free`, the `.o` names
   listed from the namespace folder its log names) read 0 of 19 key-named objects in common, while their
@@ -57,3 +57,9 @@ leaves when it lands or is refuted.
   during the same compile keep host layouts (reached through the bound `g_Program`), the
   cross-target program takes the table, and struct layouts fix at inference, so the switch
   cannot be codegen-only. Sized at two to three days; the check stays as the proof and gate.
+- **A gate for the class-scoped tier gates.** `with_class_target_gates`
+  (`daslib/llvm_jit_common.das`) saves, sets and restores each `g_target_*` tier gate by hand,
+  and a gate set there with no save and restore leaks the last class's value into every later
+  emission; `tests/llvm_class_target_gates.das` holds the thirteen gates it names today. The
+  change: a `REVIEW.das` check that every global the function assigns before its `invoke` is
+  assigned again after it, so a new gate cannot be added half way.
