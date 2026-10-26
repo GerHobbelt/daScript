@@ -291,7 +291,7 @@ def reset_jit_globals_after_failure() {
 //! JIT (honoring [jit]/[no_jit] and jit_all), content-address the DLL, generate and optimize IR,
 //! and emit a .dll / .exe / .wasm per the program's jit policies. Returns true.
 [macro_function]
-def public run_jit(prog : Program?; var ctx : Context?) : bool {
+def public run_jit(prog : Program?; var ctx : Context?) : bool {  // nolint:STYLE037,STYLE038 - the JIT backend driver: flat policy/flag resolution feeding one linear codegen pipeline; the phases share the module/target state and do not survive a split
     // AOT-object host binding: compiled jit-aware + policies.aot, so linkCppAot binds each
     // function from the statically-linked .o (SimNode_Jit) -- no in-memory codegen needed
     // here. (Emit mode sets jit_emit_object, never aot, so it skips this.)
@@ -386,7 +386,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
     // on a host machine decline every generated kernel to its reference body).
     let exe_host_cpu = gen_exe && empty(target_triple) && has_generated_kernel(prog, jit_all_functions)
     if (exe_host_cpu) {
-        to_log(LOG_INFO, "LLVM EXE: targeting the current box (CPU + features) — the build carries [llvm_code] kernels\n")
+        to_log(LOG_INFO, "LLVM EXE: targeting the current box (CPU + features) - the build carries [llvm_code] kernels\n")
     }
     // AOT objects target the host CPU: the .o is statically linked into a binary that runs on this
     // box (same contract as the JIT), so bake host features — this force-appends +dotprod on aarch64,
@@ -563,7 +563,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
                 panic("Internal jit error. Failed to get IR for functions {fn_names}.\n")
             }
             if (compile_only) {
-                to_log(LOG_INFO, "LLVM JIT: compile-only — module built, optimized and verified; no artifact written, nothing installed\n")
+                to_log(LOG_INFO, "LLVM JIT: compile-only - module built, optimized and verified; no artifact written, nothing installed\n")
             } elif (emit_aot_object) {
                 emit_object_only(g_mod, output_path, use_host_cpu)
             } elif (gen_wasm) {
@@ -634,10 +634,9 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
 
         set_jit_state(*ctx, result.dll, result.ee, result.ctx)
 
-        if (LLVM_JIT_LOG) {
-            let totalDt = double(get_time_usec(totalTime)) / 1000000.0lf
-            to_log(LOG_INFO, "LLVM JIT: {length(funcs)} functions in {totalDt} sec\n")
-        }
+        // always-on: a silent multi-second jit is indistinguishable from a hang (or from tune)
+        let totalDt = double(get_time_usec(totalTime)) / 1000000.0lf
+        to_log(LOG_INFO, "LLVM JIT: {length(funcs)} functions in {totalDt} sec{recompile_prog ? " (codegen)" : " (cache)"}\n")
     }
     return true
 }

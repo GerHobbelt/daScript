@@ -38,6 +38,13 @@ git diff --name-only origin/master..HEAD | xargs -I{} dirname {} | sort -u \
 Worked example: `modules/dasImgui/CODEREVIEW.md` (tests placement + pre-PR suite
 run + multiplatform-tests rules for anything touching that module).
 
+The audit itself is the shared `codereview-md-auditor` agent
+(`.claude/agents/codereview-md-auditor.md`) — launch ONE instance per discovered
+CODEREVIEW.md (each audits only its assigned checklist, including the checklist itself
+under the self-review rule) and merge the reports. Registry caveat: agent definitions
+snapshot at session start, so a just-pulled or just-edited definition only exists in the
+next session.
+
 ### 0b. Build-config drift — nuke `build/` only when you see it
 
 The "never `rm -rf build`" rule stands, and there is **no per-PR clean-build step**: the drift a proactive nuke would pre-empt is rare (it needs configure args or `ExternalProject` inputs to actually change), heavily MSVC-skewed, and fixed reactively at the same cost. Nuke and reconfigure **only on these symptoms**:
@@ -346,7 +353,7 @@ Do NOT format files you didn't change — only format files that are part of the
 
 CI's `extended_checks` runs `./bin/daslang ./utils/das-fmt/dasfmt.das -- --path ./ --verify` — the script is **in the repo tree** and wraps the same `daslib/das_source_formatter` engine as MCP `format_file`, so the two agree (probe-verified: both rewrite `Foo(a=1)` → `Foo(a = 1)`). The pre-push hook runs the exact CI command on tracked files; if the hook passes, the CI formatter gate passes.
 
-**Name trap:** a locally built `bin/Release/das-fmt.exe` (the CMake `das-fmt` target, from `utils/dasFormatter/`) is the **v1→v2 syntax converter**, not the formatter. CI's `das-fmt.exe` verify pass works because CI first overwrites that binary with an `-exe`-compiled `dasfmt.das`. Locally, always invoke the formatter as `<daslang> utils/das-fmt/dasfmt.das -- ...` (or MCP `format_file`).
+**Not the converter:** `bin/Release/gen1_to_gen2.exe` (the CMake target from `utils/dasFormatter/`) is the **v1→v2 syntax converter**, a different tool. Locally, always invoke the formatter as `<daslang> utils/das-fmt/dasfmt.das -- ...` (or MCP `format_file`); CI additionally compiles the formatter itself to `bin/das-fmt.exe` via `-exe` and re-runs the verify with it.
 
 ## 6. Create the PR
 
@@ -371,6 +378,22 @@ Creating the PR does not complete the workflow. Continue immediately with
 
 Never merge solely because CI is green. CI green + Copilot reviewed current tip + zero unresolved conversations is the merge gate.
 
+## 7. After the PR lands — sweep the untracked goo
+
+Once the PR is merged, list what the arc left behind and delete the session debris:
+
+```bash
+git ls-files --others --exclude-standard
+```
+
+Probe scripts, dump/disassembly text files, ad-hoc logs (typically `_`-prefixed at the repo
+root or beside tests), and `__pycache__` directories go. They are never good: they rot, they
+mislead the next session into treating them as project files, and they bury real changes in
+`git status`. Keep intentional artifacts — configs, tune manifests/backups, user-owned
+assets — per the Workspace Hygiene rules in `CLAUDE.md`. Probes belong in the session
+scratchpad in the first place; a probe that had to live in-tree dies with the arc that
+created it.
+
 ## Quick reference
 
 | Step | Tool/Command | Fix policy |
@@ -391,3 +414,4 @@ Never merge solely because CI is green. CI green + Copilot reviewed current tip 
 | Push after PR creation | Re-request Copilot review | Mandatory after every push; latest review must target current tip |
 | Review acceptance | Require realistic reachability, scale, and impact | Reject theoretical defensive programming; prose-only round → resolve and land |
 | Babysit | Follow `skills/babysit.md` | Merge only when CI is green and Copilot is dry on current tip |
+| Post-land sweep | `git ls-files --others --exclude-standard` | Delete session debris (`_`-prefixed probes/dumps, `__pycache__`, ad-hoc logs); keep configs/manifests/user assets |

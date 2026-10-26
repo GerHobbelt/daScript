@@ -38,6 +38,18 @@ namespace das {
         return false;
     }
 
+    static bool isFreshTemporary ( ExpressionPtr expr ) {
+        if ( !expr ) return false;
+        if ( expr->rtti_isCast() ) {
+            return isFreshTemporary(static_cast<ExprCast*>(expr)->subexpr);
+        } else if ( expr->rtti_isNullCoalescing() ) {
+            return isFreshTemporary(static_cast<ExprNullCoalescing*>(expr)->defaultValue);
+        } else if ( expr->rtti_isCallLikeExpr() ) {
+            return !(expr->type && expr->type->ref);    // a call returning a reference is storage
+        }
+        return expr->rtti_isMakeLocal();
+    }
+
     // in ast_handle of all places, due to reporting fields
     void reportTrait(const TypeDeclPtr &type, const string &prefix, const callable<void(const TypeDeclPtr &, const string &)> &report);
 
@@ -1642,7 +1654,7 @@ namespace das {
                                         if (classHasUserNamedFunction(program, mid, mid->name)) {
                                             error("call to super." + eField->name + " in " + func->name
                                                     + " cannot skip " + mid->name
-                                                    + " which has its own constructor — call super." + mid->name + "(...) instead",
+                                                    + " which has its own constructor - call super." + mid->name + "(...) instead",
                                                   "", "", expr->at, CompilationError::invalid_super_call);
                                             return Visitor::visit(expr);
                                         }
@@ -1681,7 +1693,7 @@ namespace das {
                                 if (classHasUserNamedFunction(program, baseClass, eField->name)) {
                                     error("call to super." + eField->name + " in " + func->name
                                             + " cannot skip " + baseClass->name + " which defines its own "
-                                            + eField->name + " — adjust args to match " + baseClass->name + "'s overload",
+                                            + eField->name + " - adjust args to match " + baseClass->name + "'s overload",
                                           "", "", expr->at, CompilationError::invalid_super_call);
                                     return Visitor::visit(expr);
                                 }
@@ -3872,7 +3884,7 @@ namespace das {
                    valT->isRange() ? (rdim > 2) : !TypeDecl::hasVectorType(valT->getVectorBaseType(), rdim)) {
             // e.g. .s01230123 on a float4 — 8 lanes, but the float family has no 8-wide vector
             error("swizzle ." + expr->mask + " yields " + to_string(rdim)
-                    + " lane(s) — no such vector of '" + das_to_string(valT->getVectorBaseType()) + "'", "", "",
+                    + " lane(s) - no such vector of '" + das_to_string(valT->getVectorBaseType()) + "'", "", "",
                   expr->at, CompilationError::invalid_swizzle_mask);
         } else {
             auto bt = valT->getVectorBaseType();
@@ -4616,8 +4628,10 @@ namespace das {
             expr->block = block;
             block->hasReturn = true;
             if (expr->subexpr) {
-                if (!expr->subexpr->type)
+                if (!expr->subexpr->type) {
+                    reportUnresolvedReturnValue(expr);
                     return Visitor::visit(expr);
+                }
                 if (!block->returnType->ref) {
                     expr->subexpr = Expression::autoDereference(expr->subexpr);
                 } else {
@@ -4658,8 +4672,10 @@ namespace das {
             // infer
             func->hasReturn = true;
             if (expr->subexpr) {
-                if (!expr->subexpr->type)
+                if (!expr->subexpr->type) {
+                    reportUnresolvedReturnValue(expr);
                     return Visitor::visit(expr);
+                }
                 if (!func->result->ref) {
                     if (!expr->moveSemantics) {
                         expr->subexpr = Expression::autoDereference(expr->subexpr);
@@ -5441,26 +5457,14 @@ namespace das {
         if (var->type->ref && !var->init)
             error("local reference has to be initialized", "", "",
                   var->at, CompilationError::missing_local_reference_init);
-        // A reference can only bind to addressable storage. Split the non-local case in two:
-        //  - a freshly-materialized temporary - a make-local literal, or a value-returning call. It needs
-        //    its own temp-stack slot and has no storage to point at, so the reference would dangle. Never
-        //    valid: a hard error, regardless of `unsafe`. (`[1]` etc. is lowered to a value-returning call
-        //    by this point, so rtti_isMakeLocal alone is not enough - hence the call-like test.) The test
-        //    is on the initializer's SHAPE, not just type->ref: an argument of a natively-by-reference
-        //    type (struct, array, table, tuple) is addressable storage yet also carries type->ref==false,
-        //    since it is already a reference at the ABI level. A value that is neither shape - an int, a
-        //    string, a lambda - never reaches here: the value-init check below rejects it first.
-        //  - an addressable non-local - a deref, or an upcast/reinterpret view of real storage: merely
-        //    unsafe (the existing policy-gated diagnostic).
-        if (var->type->ref && var->init && !(var->init->alwaysSafe || isLocalOrGlobal(var->init))
-                && var->init->type && !var->init->type->temporary) {
-            if (!var->init->type->ref && !var->init->rtti_isCast()
-                    && (var->init->rtti_isCallLikeExpr() || var->init->rtti_isMakeLocal())) {
+        if (var->type->ref && var->init && var->init->type && !var->init->type->temporary) {
+            if (isFreshTemporary(var->init)) {
                 error("local reference to a temporary value is not allowed",
                       "a reference must bind to addressable storage (a variable, a field, or a function "
                       "returning a reference); a freshly-built temporary has none", "",
                       var->at, CompilationError::unsafe_local_reference);
-            } else if (!safeExpression(expr) && program->policies.local_ref_is_unsafe) {
+            } else if (!(var->init->alwaysSafe || isLocalOrGlobal(var->init))
+                    && !safeExpression(expr) && program->policies.local_ref_is_unsafe) {
                 error("local reference to non-local expression is unsafe", "", "",
                       var->at, CompilationError::unsafe_local_reference);
             }
@@ -6059,7 +6063,7 @@ namespace das {
                     // have ANY user-defined ctor? If yes, we'd silently skip its invariants — reject.
                     if (classHasUserNamedFunction(program, baseClass, baseClass->name)) {
                         error("call to super in " + func->name + " cannot skip " + baseClass->name
-                                + " which has its own constructor — adjust super(...) args to match " + baseClass->name,
+                                + " which has its own constructor - adjust super(...) args to match " + baseClass->name,
                               "", "", expr->at, CompilationError::invalid_super_call);
                         return Visitor::visit(expr);
                     }
@@ -6304,6 +6308,10 @@ namespace das {
             }
         }
         return Visitor::visit(expr);
+    }
+    void InferTypes::preVisitStringBuilderElement(ExprStringBuilder *sb, Expression *expr, bool last) {
+        Visitor::preVisitStringBuilderElement(sb, expr, last);
+        markNoDiscard(expr);    // interpolation formats the value into the string — a [nodiscard] result here is consumed
     }
     ExpressionPtr InferTypes::visitStringBuilderElement(ExprStringBuilder *, Expression *expr, bool) {
         auto res = Expression::autoDereference(expr);

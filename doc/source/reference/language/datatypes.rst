@@ -7,6 +7,7 @@ Values and Data Types
 Daslang is a strong, statically typed language.  All variables have a type.
 Daslang's basic POD (plain old data) data types are:
 
+.. das-doc: skip
 .. code-block:: das
 
     int, uint, float, bool, double, int64, uint64
@@ -17,6 +18,7 @@ All PODs are represented with machine register/word. All PODs are passed to func
 
 Daslang's storage types are:
 
+.. das-doc: skip
 .. code-block:: das
 
     int8, uint8, int16, uint16 - 8/16-bits signed and unsigned integers
@@ -25,6 +27,7 @@ They have no arithmetic of their own, but can be used as a storage type within s
 
 Daslang's 16/8-bit vector lattice extends the storage tier with packed small-element vectors:
 
+.. das-doc: skip
 .. code-block:: das
 
     float16                                       - IEEE-754 binary16 scalar (`half` is an alias)
@@ -41,15 +44,17 @@ computing, and rounding back — correctly rounded per operation, bit-identical 
 hardware. Division follows IEEE (``1h / 0h`` is ``inf``; ``NaN != NaN``). ``float16`` literals
 use the ``h`` suffix: ``1.5h``. The integer families carry storage, converts, and the integer
 bit surface — but no arithmetic (``byte4 + byte4`` is a compile error): widen with the wider
-ctor (``int4(b4)`` sign-extends, ``short8(b8)``), narrow with the ctor (C truncation,
-``short4(i4)``) or the saturating ``_sat`` forms (``short4_sat(i4)``, ``byte8_sat(s8)``,
-clamping to the target range). The bit surface matches the 32-bit vector families:
+ctor of matching signedness (``int4(b4)`` sign-extends, ``short8(b8)``; unsigned lanes widen
+unsigned, ``uint4(us4)`` — there is no cross-signed form such as ``int4(us4)``), narrow with
+the ctor (C truncation, ``short4(i4)``) or the saturating ``_sat`` forms (``short4_sat(i4)``,
+``byte8_sat(s8)``, clamping to the target range). The bit surface matches the 32-bit vector families:
 ``<< >> & | ^`` and their compound assigns. Shifts take a scalar ``int`` count masked to the
 lane width (``b16 >> 9`` equals ``b16 >> 1``); signed lanes shift right arithmetically,
 unsigned logically; ``<<`` wraps each lane — ``shuffle(lut, nib >> 4)`` is the nibble-unpack
 shape. The fp16 family converts to and from float per arity (``half4(f4)`` rounds each lane,
-``float4(h4)`` is exact) plus ``half8(lo, hi)`` / ``half8_lo`` / ``half8_hi`` packing against
-two ``float4``.
+``float4(h4)`` is exact) plus ``half8_lo`` / ``half8_hi``, which unpack a ``half8`` into
+``float4`` halves, and the two-argument compose ``half8(f4lo, f4hi)``, whose operands are both
+``float4`` — there is no ``half8(half4, half4)`` form.
 
 The other exception to storage-only is the 16-lane 8-bit forms, which carry exact integer
 dot-product intrinsics — the hardware dot4 class (NEON ``sdot``/``usdot``, AVX-VNNI
@@ -58,8 +63,10 @@ dot-product intrinsics — the hardware dot4 class (NEON ``sdot``/``usdot``, AVX
 first operand may instead be ``ubyte16`` (lanes zero-extended, the quantized-kernel shape); the
 result is always signed and exact — no lane sum can overflow ``int``. ``shuffle(lut, idx)``
 selects bytes from a 16-entry table (``lut[idx & 15]`` per lane, the ``tbl``/``pshufb``
-semantic). For shader code, the packed single-group forms ``sdot4``/``usdot4`` (two ``uint``
-words as 4+4 8-bit lanes) live in ``daslib/shader_lingua_franca`` and lower to native GPU ops.
+semantic); ``lut`` is a ``byte16`` and the index operand must be a ``ubyte16`` (a ``byte16``
+index does not match). For shader code, the packed single-group forms ``sdot4``/``usdot4``
+(two ``uint`` words as 4+4 8-bit lanes) live in ``daslib/shader_lingua_franca`` and lower to
+native GPU ops.
 
 Beyond ``xyzw`` (which stays capped at 4 lanes), all vectors support OpenCL-style ``.s``
 swizzles — ``s`` followed by one hex lane digit per output lane, repeats allowed: ``v.s0``,
@@ -69,6 +76,7 @@ two namespaces never mix in one mask.
 
 Daslang's other types are:
 
+.. das-doc: skip
 .. code-block:: das
 
     string, das_string, struct, pointers, references, block, lambda, function pointer,
@@ -203,8 +211,10 @@ opening the door to general implicit conversions.
 Where promotion applies
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-Promotion runs wherever the compiler already knows the target type:
+Promotion is **not** a general "the compiler already knows the target type" rule.
+It fires in a fixed set of contexts, and nowhere else:
 
+.. das-doc: given variant V { arm : float; other : int }
 .. code-block:: das
 
     var a : float = 1                 // local var init
@@ -218,9 +228,41 @@ Promotion runs wherever the compiler already knows the target type:
     var e : float = a + 1             // binary operator (either side)
     def fn() : uint8 { return 200 }   // return statement
 
-Function-call arguments and ``ExprMove`` (``<-``) are intentionally **not**
-promoted. ``foo(1)`` on a parameter typed ``float`` still needs ``foo(1.0f)``
-or ``foo(float(1))``.
+Where promotion does not apply
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Function-call arguments, function-parameter default values, and ``ExprMove``
+(``<-``) are intentionally **not** promoted, even though the target type is
+plainly visible in each case:
+
+.. das-doc: expect error[30341]
+.. code-block:: das
+
+    def take_f(a : float) {}
+    def f(a : float = 1) {}    // error[30161]: function argument default value
+                               //     type mismatch; 'float const' vs 'int const'
+
+    take_f(1)                  // error[30341]: no matching functions or generics:
+                               //     take_f(int const)
+    var m : float ; m <- 1     // error[30941]: can only move compatible type;
+                               //     float& -const = int const
+
+Spell the literal in the target type instead: ``take_f(1.0f)`` (or
+``take_f(float(1))``), and ``def f(a : float = 1.0f)``.
+
+Only *integer* literals promote. A float literal never promotes to ``double``:
+
+.. das-doc: expect error[30344]
+.. code-block:: das
+
+    var d : double = 1.0   // error[30344]: local variable d initialization
+                           //     type mismatch; double -const = float const
+
+Spell the double literal instead:
+
+.. code-block:: das
+
+    var d : double = 1.0lf // ok — double literal
 
 Accepted target types: ``int8`` / ``int16`` / ``int`` / ``int64``,
 ``uint8`` / ``uint16`` / ``uint`` / ``uint64``,
@@ -235,14 +277,15 @@ target's exact range. A value that doesn't fit raises a single
 ``error[30515] exceeds_constant_range`` and **no** downstream type-mismatch
 error:
 
+.. das-doc: expect error[30515]
 .. code-block:: das
 
-    var d : uint8 = 256
+    var too_big : uint8 = 256
     // error[30515]: constant value 256 does not fit in uint8
     //     expected range [0..255]
 
-    var d : int8 = -129               // out of range
-    var d : uint8 = -1                // negative literal, unsigned target
+    var too_small : int8 = -129       // out of range
+    var negative : uint8 = -1         // negative literal, unsigned target
 
 Float and double — precision is a lint warning
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -453,7 +496,8 @@ Pointers are types that 'reference' (point to) some other data, but can be null 
 In order to work with actual value, one need to dereference it using the dereference or safe navigation operators.
 Dereferencing will panic if a null pointer is passed to it.
 Pointers can be created using the new operator, or with the C++ environment.
-::
+
+.. code-block:: das
 
     def twice(var a: int&) {
         a = a + a
@@ -490,6 +534,9 @@ as handled types from the C++ side.
 
 Smart pointers in AST code:
 
+.. das-doc: given class DocVisitor : AstVisitor {}
+.. das-doc: given var visitor : DocVisitor?
+.. das-doc: given var program : ProgramPtr
 .. code-block:: das
 
     require daslib/ast
@@ -506,19 +553,23 @@ Smart pointers in AST code:
 The key properties of smart pointers:
 
 * They maintain a reference count and automatically release the object when the count reaches zero
-* They can be moved but not copied via ``<-``
+* They can be moved with ``<-``, but never copied with ``=``
 * Dereferencing works the same as regular pointers (``*ptr`` and ``ptr.field``)
-* Moving from a smart pointer value requires ``unsafe`` unless the value is a ``new`` expression
+* Move-**assignment** into a variable that is already live requires ``unsafe``
+  (``error[31029]``); move-**initialization** of a fresh ``var inscope`` does not
 
 Because ``strict_smart_pointers`` is enabled by default, smart pointer variables must be
-declared with ``inscope`` to ensure automatic cleanup:
+declared with ``inscope`` to ensure automatic cleanup — a plain ``var`` raises
+``error[31018] requires var inscope to be safe``:
 
 .. code-block:: das
 
-    var inscope a <- some_function()          // create — safe, no unsafe needed
-    var inscope b <- a                        // move — safe, a becomes null
+    require daslib/ast
+
+    var inscope a <- make_file_access("")     // create — safe, no unsafe needed
+    var inscope b <- a                        // move-initialize — safe, a becomes null
     unsafe {
-        var inscope c <- some_function()      // move from function result — unsafe
+        b <- a                                // move-assign into a live variable — unsafe
     }
 
 Ownership transfer functions

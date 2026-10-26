@@ -32,12 +32,21 @@ Similar to the return statement, move semantic ``yield <-`` is allowed:
 
 .. code-block:: das
 
-    return <- generator<TT> {
-        for ( w in src ) {
-            yield <- invoke(blk,w)  // move invoke result
+    def make_gen ( src : array<int>; fn : lambda<(x:int):array<int>> ) : iterator<array<int>> {
+        return <- generator<array<int>> capture(clone(src)) {
+            for ( w in src ) {
+                yield <- invoke(fn,w)   // move invoke result
+            }
+            return false
         }
-        return false
     }
+
+A generator is compiled into a lambda, so it can only capture what a lambda can hold.
+A ``block`` is not one of those — capturing it is ``error[30129]: can't capture variable`` —
+so a callable which the generator invokes must be a ``lambda`` or a function pointer.
+Non-copyable values such as ``array<T>`` are not captured implicitly either
+(``error[31003]: implicit capture by move requires unsafe``); name them in the capture
+section, as ``capture(clone(src))`` above does, or wrap the generator in ``unsafe``.
 
 Generators can output ref types. They can have a capture section:
 
@@ -82,18 +91,24 @@ Generators can have loops and other control structures:
         return false
     }
 
-Generators can have a ``finally`` expression on its blocks, with the exception of the if-then-else blocks:
+Generators can have a ``finally`` expression on its blocks, with the exception of the if-then-else blocks.
+A ``finally`` belongs to the block it follows, so a ``finally`` on a loop body runs once per iteration,
+and its ``yield`` interleaves with the yields of the loop:
 
 .. code-block:: das
 
-    let gen <- generator<int>{
-        for ( t in range(0,9) ) {
+    var gen <- generator<int>{
+        for ( t in range(0,3) ) {
             yield t
         } finally {
             yield 9
         }
         return false
     }
+    for ( t in gen ) {
+        print("{t} ")
+    }
+    // output: 0 9 1 9 2 9
 
 ----------------------
 implementation details
@@ -112,50 +127,55 @@ In the following example:
         return false
     }
 
-A lambda is generated with all captured variables:
+A lambda is generated with all captured variables.  Generated names embed the
+source position they come from, so they differ from file to file — here the
+generator expression sits on line 8, and its ``for`` loop on line 9:
 
+.. das-doc: skip
 .. code-block:: das
 
-    struct _lambda_thismodule_8_8_1 {
-        __lambda : function<(__this:_lambda_thismodule_8_8_1;_yield_8:int&):bool const> = @@_::_lambda_thismodule_8_8_1`function
-        __finalize : function<(__this:_lambda_thismodule_8_8_1? -const):void> = @@_::_lambda_thismodule_8_8_1`finalizer
+    struct _lambda_thismodule_8_1 {
+        __lambda : function<(var __this:_lambda_thismodule_8_1;var _yield_8:int&):bool const>
+        __finalize : function<(var __this:_lambda_thismodule_8_1? -const):void>
         __yield : int
-        _loop_at_8 : bool
-        x : int // captured constant
-        _pvar_0_at_8 : void?
-        _source_0_at_8 : iterator<int>
+        _loop_at_9_8 : bool
+        __x_rename_at_9_14 : int    // captured constant
+        _pvar_0_at_9_8 : void?
+        _source_0_at_9_8 : iterator<int>
     }
 
 A lambda function is generated:
 
+.. das-doc: skip
 .. code-block:: das
 
     [GENERATOR]
-    def _lambda_thismodule_8_8_1`function ( var __this:_lambda_thismodule_8_8_1; var _yield_8:int& ) : bool const {
+    [LAMBDA]
+    def private _lambda_thismodule_8_1`function(var __this:_lambda_thismodule_8_1 explicit; var _yield_8:int&) : bool const {
         goto __this.__yield
         label 0:
-        __this._loop_at_8 = true
-        __this._source_0_at_8 <- __::builtin`each(range(0,10))
-        memzero(__this.x)
-        __this._pvar_0_at_8 = reinterpret<void?>(addr(__this.x))
-        __this._loop_at_8 &&= _builtin_iterator_first(__this._source_0_at_8,__this._pvar_0_at_8,__context__)
-        label 3: /*begin for at line 8*/
-        if ( !__this._loop_at_8 ) {
+        __this._loop_at_9_8 = true
+        __this._source_0_at_9_8 <- __::builtin`each(range(0,10))
+        memzero(__this.__x_rename_at_9_14)
+        __this._pvar_0_at_9_8 = reinterpret<void?> addr(__this.__x_rename_at_9_14)
+        __this._loop_at_9_8 = _builtin_iterator_first(__this._source_0_at_9_8,__this._pvar_0_at_9_8,__context__,__lineinfo__) && __this._loop_at_9_8
+        label 3: /*begin for at line 9*/
+        if ( !__this._loop_at_9_8 ) {
                 goto label 5
         }
-        if ( !((__this.x & 1) == 0) ) {
+        if ( (__this.__x_rename_at_9_14 & 1) != 0 ) {
                 goto label 2
         }
-        _yield_8 = __this.x
+        _yield_8 = __this.__x_rename_at_9_14
         __this.__yield = 1
         return /*yield*/ true
-        label 1: /*yield at line 10*/
-        label 2: /*end if at line 9*/
-        label 4: /*continue for at line 8*/
-        __this._loop_at_8 &&= _builtin_iterator_next(__this._source_0_at_8,__this._pvar_0_at_8,__context__)
+        label 1: /*yield at line 11*/
+        label 2: /*end if at line 10*/
+        label 4: /*continue for at line 9*/
+        __this._loop_at_9_8 &&= _builtin_iterator_next(__this._source_0_at_9_8,__this._pvar_0_at_9_8,__context__,__lineinfo__)
         goto label 3
-        label 5: /*end for at line 8*/
-        _builtin_iterator_close(__this._source_0_at_8,__this._pvar_0_at_8,__context__)
+        label 5: /*end for at line 9*/
+        _builtin_iterator_close(__this._source_0_at_9_8,__this._pvar_0_at_9_8,__context__)
         return false
     }
 
@@ -166,18 +186,23 @@ This effectively produces a finite state machine, with the ``yield`` variable ho
 The ``yield`` expression is converted into a copy result and return value pair.
 A label is created to specify where to go to next time, after the ``yield``:
 
+.. das-doc: skip
 .. code-block:: das
 
-    _yield_8 = __this.x                 // produce next iterator value
-    __this.__yield = 1                  // label to go to next (1)
-    return /*yield*/ true               // return true to indicate, that iterator produced a value
-    label 1: /*yield at line 10*/       // next label marker (1)
+    _yield_8 = __this.__x_rename_at_9_14  // produce next iterator value
+    __this.__yield = 1                    // label to go to next (1)
+    return /*yield*/ true                 // return true — the iterator produced a value
+    label 1: /*yield at line 11*/         // next label marker (1)
 
 Iterator initialization is replaced with the creation of the lambda:
 
+.. das-doc: skip
 .. code-block:: das
 
-    var gen:iterator<int> <- each(new<lambda<(_yield_8:int&):bool const>> default<_lambda_thismodule_8_8_1>)
+    var gen:iterator<int> <- __::builtin`each(
+        new<lambda<(var _yield_8:int&):bool const>> struct<_lambda_thismodule_8_1>(
+            uninitialized __lambda = @@_::_lambda_thismodule_8_1`function,
+            __finalize = @@_::_lambda_thismodule_8_1`finalizer))
 
 .. seealso::
 

@@ -3696,12 +3696,6 @@ namespace das
         if ( policies.keep_alive ) {
             updateKeepAliveFlags();
         }
-        library.foreach([&](Module * mod) -> bool {
-            for ( const auto & pm : mod->preSimulateMacros ) {
-                pm->apply(this, thisModule.get());
-            }
-            return true;
-        }, "*");
         isSimulating = true;
         context.failed = true;
         context.verySafeContext = options.getBoolOption("very_safe_context",policies.very_safe_context);
@@ -3936,6 +3930,7 @@ namespace das
 #endif
         DAS_ASSERTF(context.constStringHeap->depth()<=1, "strings must come in one page");
         context.stringHeap->setIntern(options.getBoolOption("intern_strings", policies.intern_strings));
+        context.stringHeap->setReclaimDisabled(options.getBoolOption("disable_temp_string_reclaim", policies.disable_temp_string_reclaim));
         // log all functions
         if ( options.getBoolOption("log_nodes",false) ) {
             bool displayHash = options.getBoolOption("log_nodes_aot_hash",false);

@@ -84,18 +84,17 @@ Finalizers can be defined explicitly as void functions named ``finalize``:
     class Foo {
         ...
         def finalize {                      // custom finalizer
-            delFoo ++
+            print("Foo finalized\n")
         }
     }
 
-An alternative syntax for finalizers is:
+An alternative syntax for finalizers is ``def operator delete``:
 
 .. code-block:: das
 
-    class Foo {
-        ...
+    class Bar {
         def operator delete {              // custom finalizer
-            delFoo ++
+            print("Bar finalized\n")
         }
     }
 
@@ -123,6 +122,7 @@ Calling Parent Methods
 
 Inside a derived class, ``super()`` calls the parent class constructor:
 
+.. das-doc: given class Base { z : int = 0; def Base { } def process(x : int) { } def operator delete { } }
 .. code-block:: das
 
     class Derived : Base {
@@ -151,19 +151,20 @@ up the inheritance chain to the nearest ancestor that does:
 
 .. code-block:: das
 
-    class Base {
+    class Root {
+        def Root { /* ... */ }
         def process(x : int) { /* ... */ }
     }
 
-    class Mid : Base {              // empty intermediate
+    class Mid : Root {              // empty intermediate
     }
 
     class Leaf : Mid {
         def Leaf {
-            super()                 // resolves to Base`Base(self) — Mid is skipped
+            super()                 // resolves to Root`Root(self) — Mid is skipped
         }
         def override process(x : int) {
-            super.process(x)        // resolves to Base`process(self, x) — Mid is skipped
+            super.process(x)        // resolves to Root`process(self, x) — Mid is skipped
         }
     }
 
@@ -243,6 +244,7 @@ way classes do.
 
 Alternatively, the parent's method can be called directly using the backtick syntax:
 
+.. das-doc: skip
 .. code-block:: das
 
     Foo`set(self, X, Y)         // equivalent to super.set(X, Y) from within Foo3D
@@ -264,7 +266,7 @@ Sealed functions cannot be overridden. The ``sealed`` keyword is used to prevent
 
     class Foo3D : Foo {
         def sealed set(X,Y:int ) { // subclasses of Foo3D can no longer override this method
-            xyz = X + Y
+            x = X + Y
         }
     }
 
@@ -272,18 +274,19 @@ Sealed classes can not be inherited from. The ``sealed`` keyword is used to prev
 
 .. code-block:: das
 
-    class sealed Foo3D : Foo        // Foo3D can no longer be inherited from
+    class sealed Foo3D : Foo {      // Foo3D can no longer be inherited from
         ...
+    }
 
-A pointer named ``self`` is available inside any class method.
+A reference named ``self`` is available inside any class method.
 Because the method body is wrapped in ``with(self)``, all fields and methods
 can be accessed directly — ``self.`` is not required:
 
 .. code-block:: das
 
     class Foo {
-        x : int
-        def set(val : int) {
+        ...
+        def setX(val : int) {
             x = val             // same as self.x = val
         }
     }
@@ -299,7 +302,7 @@ Local class variables are unsafe:
 .. code-block:: das
 
     unsafe {
-        var f = Foo()       // unsafe
+        var localFoo = Foo()    // unsafe
     }
 
 Class methods can be invoked using ``.`` syntax:
@@ -324,6 +327,8 @@ Class methods can be constant:
 
 .. code-block:: das
 
+    require math
+
     class Foo {
         dir : float3
         def const length {
@@ -334,6 +339,8 @@ Class methods can be constant:
 Class methods can be operators:
 
 .. code-block:: das
+
+    require math
 
     class Foo {
         dir : float3
@@ -413,9 +420,16 @@ from it. This requires the ``daslib/dynamic_cast_rtti`` module:
     verify(a is Animal)         // true — Dog is an Animal
     verify(!(a is Cat))         // true — a is not a Cat
 
-Without ``daslib/dynamic_cast_rtti``, the ``is`` operator performs a static (compile-time) type
-check only. With the module, it performs runtime RTTI checking by walking the class hierarchy
-via the ``__rtti`` field.
+The ``require`` is mandatory, not an upgrade. ``is`` on a class pointer is defined by that
+module; without it there is no fallback of any kind and the code does not compile:
+
+.. code-block:: das
+
+    var a : Animal? = new Dog()
+    if (a is Dog) { }           // error[30190]: is Dog only allowed for variants
+
+With the module, ``is`` performs runtime RTTI checking by walking the class hierarchy via the
+``__rtti`` field.
 
 ----------------------------
 Type Casting (as, ?as)
@@ -457,6 +471,9 @@ not instantiated directly — they serve as blueprints for code generation via m
 
 .. code-block:: das
 
+    module tcache
+    require daslib/typemacro_boost
+
     [template_structure(KeyType, ValueType)]
     class template TCache {
         keys : array<KeyType>
@@ -473,7 +490,7 @@ not instantiated directly — they serve as blueprints for code generation via m
 
 Template parameters (``KeyType``, ``ValueType``) are replaced with concrete types during
 instantiation. The ``template_structure`` annotation (from ``daslib/typemacro_boost``) handles
-the substitution.
+the substitution; it runs as a compile-time macro, so the file that uses it must be a module.
 
 Template methods automatically inherit the template flag.
 
@@ -695,6 +712,7 @@ Class initializers are generated by adding a local ``self`` variable with ``cons
 The body of the method is prefixed via a ``with self`` expression.
 The final expression is a ``return <- self``:
 
+.. das-doc: skip
 .. code-block:: das
 
     def Foo ( X:int const; Y:int const ) : Foo {
@@ -708,6 +726,7 @@ The final expression is a ``return <- self``:
 Class methods and finalizers are generated by providing the extra argument ``self``.
 The body of the method is prefixed with a ``with self`` expression:
 
+.. das-doc: skip
 .. code-block:: das
 
     def Foo3D`set ( var self:Foo3D; X:int const; Y:int const ) {
@@ -719,6 +738,7 @@ The body of the method is prefixed with a ``with self`` expression:
 
 Calling virtual methods is implemented via invoke:
 
+.. das-doc: skip
 .. code-block:: das
 
     invoke(f3d.set,cast<Foo>(f3d),1,2)
@@ -726,6 +746,7 @@ Calling virtual methods is implemented via invoke:
 Every base class gets an ``__rtti`` pointer, and a ``__finalize`` function pointer.
 Additionally, a function pointer is added for each member function:
 
+.. das-doc: skip
 .. code-block:: das
 
     class Foo {
@@ -739,6 +760,7 @@ Additionally, a function pointer is added for each member function:
 ``__rtti`` contains rtti::TypeInfo for the specific class instance.
 There is helper function in the rtti module to access class_info safely:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def class_info ( cl ) : StructInfo const?

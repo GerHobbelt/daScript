@@ -63,7 +63,7 @@ def private synth_id(i, seed : int64) : int64 => 1000l + ((i * 17l + seed * 131l
 [export]
 def main() : int {   // nolint:STYLE038 — flat profiler driver: arg/env/tier handling, then the one measurement window
     if (!jit_enabled()) {
-        print("This profiler is JIT-only — run with: daslang -jit <file>\n")
+        print("This profiler is JIT-only - run with: daslang -jit <file>\n")
         return 1
     }
     var r <- parse_args(type<Args>)
@@ -84,13 +84,13 @@ def main() : int {   // nolint:STYLE038 — flat profiler driver: arg/env/tier h
     var threads = cfg.threads > 0 ? cfg.threads : (t_env ?? profile_threads())
     if (is_some(t_env) && unwrap(t_env) != threads) {
         threads = unwrap(t_env)
-        print("warning: DAS_JOBQUE_THREADS overrides -t — running {threads} lanes\n")
+        print("warning: DAS_JOBQUE_THREADS overrides -t - running {threads} lanes\n")
     } elif (is_none(t_env)) {
         set_jobque_threads_cap(max(threads - 1, 1))
     }
     let pinned = affinity_on() && is_none(g_env_core.jobque_affinity)
     if (pinned) {
-        set_jobque_affinity(2)   // 2 = hard mask, the llama-bench --cpu-strict mirror
+        set_jobque_affinity(2)   // 2 = hard mask (QoS classification on darwin), the llama-bench --cpu-strict mirror
     }
     apply_box_profile_runtime()   // the tuned per-box stack — what load_model users get
     if (cfg.no_fused) {
@@ -100,12 +100,12 @@ def main() : int {   // nolint:STYLE038 — flat profiler driver: arg/env/tier h
         static_if (typeinfo builtin_module_exists(das_accelerate)) {
             dasllama_accelerate_enable(32l)   // the shipped +AMX defaults: min ntok 32, work floor 512 MMAC
         } else {
-            print("--accel requested but das_accelerate is not built on this platform — no accel tier to profile\n")
+            print("--accel requested but das_accelerate is not built on this platform - no accel tier to profile\n")
             return 1
         }
     }
     if (!JOBQUE_PROFILING_ENABLED) {
-        print("decode_prof needs the marker rail compiled in — rerun with JOBQUE_PROFILING=1 (or --jobque-profiling)\n")
+        print("decode_prof needs the marker rail compiled in - rerun with JOBQUE_PROFILING=1 (or --jobque-profiling)\n")
         return 1
     }
     print("loading {cfg.model}\n")

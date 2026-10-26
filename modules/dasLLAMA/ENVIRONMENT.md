@@ -1,6 +1,6 @@
 # dasLLAMA environment variables
 
-GENERATED from the `[EnvConfig]` declarations in `dasllama/dasllama_env.das` — do not edit
+GENERATED from the `[EnvConfig]` declarations in `dasllama/dasllama_env.das` - do not edit
 by hand. Regenerate with `daslang modules/dasLLAMA/harness/gen_env_doc.das`; a knob read
 anywhere in the tree without a declaration fails `tests/test_env_registry.das`.
 
@@ -8,7 +8,7 @@ Types: **flag** is unset-means-default, `0`/`false`/`off`/`no` (any case) is fal
 anything else true; **number** falls back to the default when unset or unparseable, with
 a logged warning on garbage; **text** and **path** are taken verbatim. A SET-BUT-EMPTY
 variable counts as unset everywhere. Every knob loads ONCE, at context init, into the
-`g_env_*` globals — hot code reads struct fields, and `set_env_variable` after startup
+`g_env_*` globals - hot code reads struct fields, and `set_env_variable` after startup
 is invisible (arm a child process's environment instead).
 
 ## Engine
@@ -99,14 +99,18 @@ Vulkan GPU backend. Present only where the dasVulkan package is installed.
 | `DASLLAMA_VK_IMPORT` | flag | on | Stream mirrors import the mapped .dlim (VK_EXT_external_memory_host) instead of pinned copies; =0 restores the copy path. |
 | `DASLLAMA_TRIM` | flag | off | Serve from P3-trimmed vulkan images (big CPU weight families dropped; folded into the flavor identity). |
 | `DASLLAMA_VK_MEMPRIO` | flag | on | Tag allocations high-priority (VK_EXT_memory_priority) so the driver demotes desktop memory, not ours. |
-| `DASLLAMA_VK_FA` | flag | on | Vulkan flash-attention kernel; 0 falls back to the chunked path. |
+| `DASLLAMA_VK_FA` | flag | on | Vulkan flash attention: the decode fa kernel pick AND the cm2 prefill fa tile; 0 falls back to the chunked/scalar paths. |
 | `DASLLAMA_VK_REBAR` | flag | on | Use a ReBAR device-local host-visible heap when one larger than 1GB is present. |
+| `DASLLAMA_VK_KV32` | number | 0 | Arm the resident driver with f32 KV mirrors instead of the f16 default (A/B instrument; only sessions of the armed codec are served). |
+| `DASLLAMA_CM2_TILE` | number | 0 | cm2 prefill tile pick: 0 = occupancy heuristic, 128 = force the m tile, 256 = force the l tile (A/B instrument). |
+| `DASLLAMA_CM2_SPLITK` | number | 0 | cm2 split-k: 0 = occupancy heuristic, 1 = off, N = force N k-chunks (A/B instrument; shrinks if N strands an empty tail). |
+| `DASLLAMA_VK_SPV_OVERRIDE` | path | unset | Directory of <kernel>.spv files served instead of the emitted words at pipeline creation (offline spirv-opt / hand-patched A/B instrument). |
 | `DASLLAMA_VK_HAZARD_PARANOID` | flag | off | Barrier at every dispatch (correctness bisect). |
 | `DASLLAMA_VK_HAZARD_TRACE` | flag | off | Log every detected hazard and the barrier it produced. |
 
 ## MoltenVK (macOS)
 
-MoltenVK's own configuration — listed because the vulkan tier arms it on Apple.
+MoltenVK's own configuration - listed because the vulkan tier arms it on Apple.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
@@ -125,12 +129,12 @@ Apple Accelerate / AMX float lane. `DASLLAMA_ACCEL` arms the whole group.
 | `DASLLAMA_ACCEL_MIN_MMAC` | number | backend default | Minimum MMAC count below which Accelerate declines and the daslang kernel runs. |
 | `DASLLAMA_ACCEL_MIN_NTOK` | number | 32 | Minimum token count for the Accelerate float-batch override, floor 1. |
 
-## Harness — tuner and probes
+## Harness - tuner and probes
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
 | `DASLLAMA_MODELS_DIR` | path | unset | Directory holding the .gguf models the probes, benches and tests load. |
-| `DASLLAMA_CONFIRM_MODEL` | path | unset | Model used by the tuner's confirm gate. Must be a FULL path, not a bare filename. |
+| `DASLLAMA_CONFIRM_MODEL` | path | auto-resolved from the models dir | Model used by the tuner's confirm gate (FULL path, not a bare filename). Unset: the gate auto-resolves from the models dir — the preferred confirm carrier, else the largest present q8 gguf; the fallback pins only when the box has no q8 model at all. |
 | `DASLLAMA_BATCH_CHUNKS` | text | unset | Override the batched-dispatch chunk count in the 1-core GEMM probe. |
 | `DASLLAMA_BATCH_GRID_2D` | number | unset | Use the 2D batch grid in the parity probe. |
 | `DASLLAMA_FOCUS_BACKEND` | text | unset | Restrict the 1-core GEMM probe to one backend. |
@@ -214,14 +218,14 @@ Apple Accelerate / AMX float lane. `DASLLAMA_ACCEL` arms the whole group.
 
 ## daslang core knobs dasLLAMA honours
 
-Owned by daslang, not by dasLLAMA — listed because dasLLAMA's behaviour depends on them. `DAS_TUNE_*` is covered in `skills/tune.md`.
+Owned by daslang, not by dasLLAMA - listed because dasLLAMA's behaviour depends on them. `DAS_TUNE_*` is covered in `skills/tune.md`.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
 | `HF_HOME` | path | ~/.cache/huggingface | Hugging Face hub root; fetch_models --convert resolves checkpoint blobs under <HF_HOME>/hub. Falls back to HOME's default cache location when unset. |
 | `HOME` | path | unset | Ambient platform variable; read only to derive the default Hugging Face cache when HF_HOME is unset. |
 | `DAS_JOBQUE_THREADS` | number | conservative default | Total compute lanes for job queues (N-1 workers plus the caller). Overrides set_jobque_threads_cap; see skills/environment_variables.md. |
-| `DAS_JOBQUE_AFFINITY` | number | 0 | Worker affinity: 0 off, 1 ideal-processor hint, 2 hard mask. Matters on big SMT boxes. |
+| `DAS_JOBQUE_AFFINITY` | number | 2 on darwin (engine [init]), else 0 | Worker affinity: 0 off, 1 ideal-processor hint, 2 hard mask — on darwin mode 2 is QoS classification (no pin API) and dasLLAMA defaults it on. Matters on big SMT boxes. |
 | `DAS_JOBQUE_TEAM_RANK_GATE` | number | profile-driven | Team-dispatch rank gate. When set, it suppresses the box profile's own team_rank_gate knob. |
 | `DAS_TUNE_MANIFEST` | path | <app>.tune.json | Kernel-tuning sidecar to read/write. Point it somewhere writable when the app dir is read-only. |
 | `DAS_TUNE_MODE` | text | unset | Kernel-tuning mode. The [tune] framework owns these; see skills/tune.md. |

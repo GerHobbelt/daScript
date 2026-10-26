@@ -511,6 +511,7 @@ namespace das {
         ExpressionPtr visit(ExprTryCatch *expr) override;
         // ExprReturn
         bool inferReturnType(TypeDeclPtr &resType, ExprReturn *expr);
+        void reportUnresolvedReturnValue(ExprReturn *expr);
         virtual void preVisit(ExprReturn *expr) override;
         void getDetailsAndSuggests(ExprReturn *expr, string &details, string &suggestions) const;
         virtual ExpressionPtr visit(ExprReturn *expr) override;
@@ -643,6 +644,7 @@ namespace das {
 
         virtual ExpressionPtr visit(ExprCall *expr) override;
         // StringBuilder
+        virtual void preVisitStringBuilderElement(ExprStringBuilder *sb, Expression *expr, bool last) override;
         virtual ExpressionPtr visitStringBuilderElement(ExprStringBuilder *, Expression *expr, bool) override;
         virtual ExpressionPtr visit(ExprStringBuilder *expr) override;
         // make variant

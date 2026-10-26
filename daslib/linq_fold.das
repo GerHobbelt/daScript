@@ -41,7 +41,7 @@ require ?pugixml pugixml/linq_fold_xml       // optional XML source adapter — 
 require daslib/linq_fold_sql                 // SQL source pass-through — provider-neutral, fires only when sql_linq is in the program
 
 [macro_function]
-def private fold_linq_default(var expr : Expression?) : Expression? {
+def private fold_linq_default(var expr : Expression?) : Expression? {   // nolint:STYLE037 - one arm per linq call shape in the folded chain
     var blk = new ExprBlock(at = expr.at)
     var (top, calls) = flatten_linq(expr)
     if (empty(calls)) return null
@@ -88,7 +88,7 @@ def private fold_linq_default(var expr : Expression?) : Expression? {
             } else {
                 // Macro emits `var pass_N = call` and a later `return <- pass_N`;
                 blk.list |> emplace_new <| qmacro_expr() {
-                    var $i(newArgName) = $e(newCall)  // nolint:PERF009
+                    var $i(newArgName) = $e(newCall)  // nolint:PERF009,LINT019 - qmacro template line; PERF009 fires only in the downstream expansion
                 }
                 (blk.list.back() as ExprLet).variables[0].flags.can_shadow = true
                 if (argIndex != 0) {
@@ -248,13 +248,15 @@ class private LinqFold : AstCallMacro {
     def override visit(prog : ProgramPtr; mod : Module?; var call : ExprCallMacro?) : Expression? {
         macro_verify(call.arguments |> length == 1, prog, call.at, "expecting _fold(expression)")
         macro_verify(call.arguments[0]._type != null, prog, call.at, "expecting linq expression")
+        // defer while the chain type carries a dependent spelling (`select`'s declared typedecl return, pre-instance) — firing then bakes the unresolved typedecl into the emitted buffer decl
+        macro_verify(!call.arguments[0]._type.isAutoOrAlias, prog, call.at, "_fold: chain type is not fully inferred yet")
         var res = try_splice_patterns(prog, call.arguments[0])
         if (res != null) return res
         // Theme 6 — warn when an adapter source (today: `from_decs_template`) survives every splice arm with a non-empty chain, so the bridge materializes a temp `res` array before the cascade. Suppress: `options _no_linq_perf_warn = true`.
         if (!(prog._options |> find_arg("_no_linq_perf_warn") ?as tBool ?? false)) {
             var (top, calls) = flatten_linq(call.arguments[0])
             if (!empty(calls) && extract_decs_bridge(top) != null) {
-                to_compiler_log("{describe(call.at)}: *warning* `_fold`: from_decs_template source survived dispatch — no splice arm claimed this chain, so the bridge materializes a temp `res` array and the tier-2 cascade runs on the materialized buffer. Rewrite the chain to a recognized decs shape (see doc/source/reference/linq_fold_patterns.rst), or suppress with `options _no_linq_perf_warn = true`.\n")
+                to_compiler_log("{describe(call.at)}: *warning* `_fold`: from_decs_template source survived dispatch - no splice arm claimed this chain, so the bridge materializes a temp `res` array and the tier-2 cascade runs on the materialized buffer. Rewrite the chain to a recognized decs shape (see doc/source/reference/linq_fold_patterns.rst), or suppress with `options _no_linq_perf_warn = true`.\n")
             }
         }
         // Tier 2 — array-shape pipeline with `_inplace` reuse + explicit `delete`.

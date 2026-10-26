@@ -223,7 +223,7 @@ jobs:
             # No sccache launcher: this lane is nightly-only and runs uncached.
             cmake --no-warn-unused-cli -B./build -G "${{ matrix.cmake_generator }}" -DCMAKE_BUILD_TYPE:STRING=Release \
               $ACTIVE_MODULES -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-            cmake --build ./build --config Release --target daslang das-fmt daslang_static --parallel
+            cmake --build ./build --config Release --target daslang gen1_to_gen2 daslang_static --parallel
             ;;
           linux)
             echo "BIN=./bin" >> $GITHUB_ENV
@@ -281,6 +281,14 @@ jobs:
     - name: "Run tutorial dry-runs"
       run: cmake --build ./build --config Release --target dry_run_tutorials
 
+    - name: "Verify authored-doc code blocks (nightly only)"
+      # doc-verify compiles every das code block of the authored RST corpus
+      # (skills/doc_sweep.md). Nightly-only per policy: doc rot is not a
+      # per-PR gate. Skipped on windows: the checker spawns one daslang per
+      # page via popen and is exercised on the posix cells.
+      if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && matrix.target != 'windows'
+      run: $BIN/daslang ./utils/doc-verify/main.das -- --daslang $BIN/daslang
+
     - name: "Build standalone executables"
       run: |
         set -eux
@@ -297,7 +305,7 @@ jobs:
       # ON via ci/release_modules.txt in this workflow.
       run: |
         set -eux
-        # The main extended_checks build only targets daslang/das-fmt/daslang_static.
+        # The main extended_checks build only targets daslang/gen1_to_gen2/daslang_static.
         # Sequence loads dasGlfw + dasLiveHost + dasHV + dasAudio + dasPUGIXML +
         # dasStbImage at runtime; build their dynamic-module targets first.
         # No `cmake --install` -- the source tree already IS a usable daslang

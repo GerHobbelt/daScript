@@ -58,6 +58,16 @@ pageInit = function () {
          radio.addEventListener('change', updateButtonStates);
      }
 
+     // "new" — one click to a blank scratch buffer. Drops the autosaved
+     // session and collapses the tab strip to a single empty main.das
+     // (playground-tabs.js owns both); samples stay one dropdown pick away.
+     const newBtn = document.getElementById('new');
+     if (newBtn) newBtn.addEventListener('click', function () {
+         if (typeof window.pgResetSession === 'function') window.pgResetSession();
+         clearOutput();
+         currentAssetsUrl = null;
+     });
+
      // The curated list comes from the sample service (store-fed, phase 2 of
      // plans/dasweb_backend.md); the committed data.json remains the fallback
      // for the GH Pages mirror / an empty store on first boot.
@@ -395,7 +405,8 @@ selectSample = function(type, id) {
     const sel = sampleList[type];
     if (!sel && id === undefined) return;  // dropdown was removed; nothing to read
     let vv = id !== undefined ? id : parseInt(sel.value);
-    if (!Number.isNaN(vv) && samplesData[type] && samplesData[type][vv]) {
+    // samplesData arrives over the network - a "new" click can land before it does
+    if (!Number.isNaN(vv) && samplesData && samplesData[type] && samplesData[type][vv]) {
         // Multi-file samples ship as files[] — load all in parallel, then hand
         // the bundle to the loader (single editor today, tab strip in phase 3).
         // Hide the canvas on every sample switch; a graphics program re-reveals

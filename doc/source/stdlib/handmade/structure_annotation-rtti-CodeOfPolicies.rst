@@ -12,6 +12,7 @@ File name for AOT output (if not set, we generate a temporary file).
 If we are in code completion mode.
 Whether this is a documentation/reflection compile; build-machine-specific transforms stay disabled.
 Whether we are in lint-check mode (standalone linters set this so modules can adapt behavior).
+Skip Program::lint() entirely (as if every module set ``options lint = false``).
 Skip the Module::Initialize() assert in compileDaScript (for environments initialized later, e.g. dynamic-module discovery).
 Export all functions and global variables.
 If not set, we recompile main module each time.
@@ -74,6 +75,7 @@ Disables automatic inlining: block-literal call sites stay regular calls and inv
 Heuristic best-effort inlining of plain calls and operator sites (default ON, optimized builds only): small same-module non-generic callees splice, silently declining anything unspliceable. Cross-module inlining stays the explicit ``[inline]`` contract. Host-side counterpart of ``options auto_inline_functions`` (the option overrides the policy). ``disable_auto_inline`` overrides.
 Node budget for ``auto_inline_functions``: a loop-free callee body up to this many AST nodes is worth splicing (default 32); private callees referenced exactly once are exempt. Host-side counterpart of ``options auto_inline_cost``.
 Disables compile-time function evaluation (RunFolding of pure calls over constant arguments). Host-side counterpart of ``options disable_run`` (the option overrides the policy).
+Disables the temp-string reclaim pass: fresh-string call results consumed in place stop riding the 1-slot dispose queue. Reclaim only activates on the persistent, non-interned string heap. Host-side counterpart of ``options disable_temp_string_reclaim`` (the option overrides the policy).
 Disables infer-time constant folding.
 Fails compilation if AOT is not available.
 Fails compilation if AOT export is not available.

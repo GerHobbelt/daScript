@@ -107,9 +107,13 @@ class VkDispatch : AstStructureAnnotation {
         let family = empty(famArg) ? base : famArg
         let multi = !empty(kern)
         if (!multi && !empty(famArg)) {
-            errors := "[vk_dispatch] {base}: family= without kernel= — a family instance must name its [spirv_kernel] method"
+            errors := "[vk_dispatch] {base}: family= without kernel= - a family instance must name its [spirv_kernel] method"
             return false
         }
+        // census/override display name: the vk_dispatch name= ("<base>_spv"), not the blob
+        // global's mangled default — templated instances drop [spirv_kernel] name=, and a
+        // backticked "{Class}`run`spirv" makes the SPV-override filename unusable
+        let disp_name = "{base}_spv"
         let mname = "{compiling_module().name}"
         let bkey = "{mname}`{base}"
         let fkey = "{mname}`{family}"
@@ -128,7 +132,7 @@ class VkDispatch : AstStructureAnnotation {
             return false
         }
         if (find(grid, ",") >= 0) {
-            errors := "[vk_dispatch] {base}: grid '{grid}' — only a 1D grid is supported (vkCmdDispatch x,1,1)"
+            errors := "[vk_dispatch] {base}: grid '{grid}' - only a 1D grid is supported (vkCmdDispatch x,1,1)"
             return false
         }
         let dparts <- split(grid, "/")
@@ -155,7 +159,7 @@ class VkDispatch : AstStructureAnnotation {
                 } elif (annDecl.name == "workgroup") {
                     is_wg = true
                 } elif (annDecl.name == "uniform") {
-                    errors := "[vk_dispatch] {base}: member '{field.name}' is @uniform — UBO members are not lensed yet; params ride the @push_constant struct"
+                    errors := "[vk_dispatch] {base}: member '{field.name}' is @uniform - UBO members are not lensed yet; params ride the @push_constant struct"
                     return false
                 }
             }
@@ -214,7 +218,7 @@ class VkDispatch : AstStructureAnnotation {
         }
         sort(blist)
         if (blist[length(blist) - 1] > 7) {
-            errors := "[vk_dispatch] {base}: binding {blist[length(blist) - 1]} — the hazard rail's SetBits caps at binding 7"
+            errors := "[vk_dispatch] {base}: binding {blist[length(blist) - 1]} - the hazard rail's SetBits caps at binding 7"
             return false
         }
         let nb = length(blist)   // the set builder's arity: one buffer/size/bits entry per declared binding
@@ -225,7 +229,7 @@ class VkDispatch : AstStructureAnnotation {
         let kfn = find_kernel_fn(st, compiling_module(), kern, nmatch, blob)
         if (empty(kern)) {
             if (kfn == null || nmatch != 1) {
-                errors := "[vk_dispatch] {base}: expected exactly one [spirv_kernel] method on {st.name} (found {nmatch}) — multi-kernel classes pick per instance via kernel="
+                errors := "[vk_dispatch] {base}: expected exactly one [spirv_kernel] method on {st.name} (found {nmatch}) - multi-kernel classes pick per instance via kernel="
                 return false
             }
         } elif (kfn == null) {
@@ -261,19 +265,19 @@ class VkDispatch : AstStructureAnnotation {
                 let cov = (empty(dr) || decl == "" || decl == "alias" || decl == dr
                     || (decl == "readwrite" && (dr == "read" || dr == "write")))
                 if (!cov) {
-                    errors := "[vk_dispatch] {base}: member '{bf.name}' declares @role='{decl}' but kernel '{kern}' derives '{dr}' — the declared role must cover every kernel"
+                    errors := "[vk_dispatch] {base}: member '{bf.name}' declares @role='{decl}' but kernel '{kern}' derives '{dr}' - the declared role must cover every kernel"
                     delete res
                     delete tracked
                     return false
                 }
             } elif (decl != "" && decl != "alias" && decl != dr) {
                 let drName = empty(dr) ? "unused" : dr
-                errors := "[vk_dispatch] {base}: member '{bf.name}' declares @role='{decl}' but the body derives '{drName}' — fix whichever is wrong"
+                errors := "[vk_dispatch] {base}: member '{bf.name}' declares @role='{decl}' but the body derives '{drName}' - fix whichever is wrong"
                 delete res
                 delete tracked
                 return false
             } elif (decl == "" && empty(dr)) {
-                errors := "[vk_dispatch] {base}: @ssbo member '{bf.name}' is never accessed by the kernel body — declare @role (weight/alias) or drop the binding"
+                errors := "[vk_dispatch] {base}: @ssbo member '{bf.name}' is never accessed by the kernel body - declare @role (weight/alias) or drop the binding"
                 delete res
                 delete tracked
                 return false
@@ -321,7 +325,7 @@ class VkDispatch : AstStructureAnnotation {
             cp.arguments |> emplace_new <| mk_gvar(at, blob)
             cp.arguments |> emplace_new <| new ExprConstUInt(at = at, value = rmask)
             cp.arguments |> emplace_new <| new ExprConstUInt(at = at, value = wmask)
-            cp.arguments |> emplace_new <| new ExprConstString(at = at, value := blob)
+            cp.arguments |> emplace_new <| new ExprConstString(at = at, value := disp_name)
             var pm = new ExprCall(at = at, name := "vkd_pipe_made")
             pm.arguments |> emplace_new <| mk_gvar(at, gname)
             pm.arguments |> emplace_new <| new ExprConstInt(at = at, value = ord)
@@ -353,7 +357,7 @@ class VkDispatch : AstStructureAnnotation {
         // or not, so a never-dispatched class kernel warns like the module-global kernels do
         {
             var cs = new ExprCall(at = at, name := "vkd_census_seed")
-            cs.arguments |> emplace_new <| new ExprConstString(at = at, value := blob)
+            cs.arguments |> emplace_new <| new ExprConstString(at = at, value := disp_name)
             cs.arguments |> emplace_new <| new ExprConstUInt(at = at, value = rmask)
             cs.arguments |> emplace_new <| new ExprConstUInt(at = at, value = wmask)
             var body <- array<ExpressionPtr>(cs)

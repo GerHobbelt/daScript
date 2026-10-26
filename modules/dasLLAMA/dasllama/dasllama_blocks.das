@@ -1235,11 +1235,11 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
                 s.moe_inv[s.moe_bkt[j]] = uint(j)
             }
             matmul_moe_gpu_ffn_combined(s.moe_eout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
-                s.moe_gxq, s.moe_gxs, s.moe_w_b, s.moe_inv, dim, nfe, nk, npos, int(moe_gpu_expert_fmt(f1)), int(moe_gpu_expert_fmt(f3)), int(moe_gpu_expert_fmt(f2)), c.ffn_act == FfnAct.gelu)
+                s.moe_gxq, s.moe_gxs, s.moe_w_b, s.moe_inv, dim, nfe, nk, npos, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
             prof_add("moe_gpu", ts_g1)
         } elif (fused_gpu) {   // combine off: per-row gout + the park/CPU-reduce path below
             matmul_moe_gpu_ffn(s.moe_gout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
-                s.moe_gxq, s.moe_gxs, dim, nfe, nk, int(moe_gpu_expert_fmt(f1)), int(moe_gpu_expert_fmt(f3)), int(moe_gpu_expert_fmt(f2)), c.ffn_act == FfnAct.gelu)
+                s.moe_gxq, s.moe_gxs, dim, nfe, nk, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
             prof_add("moe_gpu", ts_g1)
         } else {
             if (fused_kq) {   // native-plane: one batched region-list GEMM per projection (never biased)
@@ -1505,7 +1505,7 @@ def forward_prefill_embd(t : Model; var s : Session; embd : array<float>; npos, 
         panic("forward_prefill_embd: q4_0 mode has no batched prefill path (use q8 or fp32)")
     }
     if (long_length(embd) < npos * t.config.dim) {
-        panic("forward_prefill_embd: embd has {long_length(embd)} floats — npos={npos} rows of dim={t.config.dim} need {npos * t.config.dim}")
+        panic("forward_prefill_embd: embd has {long_length(embd)} floats - npos={npos} rows of dim={t.config.dim} need {npos * t.config.dim}")
     }
     kv_ensure(s, start_pos + npos)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
     forward_prefill_alloc(t, s, npos, start_pos)

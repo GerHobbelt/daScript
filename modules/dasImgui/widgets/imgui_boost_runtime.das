@@ -790,7 +790,7 @@ def public imgui_memory_report() {
     let dstr = int64(str_now) - int64(g_mem_str_baseline)
     to_log(LOG_INFO, "imgui mem: heap {heap_now/1024ul}kb (peak {g_mem_heap_max/1024ul}kb, delta {dheap}), str {str_now/1024ul}kb (peak {g_mem_str_max/1024ul}kb, delta {dstr})\n")
     if (dheap > 65536l || dstr > 65536l) {
-        to_log(LOG_WARNING, "imgui mem: WARNING growth since baseline — heap +{dheap} str +{dstr} bytes (per-frame leak / GC pressure)\n")
+        to_log(LOG_WARNING, "imgui mem: WARNING growth since baseline - heap +{dheap} str +{dstr} bytes (per-frame leak / GC pressure)\n")
     }
 }
 
@@ -1079,7 +1079,7 @@ def private check_unique_render(path_key : string; kind : string) {
     // radio_button_int intentionally shares state across N per-frame calls; other kinds panic on duplicate render.
     return if (kind == "radio_button_int")
     if (key_exists(g_rendered_this_frame, path_key)) {
-        let msg = "dasImgui: widget '{path_key}' ({kind}) rendered twice in frame {g_frame}. Single-global widgets must render exactly once per frame. For multiple instances, declare a table  variable private <NAME> : table<int; <STATE_TYPE>>  and call with subscript:  {kind}(<NAME>[i], (...))"
+        let msg = "dasImgui: widget '{path_key}' ({kind}) rendered twice in frame {g_frame}. Single-global widgets must render exactly once per frame. For multiple instances, declare a table  var private <NAME> : table<int; <STATE_TYPE>>  and call with subscript:  {kind}(<NAME>[i], (...))"
         panic(msg)
     }
     g_rendered_this_frame |> insert(path_key)

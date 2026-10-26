@@ -5,7 +5,7 @@ options _function_length = 0   // same
 
 require profile_common
 require dasllama/dasllama_env   // the g_env_* knob globals ([EnvConfig] declarations; ENVIRONMENT.md is generated from them)
-require dasllama/dasllama_image   // dlim_clean + dlim_inventory — step-zero GC and the re-mint tripwire
+require dasllama/dasllama_image   // dlim_wipe + dlim_inventory — the batch lifecycle and the re-mint tripwire
 require llvm/daslib/llvm_tune   // [tune_policy]: the orchestrator never measures — it must never self-tune
 require daslib/clargs
 require daslib/fio
@@ -86,7 +86,7 @@ struct Args {
     @clarg_doc = "Timed repetitions per ASR clip, best kept (default: 2 — clips are minutes, not seconds)"
     asr_reps : int = 2
 
-    @clarg_doc = "Verify instead of measure: re-run each stored das LLM row once and gate it against the store. A missing .dlim is minted and warmed by a prepare pass first, so only the timed cell is frozen. No refs, no store writes. Stops at the first FAIL"
+    @clarg_doc = "Verify instead of measure: re-run each stored das LLM row once and gate it against the store. The batch starts with an image wipe; a prepare pass bakes and warms each cell's image so only the timed cell is frozen, and a model's images are deleted after its last cell. No refs, no store writes. Stops at the first FAIL"
     oracle : bool
 
     @clarg_doc = "Oracle: run every row and report the full board instead of stopping at the first FAIL"
@@ -183,7 +183,7 @@ def private rig_exe_checked() : string {
     }
     let newest = rig_newest_source()
     if (newest._1 > st.mtime) {
-        to_log(LOG_ERROR, "gen_bench_records: bench exe is older than {newest._0} — it bakes that source AND the tune winners, so it would measure stale code\n  rebuild: {rig_build_line()}\n")
+        to_log(LOG_ERROR, "gen_bench_records: bench exe is older than {newest._0} - it bakes that source AND the tune winners, so it would measure stale code\n  rebuild: {rig_build_line()}\n")
         return ""
     }
     return exe
@@ -217,9 +217,44 @@ def private mint_check(dir, whose : string) {
         let n = (g_mint_count?[im.path] ?? 0) + 1
         g_mint_count[im.path] = n
         if (n > 1) {
-            panic("gen_bench_records: {im.path} was minted {n} times in one sweep (last by {whose}) — two cells disagree on its identity, so their numbers are not comparable")
+            panic("gen_bench_records: {im.path} was minted {n} times in one sweep (last by {whose}) - two cells disagree on its identity, so their numbers are not comparable")
         }
         to_log(LOG_INFO, "gen_bench_records: minted {im.file} ({im.bytes >> 20l} MB) during {whose}\n")
+    }
+}
+
+// STEP ZERO of a validated batch: the rigs own the model dirs for the whole run — start by
+// deleting every image. Each model re-bakes when its first cell needs it (the cv warm-retry
+// absorbs the cold map; --oracle's prepare pass bakes before the timed cell) and its images die
+// after its last cell, so the disk high-water mark is ONE model's lanes, never the catalog's —
+// a live two-lane working set once filled a 460 GB box to 97% and failed a bake mid-sweep.
+// A fresh box pays nothing extra: it starts with no images either way.
+def private batch_start_wipe(workload : string) {
+    // scoped to what THIS batch will re-bake: an ASR-only run must not wipe LLM images it
+    // never touches again, so it wipes per ASR carrier instead of the whole models dir
+    if (workload == "llm" || workload == "all") {
+        let w_llm = dlim_wipe(models_dir())
+        if (w_llm.removed > 0) {
+            to_log(LOG_INFO, "gen_bench_records: lifecycle wipe - {w_llm.removed} image(s), {w_llm.freed >> 20l} MB in {models_dir()}\n")
+        }
+    } else {
+        for (spec in asr_catalog()) {
+            let w = dlim_wipe(asr_model_path(spec))
+            if (w.removed > 0) {
+                to_log(LOG_INFO, "gen_bench_records: lifecycle wipe - {spec.display}: {w.removed} image(s), {w.freed >> 20l} MB\n")
+            }
+        }
+    }
+    if (workload == "asr" || workload == "all") {
+        // a one-dir box points WHISPER_CPP_MODELS at the llm dir — skip the whole-dir form
+        // there on an ASR-only run (the per-carrier wipe above already covered it)
+        let wdir = whisper_models_dir()
+        if (workload == "all" || wdir != models_dir()) {
+            let w_w = dlim_wipe(wdir)
+            if (w_w.removed > 0) {
+                to_log(LOG_INFO, "gen_bench_records: lifecycle wipe - {w_w.removed} image(s), {w_w.freed >> 20l} MB in {wdir}\n")
+            }
+        }
     }
 }
 
@@ -262,14 +297,14 @@ def private absorb_cell(var models : array<BenchModel>; var cell : array<BenchMo
         if (debug_stamped) {
             // belt + braces: the rig only spawns the released exe, but a debug-stamped row
             // must never survive into the store no matter how it arrived
-            to_log(LOG_ERROR, "gen_bench_records: DROPPING debug-jit cell for {c.gguf} — debug runs are not records\n")
+            to_log(LOG_ERROR, "gen_bench_records: DROPPING debug-jit cell for {c.gguf} - debug runs are not records\n")
             continue
         }
         if (unstamped && !g_env_bench.allow_untuned) {
             // the store-time arm of the tune gate: the file-level gate passes a VALID-but-stale
             // shipped sidecar (the M4 mis-ship), the runtime then drops to fallback, and the
             // row arrives here with an empty stamp — unnameable winners are not records
-            to_log(LOG_ERROR, "gen_bench_records: DROPPING {c.gguf} — a das run carries no tune stamp, the winners it measured under cannot be named (fix the release/manifest; DASLLAMA_ALLOW_UNTUNED=1 stores a dev row)\n")
+            to_log(LOG_ERROR, "gen_bench_records: DROPPING {c.gguf} - a das run carries no tune stamp, the winners it measured under cannot be named (fix the release/manifest; DASLLAMA_ALLOW_UNTUNED=1 stores a dev row)\n")
             failed |> push("{c.gguf} unstamped")
             continue
         }
@@ -328,7 +363,7 @@ def private run_das_child(file, path, be, tag, exe : string; accel, frozen : boo
         cell |> clear()
         if (rc != 0 || !read_bench_records(cellPath, cell)) {
             let tail = slice(out, max(0, length(out) - 400))
-            to_log(LOG_ERROR, "gen_bench_records: FAILED {file} das {tag} rc={rc} ({elapsed_ms(t0)} ms) — tail: {tail}\n")
+            to_log(LOG_ERROR, "gen_bench_records: FAILED {file} das {tag} rc={rc} ({elapsed_ms(t0)} ms) - tail: {tail}\n")
             logger_error("bench.records", "cell FAILED", JV({"model" => JV(file), "engine" => JV("das"), "leg" => JV(tag), "rc" => JV(rc), "elapsed_ms" => JV(elapsed_ms(t0))}))
             return false
         }
@@ -354,11 +389,11 @@ def private run_das_child(file, path, be, tag, exe : string; accel, frozen : boo
             break
         }
         if (attempt == 0) {
-            to_log(LOG_WARNING, "gen_bench_records: HIGH VARIANCE {file} das {tag} (cv {worst * 100.0lf:.1f}%) — cold-map warming suspect, re-running the cell warm\n")
-            logger_warning("bench.records", "high variance — warm re-run", JV({"model" => JV(file), "leg" => JV(tag), "cv_pct" => JV(worst * 100.0lf)}))
+            to_log(LOG_WARNING, "gen_bench_records: HIGH VARIANCE {file} das {tag} (cv {worst * 100.0lf:.1f}%) - cold-map warming suspect, re-running the cell warm\n")
+            logger_warning("bench.records", "high variance - warm re-run", JV({"model" => JV(file), "leg" => JV(tag), "cv_pct" => JV(worst * 100.0lf)}))
             settle(cfg)
         } else {
-            to_log(LOG_WARNING, "gen_bench_records: STILL HIGH VARIANCE {file} das {tag} (cv {worst * 100.0lf:.1f}%) after a warm re-run — keeping it, treat with suspicion\n")
+            to_log(LOG_WARNING, "gen_bench_records: STILL HIGH VARIANCE {file} das {tag} (cv {worst * 100.0lf:.1f}%) after a warm re-run - keeping it, treat with suspicion\n")
         }
     }
     return true
@@ -391,7 +426,7 @@ def private oracle_cell(gguf, be, tag, exe : string; accel : bool; stored : Benc
                         cellPath : string; var board : array<string>) : OracleVerdict {
     let path = "{models_dir()}{gguf}"
     if (!stat(path).is_valid) {
-        let miss = "FAIL {gguf} das {tag} — model file missing: {path}"
+        let miss = "FAIL {gguf} das {tag} - model file missing: {path}"
         to_log(LOG_ERROR, "gen_bench_records: ORACLE {miss}\n")
         board |> push(miss)
         return OracleVerdict.fail
@@ -400,7 +435,7 @@ def private oracle_cell(gguf, be, tag, exe : string; accel : bool; stored : Benc
     logger_info("bench.records", "oracle cell start", JV({"model" => JV(gguf), "leg" => JV(tag)}))
     var cell : array<BenchModel>
     if (!run_das_child(gguf, path, be, tag, exe, accel, true, cfg, threads, cellPath, cell)) {
-        board |> push("FAIL {gguf} das {tag} — cell did not measure (missing .dlim, unfit tune, or crash — see the log)")
+        board |> push("FAIL {gguf} das {tag} - cell did not measure (missing .dlim, unfit tune, or crash - see the log)")
         return OracleVerdict.fail
     }
     remove(cellPath)
@@ -435,7 +470,7 @@ def private oracle_asr_cell(spec : AsrModelSpec; stored : BenchRun; cfg : Args; 
                             cellPath, exe : string; var board : array<string>) : OracleVerdict {
     let path = asr_model_path(spec)
     if (!stat(path).is_valid) {
-        let miss = "FAIL {spec.display} das asr — model file missing: {path}"
+        let miss = "FAIL {spec.display} das asr - model file missing: {path}"
         to_log(LOG_ERROR, "gen_bench_records: ORACLE {miss}\n")
         board |> push(miss)
         return OracleVerdict.fail
@@ -448,7 +483,7 @@ def private oracle_asr_cell(spec : AsrModelSpec; stored : BenchRun; cfg : Args; 
     let rc = run_and_stream(args, out)
     var cell : array<BenchModel>
     if (rc != 0 || !read_bench_records(cellPath, cell)) {
-        board |> push("FAIL {spec.display} das asr — cell did not measure (rc={rc}, see the log)")
+        board |> push("FAIL {spec.display} das asr - cell did not measure (rc={rc}, see the log)")
         return OracleVerdict.fail
     }
     remove(cellPath)
@@ -493,16 +528,16 @@ def private oracle_prepare(gguf, be, tag, exe : string; accel : bool; threads : 
     let rc = run_and_stream(args, out)
     remove(cellPath)
     if (rc != 0) {
-        to_log(LOG_WARNING, "gen_bench_records: ORACLE PREPARE {gguf} {tag} rc={rc} — the frozen cell below reports it\n")
+        to_log(LOG_WARNING, "gen_bench_records: ORACLE PREPARE {gguf} {tag} rc={rc} - the frozen cell below reports it\n")
         return
     }
-    // Minting means the image was ABSENT, so the frozen cell below can no longer prove the pin-set
-    // still matches the one the stored row used — say so rather than let prepare hide the drift.
+    // Under the batch lifecycle the image is EXPECTED absent (the batch starts with a wipe) —
+    // the crossgen gate before this prepare already carried the pin-set proof via tune_sha.
     if (find(out, "prepared image streamed") >= 0) {
-        to_log(LOG_WARNING, "gen_bench_records: ORACLE PREPARE {gguf} {tag} — image was ABSENT and got minted ({elapsed_ms(t0)} ms); a pin-set change would go undetected for this cell\n")
+        to_log(LOG_INFO, "gen_bench_records: ORACLE PREPARE {gguf} {tag} - image baked ({elapsed_ms(t0)} ms)\n")
         return
     }
-    to_log(LOG_INFO, "gen_bench_records: ORACLE PREPARE {gguf} {tag} — image mapped and warm ({elapsed_ms(t0)} ms)\n")
+    to_log(LOG_INFO, "gen_bench_records: ORACLE PREPARE {gguf} {tag} - image mapped and warm ({elapsed_ms(t0)} ms)\n")
 }
 
 // The --oracle driver: the work list is the STORE's das LLM rows for this box (the published
@@ -517,7 +552,7 @@ def private crossgen_ok(sr : BenchRun; currentSha : string; allow : bool; what :
         return true   // rig exe without a sidecar: the tune gate inside the cell reports it
     }
     if (empty(sr.tune_sha)) {
-        board |> push("WARN {what}: legacy row (no sidecar generation recorded) — comparing anyway")
+        board |> push("WARN {what}: legacy row (no sidecar generation recorded) - comparing anyway")
         warns++
         return true
     }
@@ -529,8 +564,8 @@ def private crossgen_ok(sr : BenchRun; currentSha : string; allow : bool; what :
         warns++
         return true
     }
-    board |> push("INCOMPARABLE {what}: sidecar generation changed (stored {slice(sr.tune_sha, 0, 12)} vs current {slice(currentSha, 0, 12)}) — re-record the row or --oracle-allow-crossgen")
-    to_log(LOG_ERROR, "gen_bench_records: ORACLE INCOMPARABLE {what} — the stored mean belongs to different winners\n")
+    board |> push("INCOMPARABLE {what}: sidecar generation changed (stored {slice(sr.tune_sha, 0, 12)} vs current {slice(currentSha, 0, 12)}) - re-record the row or --oracle-allow-crossgen")
+    to_log(LOG_ERROR, "gen_bench_records: ORACLE INCOMPARABLE {what} - the stored mean belongs to different winners\n")
     fails++
     return false
 }
@@ -551,6 +586,7 @@ def private oracle_main(cfg : Args; legNeon, legAmx, legMetal : bool; models : a
         if (!empty(cfg.only) && find(m.gguf, cfg.only) < 0) {
             continue
         }
+        let cellsBefore = cells
         for (sr in m.runs) {
             break if (stopped)
             if (sr.engine != "das" || sr.box != box) {
@@ -609,7 +645,7 @@ def private oracle_main(cfg : Args; legNeon, legAmx, legMetal : bool; models : a
                 accel = true
                 want = legAmx
             } else {
-                to_log(LOG_WARNING, "gen_bench_records: ORACLE skips stored run {m.gguf} {sr.backend}/{sr.flavor} — no rig leg produces it\n")
+                to_log(LOG_WARNING, "gen_bench_records: ORACLE skips stored run {m.gguf} {sr.backend}/{sr.flavor} - no rig leg produces it\n")
                 continue
             }
             if (!want) {
@@ -625,8 +661,8 @@ def private oracle_main(cfg : Args; legNeon, legAmx, legMetal : bool; models : a
             if (v == OracleVerdict.fail && cfg.oracle_retry_settle > 0) {
                 // a tail-of-board FAIL is a re-run instruction, never a verdict (BRINGUP): the
                 // solo re-run after settle is automatic, and ITS verdict stands
-                to_log(LOG_WARNING, "gen_bench_records: ORACLE FAIL {m.gguf} — auto solo re-run after {cfg.oracle_retry_settle}s settle (the retry is the verdict)\n")
-                board |> push("  ^ suspect FAIL — the auto solo re-run below is the verdict")
+                to_log(LOG_WARNING, "gen_bench_records: ORACLE FAIL {m.gguf} - auto solo re-run after {cfg.oracle_retry_settle}s settle (the retry is the verdict)\n")
+                board |> push("  ^ suspect FAIL - the auto solo re-run below is the verdict")
                 sleep(uint(cfg.oracle_retry_settle * 1000))
                 v = oracle_cell(m.gguf, be, tag, exe, accel, sr, cfg, threads, cellPath, board)
             }
@@ -640,16 +676,22 @@ def private oracle_main(cfg : Args; legNeon, legAmx, legMetal : bool; models : a
                 warns++
             }
         }
+        if (cells > cellsBefore) {   // fully profiled here - its images are done serving
+            let wm = dlim_wipe("{models_dir()}{m.gguf}")
+            if (wm.removed > 0) {
+                to_log(LOG_INFO, "gen_bench_records: lifecycle - {m.gguf} profiled, {wm.removed} image(s) deleted ({wm.freed >> 20l} MB)\n")
+            }
+        }
     }
     to_log(LOG_INFO, "gen_bench_records: ===== ORACLE BOARD ({box}) =====\n")
     for (line in board) {
         to_log(LOG_INFO, "gen_bench_records:   {line}\n")
     }
     if (cells == 0) {
-        to_log(LOG_ERROR, "gen_bench_records: ORACLE found no stored das rows for the selected legs on {box} — nothing verified\n")
+        to_log(LOG_ERROR, "gen_bench_records: ORACLE found no stored das rows for the selected legs on {box} - nothing verified\n")
         return 1
     }
-    let early = stopped ? " — STOPPED EARLY" : ""
+    let early = stopped ? " - STOPPED EARLY" : ""
     to_log(fails > 0 ? LOG_ERROR : LOG_INFO, "gen_bench_records: ORACLE {cells} cell(s): {fails} FAIL, {warns} WARN{early}\n")
     return fails > 0 ? 1 : 0
 }
@@ -686,7 +728,7 @@ def private ref_pass(file, path, bin, flavor : string; ngl : int; nopo : bool; c
         let why = (empty(strip(raw)) ? "child printed NOTHING (spawn or early death)"
             : (find(raw, "\n[") < 0 && !(strip(raw) |> starts_with("[")) ? "output carries NO json result array (only diagnostics?)"
                 : "a result array was found but did not parse"))
-        to_log(LOG_ERROR, "gen_bench_records: FAILED {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms) — {why}\n  cmd: {cmd}\n  tail: {tail}\n")
+        to_log(LOG_ERROR, "gen_bench_records: FAILED {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms) - {why}\n  cmd: {cmd}\n  tail: {tail}\n")
         logger_error("bench.records", "cell FAILED", JV({"model" => JV(file), "engine" => JV("llama.cpp"), "leg" => JV("{flavor} {backend}"), "elapsed_ms" => JV(elapsed_ms(t0))}))
         failed |> push("{file} ref {flavor} {backend}")
         return
@@ -732,7 +774,7 @@ def private asr_das_cell(spec : AsrModelSpec; cfg : Args; threads : int; cellPat
     var cell : array<BenchModel>
     if (rc != 0 || !read_bench_records(cellPath, cell)) {
         let tail = slice(out, max(0, length(out) - 400))
-        to_log(LOG_ERROR, "gen_bench_records: FAILED {spec.display} das asr rc={rc} ({elapsed_ms(t0)} ms) — tail: {tail}\n")
+        to_log(LOG_ERROR, "gen_bench_records: FAILED {spec.display} das asr rc={rc} ({elapsed_ms(t0)} ms) - tail: {tail}\n")
         logger_error("bench.records", "cell FAILED", JV({"model" => JV(spec.display), "engine" => JV("das"), "leg" => JV("asr"), "rc" => JV(rc)}))
         failed |> push("{spec.display} das asr")
         return
@@ -766,7 +808,7 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
                          hw : HardwareInfo; box, date, store : string;
                          var models : array<BenchModel>; var failed : array<string>) {
     if (!asr_ref_available(ref.tool)) {
-        to_log(LOG_WARNING, "gen_bench_records: SKIP {spec.display} ref {ref.tool} — tool not on this box\n")
+        to_log(LOG_WARNING, "gen_bench_records: SKIP {spec.display} ref {ref.tool} - tool not on this box\n")
         return
     }
     let t0 = ref_time_ticks()
@@ -804,7 +846,7 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
             // 25 clips in ~30 s, where a per-clip cli process would cost ~9 min per sweep
             lib <- libri_wavs()   // nolint:PERF030 — first write to the empty decl above
             if (empty(lib)) {
-                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref onnx — librispeech set absent/partial, leg skipped\n")
+                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref onnx - librispeech set absent/partial, leg skipped\n")
             } else {
                 clips |> push_from(lib)
             }
@@ -818,11 +860,11 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
             // wreck the child's stdout pipe; the file survives everything)
             let sidecar = fread(asr_pybench_out_path())
             if (find(sidecar, "BENCH") >= 0) {
-                to_log(LOG_INFO, "gen_bench_records:   {ref.tool} pipe was rowless — rows recovered from --out file\n")
+                to_log(LOG_INFO, "gen_bench_records:   {ref.tool} pipe was rowless - rows recovered from --out file\n")
                 out = sidecar
             } else {
                 let dtail = slice(out, max(0, length(out) - 400))
-                to_log(LOG_WARNING, "gen_bench_records:   {ref.tool} output carries no BENCH rows — tail: {dtail}\n")
+                to_log(LOG_WARNING, "gen_bench_records:   {ref.tool} output carries no BENCH rows - tail: {dtail}\n")
             }
         }
         for (wav in rbuckets) {
@@ -854,7 +896,7 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
                 measured++
                 to_log(LOG_INFO, "gen_bench_records:   onnx librispeech25 total {lib_ms:.0f} ms ({lib_n} clips)\n")
             } else {
-                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref onnx — {lib_n}/{length(lib)} libri clips parsed, aggregate NOT recorded\n")
+                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref onnx - {lib_n}/{length(lib)} libri clips parsed, aggregate NOT recorded\n")
             }
         }
         delete lib
@@ -882,7 +924,7 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
                 rr.files |> emplace(file_identity(wav_path, "clip"))
                 measured++
             } else {
-                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref {ref.tool} {wav} — no timing parsed\n")
+                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref {ref.tool} {wav} - no timing parsed\n")
             }
         }
         if (!empty(spec.libri_short) && ref.tool == "parakeet-cli") {
@@ -890,10 +932,10 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
             // cumulative total − load IS the aggregate (see run_asr_cli_multi)
             var lib <- libri_wavs()
             if (empty(lib)) {
-                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref {ref.tool} — librispeech set absent/partial, leg skipped\n")
+                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref {ref.tool} - librispeech set absent/partial, leg skipped\n")
             } else {
                 var paths <- [for (w in lib); "{asr_corpus_dir()}{w}"]
-                to_log(LOG_INFO, "gen_bench_records:   {ref.tool} librispeech25 — one process over {length(lib)} clip(s) ({cfg.asr_reps} rep(s))...\n")
+                to_log(LOG_INFO, "gen_bench_records:   {ref.tool} librispeech25 - one process over {length(lib)} clip(s) ({cfg.asr_reps} rep(s))...\n")
                 var cmd = ""
                 let ms = run_asr_cli_multi(ref.tool, model_path, paths, threads, cfg.asr_reps, cmd)
                 rr.cmd = cmd
@@ -906,7 +948,7 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
                     measured++
                     to_log(LOG_INFO, "gen_bench_records:   {ref.tool} librispeech25 = {ms:.0f} ms\n")
                 } else {
-                    to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref {ref.tool} librispeech25 — no timing parsed\n")
+                    to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref {ref.tool} librispeech25 - no timing parsed\n")
                 }
                 delete paths
             }
@@ -914,7 +956,7 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
         }
     }
     if (measured == 0) {
-        to_log(LOG_ERROR, "gen_bench_records: FAILED {spec.display} ref {ref.tool} — nothing measured ({elapsed_ms(t0)} ms)\n")
+        to_log(LOG_ERROR, "gen_bench_records: FAILED {spec.display} ref {ref.tool} - nothing measured ({elapsed_ms(t0)} ms)\n")
         logger_error("bench.records", "cell FAILED", JV({"model" => JV(spec.display), "engine" => JV(asr_engine_name(ref.tool)), "leg" => JV("asr")}))
         failed |> push("{spec.display} ref {ref.tool}")
         return
@@ -947,36 +989,22 @@ def main : int {
     // stdout is the live narration (cells stream their children through); the ndjson logger is
     // the timestamped machine-readable record beside it
     logger_set_name(prof_log_name())
-    to_log(LOG_INFO, "gen_bench_records: box={box_name()} workload={cfg.workload} — ndjson record: {logger_get_path()}\n")
+    to_log(LOG_INFO, "gen_bench_records: box={box_name()} workload={cfg.workload} - ndjson record: {logger_get_path()}\n")
     // The child exe owns its tune state: winners baked in at build time, sidecar shipped beside it.
     // Pointing it at a shared box manifest re-opens exactly what that replaced — the manifest is
     // older than a freshly built exe, the staleness rule drops every kernel to fallback, and the
     // cell measures nothing real. So the rig CLEARS the override rather than setting one, and an
     // inherited value from the caller's shell is cleared too.
     if (!empty(g_env_core.tune_manifest)) {
-        to_log(LOG_INFO, "gen_bench_records: clearing inherited DAS_TUNE_MANIFEST — the bench exe carries its own winners\n")
+        to_log(LOG_INFO, "gen_bench_records: clearing inherited DAS_TUNE_MANIFEST - the bench exe carries its own winners\n")
         set_env_variable("DAS_TUNE_MANIFEST", "")
     }
-    // STEP ZERO, automatic: GC image siblings that can never load again (BROKEN/version-stale)
-    // across the dirs this sweep reads — a box once carried 274 GB of them. OTHER STAYS, and
-    // keep_other is what makes that true: the cells measure through the bench EXE (its own baked
-    // winners), so this orchestrator cannot recompute their identities and must not judge them.
-    // --oracle skips it: the artifact set is frozen for the whole check.
-    if (!cfg.oracle) {
-        let gc_llm = dlim_clean(models_dir(), true, keep_other = true)
-        if (gc_llm.removed > 0) {
-            to_log(LOG_INFO, "gen_bench_records: GC freed {gc_llm.freed >> 20l} MB — {gc_llm.removed} stale image(s) in {models_dir()}\n")
-        }
-        if (cfg.workload == "asr" || cfg.workload == "all") {
-            let gc_w = dlim_clean(whisper_models_dir(), true, keep_other = true)
-            if (gc_w.removed > 0) {
-                to_log(LOG_INFO, "gen_bench_records: GC freed {gc_w.freed >> 20l} MB — {gc_w.removed} stale image(s) in {whisper_models_dir()}\n")
-            }
-        }
-    }
+    // The lifecycle wipe (batch_start_wipe) runs AFTER each mode's exe gate below — a batch
+    // that will refuse to measure must not destroy state first (bitten live: an exe-staleness
+    // refusal right after a 323 GB wipe).
     let apple = is_apple_box()
     if (cfg.backend == "metal" && !apple) {   // fail fast instead of running metal cells that all decline on non-Apple boxes
-        to_log(LOG_ERROR, "gen_bench_records: --backend metal requested on a non-Apple box — Metal is macOS-only\n")
+        to_log(LOG_ERROR, "gen_bench_records: --backend metal requested on a non-Apple box - Metal is macOS-only\n")
         return 1
     }
     let doLlm = cfg.workload == "llm" || cfg.workload == "all"
@@ -1022,11 +1050,12 @@ def main : int {
     }
     if (cfg.oracle) {
         // GATE 1: no refs run (binaries not even required); GATE 2: one das pass per stored row
-        // (the cv warm-retry stays — it REPLACES a bad cold measure); GATE 3: frozen artifacts.
+        // (the cv warm-retry stays — it REPLACES a bad cold measure); GATE 3: the timed cell is
+        // frozen — its image is baked by the prepare pass, and tune_sha carries the pin-set proof.
         let ostore = bench_records_path()
         var omodels : array<BenchModel>
         if (!read_bench_records(ostore, omodels)) {
-            to_log(LOG_ERROR, "gen_bench_records: --oracle needs an existing store — {ostore} is absent/unreadable\n")
+            to_log(LOG_ERROR, "gen_bench_records: --oracle needs an existing store - {ostore} is absent/unreadable\n")
             return 1
         }
         let othreads = cfg.threads > 0 ? cfg.threads : profile_threads()
@@ -1034,23 +1063,25 @@ def main : int {
         if (empty(oexe)) {
             return 1
         }
+        batch_start_wipe(cfg.workload)
         return oracle_main(cfg, legNeon, legAmx, legMetal, omodels,
             othreads, "modules/dasLLAMA/performance/records/_cell_{box_name()}.json", oexe)
     }
     var refClean = empty(cfg.ref_clean) ? g_env_prof.llama_bench_clean : cfg.ref_clean
     var refStock = empty(cfg.ref_stock) ? g_env_prof.llama_bench_stock : cfg.ref_stock
     if (!empty(refClean) && !stat(refClean).is_valid) {
-        to_log(LOG_WARNING, "gen_bench_records: clean-cpu ref `{refClean}` not found — neon cells run das-only\n")
+        to_log(LOG_WARNING, "gen_bench_records: clean-cpu ref `{refClean}` not found - neon cells run das-only\n")
         refClean = ""
     }
     if (!empty(refStock) && !stat(refStock).is_valid) {
-        to_log(LOG_WARNING, "gen_bench_records: stock ref `{refStock}` not found — no stock rows\n")
+        to_log(LOG_WARNING, "gen_bench_records: stock ref `{refStock}` not found - no stock rows\n")
         refStock = ""
     }
     let exe = rig_exe_checked()
     if (empty(exe)) {
         return 1
     }
+    batch_start_wipe(cfg.workload)
     mkdir_rec("modules/dasLLAMA/performance/records")
     snapshot_tune_generation(exe)
     let store = bench_records_path()
@@ -1073,7 +1104,7 @@ def main : int {
         }
         let path = "{models_dir()}{file}"
         if (!stat(path).is_valid) {
-            to_log(LOG_WARNING, "gen_bench_records: SKIP {file} — not on this box\n")
+            to_log(LOG_WARNING, "gen_bench_records: SKIP {file} - not on this box\n")
             continue
         }
         // thermal-fair pass order: each ratio's das cell and its ref run ADJACENT (the
@@ -1106,6 +1137,10 @@ def main : int {
             settle_das(cfg)
             ref_pass(file, path, refStock, "stock", 0, true, cfg, threads, hw, box, date, ent.note, store, models, failed)
         }
+        let wm = dlim_wipe(path)   // fully profiled - its images are done serving
+        if (wm.removed > 0) {
+            to_log(LOG_INFO, "gen_bench_records: lifecycle - {file} profiled, {wm.removed} image(s) deleted ({wm.freed >> 20l} MB)\n")
+        }
     }
     if (doAsr) {
         let asrTier = parse_tier(cfg.asr_tier)
@@ -1116,11 +1151,11 @@ def main : int {
                 continue
             }
             if (!stat(asr_model_path(spec)).is_valid) {
-                to_log(LOG_WARNING, "gen_bench_records: SKIP {spec.display} — model not on this box\n")
+                to_log(LOG_WARNING, "gen_bench_records: SKIP {spec.display} - model not on this box\n")
                 continue
             }
             if (!asr_model_selected(spec, asrTier)) {
-                to_log(LOG_INFO, "gen_bench_records: SKIP {spec.display} — not in --asr-tier {cfg.asr_tier}\n")
+                to_log(LOG_INFO, "gen_bench_records: SKIP {spec.display} - not in --asr-tier {cfg.asr_tier}\n")
                 continue
             }
             settle_das(cfg)
@@ -1131,6 +1166,10 @@ def main : int {
                 }
                 settle(cfg)
                 asr_ref_pass(spec, rf, toolVersions?[rf.tool] ?? "", cfg, threads, hw, box, date, store, models, failed)
+            }
+            let wasr = dlim_wipe(asr_model_path(spec))   // same lifecycle for the audio images
+            if (wasr.removed > 0) {
+                to_log(LOG_INFO, "gen_bench_records: lifecycle - {spec.display} profiled, {wasr.removed} image(s) deleted ({wasr.freed >> 20l} MB)\n")
             }
         }
     }

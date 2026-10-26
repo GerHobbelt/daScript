@@ -51,8 +51,10 @@ model gate. A test that silently vanishes on one platform is a defect.
 under `DASLLAMA_PARITY_FULL=1` — a final pre-PR gate, never the iteration loop. Check what a
 test loads before launching it.
 
-**Every moved or extracted bit ships a test for the bit itself** — feed the function, check the
-bytes. "The model still runs" is not a test for a move.
+**Every new, moved, or extracted function or data transform ships a test for the bit itself** —
+feed the function, check the bytes. "The model still runs" is not a test for a move. A
+platform-fixed predicate has no bytes to feed — test its observable (the argv it gates, the
+mode it selects) on the platform the test runs on.
 
 **Every test that compares logits also logs decoded text for both sides.** A red, or a
 suspicious green, must be readable as text in the log, not only as an id or float difference.
@@ -81,17 +83,29 @@ belongs to the image suites alone. See `ARCHITECTURE.md` §2.1.
 
 **A new measuring entry point calls `tune_gate()` (`performance/profile_common.das`) before its
 first timed rep.** A timed rep without the gate can measure fallback kernels silently. The
-three worlds the gate covers are `ARCHITECTURE.md` §2.5.
+three worlds the gate covers are `ARCHITECTURE.md` §2.5. Kernel A/B labs are exempt: both arms
+run under one tune state by construction, so the comparison holds untuned.
 
-**No new benchmark harness is written.** Performance is measured by the rigs `PROFILE.md`
-documents — `performance/gen_profile.das` (the routine check) and
+**No new record-grade timing harness is written.** Model-level time is measured by the rigs
+`PROFILE.md` documents — `performance/gen_profile.das` (the routine check) and
 `performance/gen_bench_records.das` (`--oracle` = the regression gate, bare = the publishing
-board); both spawn `benchmarks/lcpp_bench.das`, the only thing that measures. A new timing
-harness, a one-off measurement script, or a revived rig is a defect. `PROFILE.md` carries the
-commands; the rig's shape is `ARCHITECTURE.md` §2.5. Carve-out: `benchmarks/asr/mem_census.sh`
-measures peak MEMORY (`/usr/bin/time -l` around a whole process — a quantity no in-process rig
-can observe about itself); it stays macOS-only and its numbers live in `PERF_LEDGER.md`, never
-in the record stores.
+board); both spawn `benchmarks/lcpp_bench.das`, the only thing that measures record-grade
+time. A new model-timing harness, a one-off measurement script, or a revived rig is a defect;
+the one sanctioned sub-model instrument is the kernel A/B lab (next rule). `PROFILE.md`
+carries the commands; the rig's shape is `ARCHITECTURE.md` §2.5.
+
+**A kernel A/B lab under `benchmarks/` is a decision instrument, never a record rig.** A lab
+answers a kernel-join question by interleaved same-instrument A/B with a bit-exact cross-arm
+gate; hand-rolled bind lists are legal there, which is exactly where binding rot hides — a lab
+races LIVE production classes, so the change that renumbers a binding fixes or deletes the lab
+arms it rots, in the same change. Two arms that compile identical kernel text measure noise:
+when adoption closes a lab's question, its arm pair is deleted, not kept. Lab numbers never
+enter the record stores or `PERF_LEDGER.md`.
+
+**An out-of-process observer measures only what no in-process rig can observe about itself,
+and its numbers are ledger-grade.** The one instance is `benchmarks/asr/mem_census.sh`: peak
+memory via `/usr/bin/time -l` around a whole process. It stays macOS-only and its numbers live
+in `PERF_LEDGER.md`, never in the record stores.
 
 ---
 
@@ -177,7 +191,8 @@ provisioned box — BRINGUP.md §2 is the runbook.
 ### CPU kernel tiers
 
 - `dasllama_math.das` — the numeric abstraction: typedefs, active backend pointers, public
-  wrappers. No kernel bodies.
+  wrappers, dispatch shaping (jobque caps and OS-conditional scheduling defaults). No kernel
+  bodies.
 - `dasllama_math_default.das` — the portable kernel backend.
 - `dasllama_math_aarch64_neon.das` — the arm64 kernel backend.
 - `dasllama_math_accelerate.das` — the Accelerate/BNNS float tier.
@@ -230,12 +245,11 @@ is a defect.
 exception: `dasllama_metal_gemm.das` owns its second device+queue (ARCHITECTURE §1.5). Any
 other module creating a device is a defect.
 
-**A PSO set is compiled and released by the module that owns its kernels.** Decode:
-`metal_decode_init` / `metal_kernels_release` in `dasllama_metal_kernels`. Prefill:
-`metal_prefill_init` / `metal_prefill_shutdown` in `dasllama_metal_prefill`. A PSO compiled or
-released anywhere else in the engine is a defect. Vulkan: a pipeline is created only by a
-`[vk_dispatch]`-generated `ensure_*` and torn down by `vk_drop_model_state`; a hand-written
-pipeline build anywhere else in the engine is a defect. Tests are exempt: a kernel-unit gate
+**A PSO is compiled and released by the file that owns its kernel class**, through that file's
+init/release pair (`metal_decode_init` / `metal_kernels_release`, both in
+`dasllama_metal_kernels.das`; `metal_prefill_init` / `metal_prefill_shutdown` in
+`dasllama_metal_prefill.das`) — ownership follows the class, not the pipeline stage. A PSO compiled
+or released anywhere else in the engine is a defect. Tests are exempt: a kernel-unit gate
 compiles its own short-lived pipeline from the emitted source and releases it in the same gate.
 
 **Race code for a kernel family lives beside the family** — kernels races its families, prefill
@@ -328,9 +342,15 @@ profile, the knobs, and the flavor a file was baked for, and a mismatch declines
 that reinterprets a mismatched image, or widens an identity so that more files match, is a defect.
 
 **A bake reaps only its own lane.** An identity's (quant, tag) pair is its lane; a save may drop
-that lane's dead siblings plus BROKEN/version-stale images in any lane, and nothing else. Code
-that reaps an image whose identity it cannot recompute — another flavor's, another family's, or
-any image seen from a sweep orchestrator — is a defect. See `ARCHITECTURE.md` §2.1.
+that lane's dead siblings plus BROKEN/version-stale images in any lane, and nothing else. See
+`ARCHITECTURE.md` §2.1.
+
+**Only a process that can recompute an image's identity may judge it dead — with one owner
+carve-out.** Reaping an image whose identity the code cannot recompute — another flavor's,
+another family's — is a defect, except `dlim_wipe` called from `gen_bench_records.das`: the
+board rigs own the model dirs for the whole batch (wipe behind the exe gate at start, delete
+after a model's last cell), so they delete without judging. Any other `dlim_wipe` caller is a
+defect. See `ARCHITECTURE.md` §2.1.
 
 **An image carries only what its flavor uses.** A plane the target platform or config never reads
 is not written — the mint decides that, not the load. A flavor takes its own file through
@@ -342,10 +362,12 @@ planes alongside its own is a defect.
 ## Documentation
 
 **A change to user-facing API checks every tutorial and document that touches it.** User-facing
-means anything a consumer outside this repo calls or types: exported facade functions, CLI
-flags, environment knobs, file formats, and their defaults. The check covers the tutorial
-`.das` sources, their `.rst` pages, and the module documentation; a tutorial or doc that still
-shows the old call, flag, or default is a defect of the change, not of the docs.
+means anything a consumer outside this repo calls or types — exported facade functions, CLI
+flags, environment knobs, file formats, and their defaults — plus the in-repo rig and tool CLI
+surface, whose runbooks are `BRINGUP.md`, `PROFILE.md`, `METHODOLOGY.md`, and `ARCHITECTURE.md`.
+The check covers the tutorial `.das` sources, their `.rst` pages, and the module documentation;
+a tutorial or doc that still shows the old call, flag, or default is a defect of the change,
+not of the docs.
 
 **A changed default is restated everywhere the old default was stated.** Every docstring, help
 string, and doc line that named the old value names the new one in the same diff.
@@ -366,6 +388,28 @@ a helper that looks specialized in das can still lower to a runtime multiply.
 
 **Twins of a kernel family bind the same kargs type at the same binding**, even where one twin
 ignores a field. A twin that shifts the other's fields to different slots is a defect.
+Recorded exception: the moe mul_mm TENSOR twins (`MetalMoeMulMmQ8T` / `MetalMoeMulMmMx4T`)
+keep the pre-family compact slots while their base classes bind the family numbers — the
+kernel-unit gate and the race arms fork on it deliberately, and no shared bind path may span
+that pair.
+
+**Kernel twins share a template.** Same-body single/batch or format twins are stamps of one
+`class template` — a `@template_constant` axis carries the body divergence, a `@template_gate`
+field carries a stamp-varying binding. A copy-pasted twin class, or a new dummy-bound
+always-present field where a gated one serves, is a defect.
+
+**Every weight, bias, or lookup-table field on a `[metal_dispatch]` / `[vk_dispatch]` kernel
+class declares `@role = "weight"` explicitly.** Derivation classifies an un-roled weight view
+as a read and stages the whole blob per dispatch — the tracked-weight scheduler tax the
+untracked-weights doctrine exists to avoid. A weight-shaped field with no `@role` is a defect
+even when the kernel compiles and passes parity. Un-lensed lab classes in `benchmarks/` are
+out of scope — nothing derives their access.
+
+**A kernel declares its dispatch on the class; the builder is generated.** A new kernel class
+carries `[metal_dispatch]` / `[vk_dispatch]` with per-field `@binding` / `@role` / `@off` /
+`@span` / `@default`. A NEW hand-written `enc_*` body is a defect unless it is a wrapper
+shape: a format or twin pick, a default-filling wrapper, or a composite over generated
+builders.
 
 **No value reaches an encoder twice.** A scalar uniform buffer passed alongside the identical
 value as a parameter is a defect; so is a kargs field the fields beside it already determine.
@@ -373,10 +417,13 @@ Carve-out: a builder parameter the `grid=`/`tg=` spec consumes HOST-side (the di
 geometry) may repeat a kargs field the kernel reads device-side — those are two consumers,
 not one value bound twice.
 
-**Nothing in the engine, a benchmark, or a race harness dispatches a kernel except its
-`enc_*` builder.** A hand-rolled bind list in `dasllama/`, `benchmarks/`, or `performance/`
-is a defect. The kernel-unit gates under `tests/` hand-bind on purpose: the gate is an
-independent witness of the binding contract, so a builder defect cannot mask a kernel defect.
+**Nothing in the engine or a race harness dispatches a kernel except its `enc_*` builder.** A
+hand-rolled bind list in `dasllama/` or `performance/` is a defect; kernel A/B labs under
+`benchmarks/` are the recorded exception (the lab rule above), and the kernel-unit gates under
+`tests/` hand-bind on purpose: the gate is an independent witness of the binding contract, so
+a builder defect cannot mask a kernel defect. Carve-out: the IN-ENGINE moe mul_mm A/B race
+harnesses (`dasllama_metal_prefill.das`) encode through `kn_moe_mm_family_tail`, the family's
+shared private bind tail, so a binding renumber desyncs them loudly instead of unseen.
 
 **A cache keyed by a host address carries the span and the form in its key.** A hit must cover
 the request, and different upload forms live in separate tables.
@@ -403,45 +450,51 @@ that picks its own number — larger or smaller — is a defect, and so is a new
 declaration. See `ARCHITECTURE.md` §2.8.
 
 **No ad-hoc profiling.** A NEW clock read paired with a print or log of the elapsed interval is
-a defect in engine code — instrumentation goes through the sanctioned rails: the
-`jobque_profile` markers (`profile_tag` / `profile_marker` and the `trace_*` wrappers in
-`dasllama_math.das`), the `prof_add`/`forward_profile_*` decode buckets
-(`dasllama_common.das`), and the `asr_prof_add` encode buckets (`dasllama_audio.das`).
-Carve-outs where a timed line is the deliverable or a one-shot report: `benchmarks/`,
-`performance/`, `harness/`, and cold one-shot load/mint progress logs (image bake/map, load
-stages, tokenizer build). A clock whose value feeds logic is not instrumentation — mark it
-`// clock: control` so the sweep and the future lint leave it alone.
+a defect in engine code — instrumentation goes through the sanctioned rails, and a clock whose
+value feeds logic is marked `// clock: control`. The rails, the carve-outs (`benchmarks/`,
+`performance/`, `harness/`, cold one-shot load/mint progress logs), and the marker's why are
+`ARCHITECTURE.md` §2.10.
 
-**Every new kernel or mid-runtime loop is COVERED by `[hot_path]`.** The annotation sits at
-the REGION ENTRY — the `*_encode` / `*_decode` / step drivers — and the `[no_alloc]` /
-`[no_env]` / `[no_io]` contracts arm transitively down the call graph, so interior kernels
-stay bare. A new function is a defect only when no annotated entry reaches it: a new entry
-point carries the annotation itself; a new backend entry (kernel-backend override, batch
-donor) carries it too, because backends are also reached from un-annotated harness paths.
+**Every new kernel or mid-runtime loop is COVERED by `[hot_path]`.** A region entry is an
+`*_encode` / `*_decode` / step driver; a new function is a defect only when no annotated
+region entry reaches it — a new entry point (including a backend entry: kernel-backend
+override, batch donor) carries the annotation itself. The transitive-arming model and the
+`@scratch` / `[cold_path]` companions are `ARCHITECTURE.md` §2.11.
 
-**No raw environment reads.** `get_env_variable` / `has_env_variable` (and literal-name
-`env_config_*` calls) are a defect anywhere in the module outside `dasllama_env.das` — a knob is
-an `[EnvConfig]` field there, read as `g_env_*.<field>`, which is also what generates its
-`ENVIRONMENT.md` row. Tri-state knobs (presence matters, or the effective default is computed at
-runtime) are `Option<T>` fields. Dynamic names — a variable named by data, not by code — go
-through `env_is_set` / `env_value_of`. The config loads once at context init, so
-`set_env_variable` mid-process is invisible to it: arm a child process's environment instead.
-A WRITE of a foreign library's knob (`set_env_variable` with a literal name) is allowed only
-before that library first reads it, and the name must be a declared `[EnvConfig]` knob — the
-registry test scans writes too, so a re-spelled name fails it.
-`tests/test_env_registry.das` enforces all of this.
+**No raw environment access outside `dasllama_env.das`.** A knob is an `[EnvConfig]` field
+there, read as `g_env_*.<field>`; `get_env_variable` / `has_env_variable` / `set_env_variable` /
+literal-name `env_config_*` anywhere else in the module is a defect. The sanctioned forms —
+tri-state knobs, dynamic names, pre-init foreign-library writes — are `ARCHITECTURE.md` §2.9,
+and `tests/test_env_registry.das` enforces the lot.
 
 
 ### Vulkan
+
+**A pipeline is created only by a `[vk_dispatch]`-generated `ensure_*` and torn down by
+`vk_drop_model_state`.** A hand-written pipeline build anywhere else in the engine is a defect.
 
 **A buffer bound as one SSBO range stays under `vk_max_storage_range()`, checked where its
 size is NEGOTIATED, not where it binds.** The bind site cannot shrink a buffer that was sized
 wrong; past the range every read is undefined, not slow.
 
 **A resident-driver change ships with `harness/parity.das` GPU-vs-CPU runs on one q8 and one
-kq model** — the vulkan arm is `DASLLAMA_GPU=1` (never `--ngl`, which is the Metal arm and
-panics without Metal). Kernel-unit green does not cover driver wiring, and the two
-activation-quant classes ride different enc paths — one model class cannot witness the other's.
+kq model, with `--kv` matching the armed mirror codec** — the vulkan arm is `DASLLAMA_GPU=1`
+(never `--ngl`, which is the Metal arm and panics without Metal). The driver declines
+codec-mismatched sessions silently, so a mismatched parity run compares CPU against CPU and
+proves nothing; the run's log must show `resident driver armed`. Kernel-unit green does not
+cover driver wiring, and the two activation-quant classes ride different enc paths — one
+model class cannot witness the other's.
+
+**A kernel that reads or writes the K/V mirrors is stamped from a `[|> template_struct_instance]`
+codec template (`typedef KT`) with both f32 and f16 instances, and an f16 instance's mirror
+stores clamp to the f16 finite range.** A single-codec mirror kernel is legal only when a
+codec-templated sibling serves the other codec and its arming gate keys on the mirror codec
+(`kv16`); otherwise a one-codec kernel, or an f16 store without the clamp, is a defect.
+
+**Every resident override gates sessions on the armed mirror codec and on the flat
+(non-paged) cache before touching the mirror.** Mirror bytes move only between same-codec
+session rows and mirror rows; an override that byte-copies across codecs corrupts the host
+authority and is a defect.
 
 **A descriptor set cached across dispatches lives in state `vk_drop_model_state` clears** — a
 `*_ready` latch or a field inside `g_gpu` / the arena. A set cached in anything the drop does

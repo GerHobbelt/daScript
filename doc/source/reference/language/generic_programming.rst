@@ -48,6 +48,7 @@ It is the primary mechanism for inspecting types in generic functions.
 
 All ``typeinfo`` traits can operate on either an expression or a ``type<T>`` argument:
 
+.. das-doc: given var my_variable : int
 .. code-block:: das
 
     typeinfo sizeof(type<float3>)       // 12
@@ -68,6 +69,7 @@ All ``typeinfo`` traits can operate on either an expression or a ``type<T>`` arg
 * ``typeinfo sizeof(expr)`` — size of the type in bytes
 * ``typeinfo alignof(expr)`` — alignment of the type
 * ``typeinfo dim(expr)`` — size of the first dimension (fixed-size arrays)
+* ``typeinfo dim_table_value(expr)`` — size of the first dimension of a table's value type (the value must be a fixed-size array)
 * ``typeinfo offsetof<field>(expr)`` — byte offset of a field in a struct
 * ``typeinfo vector_dim(expr)`` — dimension of a vector type (e.g. 3 for ``float3``)
 
@@ -102,6 +104,7 @@ All ``typeinfo`` traits can operate on either an expression or a ``type<T>`` arg
 * ``typeinfo is_dim(expr)`` — true if has any dimension (fixed-size array)
 * ``typeinfo is_enum(expr)`` — true if enumeration
 * ``typeinfo is_bitfield(expr)`` — true if bitfield
+* ``typeinfo is_distinct(expr)`` — true if a ``distinct`` type (see :ref:`Distinct types <distinct_types>`)
 * ``typeinfo is_tuple(expr)`` — true if tuple
 * ``typeinfo is_variant(expr)`` — true if variant
 * ``typeinfo is_function(expr)`` — true if function type
@@ -137,10 +140,11 @@ All ``typeinfo`` traits can operate on either an expression or a ``type<T>`` arg
 
 * ``typeinfo has_field<name>(expr)`` — true if the struct/handle has a field named ``name``
 * ``typeinfo safe_has_field<name>(expr)`` — same as above, but returns false instead of error
-* ``typeinfo has_annotation<name>(expr)`` — true if the struct has annotation ``name``
-* ``typeinfo has_annotation_argument<name>(expr)`` — true if annotation has argument ``name``
-* ``typeinfo safe_has_annotation_argument<name>(expr)`` — returns false instead of error
-* ``typeinfo annotation_argument<name>(expr)`` — returns the value of an annotation argument
+* ``typeinfo struct_has_annotation<ann>(expr)`` — true if the struct has annotation ``ann``
+* ``typeinfo struct_safe_has_annotation<ann>(expr)`` — same as above, but returns false instead of error
+* ``typeinfo struct_has_annotation_argument<ann; arg>(expr)`` — true if annotation ``ann`` has argument ``arg``
+* ``typeinfo struct_safe_has_annotation_argument<ann; arg>(expr)`` — same as above, but returns false instead of error
+* ``typeinfo struct_get_annotation_argument<ann; arg>(expr)`` — returns the value of annotation argument ``arg``
 * ``typeinfo variant_index<name>(expr)`` — returns the index of a variant field
 * ``typeinfo safe_variant_index<name>(expr)`` — returns -1 instead of error
 
@@ -170,6 +174,7 @@ Instead of omitting the type name in a generic, it is possible to use an explici
 
 or
 
+.. das-doc: alt
 .. code-block:: das
 
     def fn(a: auto(some_name)): some_name {
@@ -178,6 +183,7 @@ or
 
 This is the same as:
 
+.. das-doc: alt
 .. code-block:: das
 
     def fn(a) {
@@ -192,11 +198,14 @@ This is very helpful if the function accepts numerous arguments, and some of the
         return a + b
     }
 
-This is not the same as:
+Naming the ``auto`` is what ties arguments together; a bare ``auto`` does not.
+``def fn(a, b: auto)`` is the very same generic as ``def fn(a, b)`` — declaring both is
+``error[30702]: generic function is already defined`` — and both accept mismatched types,
+failing only later, inside the body. Reuse a named alias instead:
 
 .. code-block:: das
 
-    def fn(a, b: auto) { // a and b are one type
+    def fn(a: auto(T); b: T) { // a and b have to be of the same type
         return a + b
     }
 
@@ -220,6 +229,7 @@ To get a clearer error, constrain the types directly in the signature:
 
 Usage of named ``auto`` with ``typeinfo``
 
+.. das-doc: alt
 .. code-block:: das
 
     def fn(a: auto(some)) {
@@ -230,6 +240,7 @@ Usage of named ``auto`` with ``typeinfo``
 
 You can also modify the type with delete syntax:
 
+.. das-doc: alt
 .. code-block:: das
 
     def fn(a: auto(some)) {
@@ -245,12 +256,14 @@ Generic function arguments, result, and inferred type aliases can be operated on
 
 ``const`` specifies, that constant and regular expressions will be matched:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : Foo const )   // accepts Foo and Foo const
 
 ``==const`` specifies, that const of the expression has to match const of the argument:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : Foo const ==const )   // accepts Foo const only
@@ -258,12 +271,14 @@ Generic function arguments, result, and inferred type aliases can be operated on
 
 ``-const`` will remove const from the matching type:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : array<auto -const> )  // matches any array, with non-const elements
 
 ``#`` specifies that only temporary types are accepted:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : Foo# )    // accepts Foo# only
@@ -278,12 +293,14 @@ Generic function arguments, result, and inferred type aliases can be operated on
 
 ``&`` specifies that argument is passed by reference:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : auto& )           // accepts any type, passed by reference
 
 ``==&`` specifies that reference of the expression has to match reference of the argument:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : auto& ==& )   // accepts any type, passed by reference (for example variable i, even if its integer)
@@ -299,6 +316,7 @@ Generic function arguments, result, and inferred type aliases can be operated on
 
 ``[]`` specifies that the argument is a fixed-size array:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : auto[] )          // accepts a fixed-size array of any type and size
@@ -337,6 +355,7 @@ dimensions included:
 
 ``implicit`` specifies that both temporary and regular types can be matched, but the type will be treated as specified. ``implicit`` is _UNSAFE_:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : Foo implicit )    // accepts Foo and Foo#, a will be treated as Foo
@@ -344,6 +363,7 @@ dimensions included:
 
 ``explicit`` specifies that LSP will not be applied, and only exact type match will be accepted:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : Foo )             // accepts Foo and any type that is inherited from Foo directly or indirectly
@@ -354,6 +374,7 @@ options
 
 Multiple options can be specified as a function argument:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : int | float )   // accepts int or float
@@ -362,12 +383,14 @@ OR types always make the function generic.
 
 Generic options will be matched in the order listed:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : Bar explicit | Foo )   // first will try to match exactly Bar, then anything else inherited from Foo
 
 ``|#`` shortcut matches previous type, with temporary flipped:
 
+.. das-doc: signatures
 .. code-block:: das
 
     def foo ( a : Foo |# )   // accepts Foo and Foo# in that order
@@ -470,17 +493,20 @@ Prefix       Resolution
              caller's overloads are **not** visible.
 ``_::``      Resolved as if the call were made implicitly in the **current
              module** (the one that instances the generic) — the caller's
-             overloads **are** visible.
-``__::``     Resolved strictly in the module where the generic is **defined**
-             — only that module's own symbols, nothing imported.
+             overloads **are** visible, along with everything it requires.
+``__::``     Resolved in the **current module only** — the same module as
+             ``_::``, but restricted to symbols declared directly in it,
+             ignoring anything imported. Inside an instanced generic that
+             is the *caller's* module, so ``__::`` cannot pin a lookup to
+             the module where the generic was defined.
 ===========  ===================================================================
 
 This distinction matters whenever a library generic should dispatch to
-user-provided overloads.  For example:
+user-provided overloads.  Given the library module ``serializer.das``:
 
+.. das-doc: file serializer.das
 .. code-block:: das
 
-    // --- module "serializer" ---
     module serializer
 
     [generic]
@@ -488,7 +514,11 @@ user-provided overloads.  For example:
         _::write(val)       // resolves in the caller's module
     }
 
-    // --- user code ---
+user code supplies the overload the generic dispatches to:
+
+.. das-doc: fresh
+.. code-block:: das
+
     require serializer
 
     struct Color { r : float; g : float; b : float }

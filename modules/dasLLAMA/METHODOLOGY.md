@@ -55,8 +55,8 @@ A box without an accelerated tier simply shows fewer categories.
   calls per clip in one amortized process and the per-clip bests sum. Load is excluded on
   every side, as everywhere.
 
-Model load is excluded everywhere. Sweeps run on pre-baked model images so first-load
-conversion cost cannot leak into a cold cell; a >3% coefficient of variation on a das cell
+Model load is excluded everywhere. Sweeps run on images the batch bakes itself (the lifecycle
+wipe/bake/delete in `PROFILE.md`) so first-load conversion cost cannot leak into a timed cell; a >3% coefficient of variation on a das cell
 triggers one warm re-run (page-cache churn from the previous process is the usual cause), and a
 cell that stays noisy is kept with its dispersion visible, not smoothed.
 
@@ -66,7 +66,9 @@ Every CPU row runs **min(16, physical performance cores)** threads — the same 
 engines, pinned. One rule for every box: 8 on M1 Max, 10 on M4 Pro, 4 on M3 Air, 16 on the
 big x86 parts. On x86 both sides pin to distinct physical cores (das through the job queue's
 hard affinity mask, llama-bench via `--cpu-mask ... --cpu-strict 1`); unpinned, SMT placement
-makes prefill bimodal. Apple boxes run the performance cores.
+makes prefill bimodal. Apple boxes run the performance cores; there is no pin API, so the job
+queue's mode 2 instead classifies das workers via QoS — the dasLLAMA darwin default —
+because unclassified workers lose several percent of big-model decode under ambient load.
 
 There is deliberately no per-engine thread detection and no thread matrix: probed-optimal
 counts turn a kernel benchmark into a contest of who probes better, and no two boxes stay
@@ -153,5 +155,5 @@ configurations still in active development. Measured rows are annotated, not del
 
 `modules/dasLLAMA/BRINGUP.md` is the box checklist: build, models, reference
 engines (scripted, pinned commits, locked venvs), corpus fetch with manifest verification,
-pre-bake, sweep. The sweep writes a per-box record store after every cell; the site renders
+sweep (the board bakes and deletes its own images). The sweep writes a per-box record store after every cell; the site renders
 from the merged stores. Every tool narrates its progress on stdout as it runs.

@@ -32,13 +32,7 @@ def public prof_log_name() : string {
 
 // Machine-local model root; override with DASLLAMA_MODELS_DIR (the x64/handoff boxes).
 def models_dir() : string {
-    let env = g_env_harness.models_dir
-    if (empty(env)) {
-        return "/Users/borisbatkin/Work/llama.cpp/models/"
-    }
-    // callers concat "{models_dir()}{file}" — guarantee the separator so a slashless override
-    // (DASLLAMA_MODELS_DIR=/models) doesn't silently skip every catalog file
-    return ends_with(env, "/") || ends_with(env, "\\") ? env : "{env}/"
+    return models_dir_resolved()   // ONE resolution, in dasllama_env — the tuner's confirm ladder shares it
 }
 
 // Short box tag baked into the JSON/TSV filenames (profile_llm_<box>.json). Override with DASLLAMA_BOX.
@@ -67,24 +61,32 @@ def profile_threads() : int {
     // garbage that looks plausible. Fail loudly until P/E pinning is implemented.
     let cpu = platform_cpu()
     if (find(cpu, "Intel") >= 0 && (find(cpu, "th Gen") >= 0 || find(cpu, "Core(TM) Ultra") >= 0)) {
-        panic("profile_threads: Intel hybrid CPU detected ({cpu}) — P/E pinning is not implemented; set DASLLAMA_THREADS + affinity manually or implement the P-core mask first")
+        panic("profile_threads: Intel hybrid CPU detected ({cpu}) - P/E pinning is not implemented; set DASLLAMA_THREADS + affinity manually or implement the P-core mask first")
     }
     let phys = physical_perf_cores()
     return phys > 0 ? min(16, phys) : 16
 }
 
-//! True when profiling lanes pin to distinct physical cores (all Windows/x64 boxes — OS placement
-//! is a lottery: SMT pairs measured pp512 bimodal on the 3990X). macOS has no thread-affinity API.
+//! True when profiling lanes get explicit scheduling treatment. Windows/x64: pin to distinct
+//! physical cores (OS placement is a lottery — SMT pairs measured pp512 bimodal on the 3990X).
+//! darwin: jobque mode 2 maps to QoS classification — unclassified workers demote under ambient
+//! load (big-model decode measured -5% tg). The llama-bench CPU mask stays Windows-only: lcpp_mask_on.
 def affinity_on() : bool {
+    return is_windows() || get_platform_name() == "darwin"
+}
+
+//! True when llama-bench gets explicit CPU-mask arguments — Windows only; macOS llama-bench has
+//! no thread-affinity support, and the das-side darwin treatment (QoS) has no lcpp mirror.
+def lcpp_mask_on() : bool {
     return is_windows()
 }
 
-//! llama-bench affinity arguments (leading space; "" when affinity is off): the first `threads`
-//! physical cores as a logical-CPU mask — SMT siblings are adjacent on Windows, so even bits
-//! (16 -> 0x55555555) — plus --cpu-strict so the pins hold. The das-side mirror is jobque affinity.
+//! llama-bench affinity arguments — an empty array when lcpp_mask_on() is false: the first
+//! `threads` physical cores as a logical-CPU mask — SMT siblings are adjacent on Windows, so even
+//! bits (16 -> 0x55555555) — plus --cpu-strict so the pins hold. The das-side mirror is jobque affinity.
 def lcpp_affinity_argv(threads : int) : array<string> {
     var args : array<string>
-    if (affinity_on()) {
+    if (lcpp_mask_on()) {
         var mask = 0ul
         for (i in range(min(threads, 32))) {
             mask |= 1ul << uint64(2 * i)
@@ -506,20 +508,20 @@ def tune_gate() : bool {
         // the release ships <exe>.tune.json from the same mint that baked the winners in
         let sc = tune_manifest_path()
         if (!stat(sc).is_valid) {
-            why = "no sidecar beside the exe ({sc}) — the release did not ship its mint"
+            why = "no sidecar beside the exe ({sc}) - the release did not ship its mint"
         } elif (find(fread(sc), "\"kernels\"") < 0) {
-            why = "the exe's sidecar ({sc}) carries no kernels section — not a minted manifest"
+            why = "the exe's sidecar ({sc}) carries no kernels section - not a minted manifest"
         }
     } elif (!empty(mpath)) {
         var mst : FStat
         var bst : FStat
         let args <- get_command_line_arguments()
         if (!stat(mpath, mst)) {
-            why = "DAS_TUNE_MANIFEST='{mpath}' does not exist — every kernel runs its fallback"
+            why = "DAS_TUNE_MANIFEST='{mpath}' does not exist - every kernel runs its fallback"
         } elif (stat(args[0], bst) && bst.mtime > mst.mtime) {
-            why = "DAS_TUNE_MANIFEST='{mpath}' is OLDER than the binary ({args[0]}) — the staleness rule drops every kernel to its fallback"
+            why = "DAS_TUNE_MANIFEST='{mpath}' is OLDER than the binary ({args[0]}) - the staleness rule drops every kernel to its fallback"
         } elif (find(fread(mpath), "\"kernels\"") < 0) {
-            why = "DAS_TUNE_MANIFEST='{mpath}' carries no kernels section — not a minted manifest"
+            why = "DAS_TUNE_MANIFEST='{mpath}' carries no kernels section - not a minted manifest"
         }
     } else {
         // per-script sidecar world: tune_status populates — require all-manifest stamps
@@ -538,16 +540,16 @@ def tune_gate() : bool {
         }
         delete st
         if (total == 0) {
-            why = "tune_status is EMPTY — the cell cannot prove its kernel provenance"
+            why = "tune_status is EMPTY - the cell cannot prove its kernel provenance"
         } elif (bad > 0) {
-            why = "{bad}/{total} kernels stamp non-manifest winners (first: {sample}) — stale or absent sidecar"
+            why = "{bad}/{total} kernels stamp non-manifest winners (first: {sample}) - stale or absent sidecar"
         }
     }
     if (empty(why)) {
         return true
     }
     if (g_env_bench.allow_untuned) {
-        to_log(LOG_WARNING, "tune gate: {why} — measuring anyway (DASLLAMA_ALLOW_UNTUNED=1, numbers are NOT publishable)\n")
+        to_log(LOG_WARNING, "tune gate: {why} - measuring anyway (DASLLAMA_ALLOW_UNTUNED=1, numbers are NOT publishable)\n")
         return true
     }
     to_log(LOG_ERROR, "tune gate: {why}. Mint with: DAS_TUNE_MODE=tune bin/daslang -jit modules/dasLLAMA/harness/dasllama_tuner.das -dasroot <repo>; DASLLAMA_ALLOW_UNTUNED=1 overrides for dev runs\n")
@@ -804,7 +806,7 @@ def private platform_ram_config() : string {
     if (count == 0) {
         return ""
     }
-    return speed > 0 ? "{count}×{cap_gb} GB @ {speed} MT/s" : "{count}×{cap_gb} GB"
+    return speed > 0 ? "{count}x{cap_gb} GB @ {speed} MT/s" : "{count}x{cap_gb} GB"
 }
 
 // Windows active power scheme name — a "Power saver" sweep is not a "High performance" sweep
@@ -929,7 +931,7 @@ def file_identity(path : string; role : string) : InputFile {
     }
     let sha = compute_sha256(path)
     if (empty(sha)) {
-        to_log(LOG_WARNING, "dasLLAMA bench: no sha256 for {path} — identity recorded without hash\n")
+        to_log(LOG_WARNING, "dasLLAMA bench: no sha256 for {path} - identity recorded without hash\n")
         return fi
     }
     fi.sha256 = sha
@@ -1378,7 +1380,7 @@ def run_asr_cli_multi(cli, model_path : string; wav_paths : array<string>; threa
             }
         }
         if (blocks != length(wav_paths)) {
-            to_log(LOG_WARNING, "run_asr_cli_multi: {blocks}/{length(wav_paths)} files timed — rep discarded\n")
+            to_log(LOG_WARNING, "run_asr_cli_multi: {blocks}/{length(wav_paths)} files timed - rep discarded\n")
             continue
         }
         let ms = parse_cli_ms(out)
@@ -1503,7 +1505,7 @@ def whisper_cpp_versions() : string {
         return ""
     }
     if (git_dirty_at(root)) {
-        to_log(LOG_WARNING, "dasLLAMA bench: {root} has uncommitted changes — reference identity is DIRTY\n")
+        to_log(LOG_WARNING, "dasLLAMA bench: {root} has uncommitted changes - reference identity is DIRTY\n")
         return "whisper.cpp @ {commit}+dirty"
     }
     return "whisper.cpp @ {commit}"
@@ -1818,7 +1820,7 @@ def write_bench_records(path : string; models : array<BenchModel>) {
         }
     }
     if (!wrote) {
-        to_log(LOG_ERROR, "dasLLAMA bench: could not open {path} for writing — records NOT persisted\n")
+        to_log(LOG_ERROR, "dasLLAMA bench: could not open {path} for writing - records NOT persisted\n")
     }
 }
 
@@ -1914,7 +1916,7 @@ def oracle_compare(fresh, stored : BenchRun; warn_pct, fail_pct : double; var li
             } elif (d_ms > warn_pct) {
                 vm = OracleVerdict.warn
             }
-            let note_ms = (vm == OracleVerdict.ok && d_ms < -fail_pct) ? " (suspicious gain — verify the cell)" : ""
+            let note_ms = (vm == OracleVerdict.ok && d_ms < -fail_pct) ? " (suspicious gain - verify the cell)" : ""
             let sign_ms = d_ms < 0.0lf ? "" : "+"
             lines |> push("{k} {f_ms:.1f} vs {s_ms:.1f} ms ({sign_ms}{d_ms:.1f}%) {oracle_verdict_str(vm)}{note_ms}")
             if (int(vm) > int(worst)) {
@@ -1937,9 +1939,9 @@ def oracle_compare(fresh, stored : BenchRun; warn_pct, fail_pct : double; var li
         } elif (delta < -warn_pct) {
             v = OracleVerdict.warn
         }
-        let note = (v == OracleVerdict.ok && delta > fail_pct) ? " (suspicious gain — verify the cell)" : ""
+        let note = (v == OracleVerdict.ok && delta > fail_pct) ? " (suspicious gain - verify the cell)" : ""
         let sign = delta < 0.0lf ? "" : "+"
-        lines |> push("{k} {f_tok:.1f} vs {s_tok:.1f}±{s_sd:.1f} ({sign}{delta:.1f}%) {oracle_verdict_str(v)}{note}")
+        lines |> push("{k} {f_tok:.1f} vs {s_tok:.1f}±{s_sd:.1f} ({sign}{delta:.1f}%) {oracle_verdict_str(v)}{note}")   // nolint:STYLE039 (plus-minus sign in the human-facing oracle report row)
         if (int(v) > int(worst)) {
             worst = v
         }

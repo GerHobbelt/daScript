@@ -266,11 +266,24 @@ struct public VulkanEnv {
     @clarg_doc = "Tag allocations high-priority (VK_EXT_memory_priority) so the driver demotes desktop memory, not ours."
     vk_memprio : bool = true
 
-    @clarg_doc = "Vulkan flash-attention kernel; 0 falls back to the chunked path."
+    @clarg_doc = "Vulkan flash attention: the decode fa kernel pick AND the cm2 prefill fa tile; 0 falls back to the chunked/scalar paths."
     vk_fa : bool = true
 
     @clarg_doc = "Use a ReBAR device-local host-visible heap when one larger than 1GB is present."
     vk_rebar : bool = true
+
+    @clarg_doc = "Arm the resident driver with f32 KV mirrors instead of the f16 default (A/B instrument; only sessions of the armed codec are served)."
+    vk_kv32 : int64 = 0l
+
+    @clarg_doc = "cm2 prefill tile pick: 0 = occupancy heuristic, 128 = force the m tile, 256 = force the l tile (A/B instrument)."
+    cm2_tile : int64 = 0l
+
+    @clarg_doc = "cm2 split-k: 0 = occupancy heuristic, 1 = off, N = force N k-chunks (A/B instrument; shrinks if N strands an empty tail)."
+    cm2_splitk : int64 = 0l
+
+    @clarg_path
+    @clarg_doc = "Directory of <kernel>.spv files served instead of the emitted words at pipeline creation (offline spirv-opt / hand-patched A/B instrument)."
+    vk_spv_override : string = ""
 
     @clarg_doc = "Barrier at every dispatch (correctness bisect)."
     vk_hazard_paranoid : bool = false
@@ -324,7 +337,8 @@ struct public HarnessEnv {
     models_dir : string = ""
 
     @clarg_path
-    @clarg_doc = "Model used by the tuner's confirm gate. Must be a FULL path, not a bare filename."
+    @clarg_default_doc = "auto-resolved from the models dir"
+    @clarg_doc = "Model used by the tuner's confirm gate (FULL path, not a bare filename). Unset: the gate auto-resolves from the models dir — the preferred confirm carrier, else the largest present q8 gguf; the fallback pins only when the box has no q8 model at all."
     confirm_model : string = ""
 
     @clarg_doc = "Override the batched-dispatch chunk count in the 1-core GEMM probe."
@@ -609,8 +623,8 @@ struct public CoreEnv {
     @clarg_doc = "Total compute lanes for job queues (N-1 workers plus the caller). Overrides set_jobque_threads_cap; see skills/environment_variables.md."
     jobque_threads : Option<int>
 
-    @clarg_default_doc = "0"
-    @clarg_doc = "Worker affinity: 0 off, 1 ideal-processor hint, 2 hard mask. Matters on big SMT boxes."
+    @clarg_default_doc = "2 on darwin (engine [init]), else 0"
+    @clarg_doc = "Worker affinity: 0 off, 1 ideal-processor hint, 2 hard mask — on darwin mode 2 is QoS classification (no pin API) and dasLLAMA defaults it on. Matters on big SMT boxes."
     jobque_affinity : Option<int>
 
     @clarg_default_doc = "profile-driven"
@@ -646,6 +660,17 @@ let public g_env_bench = env_config(type<BenchmarkEnv>)
 let public g_env_prof = env_config(type<ProfilingEnv>)
 let public g_env_test = env_config(type<TestEnv>)
 let public g_env_core = env_config(type<CoreEnv>)
+
+//! The ONE models-dir resolution (DASLLAMA_MODELS_DIR, else the primary rig's dir) with the
+//! trailing separator guaranteed — callers concat "{models_dir_resolved()}{file}", and a
+//! slashless override would silently skip every catalog file.
+def public models_dir_resolved() : string {
+    let env = g_env_harness.models_dir
+    if (empty(env)) {
+        return "/Users/borisbatkin/Work/llama.cpp/models/"
+    }
+    return ends_with(env, "/") || ends_with(env, "\\") ? env : "{env}/"
+}
 
 // ===== dynamic-name reads (the ONE sanctioned escape hatch) =====
 // For names known only at runtime: the bench repro-line forwarder, lever env names from data,
@@ -710,14 +735,14 @@ def private write_section(var w : StringBuilderWriter; title, note : string) {
 def public env_markdown() : string {
     return build_string() $(var w) {
         w |> write("# dasLLAMA environment variables\n\n")
-        w |> write("GENERATED from the `[EnvConfig]` declarations in `dasllama/dasllama_env.das` — do not edit\n")
+        w |> write("GENERATED from the `[EnvConfig]` declarations in `dasllama/dasllama_env.das` - do not edit\n")
         w |> write("by hand. Regenerate with `daslang modules/dasLLAMA/harness/gen_env_doc.das`; a knob read\n")
         w |> write("anywhere in the tree without a declaration fails `tests/test_env_registry.das`.\n\n")
         w |> write("Types: **flag** is unset-means-default, `0`/`false`/`off`/`no` (any case) is false and\n")
         w |> write("anything else true; **number** falls back to the default when unset or unparseable, with\n")
         w |> write("a logged warning on garbage; **text** and **path** are taken verbatim. A SET-BUT-EMPTY\n")
         w |> write("variable counts as unset everywhere. Every knob loads ONCE, at context init, into the\n")
-        w |> write("`g_env_*` globals — hot code reads struct fields, and `set_env_variable` after startup\n")
+        w |> write("`g_env_*` globals - hot code reads struct fields, and `set_env_variable` after startup\n")
         w |> write("is invisible (arm a child process's environment instead).\n")
         write_section(w, "Engine",
             "Read by the inference engine itself, so these affect any program that loads a model.")
@@ -730,12 +755,12 @@ def public env_markdown() : string {
             "Vulkan GPU backend. Present only where the dasVulkan package is installed.")
         write_info_rows(w, get_env_config_info(type<VulkanEnv>))
         write_section(w, "MoltenVK (macOS)",
-            "MoltenVK's own configuration — listed because the vulkan tier arms it on Apple.")
+            "MoltenVK's own configuration - listed because the vulkan tier arms it on Apple.")
         write_info_rows(w, get_env_config_info(type<MoltenVkEnv>))
         write_section(w, "Accelerate / AMX backend",
             "Apple Accelerate / AMX float lane. `DASLLAMA_ACCEL` arms the whole group.")
         write_info_rows(w, get_env_config_info(type<AccelerateEnv>))
-        write_section(w, "Harness — tuner and probes", "")
+        write_section(w, "Harness - tuner and probes", "")
         write_info_rows(w, get_env_config_info(type<HarnessEnv>))
         write_section(w, "Benchmarks", "")
         write_info_rows(w, get_env_config_info(type<BenchmarkEnv>))
@@ -746,7 +771,7 @@ def public env_markdown() : string {
         write_section(w, "Examples and tutorials", "")
         write_info_rows(w, get_env_config_info(type<ExampleEnv>))
         write_section(w, "daslang core knobs dasLLAMA honours",
-            "Owned by daslang, not by dasLLAMA — listed because dasLLAMA's behaviour depends on them. `DAS_TUNE_*` is covered in `skills/tune.md`.")
+            "Owned by daslang, not by dasLLAMA - listed because dasLLAMA's behaviour depends on them. `DAS_TUNE_*` is covered in `skills/tune.md`.")
         write_info_rows(w, get_env_config_info(type<CoreEnv>))
         var extras <- core_extra_rows()
         for (e in extras) {

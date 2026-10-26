@@ -54,18 +54,27 @@ struct ProvEntry {
 }
 
 let private HF = "https://huggingface.co"
-let private PARAKEET_RECIPE = "convert: <pinned whisper.cpp>/models/convert-parakeet-to-ggml.py --use-f32 over the nvidia/parakeet-tdt-0.6b .nemo (nemo venv; repack — sha canonical everywhere)"
-let private CANARY_ENC_RECIPE = "convert: modules/dasLLAMA/harness/convert_canary_to_ggml.py over nvidia/canary-qwen-2.5b (nemo venv; encoder is a repack — sha canonical everywhere)"
-let private CANARY_DEC_RECIPE = "convert: modules/dasLLAMA/harness/convert_canary_to_ggml.py over nvidia/canary-qwen-2.5b (nemo venv); bytes are per-arch (fp16 LoRA merge) — gate via asr_bench --text over jfk/jfk3/gb1 vs benchmarks/asr/canary_transcripts.expected"
+let private PARAKEET_RECIPE = "convert: <pinned whisper.cpp>/models/convert-parakeet-to-ggml.py --use-f32 over the nvidia/parakeet-tdt-0.6b .nemo (nemo venv; repack - sha canonical everywhere)"
+let private CANARY_ENC_RECIPE = "convert: modules/dasLLAMA/harness/convert_canary_to_ggml.py over nvidia/canary-qwen-2.5b (nemo venv; encoder is a repack - sha canonical everywhere)"
+let private CANARY_DEC_RECIPE = "convert: modules/dasLLAMA/harness/convert_canary_to_ggml.py over nvidia/canary-qwen-2.5b (nemo venv); bytes are per-arch (fp16 LoRA merge) - gate via asr_bench --text over jfk/jfk3/gb1 vs benchmarks/asr/canary_transcripts.expected"
 let private REF_Q8_RECIPE = "derive: setup_asr_rig.das --refs quantizes it from the fp bin beside it (whisper.cpp quantize q8_0); reference-side carrier, presence-gated"
 
 //! The full model set with provenance — LLM board carriers (`pub_catalog` names) first, then
 //! the ASR carriers (`asr_catalog` names). Local name differs from the upstream one where the
 //! catalog renamed (UD/MTP stems, the E2B mmproj's lowercase -bf16); the url keeps the remote
 //! spelling. gpt-oss is revision-pinned; every unpinned repo was byte-verified 2026-07-26.
-def models_provenance() : array<ProvEntry> {
+def models_provenance() : array<ProvEntry> {   // nolint:STYLE038 — flat provenance manifest, one entry per carrier
     return <- [
         // ===== LLM board (pub_catalog), ascending size =====
+        // the tensor-arm twin carriers (tests/test_metal_support_matrix.das --arm tensor): small
+        // on purpose - q8 drives the mulmm/attn twins, the K-quant one the kq mulmm twins. The
+        // arm FAILS (not skips) when they are absent, so every box gets them provisioned here
+        ProvEntry(name = "Llama-3.2-1B-Instruct-Q5_K_M.gguf", root = "llm",
+            url = "{HF}/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q5_K_M.gguf",
+            bytes = 911503488l, sha256 = "4f22f95fb1679ef8e2fd6f1659d23f06cd1dbedb79ff291db7413a7ae509e2a9"),
+        ProvEntry(name = "Llama-3.2-1B-Instruct-Q8_0.gguf", root = "llm",
+            url = "{HF}/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf",
+            bytes = 1321083008l, sha256 = "432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3"),
         ProvEntry(name = "gemma-4-12B-it-Q4_K_M.gguf", root = "llm",
             url = "{HF}/lmstudio-community/gemma-4-12B-it-GGUF/resolve/main/gemma-4-12B-it-Q4_K_M.gguf",
             bytes = 7381382944l, sha256 = "95d83ba36642b1f385fb906b5962a71763361be3bac930a709945f72d97473f8"),
@@ -161,7 +170,7 @@ def private convert_hub_root() : string {
     return "{hf}/hub" if (!empty(hf))
     let home = g_env_core.home
     if (empty(home)) {
-        to_log(LOG_ERROR, "convert: neither HF_HOME nor HOME is set — cannot locate the huggingface hub cache\n")
+        to_log(LOG_ERROR, "convert: neither HF_HOME nor HOME is set - cannot locate the huggingface hub cache\n")
         return ""
     }
     return "{home}/.cache/huggingface/hub"
@@ -183,7 +192,7 @@ def private convert_parakeet(e : ProvEntry; path : string) {
     let v = find(e.name, "-v3-") >= 0 ? "v3" : "v2"
     let src = hub_download(py, "hf_hub_download; print(hf_hub_download('nvidia/parakeet-tdt-0.6b-{v}','parakeet-tdt-0.6b-{v}.nemo'))")
     if (empty(src) || !stat(src).is_valid) {
-        to_log(LOG_ERROR, "fetch_models: --convert {e.name} — the .nemo download failed\n")
+        to_log(LOG_ERROR, "fetch_models: --convert {e.name} - the .nemo download failed\n")
         return
     }
     // the converter's default output name is ggml-model-f32.bin — --out-name is load-bearing
@@ -206,7 +215,7 @@ def private convert_canary(path : string) {
 // one canary invocation produces both the encoder and the decoder
 def private try_convert(e : ProvEntry; path : string; var canary_done : bool&) {
     if (get_platform_name() == "windows") {
-        to_log(LOG_ERROR, "fetch_models: --convert is POSIX-only (the venv/converter paths differ on Windows) — run the recipes by hand: {e.recipe}\n")
+        to_log(LOG_ERROR, "fetch_models: --convert is POSIX-only (the venv/converter paths differ on Windows) - run the recipes by hand: {e.recipe}\n")
         return
     }
     if (find(e.name, "parakeet") >= 0) {
@@ -255,7 +264,7 @@ def main() : int {
         }
         if (!st.is_valid && !empty(e.url)) {
             if (!cfg.fetch || cfg.dry_run) {
-                to_log(LOG_WARNING, "fetch_models: {e.name} — ABSENT{cfg.dry_run ? ", would fetch" : ""} ({e.url})\n")
+                to_log(LOG_WARNING, "fetch_models: {e.name} - ABSENT{cfg.dry_run ? ", would fetch" : ""} ({e.url})\n")
                 pending++
                 continue
             }
@@ -267,31 +276,31 @@ def main() : int {
         }
         if (!st.is_valid) {
             if (empty(e.recipe)) {
-                to_log(LOG_ERROR, "fetch_models: {e.name} — ABSENT and the fetch produced nothing ({e.url})\n")
+                to_log(LOG_ERROR, "fetch_models: {e.name} - ABSENT and the fetch produced nothing ({e.url})\n")
                 failed++
             } else {
-                to_log(LOG_WARNING, "fetch_models: {e.name} — ABSENT, converted on-box: {e.recipe}\n")
+                to_log(LOG_WARNING, "fetch_models: {e.name} - ABSENT, converted on-box: {e.recipe}\n")
                 pending++
             }
             continue
         }
         if (empty(e.sha256)) {
-            to_log(LOG_INFO, "fetch_models: {e.name} — present; {e.recipe}\n")
+            to_log(LOG_INFO, "fetch_models: {e.name} - present; {e.recipe}\n")
             ok++
             continue
         }
         if (int64(st.size) != e.bytes) {
-            to_log(LOG_ERROR, "fetch_models: {e.name} — SIZE MISMATCH (have {int64(st.size)}, provenance {e.bytes}) — different bytes would silently bench a different model\n")
+            to_log(LOG_ERROR, "fetch_models: {e.name} - SIZE MISMATCH (have {int64(st.size)}, provenance {e.bytes}) - different bytes would silently bench a different model\n")
             failed++
             continue
         }
         let fi = file_identity(path, "weights")
         if (fi.sha256 != e.sha256) {
-            to_log(LOG_ERROR, "fetch_models: {e.name} — sha MISMATCH (have {slice(fi.sha256, 0, 12)}…, provenance {slice(e.sha256, 0, 12)}…) — wrong upstream build, find the recorded repo/revision, never waive\n")
+            to_log(LOG_ERROR, "fetch_models: {e.name} - sha MISMATCH (have {slice(fi.sha256, 0, 12)}..., provenance {slice(e.sha256, 0, 12)}...) - wrong upstream build, find the recorded repo/revision, never waive\n")
             failed++
             continue
         }
-        to_log(LOG_INFO, "fetch_models: {e.name} — ok\n")
+        to_log(LOG_INFO, "fetch_models: {e.name} - ok\n")
         ok++
     }
     to_log(failed > 0 ? LOG_ERROR : LOG_INFO,

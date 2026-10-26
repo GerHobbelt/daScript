@@ -271,17 +271,30 @@ that both emitters read class members. Current entries:
   emitter's model, ported wholesale in the vulkan class-kernel arc) — the original blocker on
   stacking both shader annotations on one body is gone. Free-function callees and
   devirtualized overrides are symmetric too (msl_emit's devirtualization table was the donor).
-- **Multi-kernel-per-class + `family=` surface sharing: Vulkan leads.** `[vk_dispatch]`
-  accepts N kernel methods per class (`kernel=` picks, `family=` shares one set surface
-  across sibling classes); `[metal_dispatch]` still enforces one kernel per class
-  (`find_kernel_fn` nmatch==1). Pending follow-up: relax the metal lens the same way — the
-  reification layer builds on that surface.
+- **Multi-kernel-per-class is symmetric now; `family=` surface sharing stays Vulkan-only.**
+  Both lenses accept N kernel methods per class with `kernel=` picking per instance
+  (`_mtl_toy.das` / `_vkd_toy.das` are the sibling fixtures). `family=` remains Vulkan's
+  alone — Metal's `enc_*` builder is the whole generated surface, so there is nothing for a
+  family to share.
+- **Method flattening, scope splicing, and plain-member thread-local STATE are Metal-only.**
+  `msl_emit` splices method bodies inline (statically devirtualized, value and statement
+  position) and lowers plain class members to kernel-entry thread-locals (scalar-with-init,
+  fixed array, carried pointer walk — the state contract is per-thread); `spirv_emit` still
+  rejects an unannotated member and lowers method calls as calls. If a joined or
+  state-carrying class ever crosses backends, the same design ports — deliberate asymmetry
+  until then.
 - **Inheritance in the kernel corpus: Vulkan leans on it, Metal does not yet.** The vulkan
   classes are base+leaf families (kq GEMV/batch, flash attention, deltanet); the metal
   classes are flat, with at least one base duplicated inline (MetalMoeMulMmK6). Dedup
   opportunity, not a correctness gap.
 - **Grid-literal validation: Vulkan rejects non-int64 ceil-div grid params at macro apply;
   the metal lens still carries that silent infer trap.** Pending metal-side fix.
+- **cm2 decode-in-load (and its class-method decode form) is Vulkan-only by hardware.**
+  `[spirv_decode]` — including the method form, where a das-level self is erased from the
+  rigid 3-param signature so the decode body reads class members (a separate scale plane,
+  push constants, @workgroup staging) — lowers SPV_NV_cooperative_matrix2 tensor loads.
+  Metal-4 tensors have no decode-callback analogue; the Metal quant GEMMs stage dequant
+  through threadgroup memory instead. Deliberate, target-specific — not a pending port.
 
 ## Top risks
 

@@ -125,7 +125,7 @@ def private ref_for(baselines : array<LlmBaseline>; display : string; var prefil
 def main() {
     allow_cpu_prefill()   // CPU rows are this tool's product — disarm the Metal-build tripwire
     if (!jit_enabled()) {
-        print("gen_profile is JIT-only — run with: daslang -jit <file>\n")
+        print("gen_profile is JIT-only - run with: daslang -jit <file>\n")
         return
     }
     var r <- parse_args(type<Args>)
@@ -150,9 +150,9 @@ def main() {
         set_jobque_threads_cap(max(threads - 1, 1))
     }
     if (affinity_on() && is_none(g_env_core.jobque_affinity)) {
-        // 2 = HARD mask, mirroring llama-bench --cpu-strict. Mode 1 (hint) re-rolls the placement
-        // lottery on every fresh que: lanes migrate onto SMT siblings and lockstep prefill goes
-        // bimodal (~halved) while memory-bound decode barely notices — measured on the 3990X.
+        // 2 = HARD mask on Windows (mirroring llama-bench --cpu-strict; mode 1's hint re-rolls the
+        // placement lottery per fresh que — SMT siblings halve lockstep prefill, measured 3990X)
+        // and QoS classification on darwin (unclassified workers demote under ambient load).
         set_jobque_affinity(2)
     }
 

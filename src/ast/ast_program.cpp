@@ -69,6 +69,25 @@ namespace das {
         return v >= 31300 && v < 31400;
     }
 
+    // Macro-authored diagnostics are exempt from Rule 2: several macros can sit on one
+    // declaration, each failing with its own independently-actionable message — same line,
+    // same cerr, different macro. Bounded per node per macro (annotations by the annotation
+    // list × call sites, lint findings by one per AST node per rule), so they cannot avalanche.
+    static __forceinline bool isMacroDiagnostic ( CompilationError cerr ) {
+        switch ( cerr ) {
+            case CompilationError::runtime_annotation:
+            case CompilationError::runtime_annotation_transform:
+            case CompilationError::runtime_structure_annotation:
+            case CompilationError::runtime_function_annotation:
+            case CompilationError::runtime_macro:               // das-side macro_error()
+            case CompilationError::runtime_macro_performance:   // das-side macro_performance_warning() — perf_lint
+            case CompilationError::runtime_macro_style:         // das-side macro_style_warning() — style_lint
+                return true;
+            default:
+                return false;
+        }
+    }
+
     void Program::deduplicateErrors () {
         if ( errors.size() < 2 ) return;
         // errors are already sorted by Error::operator< (at, what, extra, fixme)
@@ -123,10 +142,12 @@ namespace das {
             }
             int dupCount = int(j - i);
             // Rule 2: same-line, same-cerr, different-text — collapse to first
-            // and append `(+N more on this line)` to the message.
+            // and append `(+N more on this line)` to the message. Macro diagnostics
+            // keep every distinct text (see isMacroDiagnostic).
             int sameLineSameCerrCount = 0;
             size_t k = j;
-            while ( k < N
+            while ( !isMacroDiagnostic(e.cerr)
+                && k < N
                 && errors[k].at.fileInfo == e.at.fileInfo
                 && errors[k].at.line == e.at.line
                 && errors[k].cerr == e.cerr
@@ -138,7 +159,8 @@ namespace das {
             // Emit the first instance with optional count suffixes.
             Error out = e;
             if ( dupCount > 1 ) {
-                out.what += " (\xC3\x97" + to_string(dupCount) + ")";
+                // ASCII 'x', not U+00D7: diagnostics flow into logs that are not UTF-8 aware
+                out.what += " (x" + to_string(dupCount) + ")";
             }
             if ( sameLineSameCerrCount > 0 ) {
                 out.what += " (+" + to_string(sameLineSameCerrCount) + " more on this line)";
