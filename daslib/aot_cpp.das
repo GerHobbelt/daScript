@@ -3798,7 +3798,7 @@ class public CppAot : AstVisitor {
             }
             return empty(bif.cppName);
         }
-        if (func.flags.noAot || func.flags.aotHybrid) return true;
+        if (func.flags.noAot || func.flags.aotHybrid || func.moreFlags.requestJit) return true;
         return func._module != program.getThisModule;
     }
     def needsArgPassType(argType : TypeDeclPtr) {
@@ -3923,7 +3923,7 @@ class public CppAot : AstVisitor {
         return argType.isVoidPointer ^^ passType.isVoidPointer;
     }
     def needStringCast(func : Function?; arg : TypeDeclPtr) {
-        return func.moreFlags.needStringCast && arg.isString && !arg.flags.ref;
+        return arg.isString && !arg.flags.ref;
     }
     def CallFunc_preVisitCallArg(call : ExprCallFunc?; arg : ExpressionPtr; is_last : bool) {
         if (call.func.moreFlags.propertyFunction) return ;
@@ -3962,7 +3962,7 @@ class public CppAot : AstVisitor {
         if (isPolicyBasedCallFunc(call) && policyArgNeedCast(call.func.result, argType)) {
             write(*ss, "cast<{describeCppType(argType,DescribeConfig(skip_ref=true,skip_const=true,cross_platform=cross_platform))}>::from(");
         }
-        if (needStringCast(call.func, argType)) {
+        if (needStringCast(call.func, funArgType)) {
             write(*ss, "(das_string_cast(");
         }
     }

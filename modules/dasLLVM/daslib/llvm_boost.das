@@ -183,27 +183,6 @@ def StructType(types : PrimitiveTypes?; var fields : array<LLVMOpaqueType?>) {
 }
 
 
-def LLVMBuildSRemInt32(builder : LLVMOpaqueBuilder?; var types : PrimitiveTypes?; lhs, rhs : LLVMOpaqueValue?; name : string) {
-    // convert lhs % rhs to lhs - int(double(lhs)/double(rhs))*rhs
-    let l = LLVMBuildSIToFP(builder, lhs, types.t_double, "")
-    let r = LLVMBuildSIToFP(builder, rhs, types.t_double, "")
-    let d = LLVMBuildFDiv(builder, l, r, "")
-    let i = LLVMBuildFPToSI(builder, d, types.t_int32, "")
-    let m = LLVMBuildMul(builder, i, rhs, "")
-    return LLVMBuildSub(builder, lhs, m, name)
-}
-
-
-def LLVMBuildURemUInt32(builder : LLVMOpaqueBuilder?; var types : PrimitiveTypes?; lhs, rhs : LLVMOpaqueValue?; name : string) {
-    // convert lhs % rhs to lhs - uint(double(lhs)/double(rhs))*rhs
-    let l = LLVMBuildUIToFP(builder, lhs, types.t_double, "")
-    let r = LLVMBuildUIToFP(builder, rhs, types.t_double, "")
-    let d = LLVMBuildFDiv(builder, l, r, "")
-    let i = LLVMBuildFPToUI(builder, d, types.t_int32, "")
-    let m = LLVMBuildMul(builder, i, rhs, "")
-    return LLVMBuildSub(builder, lhs, m, name)
-}
-
 def LLVMIsVector3(typ : LLVMOpaqueType?) : bool {
     return (LLVMGetTypeKind(typ) == LLVMTypeKind.LLVMVectorTypeKind) && (LLVMGetVectorSize(typ) == 3u)
 }
@@ -307,12 +286,12 @@ def LLVMAddIncoming(phi : LLVMOpaqueValue?; var phi_vals : array<LLVMOpaqueValue
     LLVMAddIncoming(phi, array_data_ptr(phi_vals), array_data_ptr(phi_blocks), uint(length(phi_vals)))
 }
 
+[arch(at = "../ARCHITECTURE.md#gep-constant-fold")]
 def LLVMBuildGEP2(builder : LLVMOpaqueBuilder?; ty : LLVMOpaqueType?; ptr : LLVMOpaqueValue?; var index : LLVMOpaqueValue?; name : string; inbounds : bool = true) {
-    var gep = LLVMBuildGEP2(builder, ty, ptr, unsafe(addr(index)), 1u, name)
     if (inbounds) {
-        LLVMSetIsInBounds(gep, 1)
+        return LLVMBuildInBoundsGEP2(builder, ty, ptr, unsafe(addr(index)), 1u, name)
     }
-    return gep
+    return LLVMBuildGEP2(builder, ty, ptr, unsafe(addr(index)), 1u, name)
 }
 
 def LLVMFunctionType(ret_type : LLVMTypeRef; var param_types : LLVMTypeRef[]; isVariadic : bool = false) {

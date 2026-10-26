@@ -493,6 +493,106 @@ one thread shows it as best 1831 / median 2925 inside ONE process, so the slow m
 flips between rounds, not between processes) and iq2s 0.90 (0.93 one thread). No gemv seat was written on
 this box, so the k6 gemv still rides the 512 tile crown here.
 
+### zen4 v4 and Intel v4 - the goal ladders on the lattice re-mints (2026-09-01; SOLO one thread d=4096, TEAM 16 lanes d=32768; ratio = reference / ours)
+
+| fmt | zen4 gemv 1T | zen4 tile 1T | zen4 gemv 16L | Intel gemv 1T | Intel tile 1T | Intel gemv 16L |
+|---|---|---|---|---|---|---|
+| q8 | 1.81 | 3.01 | 0.89 | 1.25 | 4.00 | 0.95 |
+| k4 | 2.45 | 2.19 | 1.05 | 1.52 | 3.88 | 1.47 |
+| k5 | 1.26 | 6.33 | 1.00 | 1.69 | 6.78 | 1.48 |
+| k6 | 1.10 | 3.43 | 1.01 | 1.19 | 4.14 | 0.68 |
+| q40 | 4.31 | 3.39 | 1.00 | 2.07 | 3.84 | 2.55 |
+| q51 | 2.84 | 5.03 | 0.94 | 2.51 | 7.01 | 1.84 |
+| iq4xs | 2.13 | 4.03 | 0.92 | 2.14 | 4.26 | 2.32 |
+| k3 | 2.18 | 2.75 | 0.99 | 1.85 | 4.11 | 1.01 |
+| iq3s | 2.20 | 11.87 | 1.23 | 2.19 | 14.07 | 1.95 |
+| iq3xxs | 2.18 | 10.22 | 1.25 | 2.04 | 10.39 | 2.48 |
+| iq4nl | 2.78 | 2.20 | 0.95 | 2.42 | 2.73 | 3.03 |
+| k2 | 2.06 | 1.49 | 1.14 | 2.28 | 2.66 | 1.70 |
+| iq2s | 1.33 | 6.70 | 1.21 | 1.18 | 6.90 | 1.19 |
+| iq2xs | 1.43 | 6.50 | 1.31 | 1.56 | 8.08 | 1.65 |
+| iq2xxs | 1.79 | 7.64 | 1.44 | 1.65 | 7.26 | 1.65 |
+| mx4 | 2.60 | 4.57 | 1.00 | 2.52 | 4.80 | 2.60 |
+
+Reading: every one-thread row on both boxes is past the reference (zen4 >= 1.10, Intel >= 1.18); every grid row at 16 lanes is 1.19-2.48x.
+Under 0.95 at 16 lanes: zen4 q8 0.89, iq4xs 0.92, q51 0.94 (the DRAM-bound rows; iq4nl exactly 0.95) and Intel k6 0.68 (the normal-mode stall gap).
+Both minted profiles committed; the gemv seats took grid_vbmi for all five grid families on both boxes.
+
+### Intel v8 - THE GOAL TABLE (2026-09-01, c8i.4xlarge Xeon 6975P-C, x86-amx re-minted with the L3-proof engine-shape seat race, a3a1a08ab; ratio = reference / ours)
+
+| fmt | gemv 1T | tile 1T | gemv 16L |
+|---|---|---|---|
+| q8 | 1.16 | 3.76 | 0.96 |
+| q8s16 | 1.19 | 3.78 | 1.02 |
+| k4 | 1.48 | 3.31 | 1.53 |
+| k5 | 1.61 | 6.71 | 1.51 |
+| k6 | 1.18 | 3.78 | 1.06 |
+| q40 | 2.05 | 3.64 | 2.78 |
+| q51 | 1.94 | 6.35 | 1.87 |
+| iq4xs | 2.10 | 4.11 | 2.35 |
+| k3 | 1.60 | 3.24 | 0.95 |
+| iq3s | 2.13 | 14.08 | 1.86 |
+| iq3xxs | 1.99 | 10.32 | 2.18 |
+| iq4nl | 2.37 | 2.68 | 3.30 |
+| k2 | 1.61 | 2.13 | 1.44 |
+| iq2s | 1.15 | 6.83 | 1.17 |
+| iq2xs | 1.55 | 8.00 | 1.64 |
+| iq2xxs | 1.59 | 7.27 | 1.73 |
+| mx4 | 2.44 | 4.78 | 2.79 |
+
+Every row at or past 0.95: the goal holds on Intel. q8s16 is the like-for-like q8_0 row (f16 scales); the f32-scale q8 row is informational (byte-capped at 0.944 in theory, 0.96 here).
+
+### zen4 v8 - THE GOAL TABLE (2026-09-01, c7a.4xlarge EPYC 9R14, x86-vnni512 re-minted with the L3-proof engine-shape seat race, a3a1a08ab; ratio = reference / ours)
+
+| fmt | gemv 1T | tile 1T | gemv 16L |
+|---|---|---|---|
+| q8 | 1.99 | 3.01 | 0.90 (ladder pass read 0.68; re-measured 6677-6703 vs 6059) |
+| q8s16 | 1.92 | 2.99 | 0.96 |
+| k4 | 2.29 | 2.49 | 0.98 |
+| k5 | 1.33 | 6.30 | 0.98 |
+| k6 | 1.07 | 3.47 | 0.99 |
+| q40 | 4.48 | 3.42 | 0.91-0.97 (ladder 0.89; re-measured 2944-3143 vs 2851) |
+| q51 | 2.83 | 6.02 | 1.01 |
+| iq4xs | 2.17 | 4.05 | 0.91 |
+| k3 | 1.79 | 2.69 | 1.01 |
+| iq3s | 2.24 | 11.91 | 1.30 |
+| iq3xxs | 2.22 | 10.23 | 1.19 |
+| iq4nl | 2.86 | 2.20 | 0.99 |
+| k2 | 1.74 | 1.69 | 1.10 |
+| iq2s | 1.33 | 6.71 | 1.28 |
+| iq2xs | 1.44 | 6.52 | 1.44 |
+| iq2xxs | 1.79 | 7.66 | 1.51 |
+| mx4 | 2.60 | 4.60 | 1.02 |
+
+One thread every row >= 1.07, tiles clean, every grid row 1.19-1.51 at 16 lanes. Under 0.95 at 16 lanes: the accepted streaming
+set (ruled, followup_general 67) - iq4xs 0.91-0.94, k5 0.93-0.98, iq4nl 0.94-0.99, q40 0.91-0.97 - and the f32-scale q8 row,
+byte-capped at 0.944 (q8s16, the GGUF q8_0 path, reads 0.96). The grid families' tile crowns are the vbmi rows (a tile tie -
+the lattice row's tile IS the 512 body - so the gemv companion carries the lattice without a separate seat).
+
+### M4 Pro v2 - arm-i8mm re-minted on the rebased branch (2026-09-01; SOLO one thread, TEAM 10 perf-core lanes; ratio = reference / ours)
+
+| fmt | gemv 1T | tile 1T | gemv 10L |
+|---|---|---|---|
+| q8 | 1.65 | 2.31 | 0.95 |
+| q8s16 | 1.62 | 2.24 | 1.02 |
+| k4 | 1.40 | 2.18 | 1.00 |
+| k5 | 1.10 | 3.80 | 1.09 |
+| k6 | 1.34 | 2.22 | 1.11 |
+| q40 | 2.08 | 2.37 | 1.24 |
+| q51 | 1.24 | 2.91 | 1.56 |
+| iq4xs | 1.68 | 3.22 | 1.14 |
+| k3 | 1.27 | 2.60 | 1.46 |
+| iq3s | 1.04 | 13.51 | 1.16 |
+| iq3xxs | 1.09 | 12.41 | 1.18 |
+| iq4nl | 1.85 | 3.18 | 1.30 |
+| k2 | 1.44 | 2.54 | 1.52 |
+| iq2s | 1.24 | 8.17 | 1.13 |
+| iq2xs | 0.90 | 6.79 | 0.94 |
+| iq2xxs | 1.17 | 8.58 | 1.22 |
+| mx4 | 1.35 | 2.59 | 1.51 |
+
+Every row at or past 0.95 except iq2xs one-thread (0.90; 0.95 at the engine shape) - NOT a regression: v1's 1.46 does not reproduce with v1's own sources on the same box (both ~2350 us), and the row form beats the panel on ARM for every grid at both shapes (iq2xs panel 3885 vs rows 2365 at 10 lanes). followup_general.md entry 68 carries the true standing and the two kernel-work directions; chunk grain is a null (8/16/4/1 all ~2350).
+
 ## 3. Research memos (read before touching the kernels)
 
 - `kernel_parity_research_cpu.md` - llama.cpp's CPU vec_dot for the five grid formats + Q2_K,
@@ -839,5 +939,168 @@ Vulkan grid tg (gap 3): followup_vulkan 35's levers, after gap 1 or 2 lands.
 - 2026-09-01: Intel k6 one thread, 40 rounds --each, normal mode: 3425, 1989, then steady 1637-1642 us -
   the slow reads were WARM-UP, steady state is 1.16x of the reference (1882); the ladder's 5-round
   best 1831 / median 2925 sampled the ramp. The 16-lane arm decides whether the 0.83 row is the same artifact.
+- 2026-09-01: the VBMI lattice is CORRECT and WINS (Intel c8i, first races): TEST bit-exact on all five
+  grid families (grid_vbmi maxdiff <= 2e-6); iq2xxs one thread 19334 vs the 512 row's 21823 us, 16 lanes
+  2249 vs 2599 (the reference 4254 - 1.89x); iq3xxs one thread 30438 vs ~39700 (the panel form's post-probe
+  read). The vbmi row's tile is the 512 body, so the tile race ties and the gemv's own seat crowns the
+  lattice where it wins - a plain re-mint adopts it, no framework change.
+- 2026-09-01: Intel k6 16-lane mode gap CONFIRMED mode-specific, not warm-up: same pinned seat, steady state
+  ~4900-5300 us normal vs ~3236-3400 tune over 20 rounds; one thread differs 1% (1629 vs 1616). Arena phase
+  is an 8% one-thread effect (off 64 best 1764, off 128-256 ~1920), not the 1.5x. intel_k6perf.sh counts the
+  steady loop (perf stat + record by DSO) in both modes - kernel pages vs dispatcher decides the next step.
+- 2026-09-01: the lattice's full Intel race (tune mode, d=32768; vbmi / old 512 seat / the reference at
+  16 threads): 16 lanes iq2xxs 2249 / 2599 / 4255, iq3xxs 3376 / 4536 / 6704, iq3s 3726 / 7212 / 7413,
+  iq2xs 2815 / 3951 / 4610, iq2s 3316 / 5706 / 3848; one thread iq2xxs 19334 / 21823, iq3xxs 30438 / 39773,
+  iq3s 36485 / 72793, iq2xs 23533 / 32658, iq2s 28428 / 36371 us. Every Intel grid row clears 0.95 with the
+  lattice - iq2s (the 0.90 row) reads 1.16x. The zen4 half runs next; then the re-mints adopt the seats.
+- 2026-09-01: the lattice's zen4 race (tune mode, d=32768; vbmi / old 512 seat / the reference): one thread
+  iq2xxs 17571 / 22402 / 32946, iq3xxs 27384 / 48023 / 43551, iq3s 26120 / 61810 / 49870, iq2xs 20518 /
+  36590 / 30978, iq2s 26909 / 39628 / 32855; 16 lanes best iq2xxs 1551 / 1666 / 2106, iq3xxs 2520 / 3108 /
+  2810, iq3s 2778 / 3882 / 3231, iq2xs 1618 / 2334 / 2006, iq2s 1935 / 2516 / 2113 us. TEST bit-exact.
+  Every zen4 grid row clears 0.95 with the lattice - the four 0.76-0.90 one-thread rows read 1.2-1.9x.
+- 2026-09-01: the Intel mode gap narrowed to the memory system: warm cache, both modes 96%+ of cycles in
+  the kernel DLL, same clock, same THP rollup, and the instruction rate ratio equals the wall ratio exactly
+  (identical instructions per gemv) - the normal body just stalls 1.54x more, 16 lanes only. Tune streams
+  385 MB at 127 GB/s (partial cache residency), normal at 82.8. Round 5 sweeps d (8k/32k/64k), adds q8, and
+  reads the arena VMA's own AnonHugePages plus LLC counters per mode.
+- 2026-09-01: cold-start SIGSEGV at 0xc0 right after "Library linked - ok" (normal mode, 16-lane team k6
+  d=32768, Intel; reproduced 3x cold, never warm, earlier bootstrap ladders passed) - a post-link rebind
+  bug to chase before the PR.
+- 2026-09-01: the cold-start SIGSEGV bisected. It needs only the PRESENCE of the five grid="vbmi"
+  tune_perm rows in dasllama_math_gen.das - not the emitter body, globals, or intrinsic decls (zen4 B1/B2/B3
+  disable each in turn, all still crash), and not the startup race (zen4 T1: fingerprint patched so nothing
+  races, rows present -> crash; T2: rows removed, k6's own row made to race -> clean). It fires only cold +
+  normal mode + --team; warm run 2 and every tune-mode race are clean, and the crashing format is k6, not a
+  grid format - so it is a whole-module codegen/teardown effect of the extra generated variants (backtrace
+  LLVMContextImpl::~LLVMContextImpl, fault at a small offset), not the lattice IR. Correctness is unaffected
+  (TEST bit-exact, all races produced numbers). A focused C++ session owns the fix; the parity numbers come
+  from warm/tune runs meanwhile.
+- 2026-09-01: the cold-start crash FOUND and FIXED (17e664e7f). Cuts on zen4: L1 (permi2b calls, no table
+  loads) clean vs L2 (table loads, no permi2b) crash pinned the lattice's 64-byte table-part loads; the core
+  showed glibc's malloc_consolidate under ~LLVMContextImpl - heap corruption at compile time. Cause: the
+  llvm_boost LLVMBuildGEP2 wrapper's `inbounds = true` default called LLVMSetIsInBounds on the result, and a
+  GEP over a global with a constant index folds into a ConstantExpr - the cast to GetElementPtrInst wrote a
+  flag into the constant's memory. Every emitter GEP before the lattice had a variable index or a parameter
+  base, so nothing ever folded. The wrapper now builds inbounds GEPs through LLVMBuildInBoundsGEP2. Cold
+  SOLO and cold 16-lane team both pass on zen4. Dead ends on the way: startup race path (T1/T2), frame size
+  (five by-value grid tables), constant folding of the loads, split partitions, lane count.
+- 2026-09-01: Intel re-mint on the lattice emitter (x86-amx, 60 entries, provenance ok/ok, fingerprint carries
+  avx512vbmi): the gemv seats took grid_vbmi for all five grid families and 256_mr16 for iq4xs. The goal
+  ladders after it: one thread every row >= 1.18 (k6 1.19, iq2s 1.18, iq3s 2.19, iq3xxs 2.04, iq2xs 1.56,
+  iq2xxs 1.65); 16 lanes every row >= 0.95 (q8 exactly 0.95, iq3s 1.95, iq3xxs 2.48, iq2s 1.19, iq2xs 1.65,
+  iq2xxs 1.65) EXCEPT k6 0.68 (5346 vs 3635 us) - the normal-mode stall gap, Intel's last open row.
+- 2026-09-01: cold-start cost is LLVM, not the das compile: the mint's JIT line reads optimize 60 s + emit+link
+  72 s for the whole dasLLAMA module - the lattice bodies are fully unrolled over the 8 blocks (a called block
+  loop would cut it); -module-cache trims the das side only.
+- 2026-09-01: the Intel k6 16-lane mode gap VANISHED after the rebase onto master (d76d86fe0 + binary
+  rebuild): normal 3434 us vs tune 3287 / 3119 (was 5323 vs 3698 for the identical 512 body); answers
+  bit-identical across modes (the bench's new '# ysum' line). Two facts changed at once on the pre-rebase
+  tree: the stamped gemv companion carried the TILE's 512_mr16 body although the profile named the 256_mr16
+  seat (the disassembly: outlined 491-insn EVEX body called from the das thunk), and the same 512 body ran
+  1.44x slower in normal mode than as a tune-mode clone - both gone now (normal stamps the VEX 256 seat).
+  Not isolated to a master commit; if the gap ever returns, bisect llvm_tune.das between
+  bbatkin/kernel-parity-pre-rebase and the rebased tip. Ruled out along the way: alignment/arena phase,
+  THP, L3 residency, dispatch grain, thread placement, per-call interop cost, outlined-vs-inlined body.
+- 2026-09-01: zen4 16-lane rows are NOT a mode gap (tune == normal: q8 6715 / 6733, iq4xs 3077 / 3008). Grain
+  matters for balance: at --chunks-per-lane 16 iq4xs 2978 (0.96 of 2856) and q51 4132 (0.99 of 4093) with
+  balanced lanes; q8 stays ~6700 at every grain (0.90) with every lane busy the whole wall - 70 GB/s against
+  the reference's 82 on q8 while our k4 streams at 91 on the same box: memory-level parallelism, not bandwidth.
+- 2026-09-01: x86 hybrid core detection (Apple-only today) is LEDGERED as followup_general.md entry 66, not an arc
+  follow-up; the goal boxes are homogeneous (c7a EPYC 9R14, c8i Xeon 6975P-C - no cpu_atom PMU).
+- 2026-09-01: the q8 ladder row was a byte handicap: the bench's q8 plane carries f32 group scales (9 bits/weight)
+  against llama.cpp's q8_0 f16 d (8.5) - at equal streaming rate it can never pass 0.944. The engine runs GGUF
+  q8_0 tensors on the wscale_f16 twins, so the bench got a q8s16 arm (2ad5b9980): zen4 16 lanes 6277 vs the
+  reference 5985 = 0.95 (f32 row 6673 = 0.90), both at ~79.5 GB/s. The pf=2048 software prefetch was a null
+  (6712 / 6722 / 6712 for pf / crown / 256_mr8).
+- 2026-09-01: zen4 lane sweep at d=32768, 8 vs 16 lanes: iq4xs 3004 / 3116, iq4nl 2946 / 3049, q8s16 6120 / 6339,
+  k4 2891 / 3169 (streaming formats gain 3.5-9% at one lane per core - issue width at two SMT lanes, not DRAM),
+  k5 3997 / 3949 (flat), iq2xs 2714 / 1412 (the lattice grids halve without the SMT lanes). The Mac decode policy
+  transfers to SMT x86 PER FORMAT. RULED (Boris, 2026-09-01): ledgered as followup_general.md entry 67, not built
+  this arc - zen4's iq4xs 0.92 / iq4nl 0.94 / k5 0.93-0.97 are accepted; pinned affinity is normally faster and
+  this may be the one case it is not.
+- 2026-09-01: Intel v6 (rebased, seat race at the engine shape but n=2048): every row >= 0.97 except k3 0.89 -
+  the tiled fixture's row length flipped the k3 seat to 256_mr16 again; the seat fixture is now built at n=14336
+  (29dc0b35f). Intel v7 and zen4 v7 re-mints running.
+- 2026-09-01: the board rig's parity pregate "flake" was a spawn defect, not the engine: `popen_argv`
+  builds a CreateProcess command line with a NULL application name, and Windows refuses a RELATIVE
+  argv[0] spelled with forward slashes (`modules/.../dasllama-bench.exe` -> spawn fails, rc -1, no
+  child) while `./x.exe`, `../x.exe`, absolute and backslash spellings all resolve. The rig spawned
+  exactly that spelling; the same child run by hand passed 40/40. Fixed at the source - the spawn
+  respells argv[0] natively on Windows (every `popen_argv` / `spawn_argv` / `popen_argv_pipe` caller),
+  `tests/fio/popen_argv.das` spawns the offending shape, `run_and_stream` now logs a failed spawn
+  instead of "pregate output above" with nothing above, and the caller-side backslash workaround
+  left `daslib/fio.das` and the language skill.
+- 2026-09-01: the zen2 board row for gemma-4-12B Q4_K_M re-minted on the fixed rig (`records/zen2.json`,
+  16 threads, reference unpinned as the 08-04 sweep ran it): das pp512 66.4 +-1.7 / tg128 6.74 +-0.05
+  against the clean-cpu reference 56.4 / 6.45 = 1.18x / 1.04x; the 08-04 row read 70.2 / 7.30 against
+  59.1 / 6.80 = 1.19x / 1.07x. Both engines sit ~5% under August on this box (a different reference
+  build too, 6c84c7d5d against ebd048f); the ratio held. Pinning the reference made no difference
+  today (56.8 pinned, 56.4 bare). The das side ran the adopted x86-avx2 class profile (sidecar sha
+  3fe069fc370e), the 08-04 row a paranoid box mint. NOT STORED: the records gate (`performance/REVIEW.das`)
+  rejects a run whose `hardware.remote_desktop` reads `parsec`, and the stamp fires on the parsecd
+  daemon's presence - it runs as a service on this box - so the row backs out of the branch and the
+  cell is re-minted once Parsec is stopped for the ten-minute rig window (Boris's call; the daemon is
+  his remote access). Instrument: `gen_bench_records.das -- -o gemma-4-12B --workload llm
+  --ref-no-affinity`, both walls out-of-process, direction-grade against the 08-04 row.
 - 2026-09-01: step 0 done - `kq_kernel_bench.das`, the reference rows, both memos, the fact base
   above. `test-backend-ops` built in `build-clean-cpu` and `build-vulkan` with the thread pin.
+
+- 2026-09-02: llama.cpp's four-wide coopmat2 decode measured on the 5060 Ti. Box moved to
+  Vulkan SDK 1.4.357.0 (glslc knows `GL_NV_cooperative_matrix_decode_vector`) and NVIDIA driver
+  616.56 (advertises `VK_NV_cooperative_matrix_decode_vector`); llama.cpp 6c84c7d5d rebuilt
+  into `build-vulkan-357` beside the scalar `build-vulkan`. llama-bench `-p 512 -n 128 -ngl 99
+  -r 6`, medians of six, ten Llama-3.2-1B vehicles, scalar -> vector build:
+
+  | format | pp512 scalar | pp512 vector | ratio | tg128 scalar | tg128 vector | ratio |
+  |---|---|---|---|---|---|---|
+  | Q4_K_M | 19363 | 20309 | 1.049 | 349.1 | 354.2 | 1.014 |
+  | Q3_K_L | 17073 | 18883 | 1.106 | 329.0 | 332.7 | 1.011 |
+  | Q2_K | 17625 | 19684 | 1.117 | 395.5 | 400.7 | 1.013 |
+  | IQ4_XS | 17632 | 19515 | 1.107 | 332.2 | 331.4 | 0.997 |
+  | IQ4_NL | 18606 | 20488 | 1.101 | 346.2 | 344.8 | 0.996 |
+  | IQ3_M | 17361 | 19638 | 1.131 | 306.3 | 306.4 | 1.000 |
+  | IQ3_XXS | 17512 | 19488 | 1.113 | 363.6 | 355.4 | 0.978 |
+  | IQ2_XS | 18618 | 20011 | 1.075 | 327.5 | 329.4 | 1.006 |
+  | IQ2_XXS | 18489 | 20052 | 1.085 | 393.7 | 390.8 | 0.993 |
+  | Q8_0 | 20947 | 20237 | 0.966 | 249.7 | 249.9 | 1.001 |
+
+  Every quantized format's pp512 gains 5-13% (min..max bands do not overlap); tg128 is flat
+  (the mat-vec shaders never enter coopmat2); Q8_0 pp loses 3% (no decode callback to widen -
+  a codegen side effect of the rebuilt shader set, small and real). The reference our Vulkan
+  pp512 rows are held to is therefore 5-13% higher from this driver on; the 08-31 per-format
+  rows were taken against the scalar build. A three-rep first pass was unreadable (one rep in
+  three 30-50% off on half the cells); six reps and medians are the floor for this box.
+
+- 2026-09-02: the four-wide decode twin on OUR cm2 tiles (branch bbatkin/vulkan-sdk-357: the
+  emitter synthesizes the vector callback over each format's scalar decode; the class-pipeline
+  seat strips it where the device lacks the feature; DASLLAMA_VK_DECVEC=0 is the same-build A/B).
+  `harness/vk_gemm_probe.das k4|k6` on the 5060 Ti, driver 616.56, TFLOP/s twin off -> on:
+
+  | shape | k4 l | k4 m | k6 l | k6 m | kq tile (control) |
+  |---|---|---|---|---|---|
+  | gate 9728x2560x512 | 38.0 -> 40.8 | 28.7 -> 36.8 | 33.7 -> 38.5 | 25.4 -> 32.3 | 11.8 -> 12.1 |
+  | down 2560x9728x512 | 26.5 -> 31.2 | 24.3 -> 33.4 | 24.9 -> 28.1 | 22.7 -> 28.1 | 11.8 -> 11.7 |
+  | q/wo 4096x2560 (k6: kv 1024x2560) | 37.5 -> 45.0 | 27.8 -> 37.9 | 19.7 -> 22.1 | 25.9 -> 31.7 | 11.1 -> 11.7 |
+
+  The tile gains 7-37% with the synthesized twin, so no hand-laid body is owed for k4/k6. The
+  tile oracles stay bit-exact under both callbacks (test_vulkan_kernels 86/86; the stripped
+  blobs 8/8). End to end (`lcpp_bench --for-debug-purposes -p 512 -n 128 -r 10`, ten 1B vehicles,
+  DASLLAMA_VK_DECVEC 1 vs 0): Q4_K_M 14510 vs 13283 (+9%), IQ4_NL +5%, Q8_0 +4%, IQ3_M +3%,
+  IQ2_XS +3%, Q3_K/Q2_K/IQ4_XS/IQ3_XXS within the band, IQ2_XXS 11987 vs 13799 (-13%, wide
+  spread) - the e2e spread on this box is 3-11% of the mean per row, so only the tile rates
+  above are load-bearing; the grid formats' tile rates follow (the new `cm2:<fmt>` probe arm).
+  The grid formats and q40 through `cm2:<fmt>` (l-tile / m-tile, twin off -> on, gate | down):
+  iq2xs 34.5->45.3 / 30.3->37.8 | 27.9->32.2 / 26.3->33.2 (+15..31%); q40 41.4->46.3 / 39.8->41.1 |
+  35.1->35.7 / 37.0->38.6 (+2..12%); iq3xxs 28.8->29.5 / 21.0->21.6 | 21.0->20.6 / 18.0->18.6 (flat);
+  iq3s 30.2->28.9 / 22.8->21.8 | 22.6->21.2 / 20.4->19.0 (-4..9%); iq2s 31.8->30.9 / 24.5->23.6 |
+  24.0->21.3 / 21.0->19.8 (-1..11%); iq2xxs 34.9->30.0 / 26.6->22.0 | 25.4->21.2 / 22.6->19.6
+  (-13..17%). RULING (mine): the twin is the template's DECVEC axis, default on, overridden off for
+  iq3s / iq2s / iq2xxs; their hand-laid twins are followup_vulkan 36.
+  IN ONE PROCESS (the probe's both-arms run through `vkd_pipes_rebuild`, two rounds each, the three
+  opt-outs flipped on for the measurement; l-tile gate | down, twin on vs off): iq3s 29.3/30.3 vs
+  30.6 | 21.5 vs 22.7 (-1..5%); iq2s 31.0 vs 32.9/33.3 | 21.8 vs 24.0 (-6..9%); iq2xxs 30.5 vs
+  35.0 | 21.7 vs 25.5 (-13..15%); k4 41.4/40.8 vs 35.8/35.9 | 31.5 vs 27.1 (+15..16%). The
+  two-process reading and the one-process reading agree in sign and size on every row, so the
+  DECVEC overrides stand on the in-process instrument. The instrument's own first run caught a seat
+  defect: the strip mutated the class's emitted words in place, so a later rebuild with the twin on
+  served stripped words - the seat now strips a copy.

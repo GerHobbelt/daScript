@@ -213,6 +213,7 @@ var g_pso_dn_ba : MetalComputePipeline?     // DeltaNet β/α batched narrow GEM
 var g_pso_moe_router_b : MetalComputePipeline?   // position-blocked router / f32-slab GEMV (prefill-only dispatch)
 
 var g_pso_argmax : MetalComputePipeline?
+var g_pso_argmax_rows : MetalComputePipeline?   // the same-slab verify's per-row accept-walk argmax
 var g_pso_copy_row : MetalComputePipeline?   // zero-copy logits: staging row -> wrapped session storage
 var g_pso_emb : MetalComputePipeline?
 var g_pso_emb_k6 : MetalComputePipeline?     // tied-k6 spec chain's embed gather
@@ -247,6 +248,7 @@ var g_pso_kq_k6 : MetalComputePipeline?
 var g_pso_kq_iq4xs : MetalComputePipeline?
 var g_pso_kq_k3 : MetalComputePipeline?
 var g_pso_kq_mvb2_k4 : MetalComputePipeline?   // batch B=2..8: the kq ext small-batch mv twins
+var g_pso_kq_mvb2_k4r2 : MetalComputePipeline?   // the k4 twin's two-row register tile (the `kq_mvb2_k4_r2` crown)
 var g_pso_kq_mvb4_k4 : MetalComputePipeline?
 var g_pso_kq_mvb2_k5 : MetalComputePipeline?
 var g_pso_kq_mvb4_k5 : MetalComputePipeline?
@@ -1873,6 +1875,14 @@ var @scratch g_lp_cbs : array<MetalCommandBuffer?>   // per-step cb stash; relea
 var @scratch g_lp_pooled : array<tuple<buf : MetalBuffer?; size : uint64>>   // pending-step stash; clear()-recycled per finish
 var @scratch g_lp_upooled : array<tuple<buf : MetalBuffer?; size : uint64>>
 var g_lp_blog : MetalBuffer?
+var g_lp_sameslab = false       // same-slab verify: land every row's logits + hidden on sessions[0]
+var g_lp_bxf : MetalBuffer?     // ... the rows' post-final-norm hidden (nrows x dim)
+var g_lp_bxf_bytes = 0l
+var g_lp_bvarg : MetalBuffer?   // same-slab verify: the rows' GPU argmax (uint per row), landed into g_sameslab_arg
+var @scratch g_sameslab_arg : array<int64>
+
+//! The same-slab verify's per-row argmax as the join landed it (row i = the truth for draft i+1).
+def sameslab_argmax(i : int64) : int64 => g_sameslab_arg[i]
 var g_lp_xb : MetalBuffer?      // production sync + CPU-classifier path: x_b writeback
 var g_lp_xb_dst : void?         // ... into the caller's workspace (borrowed, sync-only)
 var g_lp_xb_bytes = 0l
@@ -1895,6 +1905,38 @@ var g_lp_prev_gpu_end = 0.0lf   // last finished step's gpu_end — the handoff 
 
 // wait + read back + release the pending step; x_b writes back only on the sync CPU-classifier
 // path (pipe mode skips it — stale). A dispatch error sets g_lp_err (sync reruns on CPU; a pipelined step is lost).
+// same-slab landing: every row's logits (row 0 also into mtp_logits) + the post-norm hidden rows onto the ONE session
+def private land_sameslab_rows(lgp : uint8?) {
+    var s0 = g_lp_sessions[0]
+    let vb = g_lp_vocab * 4l
+    unsafe {
+        if (lgp != null) {
+            if (long_length(s0.mtp_logits_b) < g_lp_nrows * g_lp_vocab) {
+                s0.mtp_logits_b |> resize(g_lp_nrows * g_lp_vocab)
+            }
+            memcpy(addr < void? >(s0.mtp_logits_b[0]), reinterpret<void?>(lgp), g_lp_nrows * vb)
+            if (long_length(s0.mtp_logits) >= g_lp_vocab) {   // sized only on NextN-headed sessions
+                memcpy(addr < void? >(s0.mtp_logits[0]), reinterpret<void?>(lgp), vb)
+            }
+        }
+        if (g_lp_bxf != null) {
+            if (long_length(s0.mtp_hrows) * 4l < g_lp_bxf_bytes) {
+                s0.mtp_hrows |> resize(g_lp_bxf_bytes / 4l)
+            }
+            memcpy(addr < void? >(s0.mtp_hrows[0]), metal_buffer_contents(g_lp_bxf), g_lp_bxf_bytes)
+        }
+        if (g_lp_bvarg != null) {
+            if (long_length(g_sameslab_arg) < g_lp_nrows) {
+                g_sameslab_arg |> resize(g_lp_nrows)
+            }
+            let ap = reinterpret<uint?>(metal_buffer_contents(g_lp_bvarg))
+            for (i in range64(g_lp_nrows)) {
+                g_sameslab_arg[i] = int64(ap[i])
+            }
+        }
+    }
+}
+
 def finish_pending_step {   // nolint:STYLE038 — the pipeline join: wait/error/stats/release/readback share the step's locals
     if (!g_lp_active) {
         return
@@ -1948,7 +1990,7 @@ def finish_pending_step {   // nolint:STYLE038 — the pipeline join: wait/error
                     memcpy(reinterpret<void?>(kv_layer_vbase(*sp, l, g_lp_seq) + prow * rowb_l),
                         reinterpret<void?>(ab + (g_lp_voffs[i] + uint64(g_lp_lvbase[fb] + pos * rowb_l))), rowb_l)
                 }
-                if (lgp != null) {
+                if (lgp != null && !g_lp_sameslab) {
                     memcpy(addr < void? >(sp.logits[0]),
                         reinterpret<void?>(lgp + i * g_lp_vocab * 4l), g_lp_vocab * 4l)
                 }
@@ -1956,6 +1998,9 @@ def finish_pending_step {   // nolint:STYLE038 — the pipeline join: wait/error
                     let wm0 = g_mirrors[sp.uid].watermark
                     g_mirrors[sp.uid].watermark = max(wm0, pos + 1l)
                 }
+            }
+            if (g_lp_sameslab && g_lp_nrows > 0l) {
+                land_sameslab_rows(lgp)
             }
         }
         g_us_breadback += int64(get_time_usec(ts_rb))
@@ -1985,6 +2030,9 @@ def finish_pending_step {   // nolint:STYLE038 — the pipeline join: wait/error
     }
     g_lp_upooled |> clear()
     g_lp_blog = null
+    g_lp_sameslab = false
+    g_lp_bxf = null
+    g_lp_bvarg = null
     g_lp_xb = null
     g_lp_xb_dst = null
     g_lp_sessions |> clear()   // borrowed handles — clear, never delete
@@ -2231,6 +2279,66 @@ def race_x_f32(count : int) : array<float> {
         xa[i] = 0.25 * float(i % 17 - 8)
     }
     return <- xa
+}
+
+// the race fixture's scale-plane layout, one value per on-disk scale form
+enum KqRaceScaleForm {
+    compact     //!< k4/k5: 16B kmask blocks, d+dmin leading halves
+    split_d     //!< k6 + every split-scale iquant: 16B strips + a 2B f16 d tail
+    split_dmin  //!< k2: 16B strips + a 4B d+dmin tail
+    pure_d      //!< iq4nl: a pure-d plane, 8 f16 per superblock
+}
+
+//! A K-quant weight fixture in the engine's split-plane layout: random quant bits (any pattern is a
+//! valid plane, so a twin-vs-base envelope doubles as a layout-agreement check) and constant f16
+//! scales. Returns the quant buffer, the scale buffer and the d-tail byte offset the encoders bind.
+def race_kq_planes(dev : MetalDevice?; nblk, qu_per_sb : int; sform : KqRaceScaleForm) : tuple<bq : MetalBuffer?; bs : MetalBuffer?; doff : uint64> {
+    var qplane : array<uint>
+    qplane |> resize(nblk * qu_per_sb)
+    for (i in range(nblk * qu_per_sb)) {
+        qplane[i] = uint(i) * 2654435761u   //! deterministic pseudo-random bit pattern
+    }
+    var splane : array<uint8>
+    let sbytes = sform == KqRaceScaleForm.split_d ? nblk * 18 : (sform == KqRaceScaleForm.split_dmin ? nblk * 20 : nblk * 16)
+    splane |> resize(sbytes)
+    if (sform == KqRaceScaleForm.split_d || sform == KqRaceScaleForm.split_dmin) {
+        for (i in range(nblk * 16)) {
+            splane[i] = uint8(2)
+        }
+        unsafe {
+            var ph = addr<float16?>(splane[nblk * 16])
+            let per = sform == KqRaceScaleForm.split_dmin ? 2 : 1
+            for (b in range(nblk * per)) {
+                ph[b] = float16(0.25)
+            }
+        }
+    } elif (sform == KqRaceScaleForm.pure_d) {
+        unsafe {
+            var ph = addr<float16?>(splane[0])
+            for (b in range(nblk * 8)) {
+                ph[b] = float16(0.25)
+            }
+        }
+    } else {
+        unsafe {
+            var ph = addr<float16?>(splane[0])
+            for (b in range(nblk)) {
+                ph[b * 8] = float16(0.25)       //! d
+                ph[b * 8 + 1] = float16(0.25)   //! dmin
+            }
+        }
+        for (b in range(nblk)) {
+            for (kx in range(4, 12)) {
+                splane[b * 16 + kx] = uint8(17)   //! kmask bytes: small scales, both halves
+            }
+        }
+    }
+    var bq = race_buf(dev, uint64(nblk * qu_per_sb * 4), unsafe(addr<void?>(qplane[0])))
+    var bs = race_buf(dev, uint64(sbytes), unsafe(addr<void?>(splane[0])))
+    let doff = sform == KqRaceScaleForm.split_d || sform == KqRaceScaleForm.split_dmin ? uint64(nblk * 16) : 0ul
+    delete qplane
+    delete splane
+    return (bq = bq, bs = bs, doff = doff)
 }
 
 // deterministic f16 panel — the f16-slab races (attention scores) feed and compare in half

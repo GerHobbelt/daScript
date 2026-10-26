@@ -199,7 +199,13 @@ verbatim; scales the 20 B `KQ_DEV_SSB` row) plus three eight-line width stamps, 
 `cm2_cls_ensure/set/enc` ladders, and `pf_f16_feed` admits it via `kq_sb` automatically. A
 codebook format raises the `IQLUT` axis - a gated `@workgroup` f16 table staged ahead of the
 tile loop (llama.cpp's `init_iq_shmem` form); never select codes out of a register vector per
-element inside a decode callback. Gate: a device-form CPU oracle (`<fmt>f16_gemm_oracle`) and
+element inside a decode callback. The four-wide decode twin comes with the template: its loads
+pass the `DECVEC` axis as `coopmatLoadTensorDecode`'s tenth argument, so the emitter synthesizes
+the vector callback over `decode` and a format authors nothing for it. Run
+`harness/vk_gemm_probe.das -- cm2:<fmt>` with `DASLLAMA_VK_DECVEC` 1 and 0: a format whose row
+loses overrides `DECVEC = false` (iq3s, iq2s, iq2xxs today), and a hand-laid `half4` twin (a
+second `[spirv_decode]` method in that slot) is the lever for it. Gate: a device-form CPU oracle
+(`<fmt>f16_gemm_oracle`) and
 an l/m/s cell in `tests/test_vulkan_kernels.das`. Payoff on the 1B: iq4xs pp512 5161 -> 15334,
 k3 5174 -> 14031 (0.90x / 0.80x llama.cpp's Vulkan, from 0.30x).
 
@@ -567,7 +573,7 @@ only the step-3 0.0267 top-2 flip vs llama.cpp. M1 benches: CPU das 897.4/56.3 v
 is CLOSED - and with it THE FORMAT LADDER: four-tier table zen2 2.86x/0.70x, vk 0.78x/0.70x,
 M1 CPU 6.41x/0.57x, Metal 0.93x/0.78x.
 
-2026-09-01 (kernel parity pass): zen2 16t vs clean-cpu on the IQ2_XXS-local 1B: pp512 506.9 vs
+2026-09-01 (kernel parity pass): zen2 16t (`benchmarks/lcpp_bench.das --for-debug-purposes`, debug-jit) vs the clean-cpu `llama-bench` on the IQ2_XXS-local 1B: pp512 506.9 vs
 181.2 (2.80x), tg128 88.6 vs 86.2 (1.03x, was 0.70x) - the sign column + u64 pair gemv.
 
 ### IQ2_XS Phase A (CPU, 2026-08-31) - the ksigns u64 tier
@@ -637,7 +643,7 @@ tiers. M1 16GB benches: CPU das 746.6/51.6 vs llama.cpp 144.8/101.1 (5.16x/0.51x
 (0.93x/0.86x - the iq2s pp class). The format is CLOSED on all four tiers; four-tier table:
 zen2 2.78x/0.70x, vk 0.77x/0.54x, M1 CPU 5.16x/0.51x, Metal 0.93x/0.86x.
 
-2026-09-01 (kernel parity pass): zen2 16t vs clean-cpu on the IQ2_XS-local 1B: pp512 480.7 vs
+2026-09-01 (kernel parity pass): zen2 16t (`benchmarks/lcpp_bench.das --for-debug-purposes`, debug-jit) vs the clean-cpu `llama-bench` on the IQ2_XS-local 1B: pp512 480.7 vs
 174.6 (2.75x), tg128 93.8 vs 85.9 (1.09x, was 0.70x) - sign column + u64 pair + column dword read.
 
 ### IQ2_S Phase A (CPU, 2026-08-31) - the u64-grid tier

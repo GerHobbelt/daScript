@@ -38,7 +38,12 @@ on the dense role shapes (gate/up, down, q/wo, k/v - the mm_a kernel against the
 tiles, the sdot4 kq tile against the k4 and k6 cm2 tiles); one decode callback against
 spellings of itself with the rest of the tile held fixed (the `cm2x` and `k6x` bisect arms);
 and our tile against the upstream coopmat2 GEMM blob, served in place of a probe class's body
-through `DASLLAMA_VK_SPV_OVERRIDE` (the `ref` arm). A new arm joins one of the three.
+through `DASLLAMA_VK_SPV_OVERRIDE` (the `ref` arm). The `cm2:<fmt>` arm generalizes the first
+axis to any kq superblock format: it drives the prefill's own (format, column) ladders for the
+l and m columns with the kq batch tile as the control row, over random block bytes at that
+format's device block size, and it runs the four-wide decode's two arms (the twin served, then
+stripped through `vkd_pipes_rebuild`) interleaved in one process, two rounds each, so a format's
+`DECVEC` verdict comes from one instrument. A new arm joins one of the three.
 
 **A measured number proves its kernel provenance through `tune_gate()`
 (`performance/profile_common.das`), one arm per world it can run in.** Three worlds, because
@@ -53,6 +58,17 @@ all - neither can measure a fallback silently. A kernel A/B lab is also outside 
 in-process reference check: `harness/vk_gemm_probe.das` dispatches the shipped, suite-gated
 kernels on timing fixtures, compares no arm's output, and marks every row `timing-only`; its
 rows never enter a record store, and a decision it seeds is confirmed by the e2e board rows.
+
+**A binary-stale sidecar still serves its `runtime` section; a foreign one serves nothing.**
+The staleness rule kills measured kernel WINNERS - a rebuild can change the bodies they were
+raced on - but the `runtime` knobs (lane caps, jobque shape, the `metal_tensor` crowns that turn
+the tensor mul_mm twins on) are properties of the box, not of the binary. The engine's no-path
+`apply_box_profile_runtime()` therefore takes the checked route: `stale_binary` applies the
+runtime section and says so; `foreign_box` and `unreadable` apply nothing, because those knobs
+are the minting box's state; `absent` is an unminted box. Without the crowns the twins run their
+base forms - gemma-26B pp512 on an M5 reads 1662 against 3835 tok/s - so `metal_decode_init`
+warns when a profile was asked for, declined, and no crowns are set, and `lcpp_bench` stamps a
+cell that passed `tune_gate()` on `DASLLAMA_ALLOW_UNTUNED=1` with an `untuned:` flavor prefix.
 
 **The retune re-exec bites scaffolding, and the pin for it is checked in.** Any bare `daslang`
 run that requires the engine - a probe, a one-off script, a REPL experiment - re-execs into a
@@ -160,3 +176,32 @@ no model, no tuner, every arm gated against a CPU plane-dequant oracle before it
 chain every dispatch through ONE shared output buffer on purpose - the serialized regime is
 the instrument's probe shape, imitating the reference tool it is compared against - and its
 numbers reach the engine only through a human porting decision, never a minted crown.
+
+### 2.26 The gemv takes its own tune seat {#gemv-seat}
+
+A kq family's manifest entry is its tile-best row, and the gemv gets a SECOND entry when a different
+row serves the streamed decode better. Only same-mr rows can differ, because the layout companion
+pins the plane's interleave; of those the two best by tile time race, the winner takes the gemv only
+by the margin over the tile winner's own gemv, and the incumbent keeps a tie. Every family's perm grid
+therefore carries a 256-wide `mr = 16` alternate beside its 512-wide tile crown. The seat is decided
+at the engine's decode shape - a DRAM-bound plane streamed by every lane through the engine's own
+splitter - because the engine's row length moves the answer (k3 on Granite Rapids: the 256 seat wins
+at n=2048 and loses at 14336 - `benchmarks/matmul/kq_kernel_bench.das`, tune mode, seats pinned, d=32768). The seat fixture is a 512-row build at the ffn width tiled 320 times,
+past the largest L3 a socket lends a slice of, and the seat takes the MEDIAN of seven rounds: a round
+that finds the plane in L3 must not crown it. In normal mode `llvm_tune` stamps a companion from its
+own manifest entry when one exists and is a perm this box can run, else from the tile's.
+
+### 2.27 The CPU kernel bench's fixture conditions {#cpu-kernel-bench-fixture}
+
+`benchmarks/matmul/kq_kernel_bench.das` times raw kernels on synthetic planes, and three fixture
+properties decide whether its numbers mean anything. Every plane of one format lives in ONE arena at
+fixed offsets, staggered so no two starts share their low 12 address bits: the heap places separate
+arrays at run-dependent relative addresses, and planes that alias in the L1/L2 set logic make a run's
+time depend on where the heap put them. Scale planes are filled with a byte that is a normal number in
+every scale form, never random bytes, because denormal math runs orders of magnitude slower. Each row
+is warmed before it is timed - three unmeasured rounds solo, six dispatches per row on the team arm -
+because a core ramps over several rounds and one warm call is not enough. The q8 row exists in two
+flavors: f32 group scales (the engine's own quantization) and `q8s16` over binary16 scales - the
+wscale_f16 rail a GGUF q8_0 tensor runs, and the like-for-like row against the reference's q8_0.
+Provenance for every figure in this section: `benchmarks/matmul/kq_kernel_bench.das` under
+`DAS_TUNE_MODE=tune`, one thread, its default `--fmt` / `-n` / `-d` shape.

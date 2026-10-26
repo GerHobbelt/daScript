@@ -3,14 +3,16 @@
 # one thread, normal tune mode = the winner this box ships) against the reference exe's
 # test-backend-ops perf at the same shape, decode (n=1) and prefill (n=512) rows, joined with
 # the ratio (reference us / ours us; >= 1.0 = ours is faster). No model, no jobque: the kernel
-# and nothing else. The bench's arena sits page-aligned (--base-align 4096) - the engine's image
-# planes start on 16 KiB boundaries, and k6/k3 read 10-30% differently at the heap's random phase. The reference binary needs the GGML_BENCH_THREADS define (harness README).
+# and nothing else. The bench's arena sits page-aligned (--base-align 4096), the phase the engine's
+# image planes give the kernels. The reference binary needs the GGML_BENCH_THREADS define (harness README).
 #
 # Usage: kernel_ladder.sh [fmt,fmt,...]          (default: every format)
 #   KL_DASLANG the daslang binary (default: this tree's bin/daslang, or bin/Release/daslang.exe on
 #              Windows - never the global DASLANG, which names another tree's binary on dev boxes)
 #   LCPP_TBO   test-backend-ops (default: $HOME/Work/llama.cpp/build-clean-cpu/bin/Release/test-backend-ops.exe)
 #   NTOK       prefill tokens (default 512; 0 = decode rows only)
+#   KL_MODULE_CACHE  a -module-cache path for the bench start (the AST cache: a cold dasLLAMA compile is
+#              minutes; keep it outside .jitted_scripts, which measurement scripts wipe)
 #   ROUNDS     interleaved rounds per row (default 5)
 #   TEAM       lanes for the decode rows: the bench dispatches the GEMV the engine's way (--team,
 #              DAS_JOBQUE_THREADS=N) and the reference runs GGML_BENCH_THREADS=N. Default: the box's
@@ -42,7 +44,7 @@ trap 'rm -rf "$WORK"' EXIT
 # KqFmt name -> ggml type name (the reference's type_a)
 ggml_type() {
     case "$1" in
-        q8) echo q8_0;; k4) echo q4_K;; k5) echo q5_K;; k6) echo q6_K;; q40) echo q4_0;; q51) echo q5_1;;
+        q8) echo q8_0;; q8s16) echo q8_0;; k4) echo q4_K;; k5) echo q5_K;; k6) echo q6_K;; q40) echo q4_0;; q51) echo q5_1;;
         iq4xs) echo iq4_xs;; k3) echo q3_K;; iq3s) echo iq3_s;; iq3xxs) echo iq3_xxs;; iq4nl) echo iq4_nl;;
         k2) echo q2_K;; iq2s) echo iq2_s;; iq2xs) echo iq2_xs;; iq2xxs) echo iq2_xxs;; mx4) echo mxfp4;;
         *) echo "";;
@@ -55,7 +57,9 @@ echo "# kernel ladder  $(date +%F)  box=$(hostname)  daslang=$DASLANG  ref=$TBO 
 [ -x "$TBO" ] || { echo "kernel_ladder: no test-backend-ops at '$TBO' (set LCPP_TBO)" >&2; exit 1; }
 grep -q GGML_BENCH_THREADS "$TBO" || { echo "kernel_ladder: '$TBO' lacks the GGML_BENCH_THREADS define - it would run every core and the ratio column would lie (harness README)" >&2; exit 1; }
 set +e
-DAS_TUNE_MODE=normal DAS_JOBQUE_THREADS=$THREADS "$DASLANG" -jit "$ROOT/modules/dasLLAMA/benchmarks/matmul/kq_kernel_bench.das" \
+MC_ARGS=""
+if [ -n "${KL_MODULE_CACHE:-}" ]; then mkdir -p "$(dirname "$KL_MODULE_CACHE")"; MC_ARGS="-module-cache $KL_MODULE_CACHE"; fi
+DAS_TUNE_MODE=normal DAS_JOBQUE_THREADS=$THREADS "$DASLANG" -jit $MC_ARGS "$ROOT/modules/dasLLAMA/benchmarks/matmul/kq_kernel_bench.das" \
     -- --fmt "$FMTS" --d "$ROWS" --ntok "$NTOK" --rounds "$ROUNDS" --tsv --base-align 4096 $TEAM_ARGS > "$WORK/ours.raw" 2> "$WORK/ours.err"
 rc=$?
 set -e
@@ -71,7 +75,7 @@ fi
 for f in $(cut -f1 "$WORK/ours.tsv" | sort -u); do
     t=$(ggml_type "$f")
     [ -n "$t" ] || { echo "kernel_ladder: no ggml type for '$f'" >&2; continue; }
-    GGML_BENCH_THREADS=$THREADS "$TBO" perf -b CPU -o MUL_MAT -p "type_a=$t,type_b=f32,m=$ROWS,n=(1|512)," 2>/dev/null \
+    GGML_BENCH_THREADS=$THREADS "$TBO" perf -b CPU -o MUL_MAT -p "type_a=$t,type_b=f32,m=$ROWS,n=(1|$NTOK)," 2>/dev/null \
         | sed 's/\x1b\[[0-9;]*m//g' | awk -v f="$f" '
             /MUL_MAT\(/ {
                 n = $0; sub(/.*,n=/, "", n); sub(/,.*/, "", n)

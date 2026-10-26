@@ -315,6 +315,7 @@ def run_and_stream(args : array<string>; var tail_out : string&; keep_tail : int
     var acc = ""
     let rc = unsafe(popen_argv(args, 0.0, $(f) {
         if (f == null) {
+            to_log(LOG_ERROR, "dasLLAMA bench: could not spawn {args[0]} (no child, no output)\n")
             return
         }
         while (true) {
@@ -410,13 +411,7 @@ def run_capture(cmd : string; first_line : bool) : string {
 // The running daslang's version, via the box's binary (DASLANG_BIN, default bin/daslang from the
 // repo-root cwd these tools run in). Takes the last token of the first --version line ("0.6.3").
 def das_version() : string {
-    // shell-free spawn (fio's run_and_capture → popen_argv), so no cmd and no quote/option traps;
-    // CreateProcess still wants backslashes in the program path (probe-verified: `bin/daslang`
-    // fails to spawn, `bin\daslang` runs), hence the normalize
-    var bin = g_env_prof.daslang_bin
-    if (is_windows()) {
-        bin = replace(bin, "/", "\\")
-    }
+    let bin = g_env_prof.daslang_bin
     var out = ""
     if (run_and_capture([bin, "--version"], out) != 0) {
         return "unknown"
@@ -506,6 +501,14 @@ def tune_summary() : string {
 //! * **plain script**: the policy rail ran, so every row must stamp a manifest winner.
 //! ``DASLLAMA_ALLOW_UNTUNED=1`` is the dev-run escape in all three (it also suppresses the
 //! auto-mint at ``[init]`` — see ``dasllama_math_gen_register`` — so the gate is reached at all).
+var private g_tune_gate_bypassed = false
+
+//! True once `tune_gate` let a cell through on `DASLLAMA_ALLOW_UNTUNED=1` - the flavor stamp
+//! carries it so no such number reads as a tuned one.
+def tune_gate_bypassed() : bool {
+    return g_tune_gate_bypassed
+}
+
 def tune_gate() : bool {
     var why = ""
     let mpath = g_env_core.tune_manifest
@@ -524,7 +527,7 @@ def tune_gate() : bool {
         if (!stat(mpath, mst)) {
             why = "DAS_TUNE_MANIFEST='{mpath}' does not exist - every kernel runs its fallback"
         } elif (stat(args[0], bst) && bst.mtime > mst.mtime) {
-            why = "DAS_TUNE_MANIFEST='{mpath}' is OLDER than the binary ({args[0]}) - the staleness rule drops every kernel to its fallback"
+            why = "DAS_TUNE_MANIFEST='{mpath}' is OLDER than the binary ({args[0]}) - the staleness rule drops every kernel to its fallback (the runtime knobs still apply)"
         } elif (find(fread(mpath), "\"kernels\"") < 0) {
             why = "DAS_TUNE_MANIFEST='{mpath}' carries no kernels section - not a minted manifest"
         }
@@ -554,6 +557,7 @@ def tune_gate() : bool {
         return true
     }
     if (g_env_bench.allow_untuned) {
+        g_tune_gate_bypassed = true
         to_log(LOG_WARNING, "tune gate: {why} - measuring anyway (DASLLAMA_ALLOW_UNTUNED=1, numbers are NOT publishable)\n")
         return true
     }

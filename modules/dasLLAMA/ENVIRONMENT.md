@@ -21,6 +21,7 @@ Read by the inference engine itself, so these affect any program that loads a mo
 | `DASLLAMA_IMAGE_SAVE` | flag | on | Persist the prepared image beside the source; 0 builds it in memory and serves that, leaving no .dlim behind. |
 | `DASLLAMA_CPU_PREFILL` | flag | off | Allow the CPU prefill path even when a GPU prefill override is registered. |
 | `DASLLAMA_PIN_PREFILL` | text | unset | Pin prefill to one registered override by name (e.g. metal, vulkan); anything else declines before upload. |
+| `DASLLAMA_MTP_HEAD` | path | unset | Split NextN/MTP head GGUF to attach to the trunk being loaded (the ggml-org mtp-<model>.gguf form: its blk.<n_layers>.* tensors become the draft block; its copies of the trunk's tables are ignored). Default: the mtp-<trunk basename> sibling beside the trunk when present. The head rides the split-shard walk, so one prepared image carries trunk and head. |
 | `DASLLAMA_PIN_BACKEND` | text | unset | Pin the matmul backend by name, bypassing the measured auto-selection. |
 | `DASLLAMA_PIN_BATCH_BACKEND` | text | unset | Pin the batched (prefill) matmul backend independently of the decode one. |
 | `DASLLAMA_EXPERT_REUSE` | flag | off | Arm the MoE expert-reuse counter (probes and servers; benches use set_expert_reuse instead). |
@@ -124,6 +125,7 @@ Vulkan GPU backend. Present only where the dasVulkan package is installed.
 | `DASLLAMA_MM_SMALLD` | number | 64 | Small-d cutoff routing narrow roles (k/v) to the small tier; widening measured worse, so this is an instrument. |
 | `DASLLAMA_VK_FUSE` | flag | on | Fused add+rms+requant: the decode tail (plus qk-norm+rope) AND the prefill batch ar+rq pairs; 0 pins the split dispatches for a same-build A/B. |
 | `DASLLAMA_VK_XFERQ` | flag | on | Stream expert uploads on the dedicated transfer queue, overlapped via a timeline semaphore; 0 keeps the single-queue rail. |
+| `DASLLAMA_VK_DECVEC` | flag | on | Run the cm2 tiles' four-wide decode callback where the device has VK_NV_cooperative_matrix_decode_vector; 0 strips it and serves the scalar callback - the same-build A/B and the fallback probe. |
 | `DASLLAMA_VK_IMPORT` | flag | on | Stream mirrors import the mapped .dlim (VK_EXT_external_memory_host) instead of pinned copies; =0 restores the copy path. |
 | `DASLLAMA_TRIM` | flag | off | Serve from P3-trimmed vulkan images (big CPU weight families dropped; folded into the flavor identity). |
 | `DASLLAMA_VK_MEMPRIO` | flag | on | Tag allocations high-priority (VK_EXT_memory_priority) so the driver demotes desktop memory, not ours. |
@@ -169,6 +171,7 @@ Apple Accelerate / AMX float lane. `DASLLAMA_ACCEL` arms the whole group.
 | `DASLLAMA_MODELS_DIR` | path | unset | Directory holding the .gguf models the probes, benches and tests load. dasllama-server's model catalog downloads here too when set. |
 | `DASLLAMA_CONFIRM_MODEL` | path | auto-resolved from the models dir | Model used by the tuner's confirm gate (FULL path, not a bare filename). Unset: the gate auto-resolves from the models dir - the preferred confirm carrier, else the largest present q8 gguf; the fallback pins only when the box has no q8 model at all. |
 | `DASLLAMA_CONFIRM_IQ2XXS` | path | auto-resolved from the models dir | IQ2_XXS vehicle for the tuner's serving-crown confirm (FULL path). Unset: the confirm auto-resolves the first *IQ2_XXS*.gguf in the models dir; none found = no crown (the base kernel serves). |
+| `DASLLAMA_CONFIRM_MTP_GEMMA` | path | auto-resolved from the models dir | gemma-4 vehicle for the tuner's assistant-depth confirm (FULL path; its mtp- head must sit beside it). Unset: the confirm auto-resolves the first gemma-4*.gguf with a head in the models dir; none found = depth 1 serves |
 | `DASLLAMA_BATCH_CHUNKS` | text | unset | Override the batched-dispatch chunk count in the 1-core GEMM probe. |
 | `DASLLAMA_PROBE_MODEL` | text | Qwen3VL-8B-Instruct-Q8_0.gguf | Model filename (inside the models dir) the image-turn attribution probe loads. |
 | `DASLLAMA_BATCH_GRID_2D` | number | unset | Use the 2D batch grid in the parity probe. |

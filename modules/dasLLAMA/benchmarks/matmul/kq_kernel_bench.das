@@ -5,13 +5,13 @@ options _dasllama_internal = true
 
 require daslib/clargs
 require daslib/enum_trait
-require daslib/fio
 require daslib/jobque_boost
 require dasllama/dasllama_par
 require dasllama/dasllama_math_gen
 require dasllama/dasllama_math
 require dasllama/dasllama_kqformat
 require dasllama/dasllama_gemm_schema
+require llvm/daslib/llvm_env
 require math
 require strings
 require daslib/strings_boost
@@ -30,7 +30,7 @@ require daslib/strings_boost
 [CommandLineArgs]
 struct BenchArgs {
     @clarg_short = "f"
-    @clarg_doc = "KqFmt names, comma-separated (q8,k4,k5,k6,q40,q51,iq4xs,k3,iq3s,iq3xxs,iq4nl,k2,iq2s,iq2xs,iq2xxs; mx4 = mxfp4), or all"
+    @clarg_doc = "KqFmt names, comma-separated (q8,k4,k5,k6,q40,q51,iq4xs,k3,iq3s,iq3xxs,iq4nl,k2,iq2s,iq2xs,iq2xxs; mx4 = mxfp4; q8s16 = q8 over binary16 group scales, the GGUF q8_0 tensor's path), or all"
     fmt : string = "all"
     @clarg_doc = "Reduction length - the weight row length (k in test-backend-ops terms)"
     n : int = 14336
@@ -62,18 +62,21 @@ struct BenchArgs {
 typedef GemvFn = function<(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) : void>
 typedef TileFn = function<(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void>
 typedef GemvQ8Fn = function<(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) : void>
+typedef GemvQ8S16Fn = function<(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) : void>
+typedef TileQ8S16Fn = function<(var yp : float?; wg : int8 const?; sg : uint16 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void>
 typedef TileQ8Fn = function<(var yp : float?; wg : int8 const?; sg : float const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void>
 typedef GemvMx4Fn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) : void>
 typedef LayoutFn = function<() : int>
 
 let TILE_TOKENS = 4l   // tokens one kq / q51 / mx4 tile call covers (q8's tokstep companion says its own)
 let MX4_NAME = "mx4"   // mxfp4 has no KqFmt row; it rides the q8q8 grid as a companion
+let S16_NAME = "q8s16"   // q8 over binary16 group scales - the wscale_f16 rail a GGUF q8_0 tensor runs (8.5 bits/weight, the reference build's q8_0 bytes)
+var g_s16 = false        // the current q8-family row is the s16 flavor
 
 def fmt_of_name(name : string) : KqFmt {
-    for (f in type<KqFmt>) {
-        if ("{f}" == name) {
-            return f
-        }
+    var f : KqFmt
+    if (kq_fmt_of_name(name, f)) {
+        return f
     }
     panic("unknown kq format '{name}'")
     return KqFmt.q8
@@ -148,37 +151,36 @@ def tile_kq_bytes_per_sb(f : KqFmt) : int64 => kq_reads_packed_planes(int64(kq_s
 
 //! plane bytes per row: kq formats per 256-superblock, q51 per 32-block (20 + 4), q8 n int8 + n/32 f32, mx4 n/2 nibbles + n/32 e8m0
 struct PlaneShape {
-    wq_row : int64   // the gemv's weight plane bytes per row
-    tq_row : int64   // the tile's weight plane bytes per row
+    gemvW_row : int64   // the gemv's weight plane bytes per row
+    tileW_row : int64   // the tile's weight plane bytes per row
     ws_row : int64   // scale plane bytes per row
 }
 
 def plane_shape(f : KqFmt; mx4 : bool; n : int64) : PlaneShape {
     if (mx4) {
-        return PlaneShape(wq_row = n / 2l, tq_row = n / 2l, ws_row = n / 32l)
+        return PlaneShape(gemvW_row = n / 2l, tileW_row = n / 2l, ws_row = n / 32l)
     }
     if (f == KqFmt.q8) {
-        return PlaneShape(wq_row = n, tq_row = n, ws_row = (n / 32l) * 4l)
+        return PlaneShape(gemvW_row = n, tileW_row = n, ws_row = (n / 32l) * (g_s16 ? 2l : 4l))
     }
     if (f == KqFmt.q51) {
-        return PlaneShape(wq_row = (n / 32l) * 20l, tq_row = (n / 32l) * 20l, ws_row = (n / 32l) * 4l)
+        return PlaneShape(gemvW_row = (n / 32l) * 20l, tileW_row = (n / 32l) * 20l, ws_row = (n / 32l) * 4l)
     }
     let nsb = n / 256l
-    return PlaneShape(wq_row = nsb * kq_qsb(f), tq_row = nsb * tile_kq_bytes_per_sb(f), ws_row = nsb * kq_ssb(f))
+    return PlaneShape(gemvW_row = nsb * kq_qsb(f), tileW_row = nsb * tile_kq_bytes_per_sb(f), ws_row = nsb * kq_ssb(f))
 }
 
 var BASE_ALIGN = 64l   // the arena's start alignment - --base-align; the planes' phase against 4 KB pages follows it
 var BASE_OFFSET = 0l   // --base-offset, added past the aligned start
-let ALIGN = 64l   // the image's planes are page-aligned (ARCHITECTURE_IMAGE.md, image-page-alignment); a 64-byte load split across cache lines is what Intel penalizes 2x
-let STAGGER = 1088l   // plane starts differ in their low 12 address bits (1088 = 1024 + 64 keeps six starts distinct mod 4096): planes that alias in the L1/L2 set logic make a run's time depend on where the heap put them
+let ALIGN = 64l   // a 64-byte load split across two cache lines is the 2x penalty the fixture must not introduce
+let STAGGER = 1088l   // 1024 + 64: keeps the six plane starts distinct in their low 12 address bits
 let SCALE_BYTE = uint8(0x3C)   // as f16 0x3C3C = 1.06, as f32 0x3C3C3C3C = 0.0115, as e8m0 2^-67, as a 6-bit sub-scale 60 - normal in every scale form
 
-//! every plane of one format in ONE arena at fixed offsets: the heap places separate arrays at
-//! run-dependent relative addresses, and k6 decode read 3.9-6.0 ms across identical runs from that alone
+//! every plane of one format in ONE arena at fixed offsets
 struct Planes {
     arena : array<uint8>
-    kq : int64    // the gemv's weight plane
-    tkq : int64   // the tile's weight plane (the unpacked panel form where the format has one)
+    gemvKq : int64    // the gemv's weight plane
+    tileKq : int64   // the tile's weight plane (the unpacked panel form where the format has one)
     ks : int64    // scale plane
     xq : int64    // int8 activations
     xs : int64    // f32 activation scales
@@ -200,10 +202,11 @@ def arena_base(var p : Planes) : int64 {
     }
 }
 
+[arch(at = "../../ARCHITECTURE_MEASUREMENT.md#cpu-kernel-bench-fixture")]
 def fill_planes(var p : Planes; sh : PlaneShape; n, d, ntok : int64) {
     var end = 0l
-    p.kq = next_plane(end, d * sh.wq_row, 0)
-    p.tkq = next_plane(end, d * sh.tq_row, 1)
+    p.gemvKq = next_plane(end, d * sh.gemvW_row, 0)
+    p.tileKq = next_plane(end, d * sh.tileW_row, 1)
     p.ks = next_plane(end, d * sh.ws_row, 2)
     p.xq = next_plane(end, ntok * n, 3)
     p.xs = next_plane(end, ntok * n / 32l * 4l, 4)
@@ -212,24 +215,24 @@ def fill_planes(var p : Planes; sh : PlaneShape; n, d, ntok : int64) {
     p.arena |> reserve(end + BASE_ALIGN + BASE_OFFSET)
     p.arena |> resize(end + BASE_ALIGN + BASE_OFFSET)
     let base = arena_base(p)
-    p.kq += base
-    p.tkq += base
+    p.gemvKq += base
+    p.tileKq += base
     p.ks += base
     p.xq += base
     p.xs += base
     p.xbs += base
     p.y += base
     var seed = 0x1234u
-    for (i in range64(p.kq, p.kq + d * sh.wq_row)) {
+    for (i in range64(p.gemvKq, p.gemvKq + d * sh.gemvW_row)) {
         seed = seed * 1664525u + 1013904223u
         p.arena[i] = uint8(seed >> 24u)
     }
-    for (i in range64(p.tkq, p.tkq + d * sh.tq_row)) {
+    for (i in range64(p.tileKq, p.tileKq + d * sh.tileW_row)) {
         seed = seed * 1664525u + 1013904223u
         p.arena[i] = uint8(seed >> 24u)
     }
     for (i in range64(p.ks, p.ks + d * sh.ws_row)) {
-        p.arena[i] = SCALE_BYTE   // scale planes hold normal numbers in every scale form, never random bytes: Intel runs denormal math ~100x slower
+        p.arena[i] = SCALE_BYTE
     }
     for (i in range64(p.xq, p.xq + ntok * n)) {
         seed = seed * 1664525u + 1013904223u
@@ -256,6 +259,7 @@ struct RowStat {
 }
 
 let TEAM_BURN = 6   // warmup dispatches per row before the team arm times anything
+let SOLO_BURN = 3   // the solo arm's unmeasured warm rounds (a core ramps for ~3)
 var g_each_round = false   // --each
 
 //! the engine's decode dispatch, verbatim (dasllama_math's matmul shape): the splitter's chunk count over the
@@ -280,6 +284,16 @@ def team_gemv_q8(fn : GemvQ8Fn; var yp : float?; wp : int8 const?; sp : float co
     }
 }
 
+def team_gemv_q8s16(fn : GemvQ8S16Fn; var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, d : int64; var laneP : int64?) {
+    maybe_parallel_for_indexed(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(slot : int; rb : int; re : int) {
+        let l0 = ref_time_ticks()
+        invoke(fn, yp, wp, sp, xqp, xsp, n, int64(rb), int64(re))
+        unsafe {
+            laneP[slot] += int64(get_time_usec(l0))
+        }
+    }
+}
+
 def team_gemv_mx4(fn : GemvMx4Fn; var yp : float?; wn, we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64; var laneP : int64?) {
     maybe_parallel_for_indexed(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(slot : int; rb : int; re : int) {
         let l0 = ref_time_ticks()
@@ -292,6 +306,7 @@ def team_gemv_mx4(fn : GemvMx4Fn; var yp : float?; wn, we : uint8 const?; xqp : 
 
 //! the team arm's interleaved timing: the block dispatches row `row` the engine's way and every lane adds its
 //! call time to laneP[slot]; the row keeps the wall (best, median) and the lanes' fastest and slowest sums
+[arch(at = "../../ARCHITECTURE_MEASUREMENT.md#cpu-kernel-bench-fixture")]
 def time_rows_team(var stats : array<RowStat>; rounds : int; blk : block<(row : int; var laneP : int64?) : void>) {
     var laneUs : array<int64>
     laneUs |> resize(get_total_hw_jobs() + 1)
@@ -299,10 +314,11 @@ def time_rows_team(var stats : array<RowStat>; rounds : int; blk : block<(row : 
     for (row in range(length(stats))) {
         stats[row].us |> reserve(rounds)
         stats[row].lane_lo = 999999999l
-        for (_w in range(TEAM_BURN)) {   // codegen, then a burn: the first format's team rows read one slot at 8 ms without it
+        for (_w in range(TEAM_BURN)) {
             invoke(blk, row, laneP)
         }
     }
+    to_log(LOG_INFO, "kq_kernel_bench: timed rounds begin\n")   // the profiler sync line, as in time_rows
     for (_r in range(rounds)) {
         for (row in range(length(stats))) {
             for (u in laneUs) {
@@ -339,7 +355,7 @@ def emit_row(var rows : int&; name, tier : string; var st : RowStat; n, d, ntok,
     let ns_per_sb = float(best) * 1000.0 / float(d * nsb * ntok)
     let gbs = float(plane_bytes) / (float(best) * 1000.0)
     let gflops = 2.0 * float(n) * float(d) * float(ntok) / (float(best) * 1000.0)
-    let mode = get_env_variable("DAS_TUNE_MODE")
+    let mode = g_env_tune.tune_mode
     let perm = (st.perm == "reference" && mode != "tune" && mode != "test") ? "stamped" : st.perm   // normal mode: the registry's one row IS the stamped winner
     let lanes = st.lane_hi > 0l ? "\t{st.lane_lo}\t{st.lane_hi}" : ""
     var each = ""
@@ -367,13 +383,15 @@ def perm_wanted(spec, suffix : string) : bool {
 }
 
 //! interleaved timing: round r calls every selected row once before round r + 1 starts
+[arch(at = "../../ARCHITECTURE_MEASUREMENT.md#cpu-kernel-bench-fixture")]
 def time_rows(var stats : array<RowStat>; rounds : int; blk : block<(row : int) : void>) {
     for (row in range(length(stats))) {
         stats[row].us |> reserve(rounds)
-        for (_w in range(3)) {   // codegen + warm-up, unmeasured: Intel k6 ramps for ~3 rounds (3425, 1989, then steady 1637 us) - one warm call is not enough
+        for (_w in range(SOLO_BURN)) {
             invoke(blk, row)
         }
     }
+    to_log(LOG_INFO, "kq_kernel_bench: timed rounds begin\n")   // external profilers key on this line to skip the JIT startup
     for (_r in range(rounds)) {
         for (row in range(length(stats))) {
             let t0 = ref_time_ticks()
@@ -386,7 +404,7 @@ def time_rows(var stats : array<RowStat>; rounds : int; blk : block<(row : int) 
 def bench_gemv_kq(var rows : int&; cfg : BenchArgs; name : string; f : KqFmt; var p : Planes; nsb : int64; sh : PlaneShape) {
     let n = int64(cfg.n)
     let d = int64(cfg.d)
-    let plane_bytes = int64(cfg.d) * (sh.wq_row + sh.ws_row)
+    let plane_bytes = int64(cfg.d) * (sh.gemvW_row + sh.ws_row)
     var vs <- gemv_variants(f)
     var stats : array<RowStat>
     var fns : array<GemvFn>
@@ -397,7 +415,7 @@ def bench_gemv_kq(var rows : int&; cfg : BenchArgs; name : string; f : KqFmt; va
         }
     }
     unsafe {
-        let kqp = addr<uint8 const?>(p.arena[p.kq])
+        let kqp = addr<uint8 const?>(p.arena[p.gemvKq])
         let ksp = addr<uint8 const?>(p.arena[p.ks])
         let xqp = addr<int8 const?>(p.arena[p.xq])
         let xsp = addr<float const?>(p.arena[p.xs])
@@ -410,6 +428,16 @@ def bench_gemv_kq(var rows : int&; cfg : BenchArgs; name : string; f : KqFmt; va
         } else {
             time_rows(stats, cfg.rounds) $(row : int) {
                 invoke(fns[row], yp, kqp, ksp, xqp, xsp, xbsp, n, 0l, d)
+            }
+        }
+        if (cfg.tsv) {   // the row's answer, one solo call each: modes and seats must agree here before their times are compared
+            for (fn, st in fns, stats) {
+                invoke(fn, yp, kqp, ksp, xqp, xsp, xbsp, n, 0l, d)
+                var acc = 0.0lf
+                for (i in range64(d)) {
+                    acc += double(yp[i])
+                }
+                print("# ysum\t{name}\t{st.perm}\t{acc}\t{yp[0]}\t{yp[d - 1l]}\n")
             }
         }
     }
@@ -425,9 +453,9 @@ def bench_tile_kq(var rows : int&; cfg : BenchArgs; name : string; f : KqFmt; va
     let n = int64(cfg.n)
     let d = int64(cfg.d)
     let ntok = int64(cfg.ntok)
-    let qrow = sh.tq_row
+    let qrow = sh.tileW_row
     let srow = sh.ws_row
-    let plane_bytes = int64(cfg.d) * (sh.tq_row + sh.ws_row)
+    let plane_bytes = int64(cfg.d) * (sh.tileW_row + sh.ws_row)
     var mrs <- companion_ints(layout_variants(f))
     var vs <- tile_variants(f)
     var stats : array<RowStat>
@@ -447,7 +475,7 @@ def bench_tile_kq(var rows : int&; cfg : BenchArgs; name : string; f : KqFmt; va
         mrOf |> push(mr)
     }
     unsafe {
-        let kqp = addr<uint8 const?>(p.arena[p.tkq])
+        let kqp = addr<uint8 const?>(p.arena[p.tileKq])
         let ksp = addr<uint8 const?>(p.arena[p.ks])
         let xqp = addr<int8 const?>(p.arena[p.xq])
         let xsp = addr<float const?>(p.arena[p.xs])
@@ -475,13 +503,22 @@ def bench_tile_kq(var rows : int&; cfg : BenchArgs; name : string; f : KqFmt; va
 }
 
 //! the q8q8 grid's gemv rows (q8 or its mx4 companion) into stats + typed function lists
-def q8_gemv_rows(cfg : BenchArgs; mx4 : bool; var stats : array<RowStat>; var fnsQ : array<GemvQ8Fn>; var fnsM : array<GemvMx4Fn>) {
+def q8_gemv_rows(cfg : BenchArgs; mx4 : bool; var stats : array<RowStat>; var fnsQ : array<GemvQ8Fn>; var fnsM : array<GemvMx4Fn>; var fnsS : array<GemvQ8S16Fn>) {
     if (mx4) {
         var vs <- mx4q8_gemv_gen_variants()
         for (v in vs) {
             if (perm_wanted(cfg.perm, v._0)) {
                 stats |> emplace(RowStat(perm = v._0))
                 fnsM |> push(v._1)
+            }
+        }
+        delete vs
+    } elif (g_s16) {
+        var vs <- q8q8_gemv_s16_gen_variants()
+        for (v in vs) {
+            if (perm_wanted(cfg.perm, v._0)) {
+                stats |> emplace(RowStat(perm = v._0))
+                fnsS |> push(v._1)
             }
         }
         delete vs
@@ -498,7 +535,7 @@ def q8_gemv_rows(cfg : BenchArgs; mx4 : bool; var stats : array<RowStat>; var fn
 }
 
 //! the q8q8 grid's tile rows with each row's mr and tokens-per-call; skips rows whose mr the row count does not divide
-def q8_tile_rows(cfg : BenchArgs; mx4 : bool; d : int64; var stats : array<RowStat>; var fnsQ : array<TileQ8Fn>; var fnsM : array<TileFn>; var mrOf, stepOf : array<int64>) {
+def q8_tile_rows(cfg : BenchArgs; mx4 : bool; d : int64; var stats : array<RowStat>; var fnsQ : array<TileQ8Fn>; var fnsM : array<TileFn>; var fnsS : array<TileQ8S16Fn>; var mrOf, stepOf : array<int64>) {
     var mrs <- companion_ints(q8q8_layout_gen_variants())
     var steps <- companion_ints(q8q8_tokstep_gen_variants())
     if (mx4) {
@@ -510,6 +547,18 @@ def q8_tile_rows(cfg : BenchArgs; mx4 : bool; d : int64; var stats : array<RowSt
                 fnsM |> push(v._1)
                 mrOf |> push(mr)
                 stepOf |> push(TILE_TOKENS)
+            }
+        }
+        delete vs
+    } elif (g_s16) {
+        var vs <- q8q8_tile_s16_gen_variants()
+        for (v in vs) {
+            let mr = mrs?[v._0] ?? (mrs?["reference"] ?? 0l)
+            if (perm_wanted(cfg.perm, v._0) && mr > 0l && d % mr == 0l) {
+                stats |> emplace(RowStat(perm = v._0))
+                fnsS |> push(v._1)
+                mrOf |> push(mr)
+                stepOf |> push(steps?[v._0] ?? (steps?["reference"] ?? TILE_TOKENS))
             }
         }
         delete vs
@@ -531,19 +580,19 @@ def q8_tile_rows(cfg : BenchArgs; mx4 : bool; d : int64; var stats : array<RowSt
 }
 
 //! q8 (the q8q8 grid) and its mx4 companion: int8 / nibble weight planes with f32 / e8m0 scales
-def bench_q8_family(var rows : int&; cfg : BenchArgs; mx4 : bool; var p : Planes; nsb : int64; sh : PlaneShape) {
+def bench_q8_family(var rows : int&; cfg : BenchArgs; mx4 : bool; var p : Planes; nsb : int64; sh : PlaneShape) { // nolint:STYLE038 — the q8 family's three flavors (f32, s16, mx4) x two arms: one dispatch ladder over shared planes
     let n = int64(cfg.n)
     let d = int64(cfg.d)
     let ntok = int64(cfg.ntok)
-    let name = mx4 ? MX4_NAME : "q8"
-    let plane_bytes = int64(cfg.d) * (sh.wq_row + sh.ws_row)
+    let name = mx4 ? MX4_NAME : (g_s16 ? S16_NAME : "q8")
+    let plane_bytes = int64(cfg.d) * (sh.gemvW_row + sh.ws_row)
     var wvs <- q8q8_family_live_variants()   // the family's witness rows: the amx one takes the per-process tile permission its tiles need (SIGILL without it), as the probe does
     for (w in wvs) {
         invoke(w._1)
     }
     delete wvs
     unsafe {
-        let kqp = addr<uint8 const?>(p.arena[p.kq])
+        let kqp = addr<uint8 const?>(p.arena[p.gemvKq])
         let ksp = addr<uint8 const?>(p.arena[p.ks])
         let xqp = addr<int8 const?>(p.arena[p.xq])
         let xsp = addr<float const?>(p.arena[p.xs])
@@ -553,11 +602,14 @@ def bench_q8_family(var rows : int&; cfg : BenchArgs; mx4 : bool; var p : Planes
             var stats : array<RowStat>
             var fnsQ : array<GemvQ8Fn>
             var fnsM : array<GemvMx4Fn>
-            q8_gemv_rows(cfg, mx4, stats, fnsQ, fnsM)
+            var fnsS : array<GemvQ8S16Fn>
+            q8_gemv_rows(cfg, mx4, stats, fnsQ, fnsM, fnsS)
             if (cfg.team) {
                 time_rows_team(stats, cfg.rounds) $(row : int; var laneP : int64?) {
                     if (mx4) {
                         team_gemv_mx4(fnsM[row], yp, kqp, ksp, xqp, xsp, n, d, laneP)
+                    } elif (g_s16) {
+                        team_gemv_q8s16(fnsS[row], yp, reinterpret<int8 const?>(kqp), reinterpret<uint16 const?>(ksp), xqp, xsp, n, d, laneP)
                     } else {
                         team_gemv_q8(fnsQ[row], yp, reinterpret<int8 const?>(kqp), reinterpret<float const?>(ksp), xqp, xsp, n, d, laneP)
                     }
@@ -566,6 +618,8 @@ def bench_q8_family(var rows : int&; cfg : BenchArgs; mx4 : bool; var p : Planes
                 time_rows(stats, cfg.rounds) $(row : int) {
                     if (mx4) {
                         invoke(fnsM[row], yp, kqp, ksp, xqp, xsp, n, 0l, d)
+                    } elif (g_s16) {
+                        invoke(fnsS[row], yp, reinterpret<int8 const?>(kqp), reinterpret<uint16 const?>(ksp), xqp, xsp, n, 0l, d)
                     } else {
                         invoke(fnsQ[row], yp, reinterpret<int8 const?>(kqp), reinterpret<float const?>(ksp), xqp, xsp, n, 0l, d)
                     }
@@ -577,23 +631,27 @@ def bench_q8_family(var rows : int&; cfg : BenchArgs; mx4 : bool; var p : Planes
             delete stats
             delete fnsQ
             delete fnsM
+            delete fnsS
         }
         if (ntok > 0l) {
             var stats : array<RowStat>
             var fnsQ : array<TileQ8Fn>
             var fnsM : array<TileFn>
+            var fnsS : array<TileQ8S16Fn>
             var mrOf : array<int64>
             var stepOf : array<int64>
-            q8_tile_rows(cfg, mx4, d, stats, fnsQ, fnsM, mrOf, stepOf)
+            q8_tile_rows(cfg, mx4, d, stats, fnsQ, fnsM, fnsS, mrOf, stepOf)
             time_rows(stats, cfg.rounds) $(row : int) {
                 let mr = mrOf[row]
                 for (g in range64(d / mr)) {
                     var t0k = 0l
                     while (t0k < ntok) {
                         if (mx4) {
-                            invoke(fnsM[row], yp, kqp + g * mr * sh.tq_row, ksp + g * mr * sh.ws_row, xqp, xsp, xbsp, n, d, g, t0k)
+                            invoke(fnsM[row], yp, kqp + g * mr * sh.tileW_row, ksp + g * mr * sh.ws_row, xqp, xsp, xbsp, n, d, g, t0k)
+                        } elif (g_s16) {
+                            invoke(fnsS[row], yp, reinterpret<int8 const?>(kqp + g * mr * sh.tileW_row), reinterpret<uint16 const?>(ksp + g * mr * sh.ws_row), xqp, xsp, xbsp, n, d, g, t0k)
                         } else {
-                            invoke(fnsQ[row], yp, reinterpret<int8 const?>(kqp + g * mr * sh.tq_row), reinterpret<float const?>(ksp + g * mr * sh.ws_row), xqp, xsp, xbsp, n, d, g, t0k)
+                            invoke(fnsQ[row], yp, reinterpret<int8 const?>(kqp + g * mr * sh.tileW_row), reinterpret<float const?>(ksp + g * mr * sh.ws_row), xqp, xsp, xbsp, n, d, g, t0k)
                         }
                         t0k += stepOf[row]
                     }
@@ -605,6 +663,7 @@ def bench_q8_family(var rows : int&; cfg : BenchArgs; mx4 : bool; var p : Planes
             delete stats
             delete fnsQ
             delete fnsM
+            delete fnsS
             delete mrOf
             delete stepOf
         }
@@ -619,6 +678,7 @@ def formats_of(spec : string) : array<tuple<string; KqFmt; bool>> {
             fs |> emplace(("{f}", f, false))
         }
         fs |> emplace((MX4_NAME, KqFmt.q8, true))
+        fs |> emplace((S16_NAME, KqFmt.q8, false))
         return <- fs
     }
     for (tok in split(spec, ",")) {
@@ -628,6 +688,8 @@ def formats_of(spec : string) : array<tuple<string; KqFmt; bool>> {
         }
         if (name == MX4_NAME) {
             fs |> emplace((MX4_NAME, KqFmt.q8, true))
+        } elif (name == S16_NAME) {
+            fs |> emplace((S16_NAME, KqFmt.q8, false))
         } else {
             fs |> emplace((name, fmt_of_name(name), false))
         }
@@ -656,7 +718,7 @@ def main : int {
     }
     var fs <- formats_of(cfg.fmt)
     if (!cfg.tsv) {
-        print("kq_kernel_bench: n={cfg.n} d={cfg.d} ntok={cfg.ntok} rounds={cfg.rounds} team={cfg.team} tune_mode={get_env_variable("DAS_TUNE_MODE")}\n")
+        print("kq_kernel_bench: n={cfg.n} d={cfg.d} ntok={cfg.ntok} rounds={cfg.rounds} team={cfg.team} tune_mode={g_env_tune.tune_mode}\n")
         print("fmt\ttier\tperm\tn\td\tntok\tbest_us\tmedian_us\tns_per_sb\tGB/s\tGFLOP/s{cfg.team ? "\tlane_lo\tlane_hi" : ""}\n")
     }
     var rows = 0
@@ -683,6 +745,7 @@ def run_formats(cfg : BenchArgs; fs : array<tuple<string; KqFmt; bool>>) : int {
     var rows = 0
     let nsb = int64(cfg.n) / 256l
     for (fe in fs) {
+        g_s16 = fe._0 == S16_NAME
         let sh = plane_shape(fe._1, fe._2, int64(cfg.n))
         var p : Planes
         fill_planes(p, sh, int64(cfg.n), int64(cfg.d), int64(max(cfg.ntok, 1)))
