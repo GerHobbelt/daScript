@@ -30,6 +30,7 @@ One section per module: what the module is for, then its public symbols grouped 
 - [builtin](#builtin) - The BUILTIN module contains core runtime functions available in all daslang programs without explicit `require`.
 - [class_boost](#class_boost) - The CLASS_BOOST module provides macros for extending class functionality, including the `[serialize_as_class]` annotation for automatic serialization and common class patterns like abstract method enforcement.
 - [clipboard_core](#clipboard_core) - The clipboard module provides synchronous access to the operating system's text clipboard.
+- [cmp](#cmp) - The CMP module holds comparisons: it writes lexicographic orderings from a list of keys.
 - [command_line](#command_line) - Command-line utilities for daslang scripts and standalone executables.
 - [constant_expression](#constant_expression) - The CONSTANT_EXPRESSION module provides the `[constant_expression]` function annotation.
 - [consume](#consume) - The CONSUME module implements the `consume` pattern, which moves ownership of containers and other moveable values while leaving the source in a default-constructed state.
@@ -807,6 +808,9 @@ The FIO module implements file input/output and filesystem operations. It provid
 
 ### Direct IO and mapping advice
 
+- `dread_at` - Read `bytes` at file offset `off` into `dst` — any pointer, any offset, any size.
+- `dread_close` - Close the reader and free its band.
+- `dread_open` - Open `path` for cache-bypassing positional reads (`FILE_FLAG_NO_BUFFERING` on Windows, `O_DIRECT` on Linux, `F_NOCACHE` on macOS), so a cache of blocks read on demand into pinned memory is not doubled in the page cache.
 - `dwrite_append` - Append `bytes` from `data` at the writer's current end.
 - `dwrite_band` - Hand out the writer's own staging band so a producer can build bytes in place instead of building a buffer and appending a copy.
 - `dwrite_close` - Flush the writer's tail (sector-padded on cache-bypassing platforms), truncate the file to exactly what was appended, and free the handle.
@@ -3170,14 +3174,17 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 
 ### Model loading and sessions
 
-- `attach_mtp_drafter` - Attach the assistant drafter at `path` to `model` for speculative decode; false where the driver refused it (a drafter made for another target) or no driver carries one.
+- `attach_mtp_drafter` - Attach the assistant drafter at `path` to `model` for speculative decode on the GPU driver that serves it (Metal or the Vulkan resident driver); false where every driver refused it (a drafter made for another target, a model the driver does not serve whole), each refusal logged.
+- `attach_mtp_sidecar` - Attach the assistant drafter that sits beside the model at `model_path` (`mtp_drafter_sidecar`): the drafter's path where it attached, "" where none sits there or every driver refused it (each refusal logged).
 - `caps` - What `model` honestly supports at the chat layer (see LlmCaps) — e.g.
 - `create_batch_workspace` - Create the caller-owned scratch that `eval_batch` steps through — one per concurrent batch, reused across calls (buffers grow to the largest batch seen).
-- `create_kv_pool` - Create a caller-owned PAGED KV pool over `model`'s cache geometry.
+- `create_kv_pool` - Create a caller-owned PAGED KV pool over `model`'s cache geometry: sessions over it allocate pages of `page_rows` positions on demand instead of the full `seq_len` slab, so many sessions share one elastic pool; keep it alive as long as sessions live.
 - `create_session` - Create a fresh session (KV cache + scratch) sized to `model.config.seq_len` — one model, many independent conversations.
+- `detach_mtp_drafter` - Detach `model`'s assistant drafter, if one is attached; its rounds stop and plain decode serves.
 - `load_model` - Load a model AND its tokenizer from a GGUF file — architecture and tokenizer backend are auto-selected from metadata; `mode` picks the weight quantization.
 - `mtp_capable` - Whether `model` can run a speculative round: a NextN head of its own, or an assistant drafter attached - what a scheduler's `mtp` asks for.
-- `mtp_drafter_sidecar` - The assistant drafter file a model ships beside it (gemma-4: `mtp-<stem>-Q8_0.gguf`), "" where there is none or no driver carries one.
+- `mtp_drafter_sidecar` - The assistant drafter file a model ships beside it (gemma-4: `mtp-<stem>-Q8_0.gguf`, `<stem>` the file name before its quant token, an unsloth `-UD` tag dropped where the head has none), "" where there is none.
+- `mtp_drafter_stats` - The attached drafter's device rounds since its attach: drafts made, drafts accepted, rounds, and the verifies whose rows carried two streams or more.
 - `release_kv_pages` - Return `session`'s KV pages to its pool (no-op on flat sessions).
 - `setup_dasllama_jobque` - Configure the job queue for dasLLAMA's fork/join matmul dispatch: pooled fork contexts, batched dispatch, the worker spin-before-park window (`jobque_spin_us`; 0 disables).
 - `with_dasllama_jobque` - Run `blk` inside a fresh `with_job_que()` that `setup_dasllama_jobque()` has configured — the one-call form of the pair.
@@ -3191,7 +3198,7 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `prefix_checkpoint_at` - Where a recurrent `session`'s prefill of `prompt` should stop for a `prefix_insert`, after `prefix_attach` matched `matched` tokens: `stable_at` (`render_turn_marked`'s opening) when the caller knows it, else the longest opening an earlier checkpoint shares.
 - `prefix_held_groups` - Pages the cache currently holds (== pool groups retained for reuse).
 - `prefix_insert` - Donate a session's KV pages to the cache: `tokens` is its EVALED history (the first `n_past` rows exist), every full page not already cached survives `release_kv_pages`, `preview` labels the chain.
-- `prefix_insert_snapshot` - A recurrent checkpoint of the first `n_past` of `tokens` out of `session`'s pages, its state `snap` (moved in) taken elsewhere - a device's slots.
+- `prefix_insert_snapshot` - A recurrent checkpoint of the first `n_past` of `tokens` out of `session`'s pages, its state `snap` (moved in) taken elsewhere - a device's slots, or a window's capture at `upto` (0 = the tokens' end).
 - `prefix_match_len` - How many leading positions of `prompt` a `prefix_attach` would attach right now, attaching nothing: a probe for a caller deciding what a request must bring (a media span's rows).
 - `prefix_release` - Release every cached page back to `pool` and clear the cache (pages still used by live sessions stay alive until those sessions release them).
 - `prefix_share_pages` - Share the whole pages of the first `n` of `tokens` `cache` already holds into the fresh paged `session`; answers the positions they cover, where the rows still to write start.
@@ -3342,12 +3349,12 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `gpu_host_layers_pin` - The host-layers pin as set (`set_gpu_host_layers`), or -1 where none is - what a caller reads before it pins and hands back to `set_gpu_host_layers` after.
 - `gpu_kv_dtype_pin` - The in-process ask as `set_gpu_kv_dtype` left it: `pinned` false where no caller asked and `DASLLAMA_GPU_KV` decides.
 - `gpu_resident_decline` - Why the whole-model GPU driver does not serve the model loaded last: its decline reason (with the remedy where one exists), or why it was never attempted.
-- `gpu_resident_experts_host` - Whether the whole-model driver serving the model loaded last sums some routed layers' experts on the host (a hyper-connection MoE, a plain MoE the card does not hold whole, or one whose host-layers ask - `set_gpu_host_layers`, `DASLLAMA_GPU_HOST_LAYERS` - moved them) - the form whose speculative round does not pay, so a server slot leaves it off.
+- `gpu_resident_experts_host` - Whether the whole-model driver serving the model loaded last sums some routed layers' experts on the host (a hyper-connection MoE, a plain MoE the card does not hold whole, or one whose host-layers ask - `set_gpu_host_layers`, `DASLLAMA_GPU_HOST_LAYERS` - moved them): the form whose speculative round pays at the NextN depth alone (`mtp_auto_arms`).
 - `reset_gpu_kv_dtype` - Lift the in-process ask `set_gpu_kv_dtype` made: `DASLLAMA_GPU_KV` decides the next load's mirror codec again.
 - `set_gpu_ctx_max` - Cap the whole-model GPU driver's K/V context at `n` positions per region for the models loaded next (0 lifts it): a server's `ctx`.
 - `set_gpu_ctx_strict` - The `set_gpu_ctx_max` pin is the context asked, not a cap, for the models loaded next: a K/V mirror the card cannot hold at it declines the whole-model GPU driver instead of shortening the context, and the per-op rails serve the asked context (DASLLAMA_GPU_CTX_STRICT in the environment).
 - `set_gpu_host_layers` - Serve at least `n` routed layers' experts on the host - the first in layer order - on the whole-model GPU driver of a plain MoE loaded next, whatever the card holds (DASLLAMA_GPU_HOST_LAYERS in the environment): the host-layers form reached on any card.
-- `set_gpu_kv_dtype` - Ask the whole-model GPU driver to hold its K/V mirror in codec `dt` for the models loaded next - the codec of their sessions (`gpu_device_session_dtype` reads what armed).
+- `set_gpu_kv_dtype` - Ask the whole-model GPU driver to hold its K/V mirror in codec `dt` for the models loaded next - the codec of their sessions (`gpu_device_session_dtype` reads what armed; `q8_0` is about half the `f16` mirror's bytes, `tq4` a quarter; `f32` reads as `f16`).
 - `set_gpu_resident_regions` - Ask the whole-model GPU driver for `n` K/V regions on the models loaded next, so `n` sessions keep their K/V on the device at once - a server's stream count.
 
 ## dasllama_tts
@@ -5064,6 +5071,7 @@ The AST_BOOST module provides high-level utilities for working with the AST. It 
 - `find_argument_index` - Searches the `argNames` of a `TypeDeclPtr` (tuple or variant) for the given name and returns its zero-based index, or `-1` if not found.
 - `find_unique_function` - Searches the compiling program for exactly one non-generic function with the given name; returns it or `null` if zero or multiple matches exist.
 - `find_unique_generic` - Searches the compiling program for exactly one generic function with the given name; returns it or `null` if zero or multiple matches exist.
+- `find_var_refs` - Returns every `ExprVar` under `expr`; when `name` is given, only those reading a variable of that name.
 - `getVectorElementCount` - Returns the number of scalar elements in a vector `Type` (e.g., 2 for `float2`/`range`, 3 for `float3`, 4 for `float4`), or 0 for non-vector types.
 - `getVectorElementSize` - Returns the byte size of a single scalar element in a vector `Type` — 8 for `range64`/`urange64`, 4 for all other vector types.
 - `getVectorElementType` - Returns the scalar `Type` of each element in a vector type (e.g., `tFloat` for `float2`, `tInt` for `int3` and `range`, `tInt64` for `range64`).
@@ -7438,6 +7446,27 @@ The SORT_BOOST module provides the `qsort` macro that uniformly sorts built-in a
 - `pop_heap`
 - `push_heap`
 
+## cmp
+
+The CMP module holds comparisons: it writes lexicographic orderings from a list of keys. The `[ordered]` structure annotation generates the structure's `operator <`, so `sort` and everything else that compares with `<` orders it by default; the `cmp_by` call macro writes a comparator block for one call, with each key an expression over `_`, the element, and a leading `-` for descending order.
+
+
+### Call macros
+
+- `cmp_by`
+
+### Structure macros
+
+- `ordered`
+
+### Classes
+
+- `OrderedMacro`
+- `OrderedMacro.apply`
+- `CmpByMacro`
+- `CmpByMacro.visit`
+- `CmpByMacro.canVisitArgument`
+
 ## static_let
 
 The STATIC_LET module implements the `static_let` pattern — local variables that persist across function calls, similar to C `static` variables. The declaration is promoted to module scope under a mangled name, so it is initialized once when the context starts (not lazily on first call) and retains its value across calls. `static_let_finalize` additionally deletes the variable on context shutdown.
@@ -7911,6 +7940,8 @@ The UTF8_UTILS module provides Unicode UTF-8 string utilities including characte
 
 - `s_utf8d` - Byte-class and state-transition table for the UTF-8 DFA decoder.
 - `UTF8_ACCEPT` - DFA accept state indicating a valid UTF-8 sequence.
+- `UTF8_REJECT` - DFA reject state: no byte continues or starts a sequence from here
+- `UTF8_REPLACEMENT` - what a sanitizer writes for an invalid or incomplete sequence
 - `_UTF32_NON_WORD_RANGES`
 - `_UTF32_LATIN1_LOWER`
 
@@ -7934,6 +7965,7 @@ The UTF8_UTILS module provides Unicode UTF-8 string utilities including characte
 - `contains_utf8_bom` - Returns true if the byte array starts with a UTF-8 BOM (byte order mark).
 - `is_first_byte_of_utf8_char` - Returns true if the given byte is the first byte of a UTF-8 character.
 - `is_utf8_string_valid` - Returns true if the byte array contains a valid UTF-8 encoded string.
+- `utf8_sanitize` - Returns the string with every invalid or incomplete UTF-8 sequence replaced by U+FFFD, one a maximal subpart (the byte that cut a sequence is read again on its own); valid input as is.
 
 ### Unicode word/case primitives
 

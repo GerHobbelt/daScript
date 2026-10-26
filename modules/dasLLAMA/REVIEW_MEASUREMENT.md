@@ -87,19 +87,24 @@ covering it, names the other run.** The opening paragraph is the one the entry's
 in; the provenance it states covers every later paragraph and table of that entry that no naming
 of another run covers.
 
-**A tag (`external`, `direction-grade`, `out-of-process`, `debug-jit`) covers only the figures of
-the sentence it sits in; a tag inside a parenthesis covers the figures of that parenthesis alone,
-and a parenthesis holding a tag and no figure covers nothing, in a provenance line or an entry's
-opening paragraph too. A tag outside any parenthesis in a figure-free sentence of a provenance line
-or of a `PERF_LEDGER.md` entry's opening paragraph covers the figures that line or paragraph
-covers.**
+**A tag (`external`, `direction-grade`, `out-of-process`, `debug-jit`) in the dated parenthesis of a
+`PERF_LEDGER.md` entry's bold head covers the whole entry. Anywhere else, a tag covers only the
+figures of its own sentence. A tag inside a parenthesis covers only that parenthesis's figures,
+and a tag in a parenthesis with no figure covers nothing. A tag outside any parenthesis, in a
+figure-free sentence of a provenance line or of an entry's opening paragraph, covers the figures
+that line or paragraph covers.**
 
 **A `PERF_LEDGER.md` entry states a turn wall (the wall of one whole served request, whatever the
-modality) or a tok/s rate of the engine this repository builds only when
-`benchmarks/lcpp_bench.das` produced it - as the released exe (`daspkg release`) or as the `-jit`
-script - or a spawned or manual cell did, or, for a modality `benchmarks/lcpp_bench.das` has no
-command-line flag for, the `harness/` instrument that produced it, named with its command line.** A
-turn wall or tok/s rate printed by any other instrument stays in that run's log: the ledger entry
+modality) or a tok/s rate of the engine this repository builds only when one of these produced
+it, named in the entry:**
+- `benchmarks/lcpp_bench.das`, as the released exe from `daspkg release` or as the `-jit` script;
+- a spawned or manual cell;
+- for a modality `lcpp_bench.das` has no command-line flag for, the `harness/` instrument, with its
+  command line;
+- for a figure timed through the scheduler or the server, `harness/served_bench.das` with its
+  command line, or an out-of-process replay named as the replay (its name, its request count),
+  over a server whose flags the entry states.
+A turn wall or tok/s rate printed by any other instrument stays in that run's log: the ledger entry
 carries what the instrument decided - served, declined, how many rows it counted - never that wall
 or rate.
 

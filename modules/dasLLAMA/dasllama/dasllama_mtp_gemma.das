@@ -30,6 +30,7 @@ require math
 struct GemmaDrafter {
     ok : bool
     why : string
+    fmt : KqFmt                 //! the weight planes' format, tagged from the sidecar's disk type - the GEMV sites read it
     dim : int64
     tdim : int64
     hidden : int64
@@ -105,9 +106,9 @@ def private quant_stem(stem : string) : string {
     return cut < 0 ? stem : slice(stem, 0, cut)
 }
 
-//! The gemma-4 drafter sidecar beside `model_path`: `mtp-<stem>-Q8_0.gguf` when it exists (the head's quant is chosen independently
-//! of the trunk's), `<stem>` the quant stem and then that stem with an unsloth `-UD` tag dropped (the upstream head carries none),
-//! else the exact-name `mtp-<basename>` sibling, else "". A path already naming a head never recurses onto itself.
+//! The gemma-4 drafter sidecar beside `model_path` - `mtp-<stem>-Q8_0.gguf` for the quant stem, then for it without `-UD`,
+//! then the exact-name `mtp-<basename>`, each only an assistant's file (never a split NextN head), else "" - and never for a
+//! path naming a head
 [arch(at="../ARCHITECTURE_GPU_MTP_ASSISTANT.md#assistant-drafter-attach")]
 def gemma_drafter_sidecar(model_path : string) : string {
     let name = base_name(model_path)
@@ -118,11 +119,13 @@ def gemma_drafter_sidecar(model_path : string) : string {
     let stem = quant_stem(trim_suffix(name, ".gguf"))
     for (head in [stem, trim_suffix(stem, "-UD")]) {
         let pref = path_join(dir, "mtp-{head}-Q8_0.gguf")
-        return pref if (fexist(pref))
+        return pref if (assistant_file(pref))
     }
     let exact = path_join(dir, "mtp-{name}")
-    return fexist(exact) ? exact : ""
+    return assistant_file(exact) ? exact : ""
 }
+
+def private assistant_file(path : string) : bool => fexist(path) && gguf_is_assistant(path)
 
 // ===== loader =====
 
@@ -153,6 +156,9 @@ def private plan_tensor(var dr : GemmaDrafter; m : GGUFMeta; var plans : array<D
     let want_type = q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F32
     if (m.tensors[ti].ggml_type != want_type) {
         return refuse_off(dr, "tensor '{name}' is {ggml_type_name(m.tensors[ti].ggml_type)}, expected {ggml_type_name(want_type)}: the drafter serves a Q8_0 sidecar alone")
+    }
+    if (q8) {
+        dr.fmt = gguf_kq_fmt_of_type(m.tensors[ti].ggml_type)
     }
     if (m.tensors[ti].n_elem != want_n) {
         return refuse_off(dr, "tensor '{name}' has {m.tensors[ti].n_elem} elements, expected {want_n}")
@@ -361,7 +367,7 @@ def gemma_drafter_target_why(t : Model; dr : GemmaDrafter) : string {
 //! Load the gemma-4 assistant drafter sidecar at `path`. Never panics: any refusal - a wrong
 //! architecture, a missing or non-Q8_0 weight, a stray K/V tensor - lands as `ok = false` plus a
 //! `why`. `target_n_layers > 0` binds `kv_layer` in the same call.
-[arch(at="../ARCHITECTURE_IMAGE.md#drafter-non-image-lane")]
+[arch(at="../ARCHITECTURE_IMAGE_LEDGER.md#drafter-non-image-lane")]
 def load_gemma_drafter(path : string; target_n_layers : int64 = 0l) : GemmaDrafter {
     var dr : GemmaDrafter
     if (!fexist(path)) {

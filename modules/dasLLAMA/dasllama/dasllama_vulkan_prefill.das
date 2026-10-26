@@ -9,6 +9,7 @@ options _function_length = 0   // same
 require dasllama/dasllama_lint public
 require dasllama/dasllama_vulkan_common   // g_gpu/g_rd state, plumbing, hazard rail, fill metas
 require dasllama/dasllama_vulkan_classes   // the class-kernel rail (generated set_/enc_ + gemv_cls_*)
+require dasllama/dasllama_common   // cap_ring_rows - the capture's n-gram ring rows, the Metal window's walk too
 require dasllama/dasllama_vulkan_decode   // vk_moe_dn_step — the dn chain's npos==1 arm routes through the decode step
 require dasllama/dasllama_kqformat   // KqFmt — the arena fmt slots are its ordinals
 require dasllama/dasllama_gemm_schema   // Q8_BLOCK_ELEMS - the window chain's hyper-connection scale planes
@@ -74,12 +75,79 @@ var private @scratch g_pf_wsegs : array<RdecPfSeg>   //! the parts of them insid
 //! the segment parts a window `[w0, w0 + wlen)` holds, into `g_pf_wsegs`; a part's `pos0` is the segment's position at the window's first row of it
 def private pf_window_segs(w0, wlen : int64) {
     g_pf_wsegs |> clear()
-    for (sg in g_pf_segs) {
+    for (sg, i in g_pf_segs, count()) {
         let lo = max(sg.row0, w0)
         let hi = min(sg.row0 + sg.npos, w0 + wlen)
         continue if (hi <= lo)
-        g_pf_wsegs |> push(RdecPfSeg(row0 = lo - w0, npos = hi - lo, pos0 = sg.pos0 + (lo - sg.row0), region = sg.region))
+        g_pf_wsegs |> push(RdecPfSeg(row0 = lo - w0, npos = hi - lo, pos0 = sg.pos0 + (lo - sg.row0), region = sg.region, seg = int64(i)))
     }
+}
+
+let PF_CAP_WORDS = 256l   //! the capture records a window holds (two words a capture)
+
+var private @scratch g_pf_caps : array<RdecPfCap>         //! the call's captures (`vk_rdec_prefill_caps`), segment-relative rows
+var private @scratch g_pf_wcaps : array<tuple<n : int64; rec : int64>>   //! each window part's captures: their count and first record word
+var private @scratch g_pf_cap_words : array<uint>
+
+def vk_rdec_prefill_caps(caps : array<RdecPfCap>) {
+    g_pf_caps := caps
+    return if (empty(caps) || g_rd == null || !g_rd.hybrid)
+    if (g_rd.snap_dev == 0ul) {
+        rd_snap_alloc()
+    }
+    if (g_rd.pf_ready && g_rd.pf_snap_bound != g_rd.snap_dev) {   //! a checkpoint save may have made the rows after the sets were built
+        for (l in range64(g_rd.n_layers)) {
+            if (g_rd.layers[l].recurrent) {
+                pf_dn_layer_sets(l, g_rd.dim, g_rd.dn_cd, g_rd.dn_di)
+            }
+        }
+    }
+}
+
+def private pf_window_caps(w0 : int64) {
+    g_pf_wcaps |> clear()
+    g_pf_wcaps |> reserve(length(g_pf_wsegs))
+    g_pf_cap_words |> clear()
+    g_pf_cap_words |> reserve(PF_CAP_WORDS)
+    for (ws in g_pf_wsegs) {
+        let sg = g_pf_segs[ws.seg]
+        let part_row0_in_seg = w0 + ws.row0 - sg.row0
+        var n = 0l
+        let rec = long_length(g_pf_cap_words)
+        for (cap in g_pf_caps) {
+            continue if (cap.seg != ws.seg || cap.row <= part_row0_in_seg || cap.row >= part_row0_in_seg + ws.npos)
+            g_pf_cap_words |> push(uint(cap.row - part_row0_in_seg))
+            g_pf_cap_words |> push(uint(((ws.region * int64(RDEC_DN_SNAPS) + cap.slot) * g_rd.snap_row_bytes) / 4l))
+            n++
+        }
+        g_pf_wcaps |> push((n = n, rec = rec))
+    }
+    if (long_length(g_pf_cap_words) > PF_CAP_WORDS) {
+        panic("vk prefill: {long_length(g_pf_cap_words) / 2l} checkpoint captures in one window, past the {PF_CAP_WORDS / 2l} the records hold")
+    }
+    if (!empty(g_pf_cap_words)) {
+        upload_region_at(g_rd.pf_cap_dev, 0l, unsafe(addr<uint8 const?>(g_pf_cap_words[0])), long_length(g_pf_cap_words) * 4l)
+    }
+}
+
+def private pf_caps_done {
+    for (cap in g_pf_caps) {
+        let sg = g_pf_segs[cap.seg]
+        g_rd.snap_par[sg.region * int64(RDEC_DN_SNAPS) + cap.slot] = 0
+    }
+    g_pf_caps |> clear()
+}
+
+//! the captures name the dropped driver's regions and checkpoint rows: the next model's first call hands its own
+def private pf_caps_forget {
+    g_pf_caps |> clear()
+    g_pf_wcaps |> clear()
+    g_pf_cap_words |> clear()
+}
+
+[init]
+def private pf_register_drop_hooks {
+    register_vk_drop_hook(@@pf_caps_forget)
 }
 
 //! the slot of the segment whose last row is window row `row` of the window at `w0`, else -1
@@ -114,6 +182,9 @@ def private pf_fa128s : bool => !(cm2_fa_on() && vk_fa_on() && rd_pf_reads_f16()
 def private pf_window_len(npos, w0 : int64) : int64 {
     let taps = max(g_rd.dn_dconv - 1l, 0l)
     var wlen = min(g_rd.pf_np, npos - w0)
+    if (g_rd.hybrid) {   //! a recurrent window is one deltanet chunk: the smalls planes (beta, g) and the scan workspace hold DN_WINDOW rows
+        wlen = min(wlen, DN_WINDOW)
+    }
     let rem = npos - w0 - wlen
     if (rem > 0l && rem < taps) {
         wlen -= taps - rem
@@ -186,14 +257,7 @@ def private pf_gemm_enc(raw : VkCommandBuffer; var h : VkHaz; idx : int; fmt : i
         }
         cm2_cls_enc(fmt, cm2_tc, raw, h, gset, pc, groups)
         if (split) {
-            var rset = cached(g_rd.pf_cls_gemm, idx * 16 + 12) $ {
-                verify(ensure_splitk_reduce_cls(), "vk prefill: the split-k reduce class rail must engage")
-                return set_splitk_reduce_cls(
-                    fixed_array(g_rd.pf_splitk, yb),
-                    fixed_array(g_rd.pf_splitk_bytes, yn),
-                    fixed_array(VHZ_SK, ybit))
-            }
-            splitk_reduce_enc(raw, h, rset, rows * d, nsplit)
+            pf_splitk_reduce_enc(raw, h, idx, yb, yn, ybit, rows * d, nsplit)
         }
     } elif (kq_sb(fmt) || cm2_b32_routed(fmt)) {
         // the role's format is static, so the slot never collides with the q8 router's variants
@@ -225,7 +289,7 @@ def private pf_gemm_enc(raw : VkCommandBuffer; var h : VkHaz; idx : int; fmt : i
 //! the small f16 GEMM route serves: the shape admits it and the split-k scratch holds a whole window's partial planes at the router's row
 [arch(at="../ARCHITECTURE_GPU_VULKAN_MOE.md#vk-prefill-moe-block")]
 def private pf_f16g_on() : bool => (g_rd.pf_splitk != 0ul && f16g_shape_ok(g_rd.dim)
-    && F16G_SPLIT * PF_WINDOW * g_rd.ner * 4l <= g_rd.pf_splitk_bytes)
+    && F16G_SPLIT * pf_window_rows() * g_rd.ner * 4l <= g_rd.pf_splitk_bytes)
 
 //! one small f16 GEMM: y[rows x d] at ybase = x[rows x n] w[d x n]^T over the weight rows at woff, through the split-k planes
 [arch(at="../ARCHITECTURE_GPU_VULKAN_MOE.md#vk-prefill-moe-block")]
@@ -270,10 +334,20 @@ def private pf_dn_layer_sets(l, dim, cd, di : int64) {
         fixed_array(g_rd.pf_dnqkv, g_rd.pf_dnconv, smalls_dev),
         fixed_array(np * cd * 4l, np * cd * 4l, smalls_bytes),
         fixed_array(VHZ_DNP, VHZ_DNC, VHZ_DNSM))
+    let snap_dev = g_rd.snap_dev != 0ul ? g_rd.snap_dev : smalls_dev
+    g_rd.pf_snap_bound = g_rd.snap_dev
+    let snap_bytes = g_rd.snap_dev != 0ul ? g_rd.snap_row_bytes * g_rd.regions * int64(RDEC_DN_SNAPS) : smalls_bytes
+    if (!vk_range_ok(snap_bytes)) {   //! the scan and the cap tail bind the checkpoint rows whole
+        panic("dasLLAMA vulkan prefill: the checkpoint rows ({snap_bytes} bytes: {g_rd.regions} regions x {RDEC_DN_SNAPS} rows of {g_rd.snap_row_bytes}) pass the device's storage range {vk_max_storage_range()}")
+    }
     L.pf_dn_scan_set = set_dn_scan_cls(
-        fixed_array(g_rd.pf_dnconv, dn0.state_dev, smalls_dev, g_gpu.dn_ws_dev),
-        fixed_array(np * cd * 4l, dn0.slot_state_bytes * long_length(L.dn), smalls_bytes, DN_WS_BYTES),
-        fixed_array(VHZ_DNC, VHZ_DNST, VHZ_DNSM, VHZ_DNWS))
+        fixed_array(g_rd.pf_dnconv, dn0.state_dev, smalls_dev, g_gpu.dn_ws_dev, g_rd.pf_cap_dev, snap_dev),
+        fixed_array(np * cd * 4l, dn0.slot_state_bytes * long_length(L.dn), smalls_bytes, DN_WS_BYTES, PF_CAP_WORDS * 4l, snap_bytes),
+        fixed_array(VHZ_DNC, VHZ_DNST, VHZ_DNSM, VHZ_DNWS, 0u, VHZ_DNSM))
+    L.pf_dn_captail_set = set_dn_cap_tail_cls(
+        fixed_array(g_rd.pf_dnqkv, smalls_dev, g_rd.pf_cap_dev, snap_dev),
+        fixed_array(np * cd * 4l, smalls_bytes, PF_CAP_WORDS * 4l, snap_bytes),
+        fixed_array(VHZ_DNP, VHZ_DNSM, 0u, VHZ_DNSM))
     let p3_bufs = fixed_array(g_rd.pf_dnz, g_gpu.dn_ws_dev, smalls_dev)
     let p3_bytes = fixed_array(np * di * 4l, DN_WS_BYTES, smalls_bytes)
     let p3_bits = fixed_array(VHZ_DNZ, VHZ_DNWS, VHZ_DNSM)
@@ -371,6 +445,7 @@ def private dn_window_enc(raw : VkCommandBuffer; var h : VkHaz; var conv_set, sc
 def private dn_window_parts_enc(raw : VkCommandBuffer; var h : VkHaz; var L : RLayer; wlen, cd, kd, nvh, nkh, ds, di, dconv : int64; sig : bool; eps : float) {
     let taps = dconv - 1l
     for (ws in g_pf_wsegs) {
+        assert(ws.row0 + ws.npos <= DN_WINDOW, "dasLLAMA vulkan prefill: a recurrent window part past DN_WINDOW rows - the smalls planes and the scan workspace hold that many")
         let st & = unsafe(L.dn[ws.region])
         let img = int(st.ring_image_bytes / 4l)
         let cur = g_rd.pf_dn_cur[ws.region]
@@ -380,12 +455,22 @@ def private dn_window_parts_enc(raw : VkCommandBuffer; var h : VkHaz; var L : RL
         enc_dn_conv_cls(raw, h, L.pf_dn_conv_set, pcc, dn_conv_wgs(cd, ws.npos))
     }
     pfq_ts(raw)
-    for (ws in g_pf_wsegs) {
+    for (ws, wi in g_pf_wsegs, count()) {
         let st & = unsafe(L.dn[ws.region])
+        let wc = g_pf_wcaps[wi]
         var pcs = DnScanArgs(npos = uint(ws.npos), cd = uint(cd), kd = uint(kd), nvh = uint(nvh), nkh = uint(nkh), ds = uint(ds),
             beta_off = uint(DN_SM_BETA), g_off = uint(DN_SM_G), a_off = uint(DN_SM_A), dt_off = uint(DN_SM_DT),
-            o_off = uint(DN_O_OFF), di = uint(di), region_state_base = uint(st.state_byte_off / 4l), row0 = uint(ws.row0))
+            o_off = uint(DN_O_OFF), di = uint(di), region_state_base = uint(st.state_byte_off / 4l), row0 = uint(ws.row0),
+            cap_n = uint(wc.n), cap_rec = uint(wc.rec), cap_state_off = uint(L.snap_off / 4l))
         enc_dn_scan_cls(raw, h, L.pf_dn_scan_set, pcs, dn_scan_wgs(nvh, ds))
+        if (wc.n > 0l) {
+            let img = int(st.ring_image_bytes / 4l)
+            let cur = g_rd.pf_dn_cur[ws.region]
+            let wg = max(1l, (cd * taps + 255l) / 256l)
+            var pcx = DnCapTailArgs(cd = uint(cd), taps = uint(taps), row0 = uint(ws.row0), entry_off = uint(int(st.hist_off) + cur * img),
+                cap_rec = uint(wc.rec), cap_hist_off = uint((L.snap_off + st.slot_state_bytes) / 4l), wg_per_cap = uint(wg))
+            enc_dn_cap_tail_cls(raw, h, L.pf_dn_captail_set, pcx, wg * wc.n)
+        }
     }
     pfq_ts(raw)
     var pc3 = GkDnGateArgs(nvh = uint(nvh), di = uint(di), ds = uint(ds), o_off = uint(DN_O_OFF),
@@ -812,7 +897,7 @@ def private pf_moe_q8_experts(raw : VkCommandBuffer; var h : VkHaz; l, nk : int6
 //! the gemma-4 routed feed: x under the routed branch's pre norm into pf_xb, the rows the gather (or the host) reads
 [arch(at="../ARCHITECTURE_GPU_VULKAN_MOE.md#vk-gemma4-moe-block")]
 def private pf_moe_g4_feed(raw : VkCommandBuffer; var h : VkHaz; l, wlen : int64) {
-    var pcn = GkAddRmsArgs(dim = uint(g_rd.dim), add_on = 0u, woff = uint(rd_norm_off(l, RD_NORM_PRE_FFN2)), eps = g_rd.eps, ascale = 1.0)
+    var pcn = rd_g4_pre2_args(l)
     enc_cls_ar(raw, h, g_rd.pf_sets[int(l * PF_ROLES) + 8], pcn, wlen)
     pfq_ts(raw)
 }
@@ -889,36 +974,105 @@ def private pf_ple_block(raw : VkCommandBuffer; var h : VkHaz; l : int64; b : in
     let ple = g_rd.ple
     let all = uint(g_rd.n_layers * ple)   //! the side rows' position stride
     let L & = unsafe(g_rd.layers[l])
+    let woff = l * ple * dim   //! the layer's first element in either f32 plane
     //! every step runs the whole window, the FFN's last-layer row slice included: the branch is 256 wide, and the sliced rows' results go unread
-    if (L.bpg < 0l) {   //! the file's f32 rows read the stream as it is, on the f32 tile
+    let x6 = pf_ple_plane_f16(L.bpg, L.fpg)   //! the gate's feed: the residual rows as f16 (the tile pick and split-k serve the 256-wide GEMM) else their quants
+    if (L.bpg < 0l && !x6) {   //! the file's f32 rows read the stream as it is, on the f32 tile
         pfq_ts(raw)
-        var pcg = pf_ple_f32_args(wlen, dim, ple, l * ple * dim)
+        var pcg = pf_ple_f32_args(wlen, dim, ple, woff)
         enc_dn_ba_cls(raw, h, g_rd.pf_sets[b + 17], pcg, dn_ba_wgs(wlen, ple / 2l))
         pfq_ts(raw)
     } else {
-        let x6 = pf_f16_feed(L.fpg)   //! the gate's feed: the residual rows as f16 (the tile pick and split-k serve the 256-wide GEMM) else their quants
         pf_feed_enc(raw, h, g_rd.pf_sets[b + 16], x6, kq_sb(L.fpg) && !x6, 0l, wlen * dim)
         pfq_ts(raw)
         let xf = pf_feed_planes(x6, g_rd.pf_xf, g_rd.pf_xq, g_rd.pf_xs, dim)
-        let pg = arena_planes(L.fpg, L.bpg)
-        pf_gemm_enc(raw, h, b + 17, L.fpg, pg.wq, pg.ws, xf.q, xf.s, g_rd.pf_gate,
-            pg.wqb, pg.wsb, xf.qn, xf.sn, np * ple * 4l, VHZ_XQ, VHZ_GATE, dim, ple, L.bpg, wlen, x6)
+        if (L.bpg < 0l) {
+            pf_f32_gemm_enc(raw, h, b + 17, g_rd.ple_gf32_dev, g_rd.ple_gf32_bytes, xf.q, xf.qn, VHZ_XQ, g_rd.pf_gate, np * ple * 4l, VHZ_GATE, dim, ple, woff, wlen)
+        } else {
+            let pg = arena_planes(L.fpg, L.bpg)
+            pf_gemm_enc(raw, h, b + 17, L.fpg, pg.wq, pg.ws, xf.q, xf.s, g_rd.pf_gate,
+                pg.wqb, pg.wsb, xf.qn, xf.sn, np * ple * 4l, VHZ_XQ, VHZ_GATE, dim, ple, L.bpg, wlen, x6)
+        }
     }
-    var pca = ActArgs(nelem = uint(wlen * ple), act = ACT_GELU, ubase = uint(l * ple), ustride = all, ulen = uint(ple))
-    if (L.bpp < 0l) {   //! the act's f32 rows (in the up plane, free here) feed the f32 projection
+    let p6 = pf_ple_plane_f16(L.bpp, L.fpp)   //! the projection's feed: the act rows as f16 where the projection's tile reads them, else their quants or f32 rows
+    if (L.bpp < 0l && !p6) {   //! the act's f32 rows (in the up plane, free here) feed the f32 projection
         var pcf = GkPleActArgs(nelem = uint(wlen * ple), sbase = uint(l * ple), sstride = all, slen = uint(ple))
         enc_ple_act_f32_cls(raw, h, g_rd.pf_sets[b + 18], pcf, (wlen * ple + 255l) / 256l)
         pfq_ts(raw)
-        var pcp = pf_ple_f32_args(wlen, ple, dim, l * ple * dim)
+        var pcp = pf_ple_f32_args(wlen, ple, dim, woff)
         enc_dn_ba_cls(raw, h, g_rd.pf_sets[b + 19], pcp, dn_ba_wgs(wlen, dim / 2l))
         pfq_ts(raw)
         return
     }
-    actrq_enc(raw, h, g_rd.pf_sets[b + 18], kq_sb(L.fpp), pca, wlen * ple)
+    var pca = ActArgs(nelem = uint(wlen * ple), act = ACT_GELU, ubase = uint(l * ple), ustride = all, ulen = uint(ple))
+    if (p6) {
+        enc_actf16_cls(raw, h, g_rd.pf_sets[b + 18], pca, (wlen * ple / 4l + 255l) / 256l)
+    } else {
+        actrq_enc(raw, h, g_rd.pf_sets[b + 18], kq_sb(L.fpp), pca, wlen * ple)
+    }
     pfq_ts(raw)
+    let pf = pf_feed_planes(p6, g_rd.pf_hf, g_gpu.hq_dev, g_gpu.hs_dev, ple)
+    if (L.bpp < 0l) {
+        pf_f32_gemm_enc(raw, h, b + 19, g_rd.ple_pf32_dev, g_rd.ple_pf32_bytes, pf.q, pf.qn, VHZ_HQ, g_rd.pf_ffnout, np * dim * 4l, VHZ_FFO, ple, dim, woff, wlen)
+        return
+    }
     let pp = arena_planes(L.fpp, L.bpp)
-    pf_gemm_enc(raw, h, b + 19, L.fpp, pp.wq, pp.ws, g_gpu.hq_dev, g_gpu.hs_dev, g_rd.pf_ffnout,
-        pp.wqb, pp.wsb, np * ple, np * (ple / 32l) * 4l, np * dim * 4l, VHZ_HQ, VHZ_FFO, ple, dim, L.bpp, wlen, false)
+    pf_gemm_enc(raw, h, b + 19, L.fpp, pp.wq, pp.ws, pf.q, pf.s, g_rd.pf_ffnout,
+        pp.wqb, pp.wsb, pf.qn, pf.sn, np * dim * 4l, VHZ_HQ, VHZ_FFO, ple, dim, L.bpp, wlen, p6)
+}
+
+//! the file's f32 per-layer-embedding rows ride the staged KHR tile where the device has it (`DASLLAMA_VK_PLE_F32_TILE` holds
+//! them on the scalar f32 tile)
+[arch(at="../ARCHITECTURE_GPU_VULKAN_KHR.md#f32-rows-staged-tile")]
+def private pf_ple_f32_staged : bool => ple_f32_tile_ok(g_rd.dim, g_rd.ple, g_env_vulkan.vk_ple_f32_tile)
+
+//! the staged tile serves f32 rows of a model dim `dim` and a ple width `ple`: both GEMMs' K on its 32-deep k step, so no 16-wide
+//! row read reaches past the exactly sized plane; else the scalar f32 tile
+[arch(at="../ARCHITECTURE_GPU_VULKAN_KHR.md#f32-rows-staged-tile")]
+def public ple_f32_tile_ok(dim, ple : int64; knob : bool) : bool
+    => knob && khr_kq_tile_on() && dim % 32l == 0l && ple % 32l == 0l
+
+//! a per-layer-embedding plane at arena block `blk` in format `fmt` reads its window rows as f16: a plane the f16 feed admits, or
+//! the file's f32 rows (block -1) on the staged tile
+def private pf_ple_plane_f16(blk : int64; fmt : int) : bool => blk < 0l ? pf_ple_f32_staged() : pf_f16_feed(fmt)
+
+//! the k chunks a staged f32-row GEMM of K `n` takes: the most, up to eight, `cm2_chunk` admits, each a dependent window chain's hop
+//! cut to its deepest chunk's latency (one under 512)
+[arch(at="../ARCHITECTURE_GPU_VULKAN_KHR.md#f32-rows-staged-tile")]
+def pf_f32_split(n, rows, d, scratch_bytes : int64) : int64 => cm2_split_fit(n, n / 256l, rows * d * 4l, scratch_bytes)
+
+//! one f32-row GEMM on the staged KHR tile: y[rows x d] = x[rows x n] w^T over the plane's `d` rows of `n` from element `woff`,
+//! the f16 rows at `xf`; one region at row 0 and the tile's one column, over `pf_f32_split`'s k chunks into the split-k planes and
+//! their reduce
+[arch(at="../ARCHITECTURE_GPU_VULKAN_KHR.md#f32-rows-staged-tile")]
+def private pf_f32_gemm_enc(raw : VkCommandBuffer; var h : VkHaz; idx : int; w : uint64; wn : int64; xf : uint64; xn : int64; xbit : uint;
+                            y : uint64; yn : int64; ybit : uint; n, d, woff, rows : int64) {
+    let nsplit = pf_f32_split(n, rows, d, g_rd.pf_splitk_bytes)
+    let split = nsplit > 1l
+    if (split) {
+        verify(nsplit * rows * d * 4l <= g_rd.pf_splitk_bytes, "vk prefill: the staged f32 tile's split-k planes exceed the scratch bound")
+    }
+    let groups = int64(fill_arena_batch_sched(g_rd.pf_meta[idx], d, woff / 4l, rows, int(KqFmt.q8), true, nsplit, 0l, 128l))
+    var pc = BatchArgs(n = uint(n), d = uint(d), ksplit = split ? uint(cm2_chunk(n, nsplit)) : 0u)
+    var s = cached(g_rd.pf_cls_gemm, idx * 16 + 15) $ {
+        verify(ensure_f32_batch_khr_cls(), "vk prefill: the staged f32 tile's class rail must engage")
+        return set_f32_batch_khr_cls(fixed_array(w, g_rd.pf_meta[idx].buf, xf, split ? g_rd.pf_splitk : y),
+            fixed_array(wn, BATCH_META_BYTES, xn, split ? g_rd.pf_splitk_bytes : yn), fixed_array(0u, 0u, xbit, split ? VHZ_SK : ybit))
+    }
+    enc_f32_batch_khr_cls(raw, h, s, pc, groups)
+    if (split) {
+        pf_splitk_reduce_enc(raw, h, idx, y, yn, ybit, rows * d, nsplit)
+    }
+    pfq_ts(raw)
+}
+
+//! a split GEMM role's reduce: the `nsplit` partial planes in the split-k scratch summed into `y`, the role's cached reduce set
+def private pf_splitk_reduce_enc(raw : VkCommandBuffer; var h : VkHaz; idx : int; y : uint64; yn : int64; ybit : uint; nelem, nsplit : int64) {
+    var rset = cached(g_rd.pf_cls_gemm, idx * 16 + 12) $ {
+        verify(ensure_splitk_reduce_cls(), "vk prefill: the split-k reduce class rail must engage")
+        return set_splitk_reduce_cls(fixed_array(g_rd.pf_splitk, y), fixed_array(g_rd.pf_splitk_bytes, yn), fixed_array(VHZ_SK, ybit))
+    }
+    splitk_reduce_enc(raw, h, rset, nelem, nsplit)
 }
 
 //! the f32 tile (`DnBaGemm`) as a plain GEMM: `d` rows of `n` at `woff` over the window's rows into y[p * d + e] - its two output
@@ -958,7 +1112,7 @@ def private pf_setup {
     if (g_rd.pf_ready) {
         return
     }
-    let np = PF_WINDOW
+    let np = pf_window_rows()
     g_rd.pf_np = np
     if (g_env_vulkan.vk_f16_ffn) {
         to_log(LOG_INFO, "dasLLAMA: resident prefill - the FFN GEMMs take the f16 feed where the tile admits the plane (DASLLAMA_VK_F16_FFN=0 keeps the Q8 blocks)\n")
@@ -1013,7 +1167,7 @@ def private pf_setup {
                 let gbufs = fixed_array(g_rd.ple_wp_dev, g_rd.pf_x, g_rd.pf_plep, g_rd.ple_pnorm_dev)
                 let gsizes = fixed_array(g_rd.ple_wp_bytes, np * dim * 4l, np * all * 4l, g_rd.ple * 4l)
                 let ggbits = fixed_array(0u, VHZ_X, VHZ_MRT, 0u)
-                g_rd.pf_ple_gemm_set = g_rd.ple_wp_bf16 ? set_router_gemv_bf16_cls(gbufs, gsizes, ggbits) : set_router_gemv_cls(gbufs, gsizes, ggbits)
+                g_rd.pf_ple_gemm_set = g_rd.ple_wp_bf16 ? ple_proj_bf16_set(gbufs, gsizes, ggbits) : set_router_gemv_cls(gbufs, gsizes, ggbits)
             }
             //! the finish over [np x layers] slices of ple: side = (gathered + pnorm . rms(projected)) / sqrt(2)
             g_rd.pf_ple_ar_set = set_ple_finish_cls(fixed_array(g_rd.pf_plep, g_rd.ple_pnorm_dev, g_rd.pf_ple),
@@ -1029,6 +1183,7 @@ def private pf_setup {
             g_rd.pf_cmd_ring |> push(alloc_cmd())
         }
     }
+    g_rd.pf_cap_dev = make_device_buf(PF_CAP_WORDS * 4l)
     if (rd_emb_on()) {   //! the window's rows gather off their ids; no window row is the host's, so `xh` binds the one-row command's staging unread
         g_rd.pf_ids = make_device_buf(np * 4l)
         if (g_rd.emb_blk >= 0l) {
@@ -1054,7 +1209,7 @@ def private pf_setup {
     for (L in g_rd.layers) {
         any_f16_feed = (any_f16_feed || pf_f16_feed(L.fq) || pf_f16_feed(L.fo) || pf_f16_feed(L.f1) || pf_f16_feed(L.f2)
             || (L.recurrent && (pf_f16_feed(L.fqkv) || pf_f16_feed(L.fz) || pf_f16_feed(L.fout)))
-            || (L.ple && L.bpg >= 0l && pf_f16_feed(L.fpg)))
+            || (L.ple && (pf_ple_plane_f16(L.bpg, L.fpg) || pf_ple_plane_f16(L.bpp, L.fpp))))
         anykq = (anykq || kq_sb(L.fq) || kq_sb(L.fo) || kq_sb(L.f1) || kq_sb(L.f2) || (L.recurrent && (kq_sb(L.fqkv) || kq_sb(L.fz) || kq_sb(L.fout)))
             || (L.ple && ((L.bpg >= 0l && kq_sb(L.fpg)) || (L.bpp >= 0l && kq_sb(L.fpp)))))
         ple_f32 = ple_f32 || (L.ple && (L.bpg < 0l || L.bpp < 0l))
@@ -1177,7 +1332,7 @@ def private pf_setup {
     if (g_rd.hybrid) {
         ensure_dn_state()   // dn_ws_dev (the scan workspace) + the staging buffers the reset/handoff ride
         verify(ensure_dn_conv_cls() && ensure_dn_scan_cls() && (g_rd.dn_zsig ? ensure_dn_scan_p3_sig_cls() : ensure_dn_scan_p3_cls())
-            && ensure_dn_tail_cls() && (!g_rd.dn_ba_f32 || ensure_dn_ba_cls()),
+            && ensure_dn_tail_cls() && ensure_dn_cap_tail_cls() && (!g_rd.dn_ba_f32 || ensure_dn_ba_cls()),
             "vk prefill: the deltanet class rails must engage on a live device")
         let cd = g_rd.dn_cd
         let di = g_rd.dn_di
@@ -1308,17 +1463,20 @@ def private pf_setup {
         if (L.ple) {
             let ple = g_rd.ple
             let side_bytes = np * g_rd.n_layers * ple * 4l
-            if (L.bpg < 0l) {   //! 17: the f32 gate rows over the stream rows (`pf_ple_f32_args`)
+            if (L.bpg < 0l && !pf_ple_plane_f16(L.bpg, L.fpg)) {   //! 17: the f32 gate rows over the stream rows (`pf_ple_f32_args`)
                 g_rd.pf_sets[b + 17] = set_dn_ba_cls(fixed_array(g_rd.ple_gf32_dev, g_rd.pf_x, g_rd.pf_gate),
                     fixed_array(g_rd.ple_gf32_bytes, np * dim * 4l, np * ple * 4l), fixed_array(0u, VHZ_X, VHZ_GATE))
             } else {
-                g_rd.pf_sets[b + 16] = pf_feed_set(pf_f16_feed(L.fpg), g_rd.pf_x, VHZ_X, g_rd.pf_xf, g_rd.pf_xq, g_rd.pf_xs, dim, VHZ_XQ)
+                g_rd.pf_sets[b + 16] = pf_feed_set(pf_ple_plane_f16(L.bpg, L.fpg), g_rd.pf_x, VHZ_X, g_rd.pf_xf, g_rd.pf_xq, g_rd.pf_xs, dim, VHZ_XQ)
             }
-            if (L.bpp < 0l) {   //! 18: the act's f32 rows into the up plane; 19: the f32 projection over them
+            if (L.bpp < 0l && !pf_ple_plane_f16(L.bpp, L.fpp)) {   //! 18: the act's f32 rows into the up plane; 19: the f32 projection over them
                 g_rd.pf_sets[b + 18] = set_ple_act_f32_cls(fixed_array(g_rd.pf_gate, g_rd.pf_ple, g_rd.pf_up),
                     fixed_array(np * ple * 4l, side_bytes, np * ple * 4l), fixed_array(VHZ_GATE, VHZ_COS, VHZ_UP))
                 g_rd.pf_sets[b + 19] = set_dn_ba_cls(fixed_array(g_rd.ple_pf32_dev, g_rd.pf_up, g_rd.pf_ffnout),
                     fixed_array(g_rd.ple_pf32_bytes, np * ple * 4l, np * dim * 4l), fixed_array(0u, VHZ_UP, VHZ_FFO))
+            } elif (pf_ple_plane_f16(L.bpp, L.fpp)) {   //! 18: the act as f16 rows into the hidden plane, the projection's f16 feed
+                g_rd.pf_sets[b + 18] = set_actf16_cls(fixed_array(g_rd.pf_gate, g_rd.pf_ple, g_rd.pf_hf),
+                    fixed_array(np * ple * 4l, side_bytes, np * hid * 2l), fixed_array(VHZ_GATE, VHZ_COS, VHZ_HQ))
             } else {
                 g_rd.pf_sets[b + 18] = set_actrq_cls(fixed_array(g_rd.pf_gate, g_rd.pf_ple, g_gpu.hq_dev, g_gpu.hs_dev),
                     fixed_array(np * ple * 4l, side_bytes, BATCH_HQ_BYTES, BATCH_HS_BYTES),
@@ -1671,6 +1829,17 @@ def ple_proj_gemv_why(dim, all, w16_bytes : int64) : string {
     return vk_range_ok(w16_bytes) ? "" : "its f16 panel ({w16_bytes} bytes) passes the device's storage range {vk_max_storage_range()}"
 }
 
+//! the projection rows' GEMV class rail: the f32 rows', or the bf16 rows' word-pair or halfword stamp by the model dim
+def private ple_proj_rail_ensure(bf16 : bool) : bool {
+    if (!bf16) return ensure_router_gemv_cls()
+    return ple_proj_bf16_hw(g_rd.dim) ? ensure_router_gemv_bf16_hw_cls() : ensure_router_gemv_bf16_cls()
+}
+
+//! the bf16 projection rows' GEMV set over `bufs`: the word-pair stamp at an even model dim, the halfword stamp at an odd one (every
+//! row then starts mid-word)
+def private ple_proj_bf16_set(bufs : uint64 const[4]; sizes : int64 const[4]; gbits : uint const[4]) : VkDescriptorSet
+    => ple_proj_bf16_hw(g_rd.dim) ? set_router_gemv_bf16_hw_cls(bufs, sizes, gbits) : set_router_gemv_bf16_cls(bufs, sizes, gbits)
+
 //! The pre-step's projection on device off the file's own rows (bf16 halves `w16`, else f32 `w32`) and its norm row: the router GEMV
 //! under 1/sqrt(dim) at the token command, the window's f16 tile over a panel it converts each window (else the router GEMV) before
 //! layer 0. Refused past `pf_ready`: these sets build with the prefill buffers.
@@ -1683,7 +1852,7 @@ def vk_rdec_set_ple_proj(w16 : array<uint16>; w32 : array<float>; pnorm : array<
     let bf16 = !empty(w16)
     let n = bf16 ? long_length(w16) : long_length(w32)
     if (n != all * g_rd.dim || long_length(pnorm) != g_rd.ple || g_rd.pf_ready
-            || !((bf16 ? ensure_router_gemv_bf16_cls() : ensure_router_gemv_cls()) && ensure_ple_finish_cls())) {
+            || !(ple_proj_rail_ensure(bf16) && ensure_ple_finish_cls())) {
         return false
     }
     let wp_bytes = n * (bf16 ? 2l : 4l)
@@ -1713,7 +1882,7 @@ def vk_rdec_set_ple_proj(w16 : array<uint16>; w32 : array<float>; pnorm : array<
     let pbufs = fixed_array(g_rd.ple_wp_dev, g_rd.x_dev, g_rd.tok_plep, g_rd.ple_pnorm_dev)
     let psizes = fixed_array(g_rd.ple_wp_bytes, g_rd.dim * 4l * nb, all * 4l * nb, g_rd.ple * 4l)
     let pbits = fixed_array(0u, VHZ_X, VHZ_MRT, 0u)
-    g_rd.s_tok_pleproj = bf16 ? set_router_gemv_bf16_cls(pbufs, psizes, pbits) : set_router_gemv_cls(pbufs, psizes, pbits)
+    g_rd.s_tok_pleproj = bf16 ? ple_proj_bf16_set(pbufs, psizes, pbits) : set_router_gemv_cls(pbufs, psizes, pbits)
     g_rd.s_tok_ple_ar = set_ple_finish_cls(fixed_array(g_rd.tok_plep, g_rd.ple_pnorm_dev, g_rd.ple_dev),
         fixed_array(all * 4l * nb, g_rd.ple * 4l, all * 4l * nb), fixed_array(VHZ_MRT, 0u, VHZ_COS))
     g_rd.ple_gpu = true
@@ -1984,6 +2153,21 @@ def private pf_hc_side(raw : VkCommandBuffer; var h : VkHaz; wlen, pos0w : int64
     enc_ple_conv_cls(raw, h, g_rd.pf_s_ple_conv, pcc, (wlen * hcd + 255l) / 256l)
     let m = min(wlen, nrows)
     vhz_dep(raw, h, VHZ_DNSM, VHZ_DNSM, true)
+    if (!empty(g_pf_wcaps) && g_pf_wcaps[0].n > 0l) {
+        let wc = g_pf_wcaps[0]
+        for (ci in range64(wc.n)) {
+            let r = int64(g_pf_cap_words[wc.rec + ci * 2l])
+            let dst = int64(g_pf_cap_words[wc.rec + ci * 2l + 1l]) * 4l + g_rd.snap_ring_off
+            cap_ring_rows(r, nrows, pos0w) $(rr, slot : int64; from_window : bool) {
+                let at = slot * hcd * 4l
+                if (from_window) {
+                    cmd_copy_range(raw, g_rd.pf_hpanel, rr * hcd * 4l, g_rd.snap_dev, dst + at, hcd * 4l)
+                } else {
+                    cmd_copy_range(raw, g_rd.plehist_dev, g_rd.region * nrows * hcd * 4l + at, g_rd.snap_dev, dst + at, hcd * 4l)
+                }
+            }
+        }
+    }
     for (r in range64(wlen - m, wlen)) {
         let slot = (pos0w + r) % nrows
         cmd_copy_range(raw, g_rd.pf_hpanel, r * hcd * 4l, g_rd.plehist_dev, (g_rd.region * nrows + slot) * hcd * 4l, hcd * 4l)
@@ -2020,6 +2204,7 @@ def private pf_run_hc(x_batch : array<float>; cos_batch : array<float>; side : a
             let last = w0 + wlen >= npos
             let pos0w = pos0 + w0
             pf_window_segs(w0, wlen)
+            pf_window_caps(w0)
             rd_tok_row(pos0w, wlen)
             upload_region_at(g_rd.pf_x, 0l, addr<uint8 const?>(x_batch[int(w0 * dim)]), wlen * dim * 4l)
             upload_region_at(g_rd.pf_cos, 0l, addr<uint8 const?>(cos_batch[int(w0 * cos_elems)]), wlen * cos_elems * 4l)
@@ -2091,6 +2276,7 @@ def private pf_run_hc(x_batch : array<float>; cos_batch : array<float>; side : a
         }
         if (g_rd.hybrid) {
             pf_dn_end()
+            pf_caps_done()
         }
         host_buf_read(g_rd.pf_logits_host, addr<void?>(logits[0]), g_rd.vocab * 4l)
     }
@@ -2305,6 +2491,7 @@ def private pf_run(x_batch : array<float>; ids : array<int64>; use_ids : bool; e
             let wlen = pf_window_len(npos, w0)
             let last = w0 + wlen >= npos
             pf_window_segs(w0, wlen)
+            pf_window_caps(w0)
             let nwseg = long_length(g_pf_wsegs)
             if (nwseg > 1l) {
                 g_rd.pf_seg_windows++
@@ -2492,7 +2679,7 @@ def private pf_run(x_batch : array<float>; ids : array<int64>; use_ids : bool; e
             }
             if (vk_prof()) {
                 to_log(LOG_INFO, "vk_rdpf hz: {h.disp} nodes, {h.barriers} barriers\n")   // nolint:PERF026,PERF028 — vk_prof()-gated report leg
-                if (g_rd.moe) {
+                if (g_rd.moe && g_rd.pf_midx != 0ul) {   //! no picks buffer where every routed layer's experts serve on the host: the MoE block never set up
                     vhz_dep(raw, h, VHZ_MRT, 0u, true)
                     cmd_copy_whole(raw, g_rd.pf_midx, g_rd.pf_midx_host.buf, wlen * g_rd.k * 4l)
                 }
@@ -2509,12 +2696,13 @@ def private pf_run(x_batch : array<float>; ids : array<int64>; use_ids : bool; e
         }
         if (g_rd.hybrid) {
             pf_dn_end()
+            pf_caps_done()
         }
         host_buf_read(g_rd.pf_logits_host, addr<void?>(logits[0]), nseg * g_rd.vocab * 4l)
         // per-role GPU aggregation, LAST window, only when every stamp landed; overlapped levels (q|k|v, gate|up) bill the level on the last member's delta
         if (vk_prof()) {
             pf_prof_report(npos)
-            if (g_rd.moe) {
+            if (g_rd.moe && g_rd.pf_midx != 0ul) {
                 pf_moe_bucket_report(last_wlen)
             }
         }
@@ -2842,17 +3030,22 @@ def private ensure_comb_state {
     if (g_gpu.comb_ready) {
         return
     }
-    g_gpu.comb_stage = make_host_buf(2l * COMB_WI_BYTES, false)   // transfer_src staging: w then inv
+    g_gpu.comb_stage = make_host_buf(3l * COMB_WI_BYTES, storage = false)   //! transfer_src staging: w, inv, then the inverse map
     g_gpu.comb_w_dev = make_device_buf(COMB_WI_BYTES)
     g_gpu.comb_inv_dev = make_device_buf(COMB_WI_BYTES)
+    g_gpu.comb_bkt_dev = make_device_buf(COMB_WI_BYTES)
     g_gpu.comb_y_dev = make_device_buf(BATCH_Y_BYTES)
     g_gpu.comb_y = make_host_buf(BATCH_Y_BYTES, true, [cached = true])
     // combine (class: accumulator rows, slot map, slot weights, down rows)
-    verify(ensure_combine_cls(), "vk combine: the class rail must engage on a live device")
+    verify(ensure_combine_cls() && ensure_combine_row_cls(), "vk combine: the class rail must engage on a live device")
     g_gpu.comb_set = set_combine_cls(
         fixed_array(g_gpu.comb_y_dev, g_gpu.comb_inv_dev, g_gpu.comb_w_dev, g_gpu.batch_y1_dev),
         fixed_array(BATCH_Y_BYTES, COMB_WI_BYTES, COMB_WI_BYTES, BATCH_Y_BYTES),
         fixed_array(VHB_CY, VHB_COMB, VHB_COMB, VHB_Y1))
+    g_gpu.comb_row_set = set_combine_row_cls(
+        fixed_array(g_gpu.comb_y_dev, g_gpu.comb_w_dev, g_gpu.batch_y1_dev, g_gpu.comb_bkt_dev),
+        fixed_array(BATCH_Y_BYTES, COMB_WI_BYTES, BATCH_Y_BYTES, COMB_WI_BYTES),
+        fixed_array(VHB_CY, VHB_COMB, VHB_Y1, VHB_COMB))
     g_gpu.comb_ready = true
     to_log(LOG_INFO, "dasLLAMA vulkan tier: device-side moe combine engaged\n")
 }
@@ -2865,7 +3058,7 @@ def private ensure_batch_set(si : int; ybuf, xqbuf, xsbuf : uint64; xqbytes, xsb
         return
     }
     if (!g_gpu.stacks[si].batch_made) {
-        g_gpu.stacks[si].batch_meta = make_host_buf(BATCH_META_BYTES, false)   // transfer_src staging
+        g_gpu.stacks[si].batch_meta = make_host_buf(int64(g_gpu.stacks[si].batch_meta_ring) * BATCH_META_BYTES, storage = false)   //! transfer_src staging, one entry a ring slot
         g_gpu.stacks[si].batch_meta_dev = make_device_buf(BATCH_META_BYTES)
         g_gpu.stacks[si].batch_made = true
     }
@@ -2967,7 +3160,7 @@ def private fill_batch_meta(si : int; offs : int64 const?; nregions : int64; n, 
     let fmt = g_gpu.stacks[si].fmt
     let unit = kq_unit(fmt)
     unsafe {
-        var mp = reinterpret<uint?>(g_gpu.stacks[si].batch_meta.mapped)
+        var mp = reinterpret<uint?>(reinterpret<uint8?>(g_gpu.stacks[si].batch_meta.mapped) + int64(g_gpu.stacks[si].batch_meta_at) * BATCH_META_BYTES)
         var nrc = 0l
         var nrows = 0l
         var all128 = true   // every active region's cnt a 128-multiple -> aligned-L eligible
@@ -3078,7 +3271,7 @@ def private stack_batch_enc(raw : VkCommandBuffer; var h : VkHaz; si : int; nwg 
 }
 
 def private cmd_copy_batch_meta(raw : VkCommandBuffer; si : int) {
-    cmd_copy_whole(raw, g_gpu.stacks[si].batch_meta.buf, g_gpu.stacks[si].batch_meta_dev, BATCH_META_BYTES)
+    cmd_copy_range(raw, g_gpu.stacks[si].batch_meta.buf, int64(g_gpu.stacks[si].batch_meta_at) * BATCH_META_BYTES, g_gpu.stacks[si].batch_meta_dev, 0l, BATCH_META_BYTES)
 }
 
 def private batch_acts_head(raw : VkCommandBuffer; var h : VkHaz; axq_bytes, axs_bytes : int64; x2q_bytes : int64 = 0l; x2s_bytes : int64 = 0l) {
@@ -3264,10 +3457,10 @@ def private ensure_dn_cls_sets {
         fixed_array(g_gpu.batch_y1_dev, g_gpu.hq_dev, g_gpu.dn_smalls_dev),
         fixed_array(BATCH_Y_BYTES, BATCH_HQ_BYTES, DN_SMALLS_BYTES),
         fixed_array(VHB_Y1, VHB_HQ, VHB_SM))
-    g_gpu.dn_scan_set = set_dn_scan_cls(
-        fixed_array(g_gpu.hq_dev, g_gpu.dn_state_dev, g_gpu.dn_smalls_dev, g_gpu.dn_ws_dev),
-        fixed_array(BATCH_HQ_BYTES, DN_STATE_BYTES, DN_SMALLS_BYTES, DN_WS_BYTES),
-        fixed_array(VHB_HQ, VHB_ST, VHB_SM, VHB_WS))
+    g_gpu.dn_scan_set = set_dn_scan_cls(   //! the per-op chain captures nothing: the smalls stand in for the records and the checkpoint rows, unread
+        fixed_array(g_gpu.hq_dev, g_gpu.dn_state_dev, g_gpu.dn_smalls_dev, g_gpu.dn_ws_dev, g_gpu.dn_smalls_dev, g_gpu.dn_smalls_dev),
+        fixed_array(BATCH_HQ_BYTES, DN_STATE_BYTES, DN_SMALLS_BYTES, DN_WS_BYTES, DN_SMALLS_BYTES, DN_SMALLS_BYTES),
+        fixed_array(VHB_HQ, VHB_ST, VHB_SM, VHB_WS, 0u, VHB_SM))
     g_gpu.dn_scan_p3_set = set_dn_scan_p3_cls(
         fixed_array(g_gpu.batch_y2_dev, g_gpu.dn_ws_dev, g_gpu.dn_smalls_dev),
         fixed_array(BATCH_Y_BYTES, DN_WS_BYTES, DN_SMALLS_BYTES),
@@ -3692,24 +3885,62 @@ def private ensure_stream_slots {
     g_gpu.stream_cmd = alloc_cmd()
     let nslots = stream_slot_count()
     g_gpu.stream_slots |> reserve(nslots)
+    let cap = stream_slot_caps()
     for (_slot in range(nslots)) {
-        let s1 = make_stack_shell(-1l, 0l, 0, g_gpu.stream_max_gu_wq, g_gpu.stream_max_gu_ws, [xfer_shared = true])
-        let s3 = make_stack_shell(-1l, 0l, 0, g_gpu.stream_max_gu_wq, g_gpu.stream_max_gu_ws, [xfer_shared = true])
-        let s2 = make_stack_shell(-1l, 0l, 0, g_gpu.stream_max_dn_wq, g_gpu.stream_max_dn_ws, [xfer_shared = true])
+        let s1 = make_stack_shell(-1l, 0l, 0, cap.gu_wq, cap.gu_ws, [xfer_shared = true])
+        let s3 = make_stack_shell(-1l, 0l, 0, cap.gu_wq, cap.gu_ws, [xfer_shared = true])
+        let s2 = make_stack_shell(-1l, 0l, 0, cap.dn_wq, cap.dn_ws, [xfer_shared = true])
+        g_gpu.stacks[s1].batch_meta_ring = XF_RING   //! the per-expert chain fills XF_RING metas ahead of their copies
+        g_gpu.stacks[s3].batch_meta_ring = XF_RING
+        g_gpu.stacks[s2].batch_meta_ring = XF_RING
         g_gpu.stream_slots |> push(StreamSlot(group = -1, s1 = s1, s3 = s3, s2 = s2))
     }
     g_gpu.stream_ready = true
-    let slot_bytes = 2l * (g_gpu.stream_max_gu_wq + g_gpu.stream_max_gu_ws) + g_gpu.stream_max_dn_wq + g_gpu.stream_max_dn_ws
+    g_gpu.land_val |> clear()
+    g_gpu.land_val |> resize(max(moe_gpu_stream_ring_experts(), 1l))
+    g_gpu.land_at = 0l
+    let slot_bytes = 2l * (cap.gu_wq + cap.gu_ws) + cap.dn_wq + cap.dn_ws
     // same read-time carve carved_budget() subtracts — overcommit silently hits the WDDM paging cliff
     let need = moe_gpu_stream_need()
     let reserve = need > 0l ? int64(nslots) * need : STREAM_RESERVE
     assert(int64(nslots) * slot_bytes <= reserve, "dasLLAMA vulkan tier: stream slots exceed the carved stream reserve")
-    to_log(LOG_INFO, "dasLLAMA vulkan tier: streamed prefill engaged ({length(g_gpu.stream_stacks) / 3} layers, slot {slot_bytes} bytes x {length(g_gpu.stream_slots)})\n")
+    assert(XF_AHEAD * XF_BUNDLE <= MOE_GPU_LAND_EXPERTS,
+        "dasLLAMA vulkan tier: the ring holds fewer experts than the chain keeps in flight - a position would be reused under a command still reading it")
+    let form = moe_gpu_stream_ring() ? "a ring of {moe_gpu_stream_ring_experts()} experts" : "a whole layer"
+    to_log(LOG_INFO, "dasLLAMA vulkan tier: streamed prefill engaged ({length(g_gpu.stream_stacks) / 3} layers, slot {slot_bytes} bytes x {length(g_gpu.stream_slots)}, {form}); host-visible buffers {g_gpu.host_bytes >> 20l} MB, das heap {int64(heap_bytes_allocated()) >> 20l} MB\n")
+}
+
+//! a stream slot's plane capacities: a whole layer's widest planes, or the ring's experts of the widest expert planes under the ring
+//! form, each plane bound as one storage range the device admits
+def private stream_slot_caps : tuple<gu_wq : int64; gu_ws : int64; dn_wq : int64; dn_ws : int64> {
+    var cap = (gu_wq = g_gpu.stream_max_gu_wq, gu_ws = g_gpu.stream_max_gu_ws, dn_wq = g_gpu.stream_max_dn_wq, dn_ws = g_gpu.stream_max_dn_ws)
+    return cap if (!moe_gpu_stream_ring())
+    let ring = moe_gpu_stream_ring_experts()
+    cap = (gu_wq = 0l, gu_ws = 0l, dn_wq = 0l, dn_ws = 0l)
+    for (k in range(length(g_gpu.stream_stacks))) {
+        let ss & = unsafe(g_gpu.stream_stacks[k])
+        if (k % STREAM_PLANE_KINDS == 2) {
+            cap.dn_wq = max(cap.dn_wq, ss.qlen * ring)
+            cap.dn_ws = max(cap.dn_ws, ss.slen * ring)
+        } else {
+            cap.gu_wq = max(cap.gu_wq, ss.qlen * ring)
+            cap.gu_ws = max(cap.gu_ws, ss.slen * ring)
+        }
+    }
+    for (b in [cap.gu_wq, cap.gu_ws, cap.dn_wq, cap.dn_ws]) {
+        if (!vk_range_ok(b)) {
+            panic("dasLLAMA vulkan tier: the ring slot's plane of {b} bytes ({ring} experts) is past the device's storage range {vk_max_storage_range()} - DASLLAMA_GPU_PF_STREAM=0 serves the prompt off the host sums")
+        }
+    }
+    return cap
 }
 
 // re-base one slot pseudo-stack onto a stream stack (descriptors stay — the slot buffers are
 // the same; only the meta-resolution identity and the kernel choice follow the layer)
 def private rebase_pseudo(si : int; ss : StreamStack const) {
+    if (g_gpu.stacks[si].fmt != ss.fmt) {
+        g_gpu.stacks[si].batch_cls_ready = 0u   //! the cached class sets are the old format's: the next encode rebuilds them for this one
+    }
     g_gpu.stacks[si].base = ss.base
     g_gpu.stacks[si].elems = ss.elems
     g_gpu.stacks[si].fmt = ss.fmt
@@ -3728,37 +3959,17 @@ def private stream_copy_begin : VkCommandBuffer {
     return raw
 }
 
-//! The streamed-layer split's copy: only the regions' experts cross the bus (region r's expert =
-//! (woff - stack base) / ege), each at its own offset inside the slot's planes; the slot is marked
-//! EMPTY afterwards, so a later window never mistakes the partial fill for the whole group.
-[arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#streamed-layer-split")]
-def private copy_stream_group_partial(si, g : int; offs1 : int64 const?; nregions, ege : int64) {
-    let slot = g_gpu.stream_slots[si]
-    var raw = stream_copy_begin()
-    for (k in range(3)) {
-        let sk = g * 3 + k
-        let psi = stream_slot_stack(slot, k)
-        let nexp = g_gpu.stream_stacks[sk].elems / ege
-        let qlen = g_gpu.stream_stacks[sk].wqbytes / nexp
-        let slen = g_gpu.stream_stacks[sk].wsbytes / nexp
-        for (r in range64(nregions)) {
-            let e = (unsafe(offs1[r * 3l]) - g_gpu.stream_stacks[g * 3].base) / ege
-            cmd_copy_range(raw, g_gpu.stream_stacks[sk].hwq.buf, e * qlen, g_gpu.stacks[psi].wqbuf, e * qlen, qlen)
-            if (slen > 0l) {
-                cmd_copy_range(raw, g_gpu.stream_stacks[sk].hws.buf, e * slen, g_gpu.stacks[psi].wsbuf, e * slen, slen)
-            }
-        }
-    }
-    stream_copy_end(si, raw, false)
-    g_gpu.stream_slots[si].group = -1
-}
-
 def private copy_stream_group(si, g : int; sync : bool) {
+    let ring = moe_gpu_stream_ring()
+    assert(!ring, "dasLLAMA vulkan tier: the streamed slot is the chain's ring of experts - a whole layer's copy has no room in it")
     let slot = g_gpu.stream_slots[si]
     var raw = stream_copy_begin()
     for (k in range(3)) {
         let sk = g * 3 + k
         let psi = stream_slot_stack(slot, k)
+        if (g_gpu.stream_stacks[sk].slots < g_gpu.stream_stacks[sk].nexp) {
+            panic("dasLLAMA vulkan tier: the whole-layer stream arm copies every expert of streamed stack {sk}, and the expert cache holds {g_gpu.stream_stacks[sk].slots} of {g_gpu.stream_stacks[sk].nexp} - a partial cache serves the split chain alone (DASLLAMA_GPU_MOE_SPLIT=1)")
+        }
         cmd_copy_whole(raw, g_gpu.stream_stacks[sk].hwq.buf, g_gpu.stacks[psi].wqbuf, g_gpu.stream_stacks[sk].wqbytes)
         if (g_gpu.stream_stacks[sk].wsbytes > 0l) {
             cmd_copy_whole(raw, g_gpu.stream_stacks[sk].hws.buf, g_gpu.stacks[psi].wsbuf, g_gpu.stream_stacks[sk].wsbytes)
@@ -3805,7 +4016,8 @@ def private stream_group_bind(g : int; nrows : int64; f3, f2 : int) {
 }
 
 def private stream_group_check(g : int; nrows : int64; f3, f2 : int) {
-    assert(nrows >= BATCH_TILE, "dasLLAMA vulkan tier: streamed layers serve prefill batches only")
+    let one_row_meet = gpu_dec_meet()
+    assert(nrows >= BATCH_TILE || one_row_meet, "dasLLAMA vulkan tier: streamed layers serve prefill batches only")
     assert(g_gpu.stream_stacks[g * 3 + 1].fmt == f3 && g_gpu.stream_stacks[g * 3 + 2].fmt == f2,
         "dasLLAMA vulkan tier: streamed group format mismatch")
     ensure_stream_slots()
@@ -3825,18 +4037,6 @@ def private stream_slot_stack(slot : StreamSlot; k : int) : int => k == 0 ? slot
 
 var private g_split_announced = false
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#streamed-layer-split")]
-def stream_group_bind_partial(g : int; nrows : int64; f3, f2 : int; offs1 : int64 const?; nregions, ege : int64) {
-    if (!g_split_announced) {
-        g_split_announced = true
-        to_log(LOG_INFO, "dasLLAMA vulkan tier: streamed prefill split engaged (DASLLAMA_GPU_MOE_SPLIT=0 streams whole layers)\n")
-    }
-    stream_group_check(g, nrows, f3, f2)
-    let si = g % length(g_gpu.stream_slots)
-    copy_stream_group_partial(si, g, offs1, nregions, ege)
-    stream_slot_handoff(si, g)
-}
-
 //! prefetch of the next group runs descending while prefill runs ascending
 def private stream_group_prefetch(g : int) {
     let nslots = stream_slot_count()
@@ -3852,9 +4052,17 @@ def vk_moe_ffn_streamed(g : int; var goutp : float?; offs1 : int64 const?; offs3
 }
 
 def vk_moe_ffn_streamed_xf(g : int; var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xp : float const?; wp : float const?; invp : uint const?; n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
+    let t0 = ref_time_ticks()
+    let nslots = length(g_gpu.stream_slots)   //! none before the first bind makes them
+    let cold = nslots == 0 || g_gpu.stream_slots[g % nslots].group != g
     stream_group_bind(g, nrows, f3, f2)
+    let t1 = ref_time_ticks()
     vk_moe_ffn_batch_xf(goutp, offs1, offs3, offs2, nregions, xp, wp, invp, n, nfe, nrows, npos, f1, f3, f2, is_gelu)
+    let t2 = ref_time_ticks()
     stream_group_prefetch(g)
+    if (vk_prof()) {
+        to_log(LOG_INFO, "vk_stream g{g} {cold ? "cold" : "warm"} bind {get_time_usec(t0) - get_time_usec(t1)} chain {get_time_usec(t1) - get_time_usec(t2)} prefetch {get_time_usec(t2)} us, {nregions} regions {nrows} rows\n")   // nolint:PERF026,PERF028,LINT019 — vk_prof()-gated report leg
+    }
 }
 
 // ===== the cm2 expert chain: the batch arm over the f16 feed =====
@@ -3864,7 +4072,7 @@ def vk_moe_ffn_streamed_xf(g : int; var goutp : float?; offs1 : int64 const?; of
 //! inside the f32 x plane's cap. The combined (npos > 0) form only.
 [arch(at="../ARCHITECTURE_RUNTIME.md#activation-scale-lattice"), arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-expert-chain")]
 def vk_moe_ffn_xf_ok(npos, n : int64; f1, f3, f2 : int) : bool {
-    if (g_gpu == null || g_gpu.dry || !g_gpu.has_coopmat2) {
+    if (g_gpu == null || !g_gpu.has_coopmat2) {   //! the dry walk answers as the live one: the mint's plan is the load's
         return false
     }
     return pf_f16_feed(f1) && pf_f16_feed(f3) && pf_f16_feed(f2) && npos * n * 4l <= BATCH_Y_BYTES
@@ -3878,9 +4086,13 @@ def private ensure_xf_state {
     ensure_comb_state()
     g_gpu.batch_xf_dev = make_device_buf(BATCH_Y_BYTES)
     g_gpu.resident_bytes += BATCH_Y_BYTES
-    verify(ensure_moe_gather_f16_cls() && ensure_actf16_cls(), "vk batch: the cm2 feed class rails must engage on a live device")
+    verify(ensure_moe_gather_f16_cls() && ensure_moe_gather_f16_row_cls() && ensure_actf16_cls(), "vk batch: the cm2 feed class rails must engage on a live device")
     g_gpu.batch_gather_set = set_moe_gather_f16_cls(
         fixed_array(g_gpu.batch_xf_dev, g_gpu.comb_inv_dev, g_gpu.batch_xq_dev),
+        fixed_array(BATCH_Y_BYTES, COMB_WI_BYTES, BATCH_XQ_BYTES),
+        fixed_array(VHB_XF, VHB_COMB, VHB_ACT))
+    g_gpu.batch_gather_row_set = set_moe_gather_f16_row_cls(
+        fixed_array(g_gpu.batch_xf_dev, g_gpu.comb_bkt_dev, g_gpu.batch_xq_dev),
         fixed_array(BATCH_Y_BYTES, COMB_WI_BYTES, BATCH_XQ_BYTES),
         fixed_array(VHB_XF, VHB_COMB, VHB_ACT))
     g_gpu.batch_actf16_set = set_actf16_cls(
@@ -4010,10 +4222,446 @@ def vk_moe_ffn_batch_xf_begin(offs1 : int64 const?; offs3 : int64 const?; offs2 
     g_xf_pend_bytes = npos * n * 4l
 }
 
-//! MoeGpuFfnXfJoinFn: spin the pending chain's fence and copy its combined rows out.
+//! MoeGpuFfnXfJoinFn: wait the pending chain (its fence, or the per-expert chain's last timeline value) and copy its combined rows out.
 def vk_moe_ffn_batch_xf_join(var goutp : float?) {
     assert(g_xf_pending, "dasLLAMA vulkan tier: async cm2 chain join with nothing in flight")
-    wait_fence()
+    if (g_xf_per_expert) {
+        if (g_xf_empty) {   //! the window pushed no expert: its share of the rows is zero
+            for (i in range64(g_xf_pend_bytes / 4l)) {
+                unsafe(goutp[i]) = 0.0
+            }
+            g_xf_pending = false
+            g_xf_per_expert = false
+            return
+        }
+        cmp_wait(g_gpu.xf_last)
+        g_xf_per_expert = false
+    } else {
+        wait_fence()
+    }
     par_memcpy(unsafe(reinterpret<void?>(goutp)), g_gpu.comb_y.mapped, g_xf_pend_bytes)
     g_xf_pending = false
+}
+
+var private g_xf_per_expert = false   //! the chain in flight is the per-expert form: the join waits its timeline value, not the fence
+var private g_xf_empty = false        //! ... and it pushed no expert
+
+//! the per-expert chain's rings, made once a model: XF_RING compute and transfer commands with their last signalled values
+[cold_path]
+def private ensure_xf_rings {
+    return if (g_gpu.xf_rings_ready)
+    g_gpu.xf_cmds |> reserve(XF_RING)
+    g_gpu.xf_vals |> reserve(XF_RING)
+    g_gpu.xf_xcmds |> reserve(XF_RING)
+    g_gpu.xf_xvals |> reserve(XF_RING)
+    for (_i in range(XF_RING)) {
+        g_gpu.xf_cmds |> push(alloc_cmd())
+        g_gpu.xf_vals |> push(0ul)
+        if (g_gpu.xfer_fam >= 0) {
+            g_gpu.xf_xcmds |> push(alloc_xfer_cmd())
+        }
+        g_gpu.xf_xvals |> push(0ul)
+    }
+    g_gpu.xf_rings_ready = true
+    to_log(LOG_INFO, "dasLLAMA vulkan tier: per-expert streamed chain engaged (ring {XF_RING}, {g_gpu.xfer_fam >= 0 ? "transfer queue" : "one queue"})\n")
+}
+
+//! expert `e` of stream group `g`'s three planes, the cache slot's bytes onto slot `dslot` of the destination stacks `dst`
+//! (plane order gate, up, down); an expert the cache does not hold is a panic naming `who` - the window's fetch missed it
+def private xf_expert_copy(raw : VkCommandBuffer; g : int; e : int64; dst : int[3]; dslot : int64; who : string) {
+    for (k in range(3)) {
+        let sk = g * 3 + k
+        let src = vk_stream_slot(sk, e)
+        if (!src.present) {
+            panic("dasLLAMA vulkan tier: {who} claimed expert {e} of streamed stack {sk}, which the expert cache does not hold - the window's fetch missed it")
+        }
+        let qlen = g_gpu.stream_stacks[sk].qlen
+        let slen = g_gpu.stream_stacks[sk].slen
+        cmd_copy_range(raw, src.qbuf, src.qoff, g_gpu.stacks[dst[k]].wqbuf, dslot * qlen, qlen)
+        if (slen > 0l) {
+            cmd_copy_range(raw, src.sbuf, src.soff, g_gpu.stacks[dst[k]].wsbuf, dslot * slen, slen)
+        }
+    }
+}
+
+//! the stream slot's three stacks in plane order
+def private stream_slot_stacks(slot : StreamSlot) : int[3] => fixed_array(slot.s1, slot.s3, slot.s2)
+
+//! one bundle's chain over its `rows` chunk rows, grid entries at [r0, r1) of the grid-list ring; `first` lands the window and zeroes the accumulator
+[arch(at="../ARCHITECTURE_GPU_VULKAN_STREAM.md#streamed-layer-split")]
+def private record_xf_expert_cmd(raw : VkCommandBuffer; s1, s3, s2 : int; nwg_gu, nwg_dn : uint;
+                                 rows, n, nfe, nk, npos, r0, r1, nreg : int64; is_gelu, first : bool; copies : block<(raw : VkCommandBuffer) : void>) {
+    var h = cmd_open(raw, true)
+    invoke(copies, raw)
+    cmd_full_barrier(raw)
+    if (first) {
+        vhz_dep(raw, h, 0u, VHB_XF, true)
+        cmd_copy_whole(raw, g_gpu.staging.buf, g_gpu.batch_xf_dev, npos * n * 4l)
+        vhz_dep(raw, h, 0u, VHB_COMB | VHB_CY, true)
+        cmd_copy_whole(raw, g_gpu.comb_stage.buf, g_gpu.comb_w_dev, nk * 4l)
+        cmd_fill(raw, g_gpu.comb_y_dev, 0l, npos * n * 4l, 0u)
+    }
+    vhz_dep(raw, h, 0u, VHB_COMB, true)
+    cmd_copy_range(raw, g_gpu.comb_stage.buf, 2l * COMB_WI_BYTES + r0 * 4l, g_gpu.comb_bkt_dev, r0 * 4l, rows * 4l)
+    vhz_dep(raw, h, 0u, VHB_META, true)
+    cmd_copy_batch_meta(raw, s1)
+    cmd_copy_batch_meta(raw, s3)
+    cmd_copy_batch_meta(raw, s2)
+    let k = uint(nk / npos)
+    var pcg = GatherArgs(n = uint(n), k = k, r0 = uint(r0), r1 = uint(r1))
+    enc_moe_gather_f16_row_cls(raw, h, g_gpu.batch_gather_row_set, pcg, rows)
+    stack_batch_enc_cm2(raw, h, s1, nwg_gu, n, nfe)
+    stack_batch_enc_cm2(raw, h, s3, nwg_gu, n, nfe)
+    var pca = ActArgs(nelem = uint(rows * nfe), act = is_gelu ? ACT_GELU : ACT_SILU, nblk = uint(rows * nfe / 32l))
+    enc_actf16_cls(raw, h, g_gpu.batch_actf16_set, pca, (rows * nfe / 4l + 255l) / 256l)
+    stack_batch_enc_cm2(raw, h, s2, nwg_dn, nfe, n)
+    // the combine a region at a time: a bundle's experts share positions, and the by-row add takes no two rows of one dispatch on one position
+    for (i in range64(nreg)) {
+        let rb = uint(g_xf_boffs1[i * 3l + 1l])
+        let cnt = g_xf_boffs1[i * 3l + 2l]
+        var pcc = GkMoeCombArgs(n = uint(n), k = k, r0 = uint(r0) + rb, r1 = uint(r0) + rb + uint(cnt), goff = rb)
+        enc_combine_row_cls(raw, h, g_gpu.comb_row_set, pcc, cnt)
+    }
+    cmd_close(raw, h, "vk_ffnx")
+}
+
+//! the chain's close: the accumulator copied out behind every expert's command (the full barrier orders them)
+def private record_xf_close_cmd(raw : VkCommandBuffer; n, npos : int64) {
+    var h = cmd_open(raw, true)
+    cmd_full_barrier(raw)
+    vhz_dep(raw, h, VHB_CY, 0u, true)
+    cmd_copy_whole(raw, g_gpu.comb_y_dev, g_gpu.comb_y.buf, npos * n * 4l)
+    cmd_close(raw, h, "vk_ffnx_out")
+}
+
+//! an opened window of the expert chain: the group, its slot, the pseudo-stacks, the shape, and the commands pushed so far
+struct private XfMeet {
+    on : bool
+    g : int
+    slot : StreamSlot
+    s1 : int
+    s3 : int
+    s2 : int
+    p1 : int          //! the layer's pool stacks, the first `npool` regions' (the pool window)
+    p3 : int
+    p2 : int
+    npool : int64
+    xfer : bool
+    offs1 : int64 const?
+    offs3 : int64 const?
+    offs2 : int64 const?
+    nregions : int64
+    ege : int64
+    cap : int64
+    n : int64
+    nfe : int64
+    nk : int64
+    npos : int64
+    is_gelu : bool
+    pushed : int64
+    done : int64      //! the commands whose chains retired, in push order
+    experts : int64
+    t0 : int64
+    exp_bytes : int64
+}
+
+var private g_xfm : XfMeet
+var private @scratch g_xf_bkt : array<uint>     //! the opened window's bucket row -> grid entry (the slot map's inverse)
+var private @scratch g_xf_boffs1 : array<int64> //! a bundle's region triples at chunk-local row bases
+var private @scratch g_xf_boffs3 : array<int64>
+var private @scratch g_xf_boffs2 : array<int64>
+
+//! the pool window: the chain's first `g_xf_pool_n` regions on a layer's pool stacks, `copies[r]` the expert region `r`'s slot takes off group `g_xf_pool_g` (-1 a hit); null = the stream form
+var g_xf_pool_copies : int const?
+var g_xf_pool_n = 0l
+var g_xf_pool_g = -1
+
+def xf_pool_on : bool => g_xf_pool_copies != null
+
+//! MoeGpuXfPoolWindowFn: the next window's first `npool` regions on layer `l`'s pool, copies sourced off the group holding `woff1`; its compute waits the layer's last DMA fill
+def vk_xf_pool_window(copies : int const?; npool, l, woff1 : int64; fmt1 : int) {
+    g_xf_pool_copies = copies
+    g_xf_pool_n = copies == null ? 0l : npool
+    g_xf_pool_g = copies == null ? -1 : vk_stream_stack_at(woff1, fmt1) / 3
+    if (copies != null && g_xf_pool_g < 0) {
+        panic("dasLLAMA vulkan tier: the pool window names a layer at {woff1} (fmt {fmt1}) with no streamed stack to copy from")
+    }
+    if (copies != null && g_rd != null && l < long_length(g_rd.hot_layers)) {
+        g_gpu.pend_wait = max(g_gpu.pend_wait, g_rd.hot_layers[l].dma_value)
+    }
+}
+
+//! region `r`'s expert `e` of stream group `g` copied into the pool slot the region's gate offset names (the three planes
+//! sit at one slot index, a plane at its stack's stride)
+def private xf_expert_copy_pool(raw : VkCommandBuffer; g : int; r, e : int64) {
+    let m & = unsafe(g_xfm)
+    let slot = (unsafe(m.offs1[r * 3l]) - g_gpu.stacks[m.p1].base) / m.ege
+    assert(g_gpu.stacks[m.p1].wqbytes / (g_gpu.stacks[m.p1].elems / m.ege) == g_gpu.stream_stacks[g * 3].qlen, "dasLLAMA vulkan tier: a pool slot and a streamed expert differ in bytes")
+    xf_expert_copy(raw, g, e, fixed_array(m.p1, m.p3, m.p2), slot, "the pool window")
+}
+
+var private @scratch g_xf_pos : array<int64>   //! the ring form: the opened window's region -> its ring position (a stream region's, once its bundle is pushed)
+
+//! the ring form: regions [r_lo, r_hi) past the pool prefix take the next ring positions; returns the compute value the
+//! bundle's copies wait - the last reader of any position they land in
+[arch(at="../ARCHITECTURE_GPU_VULKAN_STREAM.md#stream-slot-ring")]
+def private xf_assign_land(r_lo, r_hi : int64) : uint64 {
+    let m & = unsafe(g_xfm)
+    var wait = XFER_NO_WAIT
+    for (r in range64(max(r_lo, m.npool), r_hi)) {
+        let pos = g_gpu.land_at % moe_gpu_stream_ring_experts()
+        g_gpu.land_at++
+        g_xf_pos[r] = pos
+        wait = max(wait, g_gpu.land_val[pos])
+    }
+    return wait
+}
+
+//! the ring form: the bundle's positions read by the chain that signals `val`
+def private xf_land_done(r_lo, r_hi : int64; val : uint64) {
+    let m & = unsafe(g_xfm)
+    for (r in range64(max(r_lo, m.npool), r_hi)) {
+        g_gpu.land_val[g_xf_pos[r]] = val
+    }
+}
+
+//! a bundle region's copy: into its pool slot for a pool region (none for a hit), onto the stream slot otherwise - at the
+//! region's ring position under the ring form, at the expert's own index in a whole-layer slot
+def private xf_push_copy(raw : VkCommandBuffer; r, base : int64) {
+    let m & = unsafe(g_xfm)
+    if (r < m.npool) {
+        let e = int64(unsafe(g_xf_pool_copies[r]))
+        if (e >= 0l) {
+            xf_expert_copy_pool(raw, m.g, r, e)
+        }
+        return
+    }
+    let e = (unsafe(m.offs1[r * 3l]) - base) / m.ege   //! the expert off the live offset table: the meet rotates the regions after the window opened
+    xf_expert_copy(raw, m.g, e, stream_slot_stacks(m.slot), moe_gpu_stream_ring() ? g_xf_pos[r] : e, "the expert chain")
+}
+
+//! MoeGpuFfnXfOpenFn's streamed form: group `g`'s window prepared - the slot rebased, the x rows, the weights and the map staged; nothing submitted until a push
+[arch(at="../ARCHITECTURE_GPU_VULKAN_STREAM.md#streamed-layer-split")]
+def vk_moe_ffn_xf_open_experts(g : int; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xp : float const?; wp : float const?; invp : uint const?; n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
+    assert(!g_xf_pending && !g_xfm.on, "dasLLAMA vulkan tier: async cm2 chain open while one is already in flight")
+    assert(nregions > 0l, "dasLLAMA vulkan tier: the per-expert chain opens over no region")
+    if (!g_split_announced) {
+        g_split_announced = true
+        to_log(LOG_INFO, "dasLLAMA vulkan tier: streamed prefill split engaged (DASLLAMA_GPU_MOE_SPLIT=0 streams whole layers)\n")
+    }
+    stream_group_check(g, nrows, f3, f2)
+    if (!g_gpu.xf_rings_ready) {
+        ensure_xf_rings()
+    }
+    g_xfm.t0 = ref_time_ticks()
+    let si = g % length(g_gpu.stream_slots)
+    let slot = g_gpu.stream_slots[si]
+    let npool = xf_pool_on() ? min(g_xf_pool_n, nregions) : 0l
+    let ring_named = !moe_gpu_stream_ring() || xf_pool_on()
+    assert(ring_named, "dasLLAMA vulkan tier: the ring form opens a window with no copy list - every stream region names its expert through it")
+    g_xf_pos |> grow_resize(nregions)
+    if (npool < nregions) {   //! a window over the pool alone binds the pool's stacks through its offsets; the stream slot stays as it is
+        rebase_pseudo(slot.s1, g_gpu.stream_stacks[g * 3])
+        rebase_pseudo(slot.s3, g_gpu.stream_stacks[g * 3 + 1])
+        rebase_pseudo(slot.s2, g_gpu.stream_stacks[g * 3 + 2])
+        g_gpu.stream_slots[si].group = -1   //! a partial fill: a later window never mistakes it for the whole group
+    }
+    var st = xf_prepare(offs1, offs3, offs2, xp, wp, invp, n, nrows, npos, f1, f3, f2)   //! the first region's stacks: the pool's under a pool prefix
+    let pst = st
+    if (npool > 0l && npool < nregions) {
+        st = (s1 = slot.s1, s3 = slot.s3, s2 = slot.s2)
+        ensure_batch_sets3(st.s1, st.s3, st.s2)
+    }
+    g_xf_bkt |> grow_resize(nrows)
+    for (gi in range64(nrows)) {
+        g_xf_bkt[int64(unsafe(invp[gi]))] = uint(gi)
+    }
+    let ege = nfe * n
+    var exp_bytes = 0l
+    for (k in range(3)) {
+        let ss & = unsafe(g_gpu.stream_stacks[g * 3 + k])
+        exp_bytes += (ss.wqbytes + ss.wsbytes) / (ss.elems / ege)
+    }
+    let cap = ffn_cm2_chunk_rows(n, nfe)
+    assert(int64(XF_RING) * cap * 4l <= COMB_WI_BYTES, "dasLLAMA vulkan tier: the grid-list ring passes its plane")
+    g_xfm = XfMeet(on = true, g = g, slot = slot, s1 = st.s1, s3 = st.s3, s2 = st.s2, p1 = pst.s1, p3 = pst.s3, p2 = pst.s2, npool = npool, xfer = g_gpu.xfer_fam >= 0,
+        offs1 = offs1, offs3 = offs3, offs2 = offs2, nregions = nregions, ege = ege, cap = cap,
+        n = n, nfe = nfe, nk = nrows, npos = npos, is_gelu = is_gelu, pushed = 0l, done = 0l, experts = 0l, t0 = g_xfm.t0, exp_bytes = exp_bytes)
+}
+
+//! the rows of regions [r_lo, r_hi) of the opened window; -1 past the chunk cap or the bundle's expert count
+def private xf_bundle_rows(r_lo, r_hi : int64) : int64 {
+    let m & = unsafe(g_xfm)
+    //! a window over the pool alone takes a token's device share in one submit
+    let cap_experts = m.npool == m.nregions && m.npool > 0l ? XF_BUNDLE : (g_env_vulkan.vk_xf_bundle > 0l ? min(g_env_vulkan.vk_xf_bundle, XF_BUNDLE) : clamp(m.nregions / XF_BUNDLE_SHARE, 1l, XF_BUNDLE))
+    return -1l if (r_hi - r_lo > cap_experts || (r_lo < m.npool && r_hi > m.npool))   //! a bundle binds one stack set: the pool's or the slot's, never across the seam
+    var rows = 0l
+    for (r in range64(r_lo, r_hi)) {
+        rows += unsafe(m.offs1[r * 3l + 2l])
+    }
+    return rows <= m.cap ? rows : -1l
+}
+
+//! the bundle's three region lists at chunk-local row bases (region after region), and its chunk rows' grid entries into
+//! ring entry `j` of the grid-list staging
+def private xf_bundle_lists(r_lo, r_hi : int64; j : int) : int64 {
+    let m & = unsafe(g_xfm)
+    let nb = r_hi - r_lo
+    g_xf_boffs1 |> grow_resize(nb * 3l)
+    g_xf_boffs3 |> grow_resize(nb * 3l)
+    g_xf_boffs2 |> grow_resize(nb * 3l)
+    var rows = 0l
+    let ring = moe_gpu_stream_ring()
+    unsafe {
+        var gl = reinterpret<uint?>(reinterpret<uint8?>(g_gpu.comb_stage.mapped) + 2l * COMB_WI_BYTES + int64(j) * m.cap * 4l)
+        for (i in range64(nb)) {
+            let r = r_lo + i
+            let b0 = m.offs1[r * 3l + 1l]
+            let cnt = m.offs1[r * 3l + 2l]
+            if (ring && r >= m.npool) {
+                g_xf_boffs1[i * 3l] = g_gpu.stream_stacks[m.g * 3].base + g_xf_pos[r] * m.ege
+                g_xf_boffs3[i * 3l] = g_gpu.stream_stacks[m.g * 3 + 1].base + g_xf_pos[r] * m.ege
+                g_xf_boffs2[i * 3l] = g_gpu.stream_stacks[m.g * 3 + 2].base + g_xf_pos[r] * m.ege
+            } else {
+                g_xf_boffs1[i * 3l] = m.offs1[r * 3l]
+                g_xf_boffs3[i * 3l] = m.offs3[r * 3l]
+                g_xf_boffs2[i * 3l] = m.offs2[r * 3l]
+            }
+            g_xf_boffs1[i * 3l + 1l] = rows
+            g_xf_boffs3[i * 3l + 1l] = rows
+            g_xf_boffs2[i * 3l + 1l] = rows
+            g_xf_boffs1[i * 3l + 2l] = cnt
+            g_xf_boffs3[i * 3l + 2l] = cnt
+            g_xf_boffs2[i * 3l + 2l] = cnt
+            for (b in range64(cnt)) {
+                gl[rows + b] = g_xf_bkt[b0 + b]
+            }
+            rows += cnt
+        }
+    }
+    return rows
+}
+
+//! MoeGpuFfnXfPushFn's streamed form: regions [r_lo, r_hi) as one bundle on ring entry `pushed % XF_RING`; without `wait` an entry still in flight answers false and nothing is queued
+[arch(at="../ARCHITECTURE_GPU_VULKAN_STREAM.md#streamed-layer-split")]
+def vk_moe_ffn_xf_push_experts(r_lo, r_hi : int64; wait : bool) : bool {
+    assert(g_xfm.on, "dasLLAMA vulkan tier: expert chain push with no window open")
+    var m & = unsafe(g_xfm)
+    let j = int(m.pushed % int64(XF_RING))
+    if (!wait) {
+        // at most XF_AHEAD bundles in flight, so the host keeps claiming from its own end: the ring's depth is for re-recording, not for claiming
+        while (m.done < m.pushed && cmp_reached(g_gpu.xf_vals[int(m.done % int64(XF_RING))])) {
+            m.done++
+        }
+        return false if (m.pushed - m.done >= XF_AHEAD || (g_gpu.xf_vals[j] > 0ul && !cmp_reached(g_gpu.xf_vals[j]))
+            || (m.xfer && g_gpu.xf_xvals[j] > 0ul && !xfer_reached(g_gpu.xf_xvals[j])))
+    }
+    let bundle_rows = xf_bundle_rows(r_lo, r_hi)
+    assert(bundle_rows >= 0l, "dasLLAMA vulkan tier: the expert chain's bundle passes the chunk cap or XF_BUNDLE")
+    let base = g_gpu.stream_stacks[m.g * 3].base
+    let ring = moe_gpu_stream_ring()
+    let land_wait = ring ? xf_assign_land(r_lo, r_hi) : XFER_NO_WAIT
+    var sig = 0ul
+    if (m.xfer) {
+        if (g_gpu.xf_xvals[j] > 0ul) {
+            xfer_wait(g_gpu.xf_xvals[j], false)   //! this entry's earlier copy retired: the command is free to re-record
+        }
+        var xraw = g_gpu.xf_xcmds[j]
+        cmd_open(xraw, true)
+        for (r in range64(r_lo, r_hi)) {
+            xf_push_copy(xraw, r, base)
+        }
+        cmd_close(xraw)
+        sig = xfer_submit_after(xraw, land_wait)
+        g_gpu.xf_xvals[j] = sig
+    }
+    if (g_gpu.xf_vals[j] > 0ul) {
+        cmp_wait(g_gpu.xf_vals[j])   //! this entry's earlier chain retired: its command, its meta entry and its grid list are free
+    }
+    let rows = xf_bundle_lists(r_lo, r_hi, j)
+    let pool = r_lo < m.npool
+    let s1 = pool ? m.p1 : m.s1
+    let s3 = pool ? m.p3 : m.s3
+    let s2 = pool ? m.p2 : m.s2
+    g_gpu.stacks[s1].batch_meta_at = j
+    g_gpu.stacks[s3].batch_meta_at = j
+    g_gpu.stacks[s2].batch_meta_at = j
+    let nb = r_hi - r_lo
+    unsafe {
+        let nwg1 = fill_batch_meta(s1, addr<int64 const?>(g_xf_boffs1[0]), nb, m.n, m.nfe, 0l, rows, true)
+        let nwg3 = fill_batch_meta(s3, addr<int64 const?>(g_xf_boffs3[0]), nb, m.n, m.nfe, 0l, rows, true)
+        assert(nwg1 == nwg3, "dasLLAMA vulkan tier: fused batch pair region mismatch")
+        let nwg2 = fill_batch_meta(s2, addr<int64 const?>(g_xf_boffs2[0]), nb, m.nfe, m.n, 0l, rows, true)
+        var raw = g_gpu.xf_cmds[j]
+        let r0 = int64(j) * m.cap
+        record_xf_expert_cmd(raw, s1, s3, s2, nwg1, nwg2, rows, m.n, m.nfe, m.nk, m.npos, r0, r0 + rows, nb, m.is_gelu, m.pushed == 0l) $(craw : VkCommandBuffer) {
+            if (!m.xfer) {
+                for (r in range64(r_lo, r_hi)) {
+                    xf_push_copy(craw, r, base)
+                }
+            }
+        }
+        g_gpu.pend_wait = max(g_gpu.pend_wait, sig)   //! the chain waits its own copy: the values ascend, so the max is this bundle's
+        g_gpu.xf_vals[j] = submit_signal(raw)
+        if (ring) {
+            xf_land_done(r_lo, r_hi, g_gpu.xf_vals[j])
+        }
+    }
+    m.pushed++
+    m.experts += nb
+    return true
+}
+
+//! MoeGpuFfnXfCloseFn's streamed form: the accumulator's copy-out queued behind the pushed chains; a window that pushed nothing leaves the join to answer zero rows
+[arch(at="../ARCHITECTURE_GPU_VULKAN_STREAM.md#streamed-layer-split")]
+def vk_moe_ffn_xf_close_experts {
+    assert(g_xfm.on, "dasLLAMA vulkan tier: per-expert chain close with no window open")
+    var m & = unsafe(g_xfm)
+    if (m.pushed > 0l) {
+        let j = int(m.pushed % int64(XF_RING))
+        if (g_gpu.xf_vals[j] > 0ul) {
+            cmp_wait(g_gpu.xf_vals[j])
+        }
+        var raw = g_gpu.xf_cmds[j]
+        record_xf_close_cmd(raw, m.n, m.npos)
+        g_gpu.xf_vals[j] = submit_signal(raw)
+        g_gpu.xf_last = g_gpu.xf_vals[j]
+    } else {
+        g_gpu.xf_last = 0ul
+    }
+    g_gpu.stacks[m.s1].batch_meta_at = 0
+    g_gpu.stacks[m.s3].batch_meta_at = 0
+    g_gpu.stacks[m.s2].batch_meta_at = 0
+    g_gpu.stacks[m.p1].batch_meta_at = 0
+    g_gpu.stacks[m.p3].batch_meta_at = 0
+    g_gpu.stacks[m.p2].batch_meta_at = 0
+    g_xf_pending = true
+    g_xf_per_expert = true
+    g_xf_empty = m.pushed == 0l
+    g_xf_pend_bytes = m.npos * m.n * 4l
+    if (vk_prof()) {
+        to_log(LOG_INFO, "vk_xf_experts g{m.g} {m.experts} of {m.nregions} experts in {m.pushed} bundles, {m.nk} rows, {m.exp_bytes * m.experts / 1000000l} MB queued in {get_time_usec(m.t0)} us\n")   // nolint:PERF026,PERF028,LINT019 — vk_prof()-gated report leg
+    }
+    m.on = false
+}
+
+//! the end of the bundle starting at region `r_lo` of the opened window: as many regions as XF_BUNDLE and the chunk cap admit, at least one
+def vk_moe_ffn_xf_bundle_end(r_lo, r_max : int64) : int64 {
+    var r_hi = r_lo + 1l
+    while (r_hi < r_max && xf_bundle_rows(r_lo, r_hi + 1l) >= 0l) {
+        r_hi++
+    }
+    return r_hi
+}
+
+//! MoeGpuFfnXfBeginFn's streamed form: the whole head at once - open, every bundle pushed in turn, close; the join collects
+def vk_moe_ffn_xf_begin_experts(g : int; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xp : float const?; wp : float const?; invp : uint const?; n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
+    vk_moe_ffn_xf_open_experts(g, offs1, offs3, offs2, nregions, xp, wp, invp, n, nfe, nrows, npos, f1, f3, f2, is_gelu)
+    var r = 0l
+    while (r < nregions) {
+        let r_hi = vk_moe_ffn_xf_bundle_end(r, nregions)
+        verify(vk_moe_ffn_xf_push_experts(r, r_hi, true), "vk expert chain: a waited push always queues")
+        r = r_hi
+    }
+    vk_moe_ffn_xf_close_experts()
 }

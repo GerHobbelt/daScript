@@ -107,6 +107,7 @@ def cmd_copy_planes(raw; var h; devs; host; sizes; bits : uint) {
 [unused_argument(elem)]
 def staged(mapped : void?; byte_off : int64; n : int; elem : auto(TT)) : array<TT -const> {
     var a : array<TT -const>
+    a |> reserve(n)   //! a whole-window o plane passes the unreserved-growth guard
     a |> resize(n)
     unsafe {
         memcpy(addr<void?>(a[0]), reinterpret<void?>(intptr(mapped) + uint64(byte_off)), int64(n) * int64(typeinfo sizeof(type<TT>)))
@@ -393,6 +394,13 @@ def f16_gemm_walk(xf, recs : array<uint>; nrec, n, d, blkw : int; var y : array<
         }
         return acc
     }
+}
+
+//! f32 rows x f16 GEMM oracle (the staged KHR tile over a file's f32 rows): a block is four f32 bit patterns, each weight
+//! rounded to f16 as the tile's stage rounds it
+def f32f16_gemm_oracle(wq : array<uint>; _wsu : array<uint>; xf : array<uint>;
+                       recs : array<uint>; nrec, n, d : int; var y : array<float>) {
+    f16_gemm_walk(xf, recs, nrec, n, d, 4, y) $(sb, e : int) : float => float(float16(uint_bits_to_float(wq[sb * 4 + e])))
 }
 
 //! Q4_K x f16 GEMM oracle (the cm2 k4 tile's shape): per weight d*sc*q - dmin*mn off the repacked planes

@@ -37,7 +37,7 @@ let ATTN_CHUNK_ROWS = 64l
 // ones the chunked pair — DASLLAMA_METAL_ATTN_SINGLE overrides for A/B (64 measured better than
 // 128 in the 65-128 band: occupancy beats the comb overhead)
 var g_attn_single_max = 64l
-// the fused add+rms kernel's threadgroup row slab — wider models take the unfused pair
+// the threadgroup row slab of the residual step (its columns past the slab re-read) and of the gemma-4 MoE step (dim caps at it)
 let ADD_RMS_MAX_DIM = 4096l
 
 var g_dev : MetalDevice?
@@ -181,6 +181,10 @@ var g_pso_geglu_side : MetalComputePipeline?   //!< the geglu over a position-ma
 var g_pso_ple_proj_bf16 : MetalComputePipeline?   //!< the per-layer-embedding projection off its native-BF16 rows
 var g_pso_ple_proj_bf16_one : MetalComputePipeline?   //!< ... its decode column's stamp
 var g_pso_ple_finish : MetalComputePipeline?   //!< the per-layer-embedding pre-step's rms + combine, in place
+var g_pso_ple_proj_bf16_hw : MetalComputePipeline?       //!< ... a halfword a lane, for an odd dim or base
+var g_pso_ple_proj_bf16_hw_one : MetalComputePipeline?   //!< ... its decode column's stamp
+var g_pso_f32_rows_one : MetalComputePipeline?   //!< the f32 rows' GEMV a lane an element: a dim off the float4 lattice, one column a row
+var g_pso_f32_rows_b : MetalComputePipeline?     //!< ... its position-blocked stamp
 var g_pso_geglu_hx : MetalComputePipeline?    // dual-store stamp
 // ===== tower primitives (compiled in the tower driver's init) =====
 var g_pso_ln : MetalComputePipeline?
@@ -202,6 +206,7 @@ var g_pso_wdec_attn_part : MetalComputePipeline?  // the chunked online-softmax 
 var g_pso_wdec_attn_comb : MetalComputePipeline?  // the log-sum-exp chunk merge
 var g_pso_bias_add_res : MetalComputePipeline?   // whisper decode: bias + residual add
 var g_pso_cls_epi : MetalComputePipeline?   //! the classifier epilogue (`MetalClsEpilogue`): the final softcap, the suppressed ids
+var g_pso_cls_select : MetalComputePipeline?   //! the classifier tail's selection (`MetalClsSelect`): a sampled stream's survivors, max, denominator and recent logits
 var g_one : MetalBuffer?                    // persistent 1.0f — the rms oscale default bind
 var g_zero : MetalBuffer?                   // persistent 0u — the sink/hass identity bind
 var g_pso_attn16 : MetalComputePipeline?
@@ -593,9 +598,9 @@ def arena_free_slice(off : uint64; size : uint64) {
     }
 }
 
-//! The KV-mirror cap in MiB: the arena's growth bound for every session together (64 at least, the device's largest buffer at
-//! most; a live session's own slice past it still gets room) AND the raw resident-bytes target idle mirrors evict down to (a
-//! tiny value is a legitimate evict-aggressively policy). Negative restores the env default (`DASLLAMA_METAL_KV_MIRROR_MB`).
+//! The KV-mirror cap in MiB: the raw resident-bytes target idle mirrors evict down to (a tiny value is a legitimate
+//! evict-aggressively policy); a live step's demand is bounded by the device's largest buffer alone, never by the cap.
+//! Negative restores the env default (`DASLLAMA_METAL_KV_MIRROR_MB`).
 def public set_metal_decode_mirror_cap_mb(v : int) {
     g_mirror_cap_mb = v
 }
@@ -632,11 +637,11 @@ struct DeclineCounter {
 }
 
 [cold_path]   // the decline leg IS the fall-off-the-GPU path; its bookkeeping is not hot
-def note_decline(var c : DeclineCounter; kind, why : string; policy : bool = false) {
+def note_decline(var c : DeclineCounter; kind, why : string; policy : bool = false; words : string = "") {
     c.total++
     c.by_reason[why]++
     if (!policy) {
-        require_or_panic(kind, why)
+        require_or_panic(kind, empty(words) ? why : words)
     }
 }
 
@@ -650,8 +655,8 @@ def note_decline(var c : DeclineCounter; kind, why : string; missing : MetalNeed
 }
 
 [cold_path]
-def decline(why : MetalDecodeDecline) {
-    note_decline(g_decode_declines, "decode", "{why}")
+def decline(why : MetalDecodeDecline; words : string = "") {   //! words: the site and member a plane-format decline names (`metal_fmt_decline_say`)
+    note_decline(g_decode_declines, "decode", "{why}", words = words)
 }
 
 [cold_path]
@@ -660,8 +665,8 @@ def decline(why : MetalDecodeDecline; missing : MetalNeed) {
 }
 
 [cold_path]
-def batch_decline(why : MetalDecodeDecline) {
-    note_decline(g_batch_declines, "batch decode", "{why}")
+def batch_decline(why : MetalDecodeDecline; words : string = "") {
+    note_decline(g_batch_declines, "batch decode", "{why}", words = words)
 }
 
 [cold_path]
@@ -919,7 +924,7 @@ def mirror_release(var mr : KVMirror) {
 //! re-initializes on the next served step; all mirrors rebuild from the CPU caches on demand.
 
 
-// ===== the residency pin (the mechanism + figures: ARCHITECTURE_RUNTIME.md 2.12) =====
+// ===== the residency pin (the mechanism + figures: ARCHITECTURE_RUNTIME.md, the post-CPU-burn GPU ramp section) =====
 // The first submission after a CPU-only window repays the per-commit residency pass over the
 // resident bytes; a committed+requested MTLResidencySet keeps it a no-op.
 var private g_rset : MetalResidencySet?
@@ -968,7 +973,7 @@ def residency_flush {
     if (g_env_metal.heartbeat_s > 0) {
         // keep-alive kick: a requested set still un-wires over a long CPU-only window, and the
         // next submission repays the whole tracked-set pass — the background re-request keeps
-        // the pages wired for heartbeat_s after the last served step (ARCHITECTURE_RUNTIME.md 2.12)
+        // the pages wired for heartbeat_s after the last served step (ARCHITECTURE_RUNTIME.md, the post-CPU-burn GPU ramp section)
         metal_residency_set_heartbeat(g_rset, g_env_metal.heartbeat_s)
     }
 }
@@ -1464,17 +1469,50 @@ def private mirror_slice_shape(t : Model; s : Session; needed : int64) : tuple<c
             vbytes = uint64(cap * kv_row_bytes(s.kv_dtype_v, m.flat_total) + kv_row_bytes(s.kv_dtype_v, m.ring_total)))
 }
 
-//! the device's largest buffer - the arena is one buffer, so neither a slice nor the arena grows past it
-def private mirror_device_max_bytes : uint64 => g_dev != null ? metal_max_buffer_length(g_dev) : 0xFFFFFFFFFFFFFFFFul
+var private g_mirror_device_max_probe = 0ul   //! a test's stand-in for the device's largest buffer; 0 = the device's
 
-[arch(at="../ARCHITECTURE_GPU_PREFILL_WINDOW.md#kv-mirror-arena")]
-def private mirror_ceiling_bytes : uint64 {
-    let ceil_mb = uint64(max(g_mirror_cap_mb >= 0 ? g_mirror_cap_mb : g_mirror_cap_env, 64))
-    return min(ceil_mb * 1024ul * 1024ul, mirror_device_max_bytes())
+//! the device's largest buffer - the arena is one buffer, so neither a slice nor the arena grows past it
+def private mirror_device_max_bytes : uint64 {
+    return g_mirror_device_max_probe if (g_mirror_device_max_probe != 0ul)
+    return g_dev != null ? metal_max_buffer_length(g_dev) : 0xFFFFFFFFFFFFFFFFul
 }
 
+//! a test's stand-in for the device's largest buffer (`bytes`; 0 reads the device's again): the refusal leg's seam
+def public set_metal_mirror_device_max_probe_(bytes : uint64) {
+    g_mirror_device_max_probe = bytes
+}
+
+//! whether the device-bound refusal has been said since the mirrors' last reset
+def public metal_mirror_refusal_said : bool => g_mirror_refusal_said
+
+var private g_mirror_refusal_said = false   //! the device-bound refusal is logged once a model (the mirrors' reset clears it)
+
+[cold_path]   // the refusal leg alone
+def private mirror_refusal_say(total, ceil_bytes : uint64) {
+    g_mirror_refusal_said = true
+    to_log(LOG_WARNING, "dasLLAMA metal decode: a step's K/V mirror demand of {total >> 20ul} MiB passes the device's largest buffer ({ceil_bytes >> 20ul} MiB) - the step takes the CPU rails\n")
+}
+
+//! the one-row prepare's refusal with nothing left to evict: a batch step's pinned rows (the batch driver's `mirror_reserve`
+//! pre-grows for that case, silently), else a slice past the device's largest buffer or an arena already at it - the live
+//! mirrors and the slice pass the device bound, said once
+def private prepare_refused(kbytes, vbytes, ceil_bytes : uint64) : bool {
+    return true if (!empty(g_pin))
+    return false if (g_arena_bytes < ceil_bytes && kbytes + vbytes <= ceil_bytes)
+    mirror_fits_device(kbytes + vbytes > ceil_bytes ? kbytes + vbytes : g_mirror_bytes + kbytes + vbytes)
+    return true
+}
+
+//! a live demand of `total` bytes against the one bound the arena has - the device's largest buffer; false logs why once
 [arch(at="../ARCHITECTURE_GPU_PREFILL_WINDOW.md#kv-mirror-arena")]
-def private mirror_ceiling_for(slice_bytes : uint64) : uint64 => clamp(slice_bytes, mirror_ceiling_bytes(), mirror_device_max_bytes())
+def private mirror_fits_device(total : uint64) : bool {
+    let ceil_bytes = mirror_device_max_bytes()
+    return true if (total <= ceil_bytes)
+    if (!g_mirror_refusal_said) {
+        mirror_refusal_say(total, ceil_bytes)
+    }
+    return false
+}
 
 [arch(at="../ARCHITECTURE_GPU_PREFILL_WINDOW.md#kv-mirror-arena")]
 def mirror_in_reach(dt : KVDtype; end : uint64) : bool => end / uint64(kv_block_codec(dt) ? 1l : kv_row_bytes(dt, 1l)) <= 0xFFFFFFFFul
@@ -1496,6 +1534,7 @@ def private arena_rebuild(want : uint64; ceil_bytes : uint64) {
     }
     delete g_mirrors
     g_mirror_bytes = 0ul
+    g_mirror_refusal_said = false
     metal_release(g_arena)
     g_arena_bytes = min(want, ceil_bytes)
     g_arena = metal_new_buffer(g_dev, g_arena_bytes)
@@ -1520,9 +1559,10 @@ def mirror_arena_demand(t : Model; s : Session; pos : int64) : uint64 {
 
 //! grow the arena until it can hold `total` bytes of slices, `largest` the biggest of them - the batch driver reserves its whole
 //! step's demand through this before pinning any row (growth is a release-all rebuild, forbidden under pins); false = past the ceiling
+[unused_argument(largest)]
 def mirror_reserve(total, largest : uint64) : bool {
-    let ceil_bytes = mirror_ceiling_for(largest)
-    if (total > ceil_bytes) {
+    let ceil_bytes = mirror_device_max_bytes()
+    if (!mirror_fits_device(total)) {
         return false
     }
     if (g_arena == null) {
@@ -1549,10 +1589,10 @@ def mirror_reserve(total, largest : uint64) : bool {
 // release-all rebuild sized for `total` — the batch driver's fragmentation fallback when the
 // per-session prepares can't pack a step that DOES fit capacity-wise (exact-fit demand around
 // older residents can strand contiguity). Callers unpin first; false = past the ceiling.
-[cold_path]   // arena defrag = the occasional rebuild leg
+[cold_path, unused_argument(largest)]   // arena defrag = the occasional rebuild leg
 def mirror_defrag(total, largest : uint64) : bool {
-    let ceil_bytes = mirror_ceiling_for(largest)
-    if (total > ceil_bytes || !empty(g_pin) || g_arena == null) {
+    let ceil_bytes = mirror_device_max_bytes()
+    if (!mirror_fits_device(total) || !empty(g_pin) || g_arena == null) {
         return false
     }
     arena_rebuild(max(g_arena_bytes, total), ceil_bytes)
@@ -1607,8 +1647,13 @@ def public get_metal_mirror_adopt() : bool => g_mirror_adopt
 //! Lifetime rows copied from a host KV cache into a mirror - what adoption and the mirror-fed prefill leave out.
 def public metal_mirror_uploaded_rows : int64 => g_mirror_uploaded_rows
 
-//! The rows a session of `row_bytes` a row fits in the arena at its ceiling - one slice holds both planes.
-def private mirror_rows_within_ceiling(row_bytes : int64) : int64 => int64(mirror_ceiling_bytes()) / max(row_bytes, 1l)
+//! The rows a session of `row_bytes` a row fits in the arena at its one bound, the device's largest buffer - one slice holds both
+//! planes; before a device is up nothing bounds them
+def private mirror_rows_within_ceiling(row_bytes : int64) : int64 {
+    let bound = mirror_device_max_bytes()
+    return int64(0x7FFFFFFFFFFFFFFFul) if (bound == 0xFFFFFFFFFFFFFFFFul)
+    return int64(bound) / max(row_bytes, 1l)
+}
 
 [init]
 def private mirror_orphan_register {
@@ -1717,13 +1762,13 @@ def mirror_prepare_rows(t : Model; var s : Session; pos, needed : int64) : tuple
         }
     }
     if (!key_exists(g_mirrors, s.uid)) {
-        //! the arena grows on demand to the ceiling - room for this slice where the slice alone passes the cap; growth releases
-        //! every mirror and rebuilds (re-mirror cost only) and never runs while pins are held
+        //! the arena grows on demand to the device's largest buffer - the cap bounds what idle mirrors keep, never a live slice;
+        //! growth releases every mirror and rebuilds (re-mirror cost only) and never runs while pins are held
         let shp = mirror_slice_shape(t, s, needed)
         let cap = shp.cap
         let kbytes = shp.kbytes
         let vbytes = shp.vbytes
-        let ceil_bytes = mirror_ceiling_for(kbytes + vbytes)
+        let ceil_bytes = mirror_device_max_bytes()
         if (g_arena == null) {
             g_arena_bytes = min(256ul * 1024ul * 1024ul, ceil_bytes)
             g_arena = metal_new_buffer(g_dev, g_arena_bytes)
@@ -1734,9 +1779,7 @@ def mirror_prepare_rows(t : Model; var s : Session; pos, needed : int64) : tuple
         while (off < 0l) {   // arena full — evict LRU until the slice fits (or nothing evictable)
             let victim = lru_victim(g_mirrors, s.uid, true)
             if (victim == 0ul) {
-                // nothing left to evict — grow toward the ceiling, unless a batch step holds
-                // pinned rows (the batch driver's mirror_reserve pre-grows for that case)
-                if (!empty(g_pin) || g_arena_bytes >= ceil_bytes || kbytes + vbytes > ceil_bytes) {
+                if (prepare_refused(kbytes, vbytes, ceil_bytes)) {   // nothing left to evict: grow toward the ceiling, or refuse
                     return (ok = false, koff = 0ul, voff = 0ul, cap = 0l)
                 }
                 arena_rebuild(max(g_arena_bytes * 2ul, kbytes + vbytes), ceil_bytes)
@@ -1750,8 +1793,7 @@ def mirror_prepare_rows(t : Model; var s : Session; pos, needed : int64) : tuple
             koff = uint64(off), voff = uint64(off) + kbytes, bytes = kbytes + vbytes, layout = mirror_layout_key_of(t))
         g_mirror_bytes += mr.bytes
         g_mirrors[s.uid] = mr
-        // the evict target honors the RAW knob (a tiny cap is legitimate idle-eviction policy —
-        // the LRU churn tests rely on it); only the arena GROWTH ceiling carries the 64MB floor
+        // the evict target honors the RAW knob (a tiny cap is legitimate idle-eviction policy - the LRU churn tests rely on it)
         let cap_mb = uint64(g_mirror_cap_mb >= 0 ? g_mirror_cap_mb : g_mirror_cap_env)
         mirror_evict_to_cap(cap_mb * 1024ul * 1024ul, s.uid)
     }
@@ -2006,25 +2048,33 @@ def dn_mirror_evict_now(uid : uint64) {
     }
 }
 
+def private dn_span_copy(var host : array<float>; var dev : uint8?; to_host : bool) {
+    return if (empty(host))
+    unsafe {
+        if (to_host) {
+            memcpy(addr<void?>(host[0]), reinterpret<void?>(dev), long_length(host) * 4l)
+        } else {
+            memcpy(reinterpret<void?>(dev), addr<void?>(host[0]), long_length(host) * 4l)
+        }
+    }
+}
+
+//! The recurrent state, conv history and n-gram ring host arrays against their device copies at `state_dev`, `conv_dev`
+//! and `ring_dev`: device to host under `to_host`, host to device otherwise; an empty array copies nothing.
+def dn_spans_copy(var state, conv, ring : array<float>; var state_dev, conv_dev, ring_dev : uint8?; to_host : bool) {
+    dn_span_copy(state, state_dev, to_host)
+    dn_span_copy(conv, conv_dev, to_host)
+    dn_span_copy(ring, ring_dev, to_host)
+}
+
 //! The session's host state and conv arrays against the mirror's region `region`, and the n-gram ring against
 //! its one copy past the regions: mirror to host under `to_host`, host to mirror otherwise.
 def private dn_mirror_copy(var s : Session; mr : DnMirror; region : int64; to_host : bool) {
+    var dev = dn_slot_dev(mr)
     let base = uint64(region) * mr.region_bytes
     unsafe {
-        var dev = dn_slot_dev(mr)
-        var spans = fixed_array(
-            (host = addr<void?>(s.dn_state[0]), dev = reinterpret<void?>(dev + base), bytes = long_length(s.dn_state) * 4l),
-            (host = addr<void?>(s.dn_conv_state[0]), dev = reinterpret<void?>(dev + base + mr.conv_off), bytes = long_length(s.dn_conv_state) * 4l),
-            (host = empty(s.ple_conv_hist) ? null : addr<void?>(s.ple_conv_hist[0]),
-                dev = reinterpret<void?>(dev + mr.region_bytes * uint64(mr.regions)), bytes = long_length(s.ple_conv_hist) * 4l))
-        for (sp in spans) {
-            continue if (sp.bytes == 0l)
-            if (to_host) {
-                memcpy(sp.host, sp.dev, sp.bytes)
-            } else {
-                memcpy(sp.dev, sp.host, sp.bytes)
-            }
-        }
+        dn_spans_copy(s.dn_state, s.dn_conv_state, s.ple_conv_hist, dev + base, dev + base + mr.conv_off,
+            dev + mr.region_bytes * uint64(mr.regions), to_host)
     }
 }
 
@@ -2151,6 +2201,13 @@ def dn_mirror_advance(uid : uint64; pos : int64) {
     if (key_exists(g_dn_mirrors, uid)) {
         let p0 = g_dn_mirrors[uid].pos
         g_dn_mirrors[uid].pos = max(p0, pos + 1l)
+    }
+}
+
+//! the live region's position moved with no flip: a reject's replay rewrote the live region in place for a shorter accept
+def dn_mirror_set_pos(uid : uint64; pos : int64) {
+    if (key_exists(g_dn_mirrors, uid)) {
+        g_dn_mirrors[uid].pos = pos
     }
 }
 
@@ -3013,7 +3070,7 @@ def register_reload_prep(f : function<void>) {
 
 //! A Metal driver's forward answer, passed through: a served one (`ok`) puts the pool on the GPU-served spin
 //! window, where it stays until the next weights load. Workers spinning the CPU window through a GPU window burn a core each.
-[arch(at="../ARCHITECTURE_RUNTIME.md#browser-workers-spin")]
+[arch(at="../ARCHITECTURE_RUNTIME_JOBQUE.md#browser-workers-spin")]
 def metal_served(ok : bool) : bool {
     if (ok && !get_dispatch_gpu_served()) {
         set_dispatch_gpu_served(true)
@@ -3098,6 +3155,7 @@ def metal_common_release {
     g_dn_pool_slots = 0l
     g_dn_slot_bytes = 0ul
     g_mirror_bytes = 0ul
+    g_mirror_refusal_said = false
     if (g_arena != null) {
         metal_release(g_arena)
         g_arena = null
@@ -3132,8 +3190,8 @@ def metal_common_release {
 var g_prefill_declines : DeclineCounter
 
 [cold_path]
-def decline(why : MetalPrefillDecline) {
-    note_decline(g_prefill_declines, "prefill", "{why}", policy = why == MetalPrefillDecline.npos_window)
+def decline(why : MetalPrefillDecline; words : string = "") {
+    note_decline(g_prefill_declines, "prefill", "{why}", policy = why == MetalPrefillDecline.npos_window, words = words)
 }
 
 [cold_path]

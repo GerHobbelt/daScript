@@ -206,7 +206,7 @@ def private pf_enc_kv_feed(enc : MetalComputeEncoder?; dt : KVDtype; bk, bv : Me
     if (dt == KVDtype.tq4) {
         enc_kv_rows_tq4(enc, bk, soff, bv, soff, g_arena, mkoff, g_arena, g_arena, mvoff, g_arena, signs_buffer(), ka, 2l * (kvd / hs), rows, hs)
     } else {
-        enc_kv_rows_q8(enc, bk, soff, bv, soff, g_arena, mkoff, g_arena, g_arena, mvoff, g_arena, ka, 2l * rows * (kvd / 32l))
+        enc_kv_rows_q8(enc, bk, soff, bv, soff, g_arena, mkoff, g_arena, g_arena, mvoff, g_arena, ka, 2l * rows * kvd)   // a lane an element
     }
 }
 
@@ -3786,11 +3786,11 @@ class template MetalAttnQKDevT {
     }
 }
 
-[metal_dispatch(name = "enc_qk_dev_c", pso = "g_pf_pso_qk_dev", tg = 128, grid = "mp/32, nk64/64, heads", params = "mp : int64, nk64 : int64, heads : int64", requires = "mp % 32, nk64 % 64")]
+[metal_dispatch(name = "enc_qk_dev_c", pso = "g_pf_pso_qk_dev", tg = 128, grid = "mp/32, nk64/64, heads", params = "mp : int64, nk64 : int64, heads : int64", requires = "mp % 32, nk64 % 64, ka.ring % 64")]
 class MetalAttnQKDev : MetalAttnQKDevT {
 }
 
-[metal_dispatch(name = "enc_qk_dev128_c", pso = "g_pf_pso_qk_dev128", tg = 128, grid = "mp/128, nk64/64, heads", params = "mp : int64, nk64 : int64, heads : int64", requires = "mp % 128, nk64 % 64")]
+[metal_dispatch(name = "enc_qk_dev128_c", pso = "g_pf_pso_qk_dev128", tg = 128, grid = "mp/128, nk64/64, heads", params = "mp : int64, nk64 : int64, heads : int64", requires = "mp % 128, nk64 % 64, ka.ring % 64")]
 class MetalAttnQKDev128 : MetalAttnQKDevT {
     override MT = 128u
 }
@@ -7112,7 +7112,16 @@ def enc_av_mm(enc : MetalComputeEncoder?; batt, bv, bxb : MetalBuffer?; var ka :
 //! Batched f32-slab GEMV on MetalMoeRouterB's builder: d rows per position, y[p*d + row].
 def private pf_enc_slab_gemv_b(enc : MetalComputeEncoder?; bw, bx, by : MetalBuffer?; n, d, npos : int64) {
     var ka = moe_router_args(d, n, npos)
-    enc_moe_router_b(enc, bw, bx, by, g_one, ka, d, npos)
+    enc_f32_rows_gemv(enc, bw, bx, by, g_one, ka, d, npos, true)
+}
+
+//! the window's rows through the file's f32 rows at `off` in fblob (`n` in, `d` out): the f32 tile (`MetalF32ExactMm`), else the
+//! slab GEMV
+def private pf_enc_f32_rows(enc : MetalComputeEncoder?; t : Model; off, n, d : int64; bx, by, bk, bn : MetalBuffer?; mp, npos : int64) {
+    var bw = upload_region(unsafe(addr<void?>(t.fblob[off])), uint64(n * d * 4l))
+    if (!pf_enc_router_mm(enc, bw, bx, by, bk, bn, d, n, mp)) {
+        pf_enc_slab_gemv_b(enc, bw, bx, by, n, d, npos)
+    }
 }
 
 //! the window's rows through layer l's per-layer-embedding gate (dim -> ple), or with `proj` its projection (ple -> dim), in the
@@ -7124,10 +7133,7 @@ def private pf_enc_ple_site(enc : MetalComputeEncoder?; t : Model; l : int64; pr
         pf_enc_site_mm(enc, t, pp.f, pp.off, pp.d, bx, by, bk, bn, mp, pp.n, npos, bxh)
         return
     }
-    var bw = upload_region(unsafe(addr<void?>(t.fblob[pp.off])), uint64(pp.n * pp.d * 4l))
-    if (!pf_enc_router_mm(enc, bw, bx, by, bk, bn, pp.d, pp.n, mp)) {
-        pf_enc_slab_gemv_b(enc, bw, bx, by, pp.n, pp.d, npos)
-    }
+    pf_enc_f32_rows(enc, t, pp.off, pp.n, pp.d, bx, by, bk, bn, mp, npos)
 }
 
 
@@ -7135,27 +7141,43 @@ def private pf_enc_ple_site(enc : MetalComputeEncoder?; t : Model; l : int64; pr
 //! one-row GEMV takes
 def private pf_narrow_ple_ok(t : Model; l : int64; proj : bool) : bool {
     let pp = ple_plane(t, l, proj)
-    return pp.f32 || kq_fmt_one_row_gemv(pp.f, proj ? t.config.n_embd_per_layer : t.config.dim)
+    return pp.f32 || kq_fmt_one_row_gemv(pp.f, pp.n)
 }
 
 //! layer l's per-layer gate (dim -> ple) or projection (ple -> dim) over the narrowed last row at row 0 of `bx` (`pf_narrow_ple_ok`)
 def private pf_enc_narrow_ple(enc : MetalComputeEncoder?; t : Model; l : int64; proj : bool; bx, by, bk, bn : MetalBuffer?) {
-    let c = t.config
-    let n = proj ? c.n_embd_per_layer : c.dim
-    let d = proj ? c.dim : c.n_embd_per_layer
     let pp = ple_plane(t, l, proj)
     if (!pp.f32) {
-        pf_enc_narrow_gemv(enc, t, pp.f, pp.off, bx, by, bk, bn, n, d)
+        pf_enc_narrow_gemv(enc, t, pp.f, pp.off, bx, by, bk, bn, pp.n, pp.d)
         return
     }
-    var bw = upload_region(unsafe(addr<void?>(t.fblob[pp.off])), uint64(n * d * 4l))
-    pf_enc_slab_gemv_b(enc, bw, bx, by, n, d, 1l)
+    var bw = upload_region(unsafe(addr<void?>(t.fblob[pp.off])), uint64(pp.n * pp.d * 4l))
+    pf_enc_slab_gemv_b(enc, bw, bx, by, pp.n, pp.d, 1l)
+}
+
+//! the bf16 tile GEMM (`pf_enc_bf16_mm`) steps a K of `kdim` in its 32-element chunks and its `nd` output rows in 64-row tiles;
+//! a projection off that grid rides the position-blocked bf16 GEMV
+def pf_bf16_tile_ok(kdim, nd : int64) : bool => kdim % 32l == 0l && nd % 64l == 0l
+
+//! the window's form for the E-series pre-step's projection
+enum PfPleProjForm {
+    bf16_tile   //! the file's bf16 rows on the tile GEMM (`pf_enc_bf16_mm`)
+    bf16_gemv   //! the bf16 rows off the tile's grid, on the position-blocked GEMV (`enc_ple_proj_bf16_rows`)
+    f32_rows    //! the file's f32 rows (`pf_enc_f32_rows`)
+}
+
+//! the form the window projects `t`'s embedded rows into its side rows on: the bf16 tile where the model dim and layers x ple sit
+//! on its grid (`pf_bf16_tile_ok`), else the bf16 GEMV; the f32 rows where the file holds the projection in f32
+def pf_ple_proj_form(t : Model) : PfPleProjForm {
+    return PfPleProjForm.f32_rows if (!t.ple_model_bf16)
+    let tile = pf_bf16_tile_ok(t.config.dim, t.config.n_layers * t.config.n_embd_per_layer)
+    return tile ? PfPleProjForm.bf16_tile : PfPleProjForm.bf16_gemv
 }
 
 //! true iff THIS window's metal prefill will engage AND the pre-step kernels cover the model
 [unused_argument(s, start_pos)]
 def private metal_ple_pre_gpu_gate(t : Model; s : Session; npos, start_pos : int64) : bool {
-    if (active_prefill_override() != "metal" || !metal_ple_dev_ok(t) || (t.config.n_layers * t.config.n_embd_per_layer) % 64l != 0l
+    if (active_prefill_override() != "metal" || !metal_ple_dev_said("prefill", t)
             || prefill_decline_caps(t, npos) != MetalPrefillDecline.none) {
         return false
     }
@@ -7253,10 +7275,9 @@ def private pf_hc_head(enc : MetalComputeEncoder?; t : Model; h : PfHc; bxf : Me
     enc_hc_mix(enc, h.bxn, h.bgate, bxf, hc_mix_args(c, 1l), c.dim)
 }
 
-//! The n-gram side input over the window before layer ple_layer's attention mixer: the key/value GEMMs off the gathered heads,
-//! then the decode's gate and conv (`enc_ple_side_rows`, the GEMMs a shape split against the step's GEMVs), then the window's
-//! last rows into the ring (one slot each) for the rows after it
-def private pf_ple_side(enc : MetalComputeEncoder?; t : Model; h : PfHc; p : PfPle; u_dim : MetalBuffer?; start_pos : int64; bring : MetalBuffer?; ring_base : uint64) {
+//! the n-gram side input over the window before layer ple_layer's mixer: the key/value GEMMs, gate and conv, each capture's ring into the arena, then the window's last rows into the ring
+def private pf_ple_side(enc : MetalComputeEncoder?; t : Model; h : PfHc; p : PfPle; u_dim : MetalBuffer?; start_pos : int64; bring : MetalBuffer?; ring_base : uint64;
+                        caps : array<DnSnapshot>; bcap : MetalBuffer?; cap_bytes, cap_ring_off : int64) {
     let c = t.config
     let hcd = hc_dim(c)
     let ind = ple_in_dim(c)
@@ -7270,9 +7291,38 @@ def private pf_ple_side(enc : MetalComputeEncoder?; t : Model; h : PfHc; p : PfP
     }
     if (g_pf_skip != "ew" && g_pf_skip != "nongemm") {
         enc_ple_side_rows(enc, t, h.bhc, 0ul, p.bkey, 0ul, p.bval, 0ul, p.bgated, 0ul, p.bcin, 0ul, bring, ring_base, start_pos, h.npos, true)
+        for (cap, ci in caps, count()) {
+            let r = cap.pos - start_pos
+            let cbase = uint64(int64(ci) * cap_bytes + cap_ring_off)
+            cap_ring_rows(r, rows, start_pos) $(rr, slot : int64; from_window : bool) {
+                let soff = uint64(slot * hcd * 4l)
+                if (from_window) {
+                    enc_copy_row(enc, p.bcin, uint64(rr * hcd * 4l), bcap, cbase + soff, h.u_hcd, hcd)
+                } else {
+                    enc_copy_row(enc, bring, ring_base + soff, bcap, cbase + soff, h.u_hcd, hcd)
+                }
+            }
+        }
         for (r in range64(max(0l, h.npos - rows), h.npos)) {
             enc_copy_row(enc, p.bcin, uint64(r * hcd * 4l), bring, ring_base + uint64(((start_pos + r) % rows) * hcd * 4l), h.u_hcd, hcd)
         }
+    }
+}
+
+def private dn_captures_from_arena(var segs : array<PfSeg>; bcap : MetalBuffer?; cap_bytes : int64) {
+    var capi = 0l
+    for (sg in segs) {
+        var ss & = unsafe(*sg.s)
+        let sb = uint64(long_length(ss.dn_state) * 4l)
+        let cb = uint64(long_length(ss.dn_conv_state) * 4l)
+        for (cap in ss.dn_captures) {
+            unsafe {
+                var base = reinterpret<uint8?>(contents_at(bcap, uint64(capi * cap_bytes)))
+                dn_spans_copy(cap.state, cap.conv, cap.ple_hist, base, base + sb, base + sb + cb, true)
+            }
+            capi++
+        }
+        ss.dn_captured = !empty(ss.dn_captures)
     }
 }
 
@@ -7411,7 +7461,7 @@ def metal_prefill_window(t : Model; var segs : array<PfSeg>) : bool {   // nolin
         if (why == MetalPrefillDecline.feature) {
             decline(why, metal_missing_needs(t, PF_NEEDS_OK))
         } else {
-            decline(why)
+            decline(why, metal_fmt_decline_say("prefill", why, t))
         }
         return false
     }
@@ -7434,18 +7484,41 @@ def metal_prefill_window(t : Model; var segs : array<PfSeg>) : bool {   // nolin
     let dn = c.recr_mask != 0ul
     var dn_tab : tuple<buf : MetalBuffer?; bytes : uint64>
     var dn_npmax = 0l
+    var bcap : MetalBuffer? = null
+    var bytes_cap = 0ul
+    var cap_bytes = 0l
     if (dn) {
         dn_mirror_room(nseg)
         dn_grp_clear()
+        var ncap = 0l
+        for (sg in segs) {
+            ncap += long_length(sg.s.dn_captures)
+        }
+        cap_bytes = (long_length(segs[0].s.dn_state) + long_length(segs[0].s.dn_conv_state) + long_length(segs[0].s.ple_conv_hist)) * 4l
+        if (ncap > 0l) {
+            bytes_cap = uint64(ncap * cap_bytes)
+            bcap = pool_acquire_untracked(g_upool, g_dev, bytes_cap)
+        }
+        var capi = 0l
         for (sg in segs) {
             var dm = dn_mirror_prepare(*sg.s, sg.start_pos)
             if (!dm.ok) {
                 decline(MetalPrefillDecline.dn_state)
                 return false
             }
-            dn_grp_push(sg.row0, sg.npos, dm.state_off, dm.state_off, dm.conv_off, dm.conv_off)
+            let nc = long_length(sg.s.dn_captures)
+            dn_grp_push(sg.row0, sg.npos, dm.state_off, dm.state_off, dm.conv_off, dm.conv_off, nc, DN_GRP_WORDS * nseg + DN_CAP_WORDS * capi)
+            capi += nc
             dn_npmax = max(dn_npmax, sg.npos)
             sg.ple_ring_base = dm.ple_off
+        }
+        capi = 0l
+        for (sg in segs) {
+            for (cap in sg.s.dn_captures) {
+                let base = uint64(capi * cap_bytes)
+                dn_grp_cap(cap.pos - sg.start_pos, base, base + uint64(long_length(sg.s.dn_state) * 4l))
+                capi++
+            }
         }
         dn_tab = dn_grp_upload()
     }
@@ -7965,19 +8038,20 @@ def metal_prefill_window(t : Model; var segs : array<PfSeg>) : bool {   // nolin
             }
             if (l == 0l && ple_gpu) {
                 //! the serial encoder orders the three PLE stages: gather -> model_proj GEMM -> rms+combine
-                var pka = ple_fin_args(ple_n, dim, c.norm_eps)
-                enc_embed_table(enc, t, t.ple_emb_fmt, t.ple_emb_off, ple_all, sqrt(float(ple_n)), bple_tok, 0ul, bple, 0ul, npos, u_ple_all, u_ple_sq)
-                if (t.ple_model_bf16) {
-                    let bwp = plane_of(g_dev, t, t.bf16blob, t.ple_model_off)
-                    pf_enc_bf16_mm(enc, bwp.buf, bwp.boff, bx, bple_proj, u_dim, u_ple_all, mp, ple_all, pf_cvt_panel(enc, bx, mp, dim, g_pf_skip == "act_cvt"), dim)
-                } else {   //! the file's f32 rows on the f32 tile, else the slab GEMV
-                    var bwp = upload_region(unsafe(addr < void? >(t.fblob[t.ple_model_off])), uint64(ple_all * dim * 4l))
-                    if (!pf_enc_router_mm(enc, bwp, bx, bple_proj, u_dim, u_ple_all, ple_all, dim, mp)) {
-                        pf_enc_slab_gemv_b(enc, bwp, bx, bple_proj, dim, ple_all, npos)
+                enc_ple_pre(enc, t, bple_tok, 0ul, bple, bple_proj, u_ple_all, u_ple_sq, npos) $ {
+                    let form = pf_ple_proj_form(t)
+                    if (form == PfPleProjForm.bf16_tile) {
+                        let bwp = plane_of(g_dev, t, t.bf16blob, t.ple_model_off)
+                        pf_enc_bf16_mm(enc, bwp.buf, bwp.boff, bx, bple_proj, u_dim, u_ple_all, mp, ple_all, pf_cvt_panel(enc, bx, mp, dim, g_pf_skip == "act_cvt"), dim)
+                    } elif (form == PfPleProjForm.bf16_gemv) {
+                        let bwp = plane_of(g_dev, t, t.bf16blob, t.ple_model_off)
+                        var ka = moe_router_args(ple_all, dim, npos)
+                        ka.woff = uint(bwp.boff / 2ul)
+                        enc_ple_proj_bf16_rows(enc, bwp.buf, bx, bple_proj, ka, ple_all, npos, true)
+                    } else {
+                        pf_enc_f32_rows(enc, t, t.ple_model_off, dim, ple_all, bx, bple_proj, u_dim, u_ple_all, mp, npos)
                     }
                 }
-                var bw_pn = upload_region(unsafe(addr < void? >(t.fblob[t.ple_pnorm_off])), uint64(ple_n * 4l))
-                enc_ple_finish(enc, bple_proj, bw_pn, bple, pka, c.n_layers * npos)
                 s.ple_gpu_pending = false
             }
             if (warm && l == c.n_layers) {
@@ -8035,7 +8109,8 @@ def metal_prefill_window(t : Model; var segs : array<PfSeg>) : bool {   // nolin
                 var bxh_x : MetalBuffer?
                 if (hcs.on) {   //! the side input at its layer, then the attention site's mixer opens the layer into bxb
                     if (pls.on && l == c.ple_layer) {
-                        pf_ple_side(enc, t, hcs, pls, u_dim, segs[0].start_pos, dn_pool_buffer(), segs[0].ple_ring_base)
+                        pf_ple_side(enc, t, hcs, pls, u_dim, segs[0].start_pos, dn_pool_buffer(), segs[0].ple_ring_base,
+                            segs[0].s.dn_captures, bcap, cap_bytes, (long_length(segs[0].s.dn_state) + long_length(segs[0].s.dn_conv_state)) * 4l)
                     }
                     pf_hc_mix_site(enc, t, hcs, l, false, bxb, hcs.binj_a)
                 } elif (g_pf_skip != "ew" && g_pf_skip != "nongemm") {
@@ -8064,7 +8139,7 @@ def metal_prefill_window(t : Model; var segs : array<PfSeg>) : bool {   // nolin
                     }
                     if (g_pf_skip != "attn" && g_pf_skip != "dn" && g_pf_skip != "nongemm") {
                         let d = DnStages(qkv = bdnqkv, cv = bdncv, cvh = bdncvh, b = bdnb, g = bdng, o = bdno, z = bdnz,
-                            grp = dn_tab.buf, ng = nseg, npmax = dn_npmax, rows = npos)
+                            grp = dn_tab.buf, capb = bcap, ng = nseg, npmax = dn_npmax, rows = npos)
                         enc_dn_front(enc, t, l, dnli, d)
                         if (bdncvh != null) {
                             //! the walk reads halves: the conv rows convert once, the gates prepare once
@@ -8755,6 +8830,9 @@ def metal_prefill_window(t : Model; var segs : array<PfSeg>) : bool {   // nolin
             for (sg in segs) {
                 dn_mirror_advance(sg.s.uid, sg.start_pos + sg.npos - 1l)
             }
+            if (bcap != null) {
+                dn_captures_from_arena(segs, bcap, cap_bytes)
+            }
         }
         let ts_rb = ref_time_ticks()
         for (sg, i in segs, count()) {
@@ -8852,6 +8930,9 @@ def metal_prefill_window(t : Model; var segs : array<PfSeg>) : bool {   // nolin
         pool_release(g_pf_upool, u_dn_di, 4ul)
         pool_release(g_pf_upool, u_dn_nvh, 4ul)
         pool_release(g_upool, dn_tab.buf, dn_tab.bytes)
+        if (bcap != null) {
+            pool_release(g_upool, bcap, bytes_cap)
+        }
     }
     if (c.q_gated) {
         pool_release(g_pf_pool, bdnqg, bytes_dn_qg)

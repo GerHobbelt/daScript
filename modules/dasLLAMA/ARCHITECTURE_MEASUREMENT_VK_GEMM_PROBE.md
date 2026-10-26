@@ -63,7 +63,14 @@ of 128 experts, 4096 bucket rows) at the gate/up shape (d 768, K 2048) and the d
 2048, K 768), dispatched to the bound the device schedule sizes with its sentinel tail, both
 decode arms interleaved as `cm2:<fmt>` runs them. `moe:` gives every expert 32 rows - the
 reference harness's uniform profile - and `moesk:` takes the 30B window's own skew (69 experts
-route, nine holding the large buckets, eight at 96 rows, four at 48, the rest at 18). Each
+route, nine holding the large buckets, eight at 96 rows, four at 48, the rest at 18). `moefn:<fmt>`
+is the 512-expert carrier's row: the gate/up shape (d 640, K 2560) and the down shape (d 2560, K
+640) over a 3000-row prompt's 30000 bucket rows, the buckets skewed as the routed-pick trace of
+Qwen3.8-Flash-Next reads at its median layer (479 of 512 experts touched; the touched experts'
+rows by rank decile 643, 148, 102, 73, 50, 38, 24, 16, 9, 4, 1) - the per-layer expert pass a
+layer-major prompt would run on the device, which the three stamps' figures sum to; a per-32
+format (the carrier's `iq4nl32` down stacks) runs the whole-bucket form alone, its one cm2 stamp
+being the s column. Each
 profile runs two schedule forms and their alternates in one process: the whole buckets at the s
 column, and the ladder, where a bucket past 32 rows takes whole 128-row columns on the e stamp
 with the last one partial and a remainder of at most 32 rows past them takes the s column; the
@@ -123,6 +130,29 @@ flush row is the split-k reduce copying a 128 MB plane between two dispatches of
 the next dispatch finds its code, descriptors and planes out of every cache - the weight a
 window chain streams between two uses of one stamp; the flush writes the feed's region, so the
 stamp after it waits on the flush and the next flush waits on the stamp.
+
+Two arms race the KHR staged tile (`ARCHITECTURE_GPU_VULKAN_KHR.md#khr-mm-kq-tile`) against what a
+cm2 card serves in its place, each form whole over the same planes, sixteen dispatches over two
+alternating outputs, the arms in turn inside each round. `kqst:<fmt>` puts a K-quant format's cm2
+l, m and s stamps, on the decode arm the device runs, beside the staged tile at gemma-4 E2B's role
+shapes (dim 1536, the FFN pair at 6144 and the doubled 12288, q 2048, a kv or gate plane of 256,
+the projection over K 256) and the 4B's FFN pair, at 512 rows, the gate again at 500 (the
+partial-tile store), through `race_arms` and `sweep_best_us` - the arms in turn inside each of four
+timed rounds after one untimed round, each arm's row its best round; the
+cm2 l stamp is its alternate. `plef32` puts the scalar f32 tile
+(`DnBaGemm`) beside the staged tile over the same f32 words at the per-layer-embedding gate and
+projection shapes of the E2B and the E4B, at 512 rows and the E2B's again at 300, through the same
+two helpers;
+then its one-at-a-time rows hold one output and one hazard rail - the latency the window's
+dependent chain pays the role - over the scalar tile, the staged tile whole, and the staged tile
+over two to eight 256-aligned k chunks chained into the split-k reduce. `narrow:<fmt>` runs a
+K-quant format's l, m and s stamps at the widths the tile pick's narrow rule decides - 256, 512
+and 640 wide, which the rule gives s at 512 rows on 82 SMs, and 768, the first it leaves to the
+wave model - over K 1536 at 512 and 300 rows, overlapped and one dispatch at a time; the m stamp
+is its alternate. The scalar tile is its
+alternate. Every shape of both arms is a compute-bound GEMM over a plane the L2 holds, which the
+window's per-layer planes are not; the served window's `ple_gate` and `ple_proj` stamps
+(`DASLLAMA_GPU_PROF=1`, `PERF_LEDGER.md`) are the production reading.
 
 `harness/vk_gk_rows_probe.das`, the row kernels' Vulkan ruler, holds one output and one hazard rail
 across each row's 64 dispatches, so each row reads a dependent decode chain's per-hop latency: the

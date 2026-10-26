@@ -169,7 +169,7 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
        [--asr <asr.bin>] [--asr-workers 2] [--mmproj <mmproj.gguf>] [--image-mmproj <mmproj.gguf>] \
        [--audio-mmproj <mmproj.gguf>] \
        [--ctx 4096] [--streams 4] [--chunk 512] [--chunk-idle 2048] [--page-rows 64] [--prefix N] \
-       [--prefix-states 256] [--prefix-state-mb 0] [--tune]
+       [--prefix-states N] [--prefix-state-mb 0] [--tune]
 
 .. list-table::
    :header-rows: 1
@@ -299,7 +299,7 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
    * - ``--chunk-idle``
      -
      - *backend*
-     - Prefill quantum in tokens while no stream is decoding (never under ``--chunk``): nothing waits on the tick, so the window can be wide. Default: 2048 on Metal, 512 on the other backends
+     - Prefill quantum in tokens while no stream is decoding (never under ``--chunk``): nothing waits on the tick, so the window can be wide. Default: on a GPU the wider of 2048 and the driver's prompt window, 512 on the CPU
    * - ``--page-rows``
      -
      - ``64``
@@ -310,8 +310,8 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
      - Prefix-cache retention cap in pages (auto: one full context per stream; ``-1`` = unbounded)
    * - ``--prefix-states``
      -
-     - ``256``
-     - Recurrent models (the Qwen3.5/3.6/3.8 hybrids) cache whole checkpoints instead of pages: the most a slot keeps (``0`` = none; config key ``prefix_states``); the byte budget binds first. Every request leaves one at its opening's shared head (the system text or the tool block, whichever its template writes first), one at its opening with the tools, one where its last message starts, one where it ends (ahead of the generation prompt), one at its finished turn; a conversation's own stops are dropped before shared openings
+     - *auto*
+     - Recurrent models (the Qwen3.5/3.6/3.8 hybrids) cache whole checkpoints instead of pages: the most a slot keeps (``0`` = none; ``-1``, or unset, = the byte budget's count; config key ``prefix_states``). Unset, the count is the byte budget over the model's recurrent state, 256 at least and 1024 at most: the budget binds under the cap, the cap once the budget would hold more. Every request leaves one at its opening's shared head (the system text or the tool block, whichever its template writes first), one at its opening with the tools, one where its last message starts, one where it ends (ahead of the generation prompt), one at its finished turn; a conversation's own stops are dropped before shared openings
    * - ``--prefix-state-mb``
      -
      - *auto*
@@ -325,7 +325,11 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
    * - ``--mtp``
      -
      - *off*
-     - MTP/NextN self-speculative decode. Unset, a slot leaves it off, except one that runs one stream (``streams = 1``) on a GPU the model's catalog row lists under ``serve_mtp`` (``modules/dasLLAMA/performance/model_specs.das``: the platforms, ``metal`` or ``vulkan``, where that model's self-speculation measured a win) --- Metal, or the whole model resident on a Vulkan device with its routed experts on the card. A model with no catalog row, a model whose row lists another platform, several streams, the CPU, and a MoE whose routed experts the resident driver sums on the host all decode plain: on the CPU the round's second verify row costs a second decode step, at several streams the plain batched step is faster, and on a MoE at one stream the draft overhead can cost more than the accepted rows buy. A drafting Vulkan slot (``--gpu vulkan``) keeps its streams' caches on the card (device-home) where the whole-model driver runs the draft head, its verify and a rejected round's rollback on the device; where any of them stays on the host (the load log names which), the slot serves host-cached sessions. ``true`` / ``false`` set it outright. It needs a model with an in-file NextN head (the ``-MTP-`` GGUFs), or an assistant drafter GGUF beside the model file (gemma-4: ``mtp-<stem>-Q8_0.gguf``, ``<stem>`` the file name before its quant token, an unsloth ``-UD`` tag dropped; the catalog's gemma-4 26B card fetches it with ``"tower": "drafter"``), which the load attaches on Metal or on the Vulkan resident driver and which drafts at the box's ``runtime.mtp_depth_assistant`` depth; on any other model the server logs one line and serves plain. Greedy requests are output-invariant; a sampled request draws each verify row with its own sampler and keeps the plain sampled distribution, at a lower acceptance rate. ``/v1/stats`` reports ``mtp_drafted`` / ``mtp_accepted``. A constrained reply (``response_format``, a forced ``tool_choice``) decodes plain.
+     - MTP/NextN self-speculative decode. Unset, a slot leaves it off, except one that runs one stream (``streams = 1``) on a GPU the model's catalog row lists under ``serve_mtp`` (``modules/dasLLAMA/performance/model_specs.das``: the platforms, ``metal`` or ``vulkan``, where that model's self-speculation measured a win) --- Metal, or the whole model resident on a Vulkan device. A model with no catalog row, a model whose row lists another platform, several streams and the CPU decode plain: on the CPU the round's second verify row costs a second decode step, at several streams the plain batched step is faster. A MoE whose routed experts the resident driver sums on the host arms too, at the box's NextN depth (1), where the round measured 1.07-1.22x. A drafting Vulkan slot (``--gpu vulkan``) keeps its streams' caches on the card (device-home) where the whole-model driver runs the draft head, its verify and a rejected round's rollback on the device; where any of them stays on the host (the load log names which), the slot serves host-cached sessions. ``true`` / ``false`` set it outright. It needs a model with an in-file NextN head (the ``-MTP-`` GGUFs), or an assistant drafter GGUF beside the model file (gemma-4: ``mtp-<stem>-Q8_0.gguf``, ``<stem>`` the file name before its quant token, an unsloth ``-UD`` tag dropped; the catalog's gemma-4 26B card fetches it with ``"tower": "drafter"``), which the load attaches on Metal or on the Vulkan resident driver and which drafts at the box's ``runtime.mtp_depth_assistant`` depth; on any other model the server logs one line and serves plain. Greedy requests are output-invariant; a sampled request draws each verify row with its own sampler and keeps the plain sampled distribution, at a lower acceptance rate. ``/v1/stats`` reports ``mtp_drafted`` / ``mtp_accepted``. A constrained reply (``response_format``, a forced ``tool_choice``) decodes plain.
+   * - ``--mtp-accept``
+     -
+     - *engine*
+     - The sampled speculative round's acceptance, process-wide: ``rejection`` (the engine's default --- each draft accepted with the probability the verify row gives it over the drafter's recorded q, a rejected draft replaced by one draw over the residual), ``typical`` (a draft accepted wherever the sampler's own cuts admit it on its row, the first cut draft replaced by one draw over the survivors) or ``exact`` (sample-and-match: a draft accepted only where the row's seeded draw lands on it). A greedy stream is unchanged. Unset keeps the engine's default.
    * - ``--rope-scaling``
      -
      - *file*

@@ -1,16 +1,21 @@
 # dasLLAMA tests - Kernel Cells Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-docs: `../ARCHITECTURE_GPU.md` for a `[vk_dispatch]` or `[metal_dispatch]` kernel,
-`../ARCHITECTURE_CPU_KERNELS.md` for a CPU kernel in `../dasllama/dasllama_math*.das`. Planned
-work: `../followup_general.md`, `../followup_vulkan.md`, `../followup_metal.md`.
+docs: `../ARCHITECTURE_GPU.md`, `../ARCHITECTURE_CPU_KERNELS.md`. Planned work:
+`../followup_general.md`, `../followup_vulkan.md`, `../followup_metal.md`.
 
 A cell is one `t |> run` subtest, or a `[test]` function that runs no subtest; a helper's asserts
 belong to every cell that calls it. A CPU kernel is a function that writes an output buffer from
-operand buffers; one that answers a size, a block or a layout is not. To loosen an assert is to let
+operand buffers; one that answers a size, a block or a layout is not. A CPU oracle is the same
+computation written in plain code in this checklist's folder - a cell, or a `_*.das` helper
+module here; it may widen a quantized operand through a `../dasllama/` function that widens a
+quantized block to floats, and calls no other `../dasllama/` function - a kernel under
+`../dasllama/` is never one. A sentinel is a value the kernel cannot write from the cell's own
+inputs - a NaN where every input is finite, or a fixed bit pattern no finite input yields; a
+zero-filled or newly allocated buffer is not one. To loosen an assert is to let
 pass an input the old assert failed. A kernel-unit cell is a cell in which a `[metal_dispatch]` or
 `[vk_dispatch]` class is dispatched, or a CPU kernel in `../dasllama/dasllama_math*.das` is called,
-by a statement in test code - the cell itself, or a helper in its own file or in a `_*.das`
+by a statement in test code outside a CPU oracle - the cell itself, or a helper in its own file or in a `_*.das`
 test-helper module - itself or through a router, a `../dasllama/` function whose only job is to
 pick which compiled form (stamp) of the dispatched class or the CPU kernel runs; a kernel run
 inside any other `../dasllama/` function does not make a cell a kernel-unit cell. A kernel run is a
@@ -18,22 +23,24 @@ dispatch or a CPU kernel call. A gate is any call site that supplies a kernel's 
 fills its kargs (kernel-argument) struct itself, other than a serving call in `../dasllama/` the
 kernel exists for - a cell, a probe, a harness. A stamp is a `[vk_dispatch]` or
 `[metal_dispatch]` class that compiles to its own shader module - a class no other class derives
-from; every rule here treats each stamp as its own class. A CPU oracle is the same computation
-written in plain code and run on the CPU. A path of a class is each branch a value read from the
+from; every rule here treats each stamp as its own class. A path of a class is each branch a value read from the
 kargs or from any bound buffer selects, and each trip-count regime of each loop whose bound such a
 value sets - the regimes read against the loop's stride: zero, under one stride, a whole number of
 strides, and past a whole number of strides (the tail). A branch or loop inside a function the
 class's methods call, other than a method of the class, is not a path of the class - covering it
 is the job of that function's cells. A branch or regime is a path only where a serving call in
-`../dasllama/` can reach it on some model the engine serves. A bound assert is an assert whose pass
+`../dasllama/` can reach it on some shape that call does not decline, whether or not any model file
+the box holds has that shape. A bound assert is an assert whose pass
 means two sides agree or a figure is good enough - a difference between two computed sides, a
 rate, an error, or a count the run decides, within a nonzero tolerance or past a floor or ceiling;
 a guard that keeps a later index or compare well-defined (a length past the index it reads) is not
 one, a counter asserted to show a route ran is not one, and an assert a rule of this list requires
 to show a compare can fail - the in-place cell's output-differs-from-input assert among them - is
-not a bound assert, and is not the control a bound assert needs. A sibling stamp is another stamp derived from the same class; it
-stands in for a stamp only where the code a rule asks about is the class's own and neither stamp
-overrides it. A control is an extra assert
+not a bound assert, and is not the control a bound assert needs. A sibling stamp is another stamp
+derived from the same class; it stands in for a stamp only where the code a rule asks about is the
+class's own, neither stamp overrides it - overriding a template constant that code reads overrides
+it - both stamps are in the same home (Metal or Vulkan), and the sibling's cell compiles once the
+diff is applied. A control is an extra assert
 in the same cell proving a compare can fail - a poisoned input, or a poisoned expectation (the
 expected value with a known amount added), that must land outside the bar, a mechanism unhooked
 whose result must miss, or a second, independent computation the result must agree with; a cell's
@@ -62,19 +69,21 @@ kernel-unit cell that dispatches it at that workgroup size, or whose dispatch co
 expression computes, in the same change.**
 
 **A kernel-unit cell's compare of kernel output against its reference logs, whether it passes or
-fails, the largest difference it measured with that element's row and column; an exact compare - a
-scan asserting that a region still holds its sentinel is one - logs its mismatch count and first
-mismatching index instead.** A failure, or a pass that looks wrong, must say how far and where, not
+fails, the largest difference it measured with that element's row and column, or, for an output
+with one value per row (a max, a denominator), the largest difference and its row; an exact
+compare - a sentinel scan, a per-row flag - logs its mismatch count and first mismatching index
+(for a per-row output, its row) instead.** A failure, or a pass that looks wrong, must say how far and where, not
 only how many.
 
 **A kernel-unit cell with a kernel run whose output no CPU-oracle compare covers at that run's
-shapes is a defect: the compare sits in that cell, or - where the cell compares two kernel forms
-against each other - in a cell of the same file that dispatches one of those two forms at the same
+shapes - every size its dispatch grid or a loop bound reads, the row count included - is a
+defect: the compare sits in that cell, or - where the cell compares two kernel forms against each
+other - in a cell of the same file that dispatches one of those two forms at the same
 shapes.** Two forms can be bit-equal and both wrong.
 
 **A diff that changes an existing `[vk_dispatch]` or `[metal_dispatch]` class's branch
 selection - a branch added, or a predicate widened or narrowed, so that a different set of kargs
-values, or of sentinel values in a bound buffer, reaches a path - ships a kernel-unit cell that
+values, or of marker values a bound buffer holds, reaches a path - ships a kernel-unit cell that
 dispatches that class at a value the change moved onto or off that path, or names the existing
 cell that already does.** A sibling stamp's cell counts. At every value the change left where it
 was the kernel computes what it did before, so a cell that dispatches only those values passes
@@ -84,8 +93,9 @@ whether the change is right or wrong.
 an existing field means, so that a stamp reads or writes different elements, ships for each such
 stamp a kernel-unit cell that dispatches it, or a sibling stamp, with the field at a value a serving
 call in `../dasllama/` can pass and at which the elements read or written differ from the ones
-before the change.** At the value where nothing moved, a cell passes whether the new indexing is
-right or wrong.
+before the change - for an added field, never 0 and never the value a serving call that does not
+use the field passes.** At the value where nothing moved, a cell passes whether the new indexing
+is right or wrong.
 
 **A diff that adds a `[vk_dispatch]` or `[metal_dispatch]` class ships a kernel-unit cell that
 dispatches it on every path its body has.** A path no cell reaches is one a merge can drop and
@@ -104,19 +114,21 @@ sides, or the operands exact by construction, the oracle's result is the kernel'
 construction; an exact compare of indices or schedule words against a CPU oracle is not a
 bit-identity assert.
 
-**A kernel-unit cell whose output buffer is its input buffer asserts, at a known index, that the
-output differs from the input or that its reference - its CPU oracle, or the second kernel form
-it compares against - differs from that input by more than the compare's bar.** An in-place kernel
-that never ran leaves the input, which can wrongly satisfy a tolerant compare.
+**A kernel-unit cell whose output buffer is its input buffer, and whose compare passes within a
+nonzero tolerance, asserts, at a known index, that the output differs from the input or that its
+reference - its CPU oracle, or the second kernel form it compares against - differs from that
+input by more than that tolerance.** An in-place kernel that never ran leaves the input, which
+can wrongly satisfy a tolerant compare.
 
 **A diff that adds or loosens, in a kernel-unit cell, a bound assert ships a control for each such
 assert, in the same change.**
 
-**A size, depth, or row count that a kernel-unit cell's name, a comment inside the cell, or an
-assert's text claims, and that the cell passes as a literal argument to the kernel it dispatches
-or calls, is asserted in that cell by an assert on the count or by comparing every output element
-that count covers against the oracle.** A count the dispatch pads, clamps or derives from that
-literal gets its own assert.
+**A size, depth, row count or block offset that a kernel-unit cell's name, a comment inside the
+cell, or an assert's text claims, and that the cell passes as a literal argument to the kernel it dispatches
+or calls, is asserted in that cell - by an assert that a figure the run produces (the count it
+wrote, the offset it read or wrote at) equals that value, or by comparing against the oracle every
+output element the value sizes or places.** A count or offset the dispatch pads, clamps or derives from
+that literal gets its own assert.
 
 **A kernel-unit cell whose kernel computes at a narrower precision than its oracle at any
 step - operands, accumulator, or the stored result - bounds that step's error by construction

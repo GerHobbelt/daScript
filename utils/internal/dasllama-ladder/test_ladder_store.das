@@ -19,14 +19,25 @@ def private ident_a : BoxIdentity {
     return b
 }
 
+def private audio_cells(text : string) : array<AudioCell> {
+    var jerr = ""
+    var js = read_json(text, jerr)
+    var out : array<AudioCell>
+    if (js != null && js is _array) {
+        out <- [for (c in js as _array); AudioCell(test = c?["test"] ?? "", ms = c?["ms"] ?? 0.0lf, audio_s = c?["audio_s"] ?? -1.0lf, voided = c?["voided"] ?? false)]
+    }
+    delete_json(js)
+    return <- out
+}
+
 [test]
 def test_migration(t : T?) {
     t |> run("fresh db migrates to latest") @(t : T?) {
         with_latest_sqlite(":memory:") $(db) {
-            t |> equal(current_schema_version(db), 3)
+            t |> equal(current_schema_version(db), 6)
         }
     }
-    t |> run("migrations 2 and 3 backfill the cells of rows inserted before the columns existed") @(tt : T?) {
+    t |> run("migrations 2 to 6 backfill the cells of rows inserted before the columns existed") @(tt : T?) {
         with_sqlite(":memory:") $(db) {
             // a v1 store: the shipped first migration, stamped applied, with a submission and its
             // two run rows inserted in the v1 shape (no cell columns to fill)
@@ -42,10 +53,41 @@ def test_migration(t : T?) {
                         sid, ri, ri == 0 ? "das" : "llama.cpp")
                 }
             }
-            tt |> equal(migrate_to_latest(db), 2, "two pending migrations applied")
-            tt |> equal(current_schema_version(db), 3)
+            // an official asr/tts import in the v1 row shape: two models, three and two runs
+            db |> exec("INSERT INTO submissions (Id, Kind, DocSha, Doc, CreatedAt, ClientIp) VALUES (9, 'official', 'sha9', ?, 1000, 'importer')", audio_doc())
+            for (slot in [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)]) {
+                db |> exec("INSERT INTO runs (SubmissionId, ModelIdx, RunIdx, Gguf, Engine, Backend, Flavor, Box, Threads, RunDate, Source, CreatedAt) " +
+                    "VALUES (9, ?, ?, 'a.bin', 'das', 'cpu', 'tuned', 'm5', 6, '2026-09-23', 'official', 1000)",
+                    slot._0, slot._1)
+            }
+            // an official audio-chat import with a cold-start clip on its reference, in the v1 row shape
+            db |> exec("INSERT INTO submissions (Id, Kind, DocSha, Doc, CreatedAt, ClientIp) VALUES (10, 'official', 'sha10', ?, 1000, 'importer')", audio_outlier_doc())
+            for (ri in range(4)) {
+                db |> exec("INSERT INTO runs (SubmissionId, ModelIdx, RunIdx, Gguf, Engine, Backend, Flavor, Box, Threads, RunDate, Source, CreatedAt) " +
+                    "VALUES (10, 0, ?, 'o.gguf', 'das', 'cpu', 'tuned', 'm5', 8, '2026-10-21', 'official', 1000)", ri)
+            }
+            tt |> equal(migrate_to_latest(db), 5, "five pending migrations applied")
+            tt |> equal(current_schema_version(db), 6)
             let rows <- _sql(db |> select_from(type<Run>) |> _order_by(_.Id))
-            tt |> equal(length(rows), 4)
+            tt |> equal(length(rows), 13)
+            tt |> equal(rows[0].Audio, "", "an LLM run carries no audio cells")
+            let asr <- audio_cells(rows[4].Audio)
+            tt |> equal(length(asr), 2, "migration 4 fills the asr cells from the document")
+            tt |> equal(asr[0].test, "gb1.wav")
+            tt |> equal(asr[1].ms, 158.0lf)
+            tt |> success(!asr[0].voided && !asr[1].voided, "two rated clips void nothing")
+            let tts <- audio_cells(rows[7].Audio)
+            tt |> equal(length(tts), 2, "... and the tts cells")
+            tt |> equal(tts[1].audio_s, 4.0lf)
+            let cold <- audio_cells(rows[10].Audio)
+            tt |> equal(length(cold), 3, "migration 6 fills the reference's cells with the verdict")
+            tt |> equal(cold[0].test, "gb1.wav")
+            tt |> equal(cold[2].test, "jfk3.wav")
+            tt |> success(!cold[0].voided && !cold[2].voided, "the even clips stand")
+            tt |> equal(cold[1].test, "jfk.wav")
+            tt |> success(cold[1].voided, "the cold-start clip is voided off the das run's lengths")
+            tt |> success(!audio_cells(rows[9].Audio)[1].voided, "the das run's own jfk.wav is even")
+            tt |> equal(rows[4].Pp512, 0.0lf, "migration 2 leaves an audio run's LLM cells at 0")
             tt |> equal(rows[0].Pp512, 100.0lf)
             tt |> equal(rows[0].Tg128, 25.0lf)
             tt |> equal(rows[0].Tg128b4, 60.0lf, "the batched cell is filled by migration 3")
@@ -359,6 +401,113 @@ def test_official_import(t : T?) {
             let res = import_official_store(db, "not json", 4000l)
             tt |> success(!res.ok, "refused")
             tt |> success(!empty(res.error), "error named")
+        }
+    }
+}
+
+def private run_of(rows : array<Run>; engine, workload : string) : Run {
+    for (r in rows) {
+        return r if (r.Engine == engine && r.Workload == workload)
+    }
+    return Run()
+}
+
+[test]
+def test_audio_cells(t : T?) {
+    with_latest_sqlite(":memory:") $(db) {
+        t |> run("an official asr/tts import fills the audio cells") @(tt : T?) {
+            let res = import_official_store(db, audio_doc(), 1000l)
+            tt |> success(res.ok, "imported ({res.error})")
+            tt |> equal(res.runs_added, 5)
+            let rows <- list_runs(db, 0)
+            let das_asr <- audio_cells(run_of(rows, "das", "asr").Audio)
+            tt |> equal(length(das_asr), 2, "zero-ms, unprefixed and other-workload tests are not cells")
+            tt |> equal(das_asr[0].test, "gb1.wav", "sorted by test, the prefix stripped")
+            tt |> equal(das_asr[0].audio_s, 198.734375lf)
+            tt |> equal(das_asr[1].test, "jfk.wav")
+            tt |> equal(das_asr[1].audio_s, 11.0lf, "an integer audio_s reads as its number")
+            let ref_asr <- audio_cells(run_of(rows, "parakeet-cli", "asr").Audio)
+            tt |> equal(length(ref_asr), 1)
+            tt |> equal(ref_asr[0].ms, 159.5lf)
+            tt |> equal(ref_asr[0].audio_s, 0.0lf, "a run that did not record the audio length carries 0")
+            let mlx_asr = run_of(rows, "mlx-audio", "asr")
+            tt |> equal(mlx_asr.Backend, "metal", "an mlx engine row lands like any other engine")
+            tt |> equal(audio_cells(mlx_asr.Audio)[0].ms, 90.0lf)
+            let das_tts <- audio_cells(run_of(rows, "das", "tts").Audio)
+            tt |> equal(length(das_tts), 2, "tts cells key on the tts: prefix")
+            tt |> equal(das_tts[0].test, "s01")
+            tt |> equal(das_tts[0].audio_s, 2.5lf)
+            tt |> equal(length(audio_cells(run_of(rows, "mlx-audio", "tts").Audio)), 1)
+        }
+        t |> run("an audio-chat run's cells are its asr-keyed clips") @(tt : T?) {
+            let res = import_official_store(db, audio_chat_doc(), 1001l)
+            tt |> success(res.ok, "imported ({res.error})")
+            let rows <- list_runs(db, 0)
+            let das_chat <- audio_cells(run_of(rows, "das", "audio-chat").Audio)
+            tt |> equal(length(das_chat), 1, "the asr: clip is the cell, the tts: key is not")
+            tt |> equal(das_chat[0].test, "jfk.wav", "the asr: prefix stripped")
+            tt |> equal(das_chat[0].audio_s, 11.0lf)
+            tt |> equal(audio_cells(run_of(rows, "llama-mtmd-cli", "audio-chat").Audio)[0].ms, 900.0lf, "the reference's clip too")
+        }
+        t |> run("an LLM run carries no audio cells") @(tt : T?) {
+            import_official_store(db, official_doc(), 2000l)
+            for (r in list_runs(db, 0)) {
+                if (r.Workload == "") {
+                    tt |> equal(r.Audio, "")
+                }
+            }
+        }
+        t |> run("a community asr submission lands its cells under the stamped-das rule") @(tt : T?) {
+            var doc = %json~
+            [ { "gguf" : "ggml-parakeet-tdt-0.6b-v3-f32.bin", "runs" : [ {
+                "engine" : "das", "backend" : "cpu", "flavor" : "tuned", "workload" : "asr",
+                "box" : "b", "threads" : 8, "date" : "2026-10-21", "cmd" : "dasllama-bench --asr",
+                "sha" : "abc123def", "version" : "0.6.5", "dasllama_version" : 17,
+                "tune" : "k4q8_tile_gen=mr8 (manifest)", "tune_sha" : "cafe0123beef", "exec_fmt" : "f32",
+                "hardware" : { "cpu" : "x" },
+                "tests" : { "asr:jfk.wav" : { "ms" : 200.0, "audio_s" : 11 } }
+            } ] } ]
+            %%
+            let put = put_records(db, write_json(doc), "10.5.0.1", test_policy(), 3000l)
+            tt |> success(put.status == PutStatus.ok, "accepted ({put.error})")
+            let row = run_of(list_runs(db, 17), "das", "asr")
+            tt |> equal(row.Source, "community")
+            tt |> equal(audio_cells(row.Audio)[0].ms, 200.0lf, "the community row carries its cells")
+        }
+    }
+}
+
+// the audio cells of the outlier fixture's one run of an engine and backend
+def private omni_cells(rows : array<Run>; engine, backend : string) : array<AudioCell> {
+    for (r in rows) {
+        if (r.Gguf == "Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf" && r.Engine == engine && r.Backend == backend) {
+            return <- audio_cells(r.Audio)
+        }
+    }
+    return <- array<AudioCell>()
+}
+
+[test]
+def test_audio_cells_voided(t : T?) {
+    with_latest_sqlite(":memory:") $(db) {
+        t |> run("a cell past the outlier rule, or named by the run's void_clips, rides voided") @(tt : T?) {
+            let res = import_official_store(db, audio_outlier_doc(), 1002l)
+            tt |> success(res.ok, "imported ({res.error})")
+            let rows <- list_runs(db, 0)
+            let cold <- omni_cells(rows, "llama-mtmd-cli", "metal")
+            tt |> equal(length(cold), 3)
+            tt |> success(cold[1].test == "jfk.wav" && cold[1].voided, "3178 ms a second against a median of 36, rated over the das run's lengths")
+            tt |> success(!cold[0].voided && !cold[2].voided, "the reference's even clips stand")
+            tt |> equal(cold[1].audio_s, 0.0lf, "the borrowed length rates the cell and is not written onto it")
+            for (c in omni_cells(rows, "llama-mtmd-cli", "cpu")) {
+                tt |> success(!c.voided, "an even run voids nothing ({c.test})")
+            }
+            for (c in omni_cells(rows, "das", "metal")) {
+                tt |> success(!c.voided, "the das run is even ({c.test})")
+            }
+            let named <- omni_cells(rows, "llama-mtmd-cli", "vulkan")
+            tt |> success(named[0].test == "gb1.wav" && named[0].voided, "a clip the run's own void_clips names rides voided")
+            tt |> success(!named[1].voided && !named[2].voided, "... and its other clips stand")
         }
     }
 }

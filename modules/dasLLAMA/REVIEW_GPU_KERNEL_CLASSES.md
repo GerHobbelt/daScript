@@ -1,24 +1,32 @@
 # dasLLAMA GPU Kernel Class Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-doc: `ARCHITECTURE_GPU.md`. Planned work: `followup_metal.md`, `followup_vulkan.md`.
+doc: `ARCHITECTURE_GPU.md`. Planned work: the `followup_*.md` ledgers beside this file.
 
 Kernel twins are two classes with the same dispatch grid formula, the same mapping of threads to
 work and the same index and guard arithmetic, whose compiled bodies differ only in expressions,
 constants or unroll counts that one value selects: a template constant, a typedef, which base
 shell's method they inherit, or a run-time count of live entries inside a fixed extent (a column
-count, a row count). A base shell is the dispatch-less base class whose methods the emitter
-splices flat into each deriving class. A stamp is a kernel class that compiles to a shader module -
-standalone, a template instance or a base-shell derivative.
+count, a row count). A base shell is the dispatch-less base class whose methods the emitter splices
+flat into each deriving class. A stamp is a kernel class that compiles to a shader module -
+standalone, a template instance or a base-shell derivative. A census key is a kernel name
+`modules/dasLLAMA/tests/test_kernel_coverage.das` counts, that the engine's Metal or Vulkan driver
+compiles at any point of a run, and that the pre-change tree does not compile. A crown is a kernel family a box's tune sidecar enables. A lens is the `[metal_dispatch]` /
+`[vk_dispatch]` macro that generates a class's builder from its bindings; kargs is the
+kernel-argument struct a dispatch hands its kernel.
 
-**A kernel twin that binds a different kargs (kernel-argument struct) type than its sibling twin,
-or shifts a shared field to a different binding number, is a defect - even where one twin ignores
-that field; a field a `@template_gate` omits on one twin is a shared field still, and keeps the
-number the other twin binds it at.**
+**A kernel twin that binds a different kargs (kernel-argument struct) type than its sibling twin
+is a defect, even where one twin ignores a field of it.**
 
-**A bind path shared between the moe mul_mm tensor twins (`MetalMoeMulMmQ8T` / `MetalMoeMulMmMx4T`, the compact kargs
-slots) and their base classes (the family binding numbers) is a defect - the two layouts are ledgered apart
-(`ARCHITECTURE_GPU.md#gpu-backends`, the kernel-binding asymmetries entry).**
+**Kernel twins keep every `@binding` number they both declare; a field a `@template_gate` omits on
+one twin leaves a hole at its number and renumbers nothing.**
+
+**Two stamps whose `@binding` numbers or kargs field offsets differ never share a host function
+that binds by number - each binds through its own generated builder.**
+
+**A diff that makes the `@binding` numbers or kargs field offsets of two stamps of one class
+template or base shell differ ledgers the pair at `ARCHITECTURE_GPU.md#gpu-backends` in the same
+change.**
 
 **Kernel twins are written once: as stamps of one `class template`, as classes deriving one base
 shell, or - where the value that selects the difference is a run-time count - as one class whose
@@ -39,8 +47,9 @@ class as a `@template_constant` where the class's stamps differ on it, pass it a
 argument of the shared method the stamp's kernel calls, or write it as a literal or a module `let`
 in the body - never a module `var`.**
 
-**A stamp sets only `@template_constant`s its own compiled body reads: a `static_if` arm, a
-`@template_gate`, an expression, a loop bound, an array extent.** A constant
+**A stamp, or an intermediate template between a stamp and its class template or base shell, sets
+only `@template_constant`s that at least one stamp built from it reads in its compiled body: a
+`static_if` arm, a `@template_gate`, an expression, a loop bound, an array extent.** A constant
 no such site reads is a defect - move it to the template whose body reads it, or make the body
 read it. A read that sits only inside a `static_if` arm the stamp's own constants compile out is
 not a read.
@@ -71,28 +80,25 @@ shell they derive from, gives the class a `//!` line above its `[metal_dispatch]
 `[vk_dispatch]` declaration naming the body difference that keeps it out of that template or
 shell.**
 
-**A diff that makes a kernel class stamp or derive a template both homes stamp
-(`dasllama/dasllama_gpu_kernels_common.das`), which it did not before, gives the class a `//!`
-line above its declaration naming the template it joined.**
+**A diff that adds a kernel class stamping or deriving from - through an intermediate template
+too - a template both backends (Metal and Vulkan) stamp
+(`dasllama/dasllama_gpu_kernels_common.das`), or makes an existing class do so, gives the class a `//!` line above its own declaration naming
+that shared template itself, not the intermediate one.**
 
 **A diff that adds or changes a `[metal_dispatch]` / `[vk_dispatch]` binding that no site writes
 after arming - a binding filled before the first encode and never written again - puts
 `@role = "weight"` on a field at that binding.**
 
-**`@role = "weight"` on per-encode data the kernel reads - a pooled buffer the host refills
-each encode - is a defect, judged per stamp by the buffer its dispatch sites bind; a per-encode
-field either omits `@role` or names the access its body performs.** `weight` means never written
-during a step on either home: the Metal builder records no hazard for it and the Vulkan lens
-leaves its ordering to the bits a site passes by hand, so nothing orders the kernel's read after
-the encode that refilled the buffer; neither lens refuses a `weight` field the body only reads.
+**`@role = "weight"` on data written during a step - a pooled buffer the host refills each encode,
+or one another kernel rewrites - is a defect, judged per stamp by the buffer its dispatch sites
+bind; such a field either omits `@role` or names the access its body performs.** Neither lens
+orders a `weight` read after the write that refilled the buffer, and neither refuses the role on a
+field the body only reads.
 
-A new census key is a kernel name that `modules/dasLLAMA/tests/test_kernel_coverage.das` counts,
-that an init of the engine's Metal or Vulkan driver compiles at run time, and that the pre-change
-tree does not compile. A crown is a kernel family a box's tune sidecar enables.
-
-**A diff that adds a `[metal_dispatch]` or `[vk_dispatch]` class under `dasllama/` that no init of
-the engine's Metal or Vulkan driver compiles is a defect - the class moves under `benchmarks/`,
-into the bench that compiles it.**
+**A diff that adds a `[metal_dispatch]` or `[vk_dispatch]` class under `dasllama/` that the
+engine's Metal or Vulkan driver never compiles at any point of a run is a defect - the class
+moves into the file under `modules/dasLLAMA/benchmarks/` or `modules/dasLLAMA/tests/` that
+compiles it, and a class nothing compiles is deleted.**
 
 **A diff that adds a new census key a census row dispatches names, in the PR body, that row and
 its nonzero count for the key, read from a census run on the key's backend.**
@@ -124,7 +130,7 @@ an entry matches a compiled census key, and that it matches no dispatched one - 
 derives each field's access and generates the builder - makes at compile time, or any
 `test_lens_*` / `test_vkd_lens_*` cell that holds one, is a defect.**
 
-**Weakening any refusal the manual-dispatch census in `dasllama/dasllama_metal_lens.das` makes in a
+**Weakening any refusal the manual-dispatch check in `dasllama/dasllama_metal_lens.das` makes in a
 module whose name starts with `dasllama` and contains `metal` - a direct
 `metal_dispatch_threadgroups` call, an `@ssbo` field with no `@role`, a function binding
 `kn_kargs` on fewer paths than it calls `kn_dispatch` - is a defect; a module that adds
@@ -145,7 +151,7 @@ hazard range.
 
 **A diff that adds or changes an ordered argument list into a generated setter (the
 `set_*(bufs, sizes, gbits)` function a `[vk_dispatch]` class's family generates) gives it one
-entry per distinct `@binding` number the stamp keeps - the class and its base declare it and no
+entry per distinct `@binding` number the stamp keeps - the class or its base declares it and no
 template gate drops it for that stamp - in ascending order; fields sharing a binding share one
 entry, a number nothing keeps gets none.** The setter checks only how many arguments it got,
 never which field each position carries.
@@ -164,7 +170,8 @@ only host-side - by the `grid=` / `tg=` spec, a `requires=` item, or an `@span` 
 the device, so it does not count.
 
 **Never bind a scalar that a stamp's other bound scalars already determine by integer
-arithmetic - derive it in that stamp's body from them instead.** Binding an integer count
+arithmetic at every dispatch site of that stamp - derive it in the stamp's body from them
+instead.** Binding an integer count
 separately adds a second place to get it wrong.
 
 **A diff that adds or changes a kernel-class method whose returned value is used anywhere but

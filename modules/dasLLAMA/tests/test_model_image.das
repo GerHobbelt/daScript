@@ -37,6 +37,7 @@ require daslib/apply
 require daslib/fio
 require strings
 require daslib/strings_boost   // split - the mint child's /usr/bin/time lines
+require daslib/enum_trait   // the served-plane compare walks every KqFmt
 require math
 require dasllama/dasllama_audio_io
 require _model_tier
@@ -297,6 +298,41 @@ def test_image_table_slot_names(t : T?) {
 }
 
 [test]
+def test_tower_exact_lanes_are_config_free(t : T?) {
+    t |> run("a tower's exact lane keys one identity whatever CPU backend the process runs; its q8 lane follows the backend") @(t : T?) {
+        if (!arm_on(t, "mechanics")) {
+            return
+        }
+        var whole <- [for (n in kernel_backend_names()); n; where !kernel_backend_batch_only(n) && kernel_backend_available_(n)]
+        if (length(whole) < 2) {
+            t |> skip("this build registers one whole CPU backend - nothing to switch between")
+            return
+        }
+        let seat = kernel_backend_seat()
+        let exact <- ["whisper-f32", "parakeet-f32", "canary-f32", "gemma4a-f32", "gemma4v", "gemma3v", "gemma4uv"]
+        var first : table<string; string>
+        for (n in whole) {
+            pin_kernel_backend(n)
+            for (tag in exact) {
+                let id = image_identity(tag)
+                if (!key_exists(first, tag)) {
+                    first |> insert(tag, id)
+                } else {
+                    t |> equal(id, first?[tag] ?? "", "{tag}: the identity under '{n}' is the one under '{whole[0]}'")
+                }
+            }
+        }
+        pin_kernel_backend(whole[0])
+        let q8_first = image_identity("parakeet-q8")
+        pin_kernel_backend(whole[1])
+        t |> success(image_identity("parakeet-q8") != q8_first, "the control: the q8 lane's identity names the backend that repacks it ('{whole[0]}' against '{whole[1]}')")
+        restore_kernel_backend(seat)
+        delete first
+        delete whole
+    }
+}
+
+[test]
 def test_image_tmp_does_not_outlive_a_save(t : T?) {
     t |> run("a failed write removes the save's temp file; a temp file a killed writer left goes at the next save, a fresh one stays") @(t : T?) {
         if (!arm_on(t, "mechanics")) {
@@ -525,6 +561,7 @@ def test_image_mechanics(t : T?) {
         t |> equal(image_lane_name("a b|c/d"), "a-b-c-d", "a lane keeps letters, digits, _ and - alone")
         t |> equal(image_lane_name("", "fp32"), "{image_lane_name()}-fp32", "an off-q8 quant suffixes the lane")
         t |> equal(image_lane_name(METAL_IMAGE_TAG, "q8", true), "metal-mtp", "a split head riding the load suffixes the lane")
+        t |> equal(image_lane_name("vulkan", "q8", true, "D:/models/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"), "vulkan-mtp-Qwen3-8-Flash-Next-shared-Q8_0", "... with the head file's stem folded in, its mtp- prefix dropped and its dots sanitized, so two heads take two lanes")
         let prev_serve = get_iq3s_serve_pin()
         let prev_devw = metal_devw_panels()
         set_iq3s_serve_pin("auto")
@@ -761,7 +798,7 @@ def private forced_logits_maxd(tc, tg : Model; prompt, teach : array<int64>; tag
         eval_(tc, sa, prompt)
         eval_(tg, sb, prompt)
         for (a, b in sa.logits, sb.logits) {
-            maxd = max(maxd, abs(a - b))
+            maxd = max(maxd, nan_wide_diff(a, b))
         }
         for (tok in teach) {
             picks |> push(argmax_of(sb.logits))
@@ -770,7 +807,7 @@ def private forced_logits_maxd(tc, tg : Model; prompt, teach : array<int64>; tag
             eval_(tc, sa, one)
             eval_(tg, sb, one)
             for (a, b in sa.logits, sb.logits) {
-                maxd = max(maxd, abs(a - b))
+                maxd = max(maxd, nan_wide_diff(a, b))
             }
             delete one
         }
@@ -1008,6 +1045,71 @@ def private time_l_field(out, field : string) : int64 {
         }
     }
     return -1l
+}
+
+//! every served plane of `a` against `b`'s, by name: the q8 pair, the fp32 rows, the lattice table and the top-level pairs
+def private served_plane_mismatches(t : T?; a, b : Model) {
+    t |> equal(count_mismatch(a.qblob, b.qblob), 0l, "qblob")
+    t |> equal(count_mismatch(a.qscales, b.qscales), 0l, "qscales")
+    t |> equal(count_mismatch(a.qscales16, b.qscales16), 0l, "qscales16")
+    t |> equal(count_mismatch(a.fblob, b.fblob), 0l, "fblob")
+    for (f in type<KqFmt>) {
+        let fname = "{f}"
+        var bad_q, bad_s, n_q = 0l
+        kq_plane_pair(a, f) $(qa : array<uint8>; sa : array<uint8>) {
+            kq_plane_pair(b, f) $(qb : array<uint8>; sb : array<uint8>) {
+                bad_q = count_mismatch(qa, qb)
+                bad_s = count_mismatch(sa, sb)
+                n_q = long_length(qa)
+            }
+        }
+        t |> equal(bad_q, 0l, "the {fname} quant plane ({n_q} bytes)")
+        t |> equal(bad_s, 0l, "the {fname} scale plane")
+    }
+}
+
+//! The last row's logits of `m` over `ids`
+def private prompt_logits(m : Model; ids : array<int64>) : array<float> {
+    var s = make_run_state(m.config)
+    eval_(m, s, ids)
+    var out := s.logits
+    delete s
+    return <- out
+}
+
+//! A cold planar mint of a per-32 file streams its planes in the layout the eager load repacks them to: every served plane of
+//! the mapped image is the eager load's byte for byte, and the image's logits are the eager load's bit for bit
+def private b32_streamed_mint(t : T?; path : string) {
+    let img = image_path_for(path, "")
+    remove(img)
+    var tm <- load_model_cached(path, QuantMode.q8, [planar_only = true])
+    t |> success(tm.image_map != null && stat(img).is_valid, "the cold load mints the planar image and maps it")
+    var te <- load_model_(path, QuantMode.q8)
+    served_plane_mismatches(t, te, tm)
+    var ids <- encode(te, "The numbers from one to ten are: one, two, three,")
+    var le <- prompt_logits(te, ids)
+    var lm <- prompt_logits(tm, ids)
+    t |> equal(count_mismatch(le, lm), 0l, "the mapped image's logits are the eager load's")
+    delete lm
+    delete le
+    delete ids
+    delete te
+    delete tm
+    remove(img)
+}
+
+[test]
+def test_b32_streamed_mint(t : T?) {
+    for (file in ["Qwen2.5-0.5B-Instruct-Q4_0-local.gguf", "Qwen2.5-0.5B-Instruct-Q5_0-pure-local.gguf", "Qwen2.5-0.5B-Instruct-IQ4_NL-pure-local.gguf"]) {
+        t |> run("{file} q8: the streamed planar mint serves the eager load's planes and logits") @(t : T?) {
+            if (!family_on(t, "qwen2") || !arm_on(t, "b32-stream")) return
+            let path = path_join(models_dir(), file)
+            return if (!jit_model_available(t, path))
+            with_dasllama_jobque_() {
+                b32_streamed_mint(t, path)
+            }
+        }
+    }
 }
 
 //! A cold planar mint of a native-MXFP4 MoE file streams the expert planes: the minting process's peak physical footprint

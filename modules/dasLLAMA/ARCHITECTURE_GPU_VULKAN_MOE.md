@@ -69,7 +69,7 @@ except where a probe arm is named.
   tile's column at the format's own k step, keyed `CM2_TC_E` in the class ladders
   (`ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default`) - and every piece dispatches one workgroup per
   column tile per 128-row weight tile of the plane. In mm mode both piece kinds run the KHR
-  128 x 128 tile (`ARCHITECTURE_GPU_VULKAN_GEMM.md#khr-mm-kq-tile`) over the same records and maps -
+  128 x 128 tile (`ARCHITECTURE_GPU_VULKAN_KHR.md#khr-mm-kq-tile`) over the same records and maps -
   a 32-row s piece is an edge tile there, and the workgroup counts agree because a column is one
   tile either way - so a KHR-mode card serves the resident MoE block (`vk_rdec_moe_ok`). The
   per-32 expert rails ride the same pieces through their own `<Fmt>Cm2T` stamps; the mx4 one
@@ -103,7 +103,7 @@ except where a probe arm is named.
   reader's barrier covers both - the act writes the f16 hidden rows, and down runs the tiles
   again. The window planes carry 128 rows of read slack past the last bucket row (the s and m
   tiles load a partial column unclamped, `ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default`) and hold a
-  whole window of `PF_WINDOW x k` bucket rows, so the block never chunks.
+  whole window of `pf_window_rows() x k` bucket rows, so the block never chunks.
 - **The combine rides the residual step.** The add+rms that follows the block (`ClsArComb`,
   its f16 twin `ClsArCombF16B` where the next layer's head takes the f16 feed) adds the shared
   expert's down rows at the sigmoid of the gate logit - the dense tail ran the shared triple
@@ -276,4 +276,7 @@ triple, writes the routed feed into xb and runs the router GEMV off its own rms 
 segment lands the feed and the logits (`ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command`; the window chain the same over its rows).
 The host selects, folds the down scale into the weights (`moe_down_scale_fold`, the CPU `gemma4_moe_ffn`'s own fold) and sums the
 experts; the next segment's combine reads that sum as one routed row of weight one (`ArArgs.slots` 1 over the ramp map and the
-ones row) under the same three norms. The hot expert pool stays off a gemma-4 model: its device sums carry no down scale.
+ones row) under the same three norms. The hot expert pool serves such a layer like any host layer's
+(`ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool`): the fold precedes the pool's split, so a hit's weight carries the down scale as a
+miss's does, the hit chain requantizes `xb`, which holds the routed feed, and the resumed segment accumulates the hit rows onto
+the host's sum before the gemma-4 combine reads it as the one routed row.

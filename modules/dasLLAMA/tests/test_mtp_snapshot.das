@@ -78,3 +78,86 @@ def test_per_position_accept_telemetry(t : T?) {
     let clean = mtp_pos_report()
     t |> success(find(clean, "p1") < 0, "reset clears every counter: {clean}")
 }
+
+// Why neither home drafts a round (`mtp_round_cold_why`), one reason at a time on a Session shell over a 64-position context:
+// each call fails one arm with every other arm's input held ready, and "" where the round drafts.
+[test]
+def test_mtp_round_cold_why(t : T?) {
+    var m = Model()
+    m.config.seq_len = 64l
+    var s <- Session(mtp_h_pos1 = 10l, mtp_h <- [for (_i in range64(8l)); 0.5])
+    t |> equal(mtp_round_cold_why(m, s, 10l, 3l, 8l), "", "the control: a carried row at the position, at the drafter's width, inside the context drafts")
+    t |> success(!mtp_round_cold_host(m, s, 10l, 3l, 8l), "... and the host predicate reads it warm")
+    t |> equal(mtp_round_cold_why(m, s, 0l, 3l, 8l), "nothing is evaled at position 0", "position 0 holds no evaled row")
+    t |> equal(mtp_round_cold_why(m, s, 11l, 3l, 8l), "the carried hidden row is from another position", "a row carried for position 10 read at 11")
+    t |> equal(mtp_round_cold_why(m, s, 10l, 3l, 9l), "the carried hidden row is shorter than the drafter's width", "an 8-wide row for a 9-wide drafter")
+    t |> equal(mtp_round_cold_why(m, s, 10l, 54l, 8l), MTP_COLD_PAST_CONTEXT, "a depth-54 round from position 10 runs past the 64-position context")
+    t |> equal(mtp_round_cold_why(m, s, 10l, 53l, 8l), "", "the depth-53 round ends on the context's last position and drafts")
+    t |> success(mtp_round_cold_host(m, s, 10l, 54l, 8l), "the host predicate reads the past-context round cold")
+    delete s
+    delete m
+}
+
+//! a 16-token window's ids
+def private window_tokens() : array<int64> => <- [for (i in range64(16l)); 500l + i]
+
+// The checkpoint capture's contract on a bare Session (`dn_capture_begin` ahead of a window, `dn_capture_check` after it):
+// the refusals panic by name, the well-formed stops open one unfilled snapshot each.
+[test]
+def test_dn_capture_contract(t : T?) {
+    t |> run("stops inside the window, ascending, open one unfilled snapshot each at its position") @(t : T?) {
+        var toks <- window_tokens()
+        var s <- Session(dn_state_prefix <- [0l], dn_stops <- [12l, 14l], dn_captured = true)
+        s.dn_state <- [for (_i in range64(8l)); 1.0]
+        s.dn_conv_state <- [for (_i in range64(4l)); 2.0]
+        let why = panic_text() ${
+            dn_capture_begin(s, toks, 6l, 10l)
+        }
+        t |> equal(why, "", "the control: stops 12 and 14 inside [10, 16)")
+        t |> equal(2, length(s.dn_captures), "a snapshot a stop")
+        t |> success(s.dn_captures[0].pos == 12l && s.dn_captures[1].pos == 14l, "each at its stop ({s.dn_captures[0].pos}, {s.dn_captures[1].pos})")
+        t |> equal(8, length(s.dn_captures[0].state), "sized to the session's state")
+        t |> success(!s.dn_captured, "and none filled yet")
+        delete s
+        delete toks
+    }
+    t |> run("a stop asked of a model with no recurrent state panics") @(t : T?) {
+        var toks <- window_tokens()
+        var s <- Session(dn_stops <- [12l])
+        let why = panic_text() ${
+            dn_capture_begin(s, toks, 6l, 10l)
+        }
+        t |> success(find(why, "no recurrent state") >= 0, "the panic names the missing state: {why}")
+        delete s
+        delete toks
+    }
+    t |> run("a stop at or outside the window's rows, or out of order, panics naming the stop and the window") @(t : T?) {
+        var toks <- window_tokens()
+        for (stops in [[10l], [16l], [9l], [14l, 12l], [12l, 12l]]) {
+            var s <- Session(dn_state_prefix <- [0l])
+            s.dn_stops := stops
+            let why = panic_text() ${
+                dn_capture_begin(s, toks, 6l, 10l)
+            }
+            t |> success(find(why, "is not inside the window [10, 16) in order") >= 0, "stops {stops}: {why}")
+            delete s
+        }
+        delete toks
+    }
+    t |> run("a window that leaves its captures unfilled is refused; a filled one passes") @(t : T?) {
+        var toks <- window_tokens()
+        var s <- Session(dn_state_prefix <- [0l], dn_stops <- [12l, 14l])
+        dn_capture_begin(s, toks, 6l, 10l)
+        let unfilled = panic_text() ${
+            dn_capture_check(s)
+        }
+        t |> success(find(unfilled, "left 2 checkpoint stop(s)") >= 0 && find(unfilled, "unfilled") >= 0, "the panic names the unfilled count: {unfilled}")
+        s.dn_captured = true
+        let filled = panic_text() ${
+            dn_capture_check(s)
+        }
+        t |> equal(filled, "", "the serving prefill filled them: the check passes")
+        delete s
+        delete toks
+    }
+}

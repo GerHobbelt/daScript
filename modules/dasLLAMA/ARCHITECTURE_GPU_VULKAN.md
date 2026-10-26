@@ -8,10 +8,12 @@ attention and the K/V mirror's codecs are in `ARCHITECTURE_GPU_VULKAN_ATTN.md`; 
 is in `ARCHITECTURE_GPU_VULKAN_WINDOW.md`. The routed block of that window and of the token command is in
 `ARCHITECTURE_GPU_VULKAN_MOE.md`. The
 cooperative-matrix tiles the chain's GEMMs run on - the cm2 decode spelling, the tile pick and
-the coopmat mode ladder, the class-pipeline build seat, the MoE expert chain on those tiles, and
-the KHR arm's hand-staged kq tile - are in `ARCHITECTURE_GPU_VULKAN_GEMM.md`, and the decode GEMV
+the coopmat mode ladder, the class-pipeline build seat and the MoE expert chain on those tiles -
+are in `ARCHITECTURE_GPU_VULKAN_GEMM.md`, the KHR arm's hand-staged tile and the f32 rows it serves
+in `ARCHITECTURE_GPU_VULKAN_KHR.md`, and the decode GEMV
 family's lane split by row length is `ARCHITECTURE_GPU_VULKAN_GEMM.md#kq-gemv-lanes`. What a
-model has to fit on the card before any of this runs is in `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`, the NextN
+model has to fit on the card before any of this runs is in `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` (the room
+it may fill on a shared card, `ARCHITECTURE_GPU_VULKAN_ROOM.md`), the NextN
 draft head the driver homes is `ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`, and the
 N-row token command a batched step's rows go through is in `ARCHITECTURE_GPU_VULKAN_NROW.md`, and
 the hyper-connection chain with its host-served routed experts is `ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command`.
@@ -48,7 +50,7 @@ walk as reference measurements of another engine's kernels.
 
 ### The Vulkan resident prefill window chain {#vk-prefill-window-chain}
 
-**A prompt longer than `PF_WINDOW` rows runs as SEQUENTIAL windows over the same activation buffers.** Every
+**A prompt longer than the prompt window (`pf_window_rows`) runs as SEQUENTIAL windows over the same activation buffers.** Every
 window's rope and attention address the KV mirror at ABSOLUTE positions, so window w attends everything the
 earlier windows stored; only a window holding a segment's last row - a one-session call's last window - runs the
 final requant and the classifier at that row.
@@ -195,7 +197,7 @@ model's first kq set rebuilds it.
 
 ### The tile probe's arms share one descriptor set layout {#khrx-shared-set-layout}
 
-`khrx` is the lever sweep of the KHR kq tile (`ARCHITECTURE_GPU_VULKAN_GEMM.md#khr-mm-kq-tile`) in
+`khrx` is the lever sweep of the KHR kq tile (`ARCHITECTURE_GPU_VULKAN_KHR.md#khr-mm-kq-tile`) in
 `harness/vk_gemm_probe.das` (`ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md#vk-gemm-probe`): eight arms
 timed over one shape. Two are shipped bodies - the KHR class, the reference each compared arm
 is checked against, and the sdot4 kq tile. `ship` is the KHR tile copied with no lever moved,

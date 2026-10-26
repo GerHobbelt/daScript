@@ -459,16 +459,6 @@
     per-clip `cmd` (schema addition) or a receipt template with the `-f` slot marked; the das
     rows are unaffected (one process serves the whole ladder).
 
-
-- **`check_committed_records` gate in `performance/REVIEW.das`** (fused-image-span review round):
-    machine-check the two records-provenance rules - every `runs[]` row's
-    `hardware.remote_desktop == "off"`, every row `sha` and sidecar `provenance.engine_sha`
-    an ancestor of HEAD, and `provenance.dasllama_version` equal to `DASLLAMA_RELEASE` at that
-    commit. When it lands, the two prose rules in `performance/REVIEW.md` collapse to the
-    "weakening that gate is a defect" residue form. Also owed: a re-mint of the gemma-3-4b cpu
-    image row (hand-minted in the gemma3v arc; still stamps `parsec` + a pre-branch sha, and
-    the image sweep's catalog does not reach it).
-
 41. **`add_user_audio` (samples in) serves the whisper-class `AudioTower` families only - the
     qwen3a conformer (Qwen3-Omni) has no chat splice, and gemma4a hears only through the
     pre-encoded rows seam (`add_user_audio_rows` off an `AudioEmbedder`).** Surfaced by the omni showcase test (the
@@ -1286,8 +1276,8 @@
    file dastest runs is in a `run.das` suite or its header names `DASLLAMA_CPU_PREFILL`; every
    test file has a `CMakeLists.txt` row. (c) `performance/REVIEW.das`: a `url =` / `bytes =` /
    `sha256 =` literal in any `.das` under the folder other than `model_specs.das` and
-   `profile_common.das`; every `records/<box>.json` row's `tune_sha` names an archive that exists;
-   a `defaults/` profile's `provenance.dasllama_version` equals `DASLLAMA_RELEASE`. (d)
+   `profile_common.das`; every retired-box `records/<box>.json` row's `tune_sha` names an archive
+   that exists (current-release rows are checked). (d)
    `harness/REVIEW.das` (new): `tune_kernels.das`'s `benches` list ends in `dot_q8q8_laneq4x4`.
    (e) `benchmarks/REVIEW.das` (new): nothing under `benchmarks/` or `performance/` but the two
    reference cells writes under `performance/records/`. (f) `daslib`: a `daslib/*.das` emitting a
@@ -1763,13 +1753,6 @@
    restart placed by the witness lines rather than a frame count), and the tts area runs green
    through `tests/run.das -- --area tts`.
 
-166. **A `--tts` path in `benchmarks/lcpp_bench.das`.** The bench has no TTS cell, so every TTS
-   turn wall in `PERF_LEDGER.md` comes from `harness/tts_synth.das` under
-   `REVIEW_MEASUREMENT.md`'s harness carve-out and no board row records what a synthesis costs.
-   Done = `lcpp_bench --tts -m <gguf>` serves the g2p corpus's first N sentences at a named
-   voice and prints the per-sentence wall and the real-time factor as its other modalities do,
-   `gen_bench_records` carries a `tts` workload, and the StyleTTS2 ledger entry cites the row.
-
 167. **A sampler arm on `benchmarks/lcpp_bench.das`'s tg row.** The bench's only sampler knob
     is `--mtp-temp`, a temperature alone, so no board row holds a sampled decode rate and the
     candidate-list sampler's `PERF_LEDGER.md` entry reads its rates off `dasllama-cli`'s stats
@@ -2084,16 +2067,78 @@
     SPIR-V text splits at its own grammar - then delete the `[line_length]` table and the file, so the
     repo limits bind the folder; the kernels and model-free suites on both homes hold the wrapped tree.
 
-214. **The board holds the two GPU homes' prefill throughput at pp512 alone, and the ledger's longest prefill rows stop
-    at 12288 tokens.** A long prompt costs the global layers' attention in the
-    square of its length and every per-window stage in its position, so a stage that grows with
-    position hides behind pp512 (`debug-jit`, direction-grade: `lcpp_bench -p <n> -n 0 -r 2` on gemma-4-E2B Q8_0 -
-    the pod's RTX PRO 4500 under `DASLLAMA_GPU=1` reads 16,400 tok/s at pp512, 11,600 at 4096, 8,900 at 16384,
-    3,900 at 65536 and 2,600 at 120000; the M5 Max under `--ngl 1` with the box profile older than the binary
-    reads 9,488 / 10,888 / 5,292 / 2,570 at 512 / 4096 / 16384 / 65536, the score-slab attention's shape; the
-    long-context cells of `tests/test_gpu_resident_regions_gemma4_e2b_ctx128k.das` run their 360k device tokens
-    in about 170 s on the pod). The pass, after the gemma leg lands and before the dasCUDA arc: `lcpp_bench` at pp512
-    and pp32768 (and pp65536 where the model's context admits it) on every stocked model on both
-    homes, one profiling pass with the per-window stage split on; a model whose pp32768 falls under
-    the N-squared expectation set by its global-layer count is investigated to the stage, and the
-    stage is fixed in that pass. The rows land in `PERF_LEDGER.md` beside the pp512 rows.
+215. **Checklist grooming - the prefill rotation arc's round.** The rule-document round over the arc's diff (one
+    review-md auditor a checklist, two dragon passes a changed document) left the structural findings it could not
+    land as wording: in `REVIEW_GPU_VULKAN.md` the two serving-gate rules carry one definition twice (merge them under one
+    prefix definition), the `unpack8` rule carries its measured exception in the text (the GEMM document's section holds
+    it), the availability-flag rule describes rather than binds (a ban, or a `REVIEW.das` check on writes outside
+    `vk_rdec_prepare`), the `vk_moe_init` and slab rules each hold several duties, the K/V codec rule lists today's codecs
+    where `RDec.kv_dt`'s storage types are the property, and the `DASLLAMA_VK_SPV_DUMP` rule repeats
+    `REVIEW_GPU_KERNEL_CLASSES.md`'s; in `REVIEW_GPU.md` "retained reference" and the two arm ledgers are undefined in the
+    opening, the one-backend asymmetry rule and the cache-key rule carry carve-outs; in `REVIEW.md` the
+    `REVIEW_OVERRIDES.md` route depends on that checklist's definition and the out-of-folder test ledger sits in
+    `tests/CLAUDE.md`; in `REVIEW_GPU_RESIDENT.md` the two resident-override rules merge (the codec mismatch declines by
+    name) and the bake-trim rule's "the three" names nothing; in `REVIEW_GPU_KERNEL_CLASSES.md` the PR-body kind
+    statement is a duty in disguise; in `REVIEW_GPU_RACE.md` the output-buffer rule's ledger exception, the two warm-up
+    rules, and "variable region", "crown" and "ranking-input branch" undefined; in `tests/REVIEW_KERNEL_CELLS.md` the
+    bit-identity rule's head against its tail and the definitions wall; in `tests/REVIEW_PINNED_GATES.md` the kept-in-
+    step rule split in three with its census arm (automated in `REVIEW.das`) deleted, the tolerance rule's binding, and
+    two `REVIEW.das` checks (every pinned entry resolves, every pinned file sits in a `run.das` suite); in the repo's
+    `src/builtin/REVIEW.md` the serializer rules into a routed companion, the bind-flavor rule's exception sentence,
+    "warm start" and the wrapper tables named; in `doc/REVIEW.md` the fetch/run/type rule into a `doc/source/`
+    checklist; in `utils/REVIEW.md` "pull-request lane", "skip-path assertion" and the `watchdog.json` rule's one
+    reading; in `utils/dasllama-server/REVIEW.md` a `REVIEW.das` check that every text field of the wire structs is
+    sanitized; in `harness/REVIEW.md` `check_last_bench_row` extended to the pin-order property and the prose rule
+    deleted; in `modules/REVIEW_SHADER_EMITTERS.md` the emitted-shape definition against the template-constant carve-out
+    and the two global-rooted-array rules merged; and the benchmarks and performance checklists' definition blocks as
+    lists. Done = the rule-doc PR this ledger already owes carries them, each a rewrite under `skills/review_md.md`, two
+    dragon passes a document, none a ruling.
+
+216. **Checklist grooming - the long-prompt pass's round.** The rule-document round over the pass's diff left these
+    for the rule-doc PR, each a rewrite under `skills/review_md.md`, two dragon passes a document, none a ruling: in
+    `benchmarks/REVIEW.md` the 330-word glossary as one short line a term with its mechanism prose in
+    `ARCHITECTURE_MEASUREMENT.md`, the GPU-race routing clause the folder walk can never fire, and the warmup and
+    refusal rules' shared trigger named once; in `tests/REVIEW.md` the exact-compare rule keyed on a fact a reviewer
+    can check (a cell's asserted top-two logit gap, or the prompt class it exempts) instead of "a prompt whose
+    continuation can tie", the engine-side duty that falsifies a `tests/CLAUDE.md` entry moved to the module checklist,
+    the arm census as a `REVIEW.das` gate over every `arm_on` literal, and `tests/REVIEW_KERNEL_CELLS.md`'s grid-formula
+    rule routed from the module checklist with "the same count for every input (the dispatcher's count function)" in
+    place of "that same expression", its opening block restored and its definitions one line a term; in
+    `modules/REVIEW_SHADER_EMITTERS.md` the shape-constant definition by the property (an index stride into a
+    fixed-extent array), the routing by kind (a kernel-declaring file, a file it requires, a dispatch or allocation that
+    binds such a kernel), the emitted-claim rule firing on any named property of the artifact, the two read-bounds rules
+    merged, and `modules/REVIEW.md`'s `bind_*.das` aside cut; in `REVIEW.md` here the race-figure rule's candidate list
+    as a property, the weight-format routing settled for a K/V codec literal, `REVIEW_GPU_KERNEL_BODY.md`'s "value" (a
+    lane's input or the branch outcome), `REVIEW_MEMORY.md`'s size-formula trigger in both directions, the announce rule
+    for a knob with no announce, the command-line-and-commit check made once across `REVIEW_GPU_RACE.md` and
+    `REVIEW_MEASUREMENT.md`, "race" settled for a codec comparison, the log-latch reading of `REVIEW_GPU.md`'s
+    model-swap rule, `REVIEW_GPU_VULKAN.md`'s "these three files", the two opening blocks off the prescribed form, and
+    the tower routing by reachability over file location. Done = the rule-doc PR carries them.
+
+218. **The speculative round loses on the served turn on Metal where `lcpp_bench` wins.** Served at one stream (the
+    IQ4_XS-pure 35B, reply 200, 5 reps, the box knob's depth 1, 2026-10-20, M5): decode off 182.9 / 171.7 tok/s at 3k /
+    9k, `--mtp` 176.6 / 161.0 (cv 4 %), `--mtp --mtp-accept typical` 174.7 / 163.2 (cv 3.4-3.8 %) - three to six percent
+    under off, while `lcpp_bench --mtp-ab` reads greedy depth 1 at 1.14 on the UD-Q4_K_M twin and the 2026-10-13 served
+    rows carried the same loss before the seats (157/148 on against 178/168 off). The round is the same code on both
+    instruments; the difference is the server's tick around it. Done = a step trace of a served speculative stream against
+    the bench's loop (the scheduler's per-round work, the paged session's per-tick cost, the pick and selection landings
+    under the server's sampler, the SSE path) naming where the margin goes, and the served decode at or above off on this
+    file at depth 1.
+
+
+219. **Kitten speaks the TTS board's corpus half again as long as the reference package.** On the g2p corpus head (20
+    sentences, voice Bella) the das Kitten rows produce 242.6 s of audio on nano and 206.5 s on mini, where the
+    `kittentts` package and mlx-audio's port produce 159.9 / 159.8 s and 145.0 / 144.8 s; Kokoro agrees on every
+    engine (145.7 against 146.6 / 146.7). The parity rail (`test_tts_kitten.das`) feeds the oracle's own tokens, so a
+    front end that lengthens the token stream - our g2p, then `kitten_phonemes_from_misaki`, where the references read
+    the fixture's espeak string - passes it. The board's Kitten rows stay off the published board until this lands.
+    Done = the das Kitten audio on the corpus head within a few percent of the package's, a cell holding the facade's
+    front end against the package's on corpus sentences (the token stream and the duration, a lengthened stream the
+    control), and the Kitten TTS rows re-measured.
+
+220. **The CPU batched decode row (`tg128@4`) has never been profiled on a routed model.** On the release-17 board
+    gpt-oss-20b mxfp4 reads 0.72 of llama.cpp's batched decode on Zen4 (AWS m7a, 46.9 against 64.7 tok/s) and 0.92 on
+    the M5 Max; Qwen3.6-35B-A3B UD-Q4_K_M reads 0.88 on the M5; the dense carriers sit at 0.98-1.0. Done = a
+    `forward_profile` split of the batched step against the single-stream step on both routed carriers (the expert GEMMs
+    at four rows, the lane split, the router and combine per row) naming where the batch loses its sharing, and the
+    routed carriers' batched row at or above llama.cpp's on both boxes.

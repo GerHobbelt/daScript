@@ -12,6 +12,8 @@ require dasllama/dasllama_tower     // layernorm + the shipped gelu flavors + th
 require dasllama/dasllama_rope      // build_rope_tabs_rows — the rope2d gate's tables
 require dasllama/dasllama_qwen3v   // q3v_reorder_src - the stem assemble gate's merge walk
 require _kernel_oracles   // pos_add_2d_ref
+require _sel_oracle   // select_rows_oracle, sel_words: the selection landing's CPU reading, the Vulkan cell's own
+require dasllama/dasllama_gpu_tier   // the SEL_* landing layout the selection gate reads its planes by
 require ?das_metal dasllama/dasllama_metal_kernels  // the decode elementwise/misc kernel set (Apple builds)
 require ?das_metal dasllama/dasllama_metal_common   // the pipeline globals the generated builders read
 require dasllama/dasllama_common   // bump_weights_epoch: the region and ring-slack drops; the layout shell's Model
@@ -98,6 +100,50 @@ def private argmax_gate(t : T?; var dev, queue; n, hi1, hi2 : int) {
         return if (!ran)
         check_buf_exact(t, tag, mc.buf[btok], [uint(min(hi1, hi2))])
     }
+}
+
+//! the selection kernel over `rows` rows of `y` under `words`: every row's landing unpacked as the host reads it
+def private cls_select_run(t : T?; var dev, queue; y : array<float>; words : array<uint>; vocab, rows : int; tag : string) : array<SelRow> {
+    var out : array<SelRow>
+    let cap = int(SEL_CAP)
+    let hdrw = int(SEL_HDR)
+    let recw = int(SEL_RECENT)
+    with_metal_cell(dev, queue) $(var mc : MetalCell) {
+        var err : string
+        let st = stamp_of(@@enc_cls_select)
+        var pso = mc |> keep_stamp(st, err)
+        return if (!pso_ok(t, tag, pso, err))
+        let py = mc |> in_(y)
+        let ps = mc |> in_plain(words)
+        let ph = mc |> out_words(hdrw * rows, 0xFFFFFFFFu)
+        let pi = mc |> out_words(cap * rows, 0xFFFFFFFFu)
+        let pv = mc |> out_(cap * rows)
+        let pr = mc |> out_(recw * rows)
+        var ka = GkClsSelArgs(vocab = uint(vocab))
+        let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
+            stamp_run(st, pso) {
+                invoke(st.enc, enc, mc.buf[py], mc.buf[ps], mc.buf[ph], mc.buf[pi], mc.buf[pv], mc.buf[pr], ka, int64(rows))
+            }
+        }
+        return if (!ran)
+        var inscope hdr <- mc |> plane_as(ph, type<uint>, hdrw * rows)
+        var inscope ids <- mc |> plane_as(pi, type<uint>, cap * rows)
+        var inscope vals <- mc |> plane_as(pv, type<float>, cap * rows)
+        var inscope rec <- mc |> plane_as(pr, type<float>, recw * rows)
+        out <- sel_unpack(hdr, ids, vals, rec, words, int64(rows))
+    }
+    return <- out
+}
+
+//! the selection gate: the shared six-row fixture at `vocab` (`sel_fixture`) through the Metal stamp against the CPU oracle, every
+//! landing compared by the shared gate (`sel_gate_compare`, the Vulkan cell's reading)
+def private cls_select_gate(t : T?; var dev, queue; vocab : int) {
+    let tag = "cls_select vocab={vocab}"
+    var inscope f <- sel_fixture(int64(vocab))
+    var inscope got <- cls_select_run(t, dev, queue, f.y, f.words, vocab, int(f.rows), tag)
+    return if (long_length(got) != f.rows)
+    var inscope want <- select_rows_oracle(f.y, f.temps, f.recent, int64(vocab), f.rows, SEL_K, SEL_CAP)
+    sel_gate_compare(t, tag, got, want, int64(vocab))
 }
 
 def private argmax_rows_gate(t : T?; var dev, queue; nrows, n : int) {
@@ -241,9 +287,10 @@ def private embed_kq_gate(t : T?; var dev, queue; st : auto(ST); fmt, dim, vocab
 }
 
 //! the per-32 token-table gather (`MetalEmbedB32T`) of one format: three rows - a middle token, token 0 and the last - off a
-//! plane pair bound past `lead` blocks of other rows (an untied table sits past the classifier's), the token list read past a lead
-//! id and the rows written past a lead row, each row bit for bit the engine's own block dequant under the embed scale
-def private embed_b32_gate(t : T?; var dev, queue; f : KqFmt; dim, vocab, lead : int) {
+//! plane pair past `lead` blocks of other rows (an untied table sits past the classifier's), bound where `enc_embed_table` binds it
+//! (`b32_table_bind`: on the 16-byte grid below, the blocks past it in `b0`), the token list read past a lead id and the rows written past a lead
+//! row, each row bit for bit the engine's own block dequant under the embed scale
+def private embed_b32_gate(t : T?; var dev, queue; f : KqFmt; dim, vocab, lead : int; want_b0 : int = 0) {
     let tag = "embed_b32 {f} dim={dim} vocab={vocab} lead={lead}"
     with_metal_cell(dev, queue) $(var mc : MetalCell) {
         var err : string
@@ -293,9 +340,12 @@ def private embed_b32_gate(t : T?; var dev, queue; f : KqFmt; dim, vocab, lead :
         let bkq = mc |> in_plain(kq)
         let btok = mc |> in_plain([0x7FFFFFFFu, uint(toks[0]), uint(toks[1]), uint(toks[2])])
         let bxo = mc |> out_words(4 * dim, PAD_SENTINEL)
-        var ka = EmbedKqArgs(dim = uint(dim), nsb = uint(nb), escale = escale)
-        let soff = uint64(lead * sb)
-        let qoff = uint64(lead * qb)
+        let bind = b32_table_bind(int64(lead) * KQ_B32_ELEMS, f)   //! the engine's own bind (`enc_embed_table`'s)
+        t |> equal(int(bind.b0), want_b0, "{tag}: the table sits {want_b0} blocks past its bind")
+        var ka = EmbedB32Args(dim = uint(dim), escale = escale, b0 = uint(bind.b0))
+        let soff = uint64(bind.off / KQ_B32_ELEMS * int64(sb))
+        let qoff = uint64(bind.off / KQ_B32_ELEMS * int64(qb))
+        t |> success(soff % 16ul == 0ul && qoff % 16ul == 0ul, "{tag}: the binds sit on the 16-byte grid (scale {soff}, quant {qoff})")
         let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
             if (f == KqFmt.q51) {
                 stamp_run(sq, pso) {
@@ -331,8 +381,9 @@ enum private ArStamp {
 
 //! the residual step against the CPU's sequential form, under the 1e-4 bar (simd_sum reassociation): x = (x + a') . ascale,
 //! a' = rmsnorm(a) . wpa on the sandwich stamps, y = rmsnorm(x) . w; the sandwich stamps' rows told apart from the plain form's
-def private add_rms_gate(t : T?; var dev, queue; stamp : ArStamp; single : bool; dim, nrows : int; ascale : float; window : bool = false) {
-    let tag = "add_rms {stamp}{single ? " 1-row grid" : ""}{window ? " window" : ""} dim={dim} rows={nrows} ascale={ascale}"
+def private add_rms_gate(t : T?; var dev, queue; stamp : ArStamp; single : bool; dim, nrows : int; ascale : float; window : bool = false;
+                         wide : bool = false) {
+    let tag = "add_rms {stamp}{single ? " 1-row grid" : ""}{window ? " window" : ""}{wide ? " 1024-lane" : ""} dim={dim} rows={nrows} ascale={ascale}"
     with_metal_cell(dev, queue) $(var mc : MetalCell) {
         var err : string
         let s1 = stamp_of(@@enc_addrms_c)
@@ -348,6 +399,11 @@ def private add_rms_gate(t : T?; var dev, queue; stamp : ArStamp; single : bool;
         let wp = stamp_of(@@pf_enc_preaddrms_b_c)
         let wph = stamp_of(@@pf_enc_preaddrms_bhx_c)
         let wa = stamp_of(@@pf_enc_preadd_b_c)
+        let lb = stamp_of(@@enc_add_rms_bw_c)
+        let lh = stamp_of(@@enc_add_rms_bhxw_c)
+        let lp = stamp_of(@@enc_preaddrms_bw_c)
+        let lph = stamp_of(@@enc_preaddrms_bhxw_c)
+        let la = stamp_of(@@enc_preadd_bw_c)
         var pso = (stamp == ArStamp.plain ? mc |> keep_stamp(s1, err) : (stamp == ArStamp.plain_hx ? mc |> keep_stamp(sh, err)
             : (stamp == ArStamp.pre ? mc |> keep_stamp(p1, err) : (stamp == ArStamp.pre_hx ? mc |> keep_stamp(ph, err) : mc |> keep_stamp(a1, err)))))
         return if (!pso_ok(t, tag, pso, err))
@@ -414,6 +470,28 @@ def private add_rms_gate(t : T?; var dev, queue; stamp : ArStamp; single : bool;
                         invoke(wa.enc, enc, x, a, w1, ka, int64(nrows))
                     }
                 }
+            } elif (wide) {   //! the decode rows' builders past the slab: the same kernels at 1024 lanes a row
+                if (stamp == ArStamp.plain) {
+                    stamp_run(lb, pso) {
+                        invoke(lb.enc, enc, x, a, w1, y, ka, int64(nrows))
+                    }
+                } elif (stamp == ArStamp.plain_hx) {
+                    stamp_run(lh, pso) {
+                        invoke(lh.enc, enc, x, a, w1, y, yh, ka, int64(nrows))
+                    }
+                } elif (stamp == ArStamp.pre) {
+                    stamp_run(lp, pso) {
+                        invoke(lp.enc, enc, x, a, w1, y, ka, int64(nrows))
+                    }
+                } elif (stamp == ArStamp.pre_hx) {
+                    stamp_run(lph, pso) {
+                        invoke(lph.enc, enc, x, a, w1, y, yh, ka, int64(nrows))
+                    }
+                } else {
+                    stamp_run(la, pso) {
+                        invoke(la.enc, enc, x, a, w1, ka, int64(nrows))
+                    }
+                }
             } elif (stamp == ArStamp.plain) {
                 if (single) {   //! the single-row builder's one threadgroup
                     stamp_run(s1, pso) {
@@ -454,6 +532,8 @@ def private add_rms_gate(t : T?; var dev, queue; stamp : ArStamp; single : bool;
         }
         return if (!ran)
         check_buf(t, "{tag} x", mc.buf[bx], want_x, BAR_TIGHT, Shape(row_width = dim))
+        t |> success(moved_off(want_x, xv, 0, BAR_TIGHT) && moved_off(want_x, xv, total - 1, BAR_TIGHT),
+            "{tag} x in place: the first row's first column and the last row's last column moved off x")
         if (stamp == ArStamp.pre_add) {
             var inscope untouched <- [for (_i in range(total)); PAD_SENTINEL]
             check_buf(t, "{tag} y untouched", mc.buf[by], untouched, BAR_EXACT, Shape(row_width = dim))
@@ -890,8 +970,8 @@ def private gelu_form_delta(t : T?) {
     var max_lut = 0.0
     var max_erf = 0.0
     for (i in range(n)) {
-        max_lut = max(max_lut, abs(an[i] - lut[i]))
-        max_erf = max(max_erf, abs(an[i] - erfv[i]))
+        max_lut = max(max_lut, nan_wide_diff(an[i], lut[i]))
+        max_erf = max(max_erf, nan_wide_diff(an[i], erfv[i]))
     }
     to_log(LOG_INFO, "gelu_form_delta over [-10,10]: |analytic-lut| max {max_lut}, |analytic-erf| max {max_erf}\n")
     // measured 3.90625e-3 = the f16 HALF-ULP at the range edge (|x|~10, spacing 2^-7): the LUT
@@ -1970,6 +2050,107 @@ def private mtl_toy_lens_gate(t : T?; var dev, queue; n : int) {
     g_mtl_toy_shift_pso = null
 }
 
+// The alignments the ringed attention, router, PLE projection and per-32 gather builders declare (`requires =`): an aligned value
+// passes every builder silently, a misaligned one trips each builder whose contract it breaks, by the builder's name and the
+// broken item. The builders record into a graph capture the cell discards, so no misaligned dispatch reaches the device.
+var private g_align_trips : array<string>
+
+def private record_align_trip(msg : string) {
+    g_align_trips |> push(msg)
+}
+
+def private want_trips(var want : array<string>; names : array<string>; item : string) {
+    want |> reserve(length(want) + length(names))
+    for (n in names) {
+        want |> push("{n}: {item} != 0")
+    }
+}
+
+def private dispatch_align_gate(t : T?; var dev, queue) {
+    let ring64 <- [ "enc_attnp16_c", "enc_attnp32_c", "enc_attnp_q8_c", "enc_attnp_tq4_c", "enc_attnpb16_c", "enc_attnpb32_c",
+                    "enc_attnpb_q8_c", "enc_attnpb_tq4_c", "enc_qk_dev_c", "enc_qk_dev128_c" ]
+    let ring32 <- [ "enc_attnd16_c", "enc_attnd32_c", "enc_attndw16_c", "enc_attndw32_c", "enc_attndx16_c", "enc_attndx32_c",
+                    "enc_attnd_q8_c", "enc_attnd_tq4_c", "enc_attndw_q8_c", "enc_attndw_tq4_c", "enc_attndx_q8_c", "enc_attndx_tq4_c" ]
+    let routers <- [ "enc_moe_router", "enc_moe_router_b" ]
+    let projs <- [ "enc_ple_proj_bf16", "enc_ple_proj_bf16_one" ]
+    let gathers <- [ "enc_q51_embed_b32", "enc_iq4nl32_embed_b32", "enc_q4032_embed_b32", "enc_q5032_embed_b32" ]
+    with_metal_cell(dev, queue) $(var mc : MetalCell) {
+        let b = mc.buf[mc |> out_words(64, 0.0)]
+        let saved_hook = metal_requires_hook()
+        set_metal_requires_hook(@@record_align_trip)
+        var inscope want : array<string>
+        gr_arm(true)
+        for (ring in fixed_array(0u, 128u, 96u, 48u)) {
+            var pk = SqAttnPartArgs(ring = ring)
+            var pb = SqAttnPartBArgs(ring = ring)
+            var dk = SqAttnDArgs(ring = ring)
+            var qk = AttnArgs(ring = ring)
+            enc_attnp16_c(null, b, 0ul, b, 0ul, b, b, pk, 1l, 32l)
+            enc_attnp32_c(null, b, 0ul, b, 0ul, b, b, pk, 1l, 32l)
+            enc_attnp_q8_c(null, b, 0ul, b, b, 0ul, b, b, b, pk, 1l, 32l)
+            enc_attnp_tq4_c(null, b, 0ul, b, b, 0ul, b, b, b, pk, 1l, 32l)
+            enc_attnpb16_c(null, b, b, b, b, b, 0ul, pb, 1l, 32l)
+            enc_attnpb32_c(null, b, b, b, b, b, 0ul, pb, 1l, 32l)
+            enc_attnpb_q8_c(null, b, b, b, b, b, b, b, 0ul, pb, 1l, 32l)
+            enc_attnpb_tq4_c(null, b, b, b, b, b, b, b, 0ul, pb, 1l, 32l)
+            enc_qk_dev_c(null, b, 0ul, b, 0ul, b, qk, 32l, 64l, 1l)
+            enc_qk_dev128_c(null, b, 0ul, b, 0ul, b, qk, 128l, 64l, 1l)
+            enc_attnd16_c(null, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attnd32_c(null, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attndw16_c(null, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attndw32_c(null, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attndx16_c(null, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attndx32_c(null, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attnd_q8_c(null, b, b, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attnd_tq4_c(null, b, b, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attndw_q8_c(null, b, b, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attndw_tq4_c(null, b, b, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attndx_q8_c(null, b, b, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            enc_attndx_tq4_c(null, b, b, b, b, b, b, b, 0ul, dk, 1l, 4l, 1l)
+            if (ring % 64u != 0u) {
+                want |> want_trips(ring64, "ka.ring % 64")
+            }
+            if (ring % 32u != 0u) {
+                want |> want_trips(ring32, "ka.ring % 32")
+            }
+        }
+        //! (dim, woff, xs): the aligned control, an even dim and woff off the float4 lattice, an odd pair, an xs off the lattice
+        for (s in fixed_array((8l, 4u, 0u), (6l, 2u, 0u), (5l, 1u, 0u), (8l, 0u, 6u))) {
+            var pa = moe_router_args(4l, s._0, 1l, int64(s._2))
+            pa.woff = s._1
+            enc_moe_router(null, b, b, b, b, pa, 4l, 1l)
+            enc_moe_router_b(null, b, b, b, b, pa, 4l, 1l)
+            enc_ple_proj_bf16(null, b, b, b, pa, 4l, 1l)
+            enc_ple_proj_bf16_one(null, b, b, b, pa, 4l, 1l)
+            for (n in routers) {
+                want |> want_trips(s._0 % 4l != 0l ? [n] : array<string>(), "pa.dim % 4")
+                want |> want_trips(s._1 % 4u != 0u ? [n] : array<string>(), "pa.woff % 4")
+                want |> want_trips(s._2 % 4u != 0u ? [n] : array<string>(), "pa.xs % 4")
+            }
+            for (n in projs) {
+                want |> want_trips(s._0 % 2l != 0l ? [n] : array<string>(), "pa.dim % 2")
+                want |> want_trips(s._1 % 2u != 0u ? [n] : array<string>(), "pa.woff % 2")
+            }
+        }
+        //! the per-32 gathers' row width: the aligned control, then one off the 32-block (the body counts a row's blocks as dim / 32)
+        for (dim in fixed_array(64u, 48u)) {
+            var ga = EmbedB32Args(dim = dim, escale = 1.0)
+            enc_q51_embed_b32(null, b, 0ul, b, 0ul, b, 0ul, b, 0ul, ga, 4l, 1l)
+            enc_iq4nl32_embed_b32(null, b, 0ul, b, 0ul, b, 0ul, b, 0ul, ga, 4l, 1l)
+            enc_q4032_embed_b32(null, b, 0ul, b, 0ul, b, 0ul, b, 0ul, ga, 4l, 1l)
+            enc_q5032_embed_b32(null, b, 0ul, b, 0ul, b, 0ul, b, 0ul, ga, 4l, 1l)
+            if (dim % 32u != 0u) {
+                want |> want_trips(gathers, "ka.dim % 32")
+            }
+        }
+        gr_arm(false)
+        restore_metal_requires_hook(saved_hook)
+        t |> equal(length(want), 50, "dispatch_align: the misaligned rings, router shapes and gather widths owe fifty trips")
+        t |> equal(join(g_align_trips, "\n"), join(want, "\n"), "dispatch_align: each builder trips on exactly the items its value breaks")
+        delete g_align_trips
+    }
+}
+
 [test]
 def test_metal_misc_kernels(t : T?) {
     t |> run("decode elementwise/misc kernels == direct CPU oracles") @(t : T?) {
@@ -1980,10 +2161,16 @@ def test_metal_misc_kernels(t : T?) {
                 argmax_gate(t, dev, queue, 700, 0, 699)         // winner at index 0
                 argmax_rows_gate(t, dev, queue, 5, 5000)        // the same-slab verify's per-row accept walk
                 argmax_rows_gate(t, dev, queue, 9, 700)         // MTP_MAX_ROWS rows, n below one threadgroup
+                cls_select_gate(t, dev, queue, 262144)
+                cls_select_gate(t, dev, queue, 1000)
+                cls_select_gate(t, dev, queue, 248320)   //! the served vocab: a tail stride under a whole subgroup's worth
                 embed_q8_gate(t, dev, queue, 512, 3, 2)
                 for (f in [KqFmt.q51, KqFmt.iq4nl32, KqFmt.q4032, KqFmt.q5032]) {
                     embed_b32_gate(t, dev, queue, f, 96, 5, 0)
                     embed_b32_gate(t, dev, queue, f, 2048, 7, 7 * 64)   //! past a whole other table's blocks: an untied table's offset
+                    embed_b32_gate(t, dev, queue, f, 96, 5, 3, 3)       //! a table off a superblock: three blocks past the bind
+                    //! ... and a row of nine blocks past a bind every four blocks (q51's 20- and 4-byte blocks) or eight (the 2-byte scales)
+                    embed_b32_gate(t, dev, queue, f, 288, 4, 7 * 64 + 13, f == KqFmt.q51 ? 1 : 5)
                 }
                 embed_kq_gate(t, dev, queue, stamp_of(@@enc_embed_kq_k4), 4, 512, 5)
                 embed_kq_gate(t, dev, queue, stamp_of(@@enc_embed_kq_k5), 5, 512, 5)
@@ -2006,13 +2193,21 @@ def test_metal_misc_kernels(t : T?) {
                     add_rms_gate(t, dev, queue, st, true, 1024, 1, 0.5)    //! the gemma4 layer_out_scale slot
                     add_rms_gate(t, dev, queue, st, false, 1500, 3, 0.75)
                     add_rms_gate(t, dev, queue, st, false, 4096, 2, 1.0)    //! the slab's whole width
+                    add_rms_gate(t, dev, queue, st, true, 5376, 1, 0.75)    //! past the slab: the gemma-4 31B's row
+                    add_rms_gate(t, dev, queue, st, false, 5376, 3, 0.75)
+                    add_rms_gate(t, dev, queue, st, false, 8192, 2, 1.0)    //! twice the slab
                 }
                 for (st in fixed_array(ArStamp.plain_hx, ArStamp.pre_hx)) {
                     add_rms_gate(t, dev, queue, st, false, 1500, 3, 0.75)
+                    add_rms_gate(t, dev, queue, st, false, 5376, 3, 0.75)
                 }
                 for (st in fixed_array(ArStamp.plain, ArStamp.plain_hx, ArStamp.pre, ArStamp.pre_hx, ArStamp.pre_add)) {
                     add_rms_gate(t, dev, queue, st, false, 2560, 5, 0.75, true)
                     add_rms_gate(t, dev, queue, st, false, 4096, 2, 1.0, true)
+                    add_rms_gate(t, dev, queue, st, false, 5376, 5, 0.75, true)
+                    add_rms_gate(t, dev, queue, st, false, 5376, 1, 0.75, false, true)
+                    add_rms_gate(t, dev, queue, st, false, 5376, 4, 0.75, false, true)
+                    add_rms_gate(t, dev, queue, st, false, 8192, 2, 1.0, false, true)
                 }
                 qk_norm_gate(t, dev, queue, 64, 4, 2, 2, false)     // in-place decode shape
                 qk_norm_gate(t, dev, queue, 64, 4, 2, 2, true)      // the no-wv V-fusion shape
@@ -2112,6 +2307,7 @@ def test_metal_misc_kernels(t : T?) {
                 ple_conv_gate(t, dev, queue, 100, 3, 4, 3, 10, 0, 14, true)     // the window form from position 0: taps before the sequence and inside the panel
                 ple_conv_gate(t, dev, queue, 100, 3, 4, 3, 10, 23, 6, true)     // a later window: taps in the ring (wrapped) and in the panel
                 mtl_toy_lens_gate(t, dev, queue, 1000)      // n%64 != 0 — the tail workgroup's guard
+                dispatch_align_gate(t, dev, queue)
             }
         } else {
             t |> skip("das_metal is not built on this platform; misc kernel checks skipped")
@@ -2263,6 +2459,10 @@ def test_metal_ring_slack_reload(t : T?) {
         bump_weights_epoch()
         t |> equal(g_mirror_ring_slack, MIRROR_RING_SLACK_MIN, "the reload returns the slack to its floor")
         t |> success(g_arena_epoch > epoch0, "the reload's slack drop stales the steps encoded over the old layout")
+        let epoch1 = g_arena_epoch
+        bump_weights_epoch()
+        t |> equal(g_mirror_ring_slack, MIRROR_RING_SLACK_MIN, "a reload at the floor leaves the slack there")
+        t |> equal(g_arena_epoch, epoch1, "a reload at the floor moves no row, so no encoded step goes stale")
         g_mirror_ring_slack = was
     } else {
         t |> skip("das_metal is not built on this platform; the Metal drivers are not compiled")
@@ -2287,29 +2487,28 @@ def private layout_shell(window : int64) : Model {
 [test]
 def test_metal_mirror_layout_key(t : T?) {
     static_if (typeinfo builtin_module_exists(das_metal)) {
-        let pin = gpu_kv_ring_pin()
         let slack0 = g_mirror_ring_slack
-        set_gpu_kv_ring(1)
         var a <- layout_shell(512l)
         var b <- layout_shell(512l)
-        let ka = mirror_layout_key_of(a)
-        t |> equal(mirror_layout_key_of(b), ka, "two shells of one layout share a key (the control)")
-        b.config.sliding_window = 256l
-        t |> success(mirror_layout_key_of(b) != ka, "another sliding window is another key")
-        b.config.sliding_window = 512l
-        b.kv_row_prefix[3] = 256l
-        t |> success(mirror_layout_key_of(b) != ka, "another row prefix is another key")
-        b.kv_row_prefix[3] = 192l
-        b.kv_row_prefix |> push(256l)
-        t |> success(mirror_layout_key_of(b) != ka, "another layer count is another key")
-        set_gpu_kv_ring(0)
-        t |> success(mirror_layout_key_of(a) != ka, "the ring pin off is another key")
-        set_gpu_kv_ring(1)
-        g_mirror_ring_slack = 2l * MIRROR_RING_SLACK_MIN
-        t |> success(mirror_layout_key_of(a) != ka, "another slack is another key")
-        g_mirror_ring_slack = slack0
-        t |> equal(mirror_layout_key_of(a), ka, "the slack put back is the first key again")
-        set_gpu_kv_ring(pin)
+        with_gpu_kv_ring(1) {
+            let ka = mirror_layout_key_of(a)
+            t |> equal(mirror_layout_key_of(b), ka, "two shells of one layout share a key (the control)")
+            b.config.sliding_window = 256l
+            t |> success(mirror_layout_key_of(b) != ka, "another sliding window is another key")
+            b.config.sliding_window = 512l
+            b.kv_row_prefix[3] = 256l
+            t |> success(mirror_layout_key_of(b) != ka, "another row prefix is another key")
+            b.kv_row_prefix[3] = 192l
+            b.kv_row_prefix |> push(256l)
+            t |> success(mirror_layout_key_of(b) != ka, "another layer count is another key")
+            set_gpu_kv_ring(0)
+            t |> success(mirror_layout_key_of(a) != ka, "the ring pin off is another key")
+            set_gpu_kv_ring(1)
+            g_mirror_ring_slack = 2l * MIRROR_RING_SLACK_MIN
+            t |> success(mirror_layout_key_of(a) != ka, "another slack is another key")
+            g_mirror_ring_slack = slack0
+            t |> equal(mirror_layout_key_of(a), ka, "the slack put back is the first key again")
+        }
         delete a
         delete b
     } else {

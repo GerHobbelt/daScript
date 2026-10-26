@@ -19,9 +19,11 @@ require vulkan/vulkan_boost
 require dasllama/dasllama_math
 require dasllama/dasllama_gpu_math   // ACT_*, act_code: the act word the act classes read
 require dasllama/dasllama_gpu_tier
+require dasllama/dasllama_env
 require math
 require daslib/strings_boost
 require daslib/algorithm
+require daslib/cmp
 
 // The Vulkan DECODE driver (dasllama_metal_decode's twin): the resident whole-stack token step
 // (prepare/set_layer/set_cls + the once-per-epoch recorded command + vk_rdec_token), the KV
@@ -247,10 +249,19 @@ def vk_rdec_prepare(n_layers, n_attn, dim, qd, kv_dim, head_size, n_heads, hidde
     r.pick_part_max_dev = make_device_buf(4l * nb * RD_PICK_CHUNKS)
     r.pick_part_id_dev = make_device_buf(4l * nb * RD_PICK_CHUNKS)
     r.pick_host = make_host_buf(4l * nb, false, [cached = true, xfer_shared = r.log_xfer])
-    r.xlog_recorded |> resize(nb + 1l)
-    r.xlog_pick_recorded |> resize(nb + 1l)
-    alloc_cmds(r.xlog_cmd, nb + 1l, r.log_xfer, true)
-    alloc_cmds(r.xlog_pick_cmd, nb + 1l, r.log_xfer, true)
+    for (k in range(3)) {
+        r.xlog_recorded[k] |> resize(nb + 1l)
+        alloc_cmds(r.xlog_cmd[k], nb + 1l, r.log_xfer, true)
+    }
+    verify(cls_sel_layout_agrees(), "vk decode: the selection kernel's layout and the engine's SEL_* constants disagree")
+    r.sel_words = make_host_buf(SEL_WORDS * 4l * nb, true)
+    r.sel_hdr_dev = make_device_buf(cls_sel_plane_bytes(0l, nb), r.log_xfer)
+    r.sel_id_dev = make_device_buf(cls_sel_plane_bytes(1l, nb), r.log_xfer)
+    r.sel_val_dev = make_device_buf(cls_sel_plane_bytes(2l, nb), r.log_xfer)
+    r.sel_rec_dev = make_device_buf(cls_sel_plane_bytes(3l, nb), r.log_xfer)
+    r.sel_host = make_host_buf(cls_sel_plane_off(4l, nb), false, [cached = true, xfer_shared = r.log_xfer])
+    r.sel_recorded |> resize(nb + 1l)
+    alloc_cmds(r.sel_cmd, nb + 1l, true)
     r.unsplit_on = r.attn_nsplit > 1l   //! the twins' availability is the device's, decided where their buffers are allocated: never a record's side effect
     r.wide_on = r.attn_nsplit > RD_SPLIT_PIECES
     r.tok_n_recorded |> resize(nb + 1l)
@@ -1088,7 +1099,7 @@ def vk_rdec_dn_own(l : int64; stp : float?; histp : float?) {
 def ple_proj_enc(raw : VkCommandBuffer; var h : VkHaz; var set_ : VkDescriptorSet; ncols : uint) {
     let all = g_rd.n_layers * g_rd.ple
     var pcr = GkRouterArgs(ne = uint(all), dim = uint(g_rd.dim), eps = g_rd.eps, ncols = ncols, yscale = 1.0 / sqrt(float(g_rd.dim)))
-    router_enc_cols(g_rd.ple_wp_bf16, raw, h, set_, pcr, all)
+    router_enc_cols(g_rd.ple_wp_bf16, raw, h, set_, pcr, all, ple_proj_bf16_hw(g_rd.dim))
 }
 
 //! The per-layer-embedding seats: the side-input row buffers at the model's ple width (after prepare, before the layers)
@@ -1203,6 +1214,15 @@ def vk_rdec_set_cls(cls_block : int64; cls_fmt : int; cap : float; supp : array<
         let part_bytes = 4l * nb * RD_PICK_CHUNKS
         g_rd.s_pick_part = set_cls_argmax_part(fixed_array(g_rd.logits_dev, g_rd.pick_part_max_dev, g_rd.pick_part_id_dev), fixed_array(vocab * 4l * nb, part_bytes, part_bytes), fixed_array(VHZ_LOG, VHZ_LOG, VHZ_LOG))
         g_rd.s_pick_fin = set_cls_argmax_fin(fixed_array(g_rd.pick_part_max_dev, g_rd.pick_part_id_dev, g_rd.pick_dev), fixed_array(part_bytes, part_bytes, 4l * nb), fixed_array(VHZ_LOG, VHZ_LOG, VHZ_LOG))
+        g_rd.sel_on = g_gpu.max_wg_invocations >= int64(CLS_SELECT_WG) && ensure_cls_select()   //! a device whose workgroups stop under the selection's 1024 threads lands the rows
+        if (!g_rd.sel_on) {
+            to_log(LOG_INFO, "vk decode: the classifier tail's selection is off on this device (maxComputeWorkGroupInvocations {g_gpu.max_wg_invocations} under {CLS_SELECT_WG}) - a sampled stream's step lands its rows\n")
+        }
+        if (g_rd.sel_on) {
+            g_rd.s_select = set_cls_select(fixed_array(g_rd.logits_dev, g_rd.sel_words.buf, g_rd.sel_hdr_dev, g_rd.sel_id_dev, g_rd.sel_val_dev, g_rd.sel_rec_dev),
+                fixed_array(vocab * 4l * nb, SEL_WORDS * 4l * nb, cls_sel_plane_bytes(0l, nb), cls_sel_plane_bytes(1l, nb), cls_sel_plane_bytes(2l, nb), cls_sel_plane_bytes(3l, nb)),
+                fixed_array(VHZ_LOG, VHZ_LOG, VHZ_LOG, VHZ_LOG, VHZ_LOG, VHZ_LOG))
+        }
         if (rd_cls_epi_on()) {
             var supp_bytes = 256l
             if (g_rd.nsupp > 0l) {
@@ -1300,7 +1320,7 @@ def vk_rdec_set_hc(hc, lr, n_sites : int64; norm_rows : array<float>; inject_row
         r.hemb_host = make_host_buf(dim * 4l * nb, false, [cached = true])
     }
     r.hcinjw_bytes = long_length(inject_rows) * 4l
-    if (!vk_range_ok(r.hcinjw_bytes) || !vk_range_ok(r.hcn_bytes) || !vk_range_ok(PF_WINDOW * hcd * 4l)) {   //! the inject rows, the norm rows and a window's wide panels bind as one range each
+    if (!vk_range_ok(r.hcinjw_bytes) || !vk_range_ok(r.hcn_bytes) || !vk_range_ok(pf_window_rows() * hcd * 4l)) {   //! the inject rows, the norm rows and a window's wide panels bind as one range each
         to_log(LOG_WARNING, "dasLLAMA vulkan resident: the hyper-connection inject rows ({n_sites} sites x {hc} x {hcd}) pass the device's storage range {vk_max_storage_range()}\n")
         return false
     }
@@ -1507,6 +1527,12 @@ def private rd_encode_hc_side(raw : VkCommandBuffer; var h : VkHaz; nrows : int6
     var pcc = GkPleConvArgs(dim = uint(dim), hc = uint(hc), kern = uint(g_rd.ngram_kern), dil = uint(g_rd.ngram_dil), rows = win ? uint(nrows) : 0u, pos0 = win ? PLE_POS_TOK : 0u)
     enc_ple_conv_cls(raw, h, g_rd.s_ple_conv, pcc, (hcd * nrows + 255l) / 256l)
     if (win) {
+        if (g_rd.ring_roll_dev != 0ul) {
+            let rb = rd_ngram_ring_bytes()
+            vhz_dep(raw, h, VHZ_DNSM, 0u, true)
+            cmd_copy_range(raw, g_rd.plehist_dev, g_rd.region * rb, g_rd.ring_roll_dev, 0l, rb)
+            cmd_full_barrier(raw)   //! the commit below writes the ring the copy just read
+        }
         var pcm = PleCommitArgs(dim = uint(dim), hc = uint(hc), nrows = uint(g_rd.ngram_nrows), rows = uint(nrows))
         enc_ple_commit_cls(raw, h, g_rd.s_ple_commit, pcm, (hcd * nrows + 255l) / 256l)
     }
@@ -1518,8 +1544,11 @@ def private rd_hot_stack(base : int64; fmt : int; slots, blocks, elems : int64) 
     return rd_hot_stack(base, fmt, slots, elems, (wq = blocks * bb.wq, ws = blocks * bb.ws))
 }
 
-def private rd_hot_stack(base : int64; fmt : int; slots, elems : int64; pb : tuple<wq : int64; ws : int64>) : int
-    => make_stack_shell(base, slots * elems, fmt, slots * pb.wq, slots * pb.ws)
+def private rd_hot_stack(base : int64; fmt : int; slots, elems : int64; pb : tuple<wq : int64; ws : int64>) : int {
+    let si = make_stack_shell(base, slots * elems, fmt, slots * pb.wq, slots * pb.ws)
+    g_gpu.stacks[si].batch_meta_ring = XF_RING   //! the pool window runs the per-expert chain over these stacks: XF_RING metas ahead, as a stream slot's
+    return si
+}
 
 def private rd_hot_planes(si : int) : tuple<wq : uint64; ws : uint64; wqb : int64; wsb : int64>
     => (wq = g_gpu.stacks[si].wqbuf, ws = g_gpu.stacks[si].wsbuf, wqb = g_gpu.stacks[si].wqbytes, wsb = ws_range(si))
@@ -1555,7 +1584,7 @@ def private rd_hot_shared(slots : int64) {
 //! Routed layer `l`'s hot expert pool (`RdecHotLayerFn`): `slots` slots of the gate, up and down planes in their formats, the
 //! hit chain's sets over them; returns the gate stack's offset base, the up and down stacks a `stride` and two past it.
 //! `base` under 0 = no pool on this layer (a class rail, a form the chain does not take, the planes' range)
-[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool")]
 def vk_rdec_hot_layer(l, slots : int64; f1, f3, f2 : int) : tuple<base : int64; stride : int64> {
     let none = (base = -1l, stride = 0l)
     let at = (base = HOT_BASE + l * 3l * HEAT_STRIDE, stride = HEAT_STRIDE)
@@ -1611,8 +1640,18 @@ def vk_rdec_hot_layer(l, slots : int64; f1, f3, f2 : int) : tuple<base : int64; 
     return at
 }
 
+//! RdecHotBatchFn: the pool's placement run lands in one submit (`upload_batch_open` / `upload_batch_close`)
+def vk_rdec_hot_batch(open : bool) {
+    return if (g_gpu == null || g_gpu.dry)
+    if (open) {
+        upload_batch_open()
+    } else {
+        upload_batch_close()
+    }
+}
+
 //! One expert's planes into slot `slot` of layer `l`'s pool (`RdecHotUploadFn`), in the gather's device layout.
-[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool")]
 def vk_rdec_hot_upload(l, slot : int64; wq1 : array<uint8>; ws1 : array<uint8>; wq3 : array<uint8>; ws3 : array<uint8>; wq2 : array<uint8>; ws2 : array<uint8>) {
     return if (g_gpu != null && g_gpu.dry)
     let H & = unsafe(g_rd.hot_layers[l])
@@ -1637,7 +1676,7 @@ def vk_rdec_hot_upload(l, slot : int64; wq1 : array<uint8>; ws1 : array<uint8>; 
     }
 }
 
-[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool")]
 def private rd_record_hot(l, nhit : int64; nrows : int64 = 1l) {
     var H & = unsafe(g_rd.hot_layers[l])
     let dim = g_rd.dim
@@ -1652,7 +1691,7 @@ def private rd_record_hot(l, nhit : int64; nrows : int64 = 1l) {
 }
 
 //! The hits of layer `l`'s routed step (`RdecHotSubmitFn`): their region records and weights written, the hit chain submitted unwaited.
-[hot_path, arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+[hot_path, arch(at="../ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool")]
 def vk_rdec_hot_submit(l, nhit : int64; slots : int64 const?; w : float const?) {
     let H & = unsafe(g_rd.hot_layers[l])
     assert(H.on && nhit <= g_rd.k, "vk_rdec_hot_submit: a layer with no pool, or more hits than routed slots")
@@ -1688,8 +1727,84 @@ def private rd_hot_go(l, nreg, nrows : int64) {
     if (!H.recorded[nreg]) {
         rd_record_hot(l, nreg, nrows)
     }
+    g_gpu.pend_wait = max(g_gpu.pend_wait, H.dma_value)   //! the slots a DMA fill is still landing in: this chain reads them after
     submit_nofence(H.cmds[nreg])
     g_rd.hot_submits++
+}
+
+let private HOT_DMA_RING = 4   //! DMA fill batches in flight: a layer's a batch, the ring's oldest waited before it re-records
+var private g_rd_hot_dma_said : table<string>   //! the DMA fill's declines, a reason once
+
+//! RdecHotDmaFn: false where no transfer queue serves, the tier is dry, or the stream stacks do not hold the expert - the host's fill then takes it
+[arch(at="../ARCHITECTURE_GPU_VULKAN_POOL.md#pool-dma-fill")]
+def vk_rdec_hot_dma(l, slot, e, woff1 : int64; f1 : int) : bool {
+    return false if (g_gpu == null || g_gpu.dry)
+    if (g_gpu.xfer_fam < 0) {
+        gpu_said_once(g_rd_hot_dma_said, LOG_WARNING, "vk_rdec_hot_dma: ", "no transfer queue serves (DASLLAMA_VK_XFERQ) - the host fill takes every miss of the pool")
+        return false
+    }
+    let g = vk_stream_stack_at(woff1, f1) / STREAM_PLANE_KINDS
+    if (g < 0) {
+        gpu_said_once(g_rd_hot_dma_said, LOG_WARNING, "vk_rdec_hot_dma: ", "a routed layer's expert stack (fmt {f1}) is not a streamed stack - the host fill takes its misses")
+        return false
+    }
+    let H & = unsafe(g_rd.hot_layers[l])
+    assert(H.on && slot >= 0l && slot < g_rd.hot_slots, "vk_rdec_hot_dma: a slot outside the layer's pool")
+    if (!g_rd.hot_dma_open) {
+        if (empty(g_rd.hot_dma_cmds)) {
+            g_rd.hot_dma_cmds |> reserve(HOT_DMA_RING)
+            g_rd.hot_dma_vals |> reserve(HOT_DMA_RING)
+            for (_i in range(HOT_DMA_RING)) {
+                g_rd.hot_dma_cmds |> push(alloc_xfer_cmd())
+                g_rd.hot_dma_vals |> push(0ul)
+            }
+        }
+        let at = g_rd.hot_dma_at
+        if (g_rd.hot_dma_vals[at] > 0ul) {
+            xfer_wait(g_rd.hot_dma_vals[at], false)   //! the entry's earlier batch retired: its command is free to re-record
+        }
+        cmd_open(g_rd.hot_dma_cmds[at], true)
+        g_rd.hot_dma_open = true
+    }
+    var raw = g_rd.hot_dma_cmds[g_rd.hot_dma_at]
+    let sts = fixed_array(H.st1, H.st3, H.st2)
+    let blks = fixed_array(H.blk1, H.blk3, H.blk2)
+    let fmts = fixed_array(H.f1, H.f3, H.f2)
+    for (k in range(3)) {
+        let src = vk_stream_slot(g * 3 + k, e)
+        if (!src.present) {
+            gpu_said_once(g_rd_hot_dma_said, LOG_WARNING, "vk_rdec_hot_dma: ", "a pool miss outside the streamed stack's resident experts - the host fill takes every such miss (a partial expert cache, DASLLAMA_EXPERT_CACHE_MB, leaves the non-resident experts to it)")
+            return false
+        }
+        let bb = arena_block_bytes(fmts[k])
+        let p = rd_hot_planes(sts[k])
+        let qlen = g_gpu.stream_stacks[g * 3 + k].qlen
+        let slen = g_gpu.stream_stacks[g * 3 + k].slen
+        if (qlen != blks[k] * bb.wq) {   //! the host's gather decodes the expert into the slot's form; a copy cannot
+            gpu_said_once(g_rd_hot_dma_said, LOG_WARNING, "vk_rdec_hot_dma: ", "layer {l}'s pool slot ({blks[k] * bb.wq} quant bytes under format {fmts[k]}) and its streamed expert ({qlen} bytes in stack {g * 3 + k}, format {g_gpu.stream_stacks[g * 3 + k].fmt}) differ - the host fill takes it")
+            return false
+        }
+        cmd_copy_range(raw, src.qbuf, src.qoff, p.wq, slot * blks[k] * bb.wq, qlen)
+        if (slen > 0l) {
+            cmd_copy_range(raw, src.sbuf, src.soff, p.ws, slot * blks[k] * bb.ws, min(slen, blks[k] * bb.ws))
+        }
+    }
+    g_rd.hot_dma_fills++
+    return true
+}
+
+//! RdecHotDmaFlushFn: layer `l`'s open DMA batch submitted on the transfer queue, its landing waited by the next compute submit and the layer's next hit chain
+def vk_rdec_hot_dma_flush(l : int64) {
+    return if (!g_rd.hot_dma_open)
+    let at = g_rd.hot_dma_at
+    var raw = g_rd.hot_dma_cmds[at]
+    cmd_close(raw)
+    let v = xfer_submit_after(raw, XFER_NO_WAIT)
+    g_rd.hot_dma_vals[at] = v
+    g_rd.hot_layers[l].dma_value = v
+    g_gpu.pend_wait = max(g_gpu.pend_wait, v)
+    g_rd.hot_dma_at = (at + 1) % HOT_DMA_RING
+    g_rd.hot_dma_open = false
 }
 
 [hot_path, arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-verify-rows")]
@@ -1716,7 +1831,7 @@ def vk_rdec_hot_submit_rows(l, nrows : int64; slots : int64 const?; w : float co
 def vk_rdec_hot_stats() : tuple<submits : int64; hits : int64>
     => g_rd != null ? (submits = g_rd.hot_submits, hits = g_rd.hot_hits) : (submits = 0l, hits = 0l)
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool")]
 def private rd_encode_routed_sum(raw : VkCommandBuffer; var h : VkHaz; l : int64; nrows : int64 = 1l) {
     let hot = l < long_length(g_rd.hot_layers) && g_rd.hot_layers[l].on
     if (hot) {
@@ -1745,7 +1860,7 @@ def private rd_encode_host_cut(raw : VkCommandBuffer; var h : VkHaz; var L : RLa
     host_land(raw, h, g_rd.xb_dev, g_rd.hx_host, g_rd.moe_dlog_dev, g_rd.hlog_host, nrows)
 }
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool")]
 def private rd_host_resume(var raw : VkCommandBuffer&; var next : VkCommandBuffer; var h : VkHaz; l, nrows : int64) {
     h = cmd_reopen(raw, next)
     raw = next
@@ -1924,6 +2039,7 @@ def vk_rdec_token_split(x : array<float>; cossin : array<float>; side : array<fl
     var picked : int64
     let guard = rd_guard_step(g_rd.tokens_served)
     let picks_only = pick_only && !guard
+    rd_sel_guard(guard)
     let seg0 = g_rd.region * g_rd.nseg
     rd_stage_row(x, -1l)
     unsafe {
@@ -1937,12 +2053,13 @@ def vk_rdec_token_split(x : array<float>; cossin : array<float>; side : array<fl
         let host_us = rd_run_host_segments(g_rd.cmd_seg, seg0) $(l : int64) {
             invoke(experts, l, reinterpret<float const?>(g_rd.hx_host.mapped), reinterpret<float const?>(g_rd.hlog_host.mapped), reinterpret<float?>(g_rd.hacc_host.mapped))
         }
+        let t_seg = ref_time_ticks()
         var last = g_rd.cmd_seg[seg0 + g_rd.nseg - 1l]
         let t = rd_submit_wait(last, 1l, picks_only, prof)
         picked = rd_land_one(pick_only, logits)
         if (prof) {
             rdq_host_add(g_rdq_token_ledger, ts0, t1, t.t1, t.t3, ref_time_ticks())
-            g_rdq_token_ledger.host_experts_us += double(host_us)
+            g_rdq_token_ledger.submit_us -= rdq_segments_add(g_rdq_token_ledger, t1, t_seg, host_us)
         }
     }
     rd_token_close(ts0, guard)
@@ -2037,8 +2154,13 @@ def private rd_roll_alloc {
     g_rd.roll_row_bytes = off
     g_rd.roll_rows = max(g_rd.verify_rows - 1l, 0l)
     g_rd.roll_region = -1l
-    if (off > 0l && g_rd.roll_rows > 0l) {
-        g_rd.roll_dev = make_device_buf(off * g_rd.roll_rows)
+    if (g_rd.roll_rows > 0l) {
+        if (off > 0l) {
+            g_rd.roll_dev = make_device_buf(off * g_rd.roll_rows)
+        }
+        if (g_rd.ngram) {   //! the n-gram ring rolls back whether or not a recurrent layer's state does
+            g_rd.ring_roll_dev = make_device_buf(rd_ngram_ring_bytes())
+        }
     }
 }
 
@@ -2348,7 +2470,7 @@ def rd_enc_kv_store(raw : VkCommandBuffer; var h : VkHaz; var s : VkDescriptorSe
                     ring : int64) {
     if (rd_kvq8() && nkh > 0l) {
         var pcs = KvQStoreArgs(kvd = uint(kvd), rows = uint(rows), layerbase = layerbase, pos0 = pos0, ring = uint(ring))
-        let wgs = (kv_row_units(KVDtype.q8_0, kvd) * rows + int64(WG_X) - 1l) / int64(WG_X)
+        let wgs = (kv_row_units(KVDtype.q8_0, kvd) * rows * 32l + int64(WG_X) - 1l) / int64(WG_X)   // a lane an element
         if (window) {
             enc_kv_q8_store_b_cls(raw, h, s, pcs, wgs)
         } else {
@@ -2694,10 +2816,15 @@ def private rd_encode_ple(raw : VkCommandBuffer; var h : VkHaz; var L : RLayer; 
     rd_ts(raw, "p:proj")
 }
 
+//! layer l's gemma-4 routed feed as a residual step with no partner: x under the routed branch's pre norm, the decode's and the
+//! window's
+def rd_g4_pre2_args(l : int64) : GkAddRmsArgs
+    => GkAddRmsArgs(dim = uint(g_rd.dim), add_on = 0u, woff = uint(rd_norm_off(l, RD_NORM_PRE_FFN2)), eps = g_rd.eps, ascale = 1.0)
+
 //! the gemma-4 routed feed: x under the routed branch's pre norm into xb, or (`fused`) straight into the experts' Q8 image
 [arch(at="../ARCHITECTURE_GPU_VULKAN_MOE.md#vk-gemma4-moe-block")]
 def private rd_encode_g4_pre2(raw : VkCommandBuffer; var h : VkHaz; var L : RLayer; l, nrows : int64; fused : bool) {
-    var pcn = GkAddRmsArgs(dim = uint(g_rd.dim), add_on = 0u, woff = uint(rd_norm_off(l, RD_NORM_PRE_FFN2)), eps = g_rd.eps, ascale = 1.0)
+    var pcn = rd_g4_pre2_args(l)
     if (fused) {
         enc_ar_rq_stamp(L.pre2_stamp, raw, h, L.s_pre2_rq, pcn)
         rd_ts(raw, "m:pre2_rq")
@@ -2895,16 +3022,17 @@ def private rd_encode_token(var first_seg_raw : VkCommandBuffer; nrows, nsplit :
                 rd_encode_ffn(raw, h, L, l, nxt, nrows, ncols, nrow_bx)
             }
             if (L.moe && L.experts_host) {
-                verify(one && split_seg_base >= 0l, "vk decode: a host layer takes the one-row split command alone")
-                rd_encode_host_cut(raw, h, L, l, 1l, "m:router")
+                verify(split_seg_base >= 0l, "vk decode: a host layer takes the split command alone")
+                rd_encode_host_cut(raw, h, L, l, nrows, "m:router")
                 seg++
-                rd_host_resume(raw, g_rd.cmd_seg[split_seg_base + seg], h, l, 1l)
+                var next = verify ? g_rd.v_seg[split_seg_base + seg] : g_rd.cmd_seg[split_seg_base + seg]
+                rd_host_resume(raw, next, h, l, nrows)
                 if (L.moe_g4) {   //! the host's sum is the one routed row of weight one: the gemma-4 step over the set its class built
                     var pcg = rd_g4_comb_args(L, l, nxt, false)
-                    enc_cls_ar_comb_g4(raw, h, L.s_addr_next, pcg, 1l)
+                    enc_cls_ar_comb_g4(raw, h, L.s_addr_next, pcg, nrows)
                 } else {
                     var pc14h = rd_ar_comb_args(L, nxt)
-                    enc_cls_ar_comb(raw, h, L.s_addr_next, pc14h, 1l)
+                    enc_cls_ar_comb(raw, h, L.s_addr_next, pc14h, nrows)
                 }
                 rd_ts(raw, "m:ar2")
                 xq_ready = false
@@ -3035,7 +3163,8 @@ def private rdq_host_report(led : RdqLedger; what : string; rows : int64) {
     let n = double(led.count + 1l)
     let of = rows > 1l ? " of {rows} rows" : ""
     let hx = led.host_experts_us > 0.0lf ? " + host experts {int(led.host_experts_us / n)}" : ""
-    to_log(LOG_INFO, "vk_rdec host wall/{what} over {led.count + 1l}{of}: {int(led.wall_us / n)} us (memcpys {int(led.memcpy_us / n)} + submit {int(led.submit_us / n)} + wait {int(led.wait_us / n)} + landing copy {int(led.land_us / n)}{hx})\n")
+    let sg = led.segments_us > 0.0lf ? " + segments {int(led.segments_us / n)}" : ""
+    to_log(LOG_INFO, "vk_rdec host wall/{what} over {led.count + 1l}{of}: {int(led.wall_us / n)} us (memcpys {int(led.memcpy_us / n)}{sg} + submit {int(led.submit_us / n)} + wait {int(led.wait_us / n)} + landing copy {int(led.land_us / n)}{hx})\n")
 }
 
 [cold_path]   // DASLLAMA_GPU_PROF reporting leg
@@ -3057,7 +3186,7 @@ def private rdq_sample(var led : RdqLedger; what, shape : string; st : RdqStamps
         }
         if (led.count == 0l) {
             var top <- [for (i in range(1, int(n))); (us = pfq_us(uint(i)), at = uint(i))]
-            top |> sort() $(a, b) => a.us > b.us
+            top |> sort() <| cmp_by(-_.us)
             let line = build_string() $(w) {
                 for (k in range(min(8, length(top)))) {
                     w |> write("#{top[k].at} {int(top[k].us)}us ")
@@ -3117,7 +3246,7 @@ def private rd_guard_rows(served, n : int64) : bool {
     return false
 }
 
-[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
+[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_ROOM.md#vk-plan-room")]
 def private rd_logits_guard(logits : float const?; n : int64) {
     for (i in range64(n)) {
         let v = unsafe(logits[i])
@@ -3126,7 +3255,7 @@ def private rd_logits_guard(logits : float const?; n : int64) {
     panic("dasLLAMA vulkan tier: the device returned an all-zero logits row - the card is over-committed (planes demoted past what the driver can page back) or lost; close other GPU applications, lower DASLLAMA_GPU_VRAM_MB, or restart")
 }
 
-[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]   // once per armed driver
+[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_ROOM.md#vk-plan-room")]   // once per armed driver
 def private rd_warmup_check(wall_us : int64) {
     vk_demotion_check("decode warm-up")
     if (g_rd.weight_bytes > 0l && wall_us > g_rd.weight_bytes / RD_PAGING_BYTES_PER_US) {
@@ -3134,37 +3263,137 @@ def private rd_warmup_check(wall_us : int64) {
     }
 }
 
-//! the logits' trip to host memory on the transfer queue: the copy command for `nrows` rows (the rows' picks behind them), or
-//! under `picks_only` the picks alone, each recorded on first use
-def private rd_xlog(nrows : int64; picks_only : bool) : VkCommandBuffer {
-    var cmd = picks_only ? g_rd.xlog_pick_cmd[nrows] : g_rd.xlog_cmd[nrows]
-    let recorded = picks_only ? g_rd.xlog_pick_recorded[nrows] : g_rd.xlog_recorded[nrows]
-    if (!recorded) {
+//! what a command's landing carries to host memory on the transfer queue beside the picks and the carry row: the logits, nothing, or the selection's planes
+enum RdXlog {
+    rows
+    picks
+    sel
+}
+
+//! the landing's trip to host memory on the transfer queue: the copy command for `nrows` rows under `kind` - the picks, the
+//! carry row where it is live, and the logits (`rows`) or the selection's four planes (`sel`) - recorded on first use
+def private rd_xlog(kind : RdXlog; nrows : int64) : VkCommandBuffer {
+    let k = int(kind)
+    var cmd = g_rd.xlog_cmd[k][nrows]
+    if (!g_rd.xlog_recorded[k][nrows]) {
         record_cmd(cmd, false) $(raw : VkCommandBuffer; var _h : VkHaz) {
-            if (!picks_only) {
+            if (kind == RdXlog.rows) {
                 cmd_copy_whole(raw, g_rd.logits_dev, g_rd.logits_host.buf, g_rd.vocab * 4l * nrows)
             }
             cmd_copy_whole(raw, g_rd.pick_dev, g_rd.pick_host.buf, 4l * nrows)
             if (g_rd.carry_live) {
                 cmd_copy_whole(raw, rd_carry_src(), g_rd.hid_host.buf, rd_carry_width() * 4l * nrows)
             }
+            if (kind == RdXlog.sel) {
+                rd_sel_copies(raw, nrows, g_rd.nb)
+            }
         }
-        if (picks_only) {
-            g_rd.xlog_pick_recorded[nrows] = true
-        } else {
-            g_rd.xlog_recorded[nrows] = true
-        }
+        g_rd.xlog_recorded[k][nrows] = true
     }
     return cmd
+}
+
+var private g_rd_sel_ask = false     //! the next command's landing is the selection ([[vk_rdec_sel_ask]]), consumed at the submit
+var private g_rd_sel_landed = 0l     //! the rows the last command landed through the selection (0 = its rows or picks landed)
+
+//! a guard step lands its rows whatever was asked: the over-commit check reads a row
+def private rd_sel_guard(guard : bool) {
+    if (guard) {
+        g_rd_sel_ask = false
+    }
+}
+
+//! the selection command for `nrows` rows: every earlier submit's writes fenced (the token command's logits), the dispatch, and
+//! the copy of its planes into the host landing where no transfer family carries it; recorded on first use
+def private rd_sel_cmd(nrows : int64) : VkCommandBuffer {
+    var cmd = g_rd.sel_cmd[nrows]
+    if (!g_rd.sel_recorded[nrows]) {
+        let nb = g_rd.nb
+        record_cmd(cmd, false) $(raw : VkCommandBuffer; var h : VkHaz) {
+            cmd_full_barrier(raw)
+            var pc = GkClsSelArgs(vocab = uint(g_rd.vocab))
+            enc_cls_select(raw, h, g_rd.s_select, pc, nrows)
+            if (!g_rd.log_xfer) {
+                vhz_dep(raw, h, VHZ_LOG, 0u, true)
+                rd_sel_copies(raw, nrows, nb)
+            }
+        }
+        g_rd.sel_recorded[nrows] = true
+    }
+    return cmd
+}
+
+//! the selection's four planes for `nrows` rows into their slots of the packed host landing
+def private rd_sel_copies(raw : VkCommandBuffer; nrows, nb : int64) {
+    cmd_copy_range(raw, g_rd.sel_hdr_dev, 0l, g_rd.sel_host.buf, cls_sel_plane_off(0l, nb), cls_sel_plane_bytes(0l, nrows))
+    cmd_copy_range(raw, g_rd.sel_id_dev, 0l, g_rd.sel_host.buf, cls_sel_plane_off(1l, nb), cls_sel_plane_bytes(1l, nrows))
+    cmd_copy_range(raw, g_rd.sel_val_dev, 0l, g_rd.sel_host.buf, cls_sel_plane_off(2l, nb), cls_sel_plane_bytes(2l, nrows))
+    cmd_copy_range(raw, g_rd.sel_rec_dev, 0l, g_rd.sel_host.buf, cls_sel_plane_off(3l, nb), cls_sel_plane_bytes(3l, nrows))
+}
+
+//! The selection ask for the next command of `nrows` rows (`words` SEL_WORDS a row); false on a device without the selection kernel
+[arch(at="../ARCHITECTURE_GPU_VULKAN_LANDING.md#logits-selection-landing")]
+def vk_rdec_sel_ask(nrows : int64; words : array<uint>) : bool {
+    return false if (g_rd == null || !g_rd.ready || !g_rd.sel_on)
+    verify(nrows >= 1l && nrows <= g_rd.nb && long_length(words) >= SEL_WORDS * nrows, "vk_rdec_sel_ask: rows past the driver's planes, or words short of them")
+    unsafe {
+        memcpy(g_rd.sel_words.mapped, addr<void?>(words[0]), SEL_WORDS * 4l * nrows)
+    }
+    g_rd_sel_ask = true
+    return true
+}
+
+//! The last command's selection landing: pointers into the packed host landing, rows = 0 where the command landed its rows or picks
+def vk_rdec_sel_landing() : SelLanding {
+    var l : SelLanding
+    g_rd_sel_ask = false   //! an ask the seat declined before any submit dies here, never on a later command
+    return l if (g_rd == null || g_rd_sel_landed == 0l)
+    let nb = g_rd.nb
+    unsafe {
+        let base = reinterpret<uint8?>(g_rd.sel_host.mapped)
+        l.rows = g_rd_sel_landed
+        l.cap = SEL_CAP
+        l.recent_cap = SEL_RECENT
+        l.hdr = reinterpret<uint const?>(base + cls_sel_plane_off(0l, nb))
+        l.ids = reinterpret<uint const?>(base + cls_sel_plane_off(1l, nb))
+        l.vals = reinterpret<float const?>(base + cls_sel_plane_off(2l, nb))
+        l.rec = reinterpret<float const?>(base + cls_sel_plane_off(3l, nb))
+    }
+    return l
+}
+
+//! The late landing of rows `row0 .. row0 + nrows` of the last command's logits plane into `dst`, intact until the next command
+def vk_rdec_sel_land_rows(row0, nrows : int64; var dst : array<float>) {
+    verify(g_rd != null && g_rd_sel_landed > 0l && row0 + nrows <= g_rd_sel_landed, "vk_rdec_sel_land_rows: no selection landed these rows")
+    if (g_rd.log_xfer) {
+        xfer_wait(xfer_submit_after(rd_xlog(RdXlog.rows, g_rd_sel_landed), g_gpu.cmp_value), true)
+    }
+    host_buf_read(g_rd.logits_host, unsafe(addr<void?>(dst[0])), g_rd.vocab * 4l * nrows, g_rd.vocab * 4l * row0)
 }
 
 var private g_rd_xlog_wait = 0ul   //! the transfer timeline value the step's landing (logits or picks) completes at (0 = the command carried its own copy, the fence is the wait)
 
 [arch(at="../ARCHITECTURE_GPU_VULKAN_LANDING.md#logits-transfer-queue")]
 def private rd_submit_land(var cmd : VkCommandBuffer; nrows : int64; picks_only : bool) {
+    g_rd_sel_landed = 0l
+    if (g_rd_sel_ask) {
+        g_rd_sel_ask = false
+        g_rd_sel_landed = nrows
+        var sel = rd_sel_cmd(nrows)
+        if (g_rd.log_xfer) {
+            submit_signal(cmd)
+            let cv = submit_signal(sel)
+            g_rd_xlog_wait = xfer_submit_after(rd_xlog(RdXlog.sel, nrows), cv)
+        } else {
+            submit_nofence(cmd)
+            submit_nowait(sel)
+            g_rd_xlog_wait = 0ul
+        }
+        return
+    }
     if (g_rd.log_xfer) {
         let cv = submit_signal(cmd)
-        g_rd_xlog_wait = xfer_submit_after(rd_xlog(nrows, picks_only), cv)
+        g_rd_xlog_wait = xfer_submit_after(rd_xlog(picks_only ? RdXlog.picks : RdXlog.rows, nrows), cv)
     } else {
         submit_nowait(cmd)
         g_rd_xlog_wait = 0ul
@@ -3179,6 +3408,15 @@ def private rd_wait_land {
     } else {
         wait_fence()
     }
+}
+
+//! the split command's segment loop between `t_a` and `t_b` into the ledger: the host sums `host_us` to their piece, the rest to the
+//! segments'; returns the loop's wall, which the caller takes off the piece the loop fell in
+def private rdq_segments_add(var led : RdqLedger; t_a, t_b, host_us : int64) : double {
+    let wall = double(get_time_usec(t_a)) - double(get_time_usec(t_b))
+    led.host_experts_us += double(host_us)
+    led.segments_us += wall - double(host_us)
+    return wall
 }
 
 //! a profiled submit's host wall into its ledger's pieces: the memcpys and meta to `t1`, the submit to `t2`, the wait to `t3`, the landing copy to `t4`
@@ -3198,8 +3436,9 @@ def rd_carry_sync {
     g_rd.carry_live = want
     rd_unmake_sets()
     rd_invalidate_token()
-    fill(g_rd.xlog_recorded, false)
-    fill(g_rd.xlog_pick_recorded, false)
+    for (k in range(3)) {   //! every landing kind copies the carry: a command recorded under a spec-off stream would land none
+        fill(g_rd.xlog_recorded[k], false)
+    }
 }
 
 //! the driver holds the token table: a quantized plane in the arena, or a float table's exact f32 rows
@@ -3506,6 +3745,7 @@ def vk_rdec_token(x : array<float>; cossin : array<float>; ple_row : array<float
     }
     let guard = rd_guard_step(g_rd.tokens_served)
     let picks_only = pick_only && !guard
+    rd_sel_guard(guard)
     rd_stage_row(x, token)
     unsafe {
         memcpy(g_rd.cos_host.mapped, addr<void?>(cossin[0]), g_rd.cos_elems * 4l)
@@ -3674,7 +3914,9 @@ def private rd_land_one(pick_only : bool; var logits : array<float>) : int64 {
     if (pick_only) {
         return rd_landed_pick(0l)
     }
-    host_buf_read(g_rd.logits_host, unsafe(addr<void?>(logits[0])), g_rd.vocab * 4l)
+    if (g_rd_sel_landed == 0l) {
+        host_buf_read(g_rd.logits_host, unsafe(addr<void?>(logits[0])), g_rd.vocab * 4l)
+    }
     return -1l
 }
 
@@ -3911,7 +4153,14 @@ def private rd_v_decline(why : string) : bool {
 [cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command")]   //! once per armed model, behind the rail's latch
 def private rd_ensure_v_rail : bool {
     if (!g_rd.head_on || !g_rd.carry) return rd_v_decline("the NextN head is off the device (the load log names why)")
-    if (vk_rdec_token_n_rows() < 2l) return rd_v_decline("the N-row token command declined on this model (its line above)")
+    if (g_rd.experts_host) {
+        if (g_rd.n_rail == NRail.unasked) {
+            g_rd.n_rail = rd_ensure_n_rail() ? NRail.built : NRail.declined
+        }
+        if (g_rd.n_rail != NRail.built) return rd_v_decline("the N-row rail's leaves declined on this device (its line above)")
+    } elif (vk_rdec_token_n_rows() < 2l) {
+        return rd_v_decline("the N-row token command declined on this model (its line above)")
+    }
     if (g_rd.verify_rows < 2l) return rd_v_decline("the driver was prepared for {g_rd.verify_rows} verify rows (the tier's verify seat was not installed at the load)")
     let nb = g_rd.nb
     let L & = unsafe(g_rd.head)
@@ -3923,7 +4172,7 @@ def private rd_ensure_v_rail : bool {
 def vk_rdec_verify_rows : int64 {
     if (g_rd == null || !g_rd.ready) return 0l
     if (g_rd.v_rail == NRail.unasked) {
-        g_rd.v_rail = (g_rd.hc ? rd_ensure_hc_v_rail() : (g_rd.experts_host ? rd_v_decline("a routed layer's experts serve on the host, and the split one-row command has no verify form") : rd_ensure_v_rail())) ? NRail.built : NRail.declined
+        g_rd.v_rail = (g_rd.hc ? rd_ensure_hc_v_rail() : rd_ensure_v_rail()) ? NRail.built : NRail.declined
     }
     return g_rd.v_rail == NRail.built ? g_rd.verify_rows : 0l
 }
@@ -3981,16 +4230,25 @@ def private rd_encode_verify_warm(raw : VkCommandBuffer; var h : VkHaz; nrows : 
     rd_encode_attn_head(raw, h, L, g_rd.n_layers, rd_head_fuse_qkr(), rd_norm_final(), rd_layer_pieces(L, rd_split_pieces(), nrows), nrows, uint(nrows), 0, true, "t:warm_")
 }
 
-[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command")]   //! once per row count, region and set epoch
-def private rd_record_verify(n : int64) {
+//! the verify command at `n` rows: whole into `v_cmd` (its unsplit twin beside it), or, from `seg0` on, the split command's segments
+//! (`hc-verify-rows`) - once per row count, region and set epoch
+[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command"), arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-verify-rows")]
+def private rd_record_verify(n : int64; seg0 : int64 = -1l) {
     rd_fill_gemv_regions_all()
     rd_fill_head_regions()
     rd_ensure_n_sets()
-    let vi = rd_v_idx(n)
     if (long_length(g_rdq_verify) <= n) {
         g_rdq_verify |> resize(n + 1l)
         g_rdq_verify_unsplit |> resize(n + 1l)
     }
+    if (seg0 >= 0l) {
+        rd_with_form_stamps() {
+            rd_encode_token(g_rd.v_seg[seg0], n, rd_split_pieces(), true, seg0)
+            rd_take_stamps(g_rdq_verify[n], g_pfq_n)
+        }
+        return
+    }
+    let vi = rd_v_idx(n)
     rd_with_form_stamps() {
         rd_encode_token(g_rd.v_cmd[vi], n, rd_split_pieces(), true)
         rd_take_stamps(g_rdq_verify[n], g_pfq_n)
@@ -4002,19 +4260,40 @@ def private rd_record_verify(n : int64) {
     g_rd.v_recorded[vi] = true
 }
 
-//! once a driver: the verify's segment command buffers, a region's `nseg`, and the per-region recorded flags
+//! once a driver: the split command's verify segments, `nseg` per (region, row count), and their recorded flags
 [cold_path]
-def private rd_hc_v_seg_alloc() {
-    alloc_cmds(g_rd.hc_v_seg, g_rd.regions * g_rd.nseg, true)
-    g_rd.hc_v_recorded |> reserve(g_rd.regions)
-    g_rd.hc_v_recorded |> resize(g_rd.regions)
+def private rd_v_seg_alloc() {
+    if (g_rd.nseg == 0l) {
+        rd_host_segments_setup(*g_rd)
+    }
+    let slots = g_rd.regions * (g_rd.nb + 1l)
+    alloc_cmds(g_rd.v_seg, slots * g_rd.nseg, true)
+    g_rd.v_seg_recorded |> reserve(slots)
+    g_rd.v_seg_recorded |> resize(slots)
+}
+
+//! the segments slot of the selected region's verify at `n` rows
+def private rd_v_seg_slot(n : int64) : int64 => g_rd.region * (g_rd.nb + 1l) + n
+
+//! the first segment of the selected region's verify at `n` rows, recorded on its first use through `record`
+def private rd_v_seg_first(n : int64; record : block<(seg0 : int64) : void>) : int64 {
+    if (long_length(g_rd.v_seg) == 0l) {
+        rd_v_seg_alloc()
+    }
+    let slot = rd_v_seg_slot(n)
+    let seg0 = slot * g_rd.nseg
+    if (!g_rd.v_seg_recorded[slot]) {
+        invoke(record, seg0)
+        g_rd.v_seg_recorded[slot] = true
+    }
+    return seg0
 }
 
 [cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-verify-rows")]
 def private rd_ensure_hc_v_rail : bool {
     if (!g_rd.head_on || !g_rd.carry || !g_rd.hc_nextn) return rd_v_decline("the NextN head is off the chain (the load log names why)")
     if (g_rd.verify_rows < 2l) return rd_v_decline("the driver was prepared for {g_rd.verify_rows} verify rows (the tier's verify seat was not installed at the load)")
-    if (g_rd.verify_rows != 2l) return rd_v_decline("the hyper-connection verify serves depth 1 alone - two rows, the driver was prepared for {g_rd.verify_rows} (the side panel commits every row, followup_vulkan.md row 129)")
+    if (g_rd.ngram && g_rd.ring_roll_dev == 0ul) return rd_v_decline("the n-gram ring has no rollback copy (the driver was prepared with no verify rows to roll back)")
     if (vk_rdec_token_n_rows() < 2l) return rd_v_decline("the N-row rail declined on this model (its line above); the hyper-connection verify is built on it")
     rd_ensure_n_sets()
     let nb = g_rd.nb
@@ -4066,7 +4345,7 @@ def private rd_verify_stage(x, cossin, hcos : array<float>; ids : array<int64>; 
 }
 
 def private rd_verify_land(n, width : int64; picks_only : bool; var logits : array<float>; var picks : array<int64>; var hid : array<float>) {
-    if (!picks_only) {
+    if (!picks_only && g_rd_sel_landed == 0l) {
         host_buf_read(g_rd.logits_host, unsafe(addr<void?>(logits[0])), g_rd.vocab * 4l * n)
     }
     host_buf_read(g_rd.hid_host, unsafe(addr<void?>(hid[0])), width * 4l * n)
@@ -4130,26 +4409,20 @@ def private rd_hc_verify(x, cossin, hemb, hcos, h0, side : array<float>; pos, n 
         g_rd.v_rail = rd_ensure_hc_v_rail() ? NRail.built : NRail.declined
     }
     return false if (g_rd.v_rail != NRail.built)
-    return rd_v_rows_mismatch(n) if (n != g_rd.verify_rows)
+    return rd_v_rows_mismatch(n) if (n < 2l || n > g_rd.verify_rows)
     rd_carry_sync()
     let dim = g_rd.dim
     let hcd = g_rd.hc_n * dim
-    let r = g_rd.region
     verify(pos >= 1l && long_length(logits) >= n * g_rd.vocab && long_length(picks) >= n && long_length(hid) >= n * hcd && long_length(h0) >= hcd,
         "vk_rdec_verify: a verify below row 1 (the head's first row is pos - 1), or a landing short of its rows")
     verify(!g_rd.ngram || long_length(side) >= n * g_rd.ngram_ind, "vk_rdec_verify: the side rows are short of the verify's rows")
-    if (long_length(g_rd.hc_v_seg) == 0l) {
-        rd_hc_v_seg_alloc()
-    }
-    let seg0 = r * g_rd.nseg
-    if (!g_rd.hc_v_recorded[r]) {
-        verify(n == g_rd.verify_rows, "vk_rdec_verify: the hyper-connection verify runs at the row count the driver was prepared for")
-        rd_record_hc_segments_n(n, true, g_rd.hc_v_seg, seg0)
-        g_rd.hc_v_recorded[r] = true
+    let seg0 = rd_v_seg_first(n) $(s0 : int64) {
+        rd_record_hc_segments_n(n, true, g_rd.v_seg, s0)
     }
     let guard = rd_guard_rows(g_rd.tokens_served, n)
     let picks_only = pick_only && !guard
-    g_rd_verify_landed_logits = !picks_only
+    rd_sel_guard(guard)
+    g_rd_verify_landed_logits = !picks_only && !g_rd_sel_ask
     let prof = vk_prof()
     let ts0 = ref_time_ticks()
     let noids : array<int64>   //! the hyper-connection chain gathers no row on the device
@@ -4161,15 +4434,16 @@ def private rd_hc_verify(x, cossin, hemb, hcos, h0, side : array<float>; pos, n 
             memcpy(g_rd.ple_emb_host.mapped, addr<void?>(side[0]), g_rd.ngram_ind * 4l * n)
         }
         let t1 = ref_time_ticks()
-        let host_us = rd_run_host_segments(g_rd.hc_v_seg, seg0) $(l : int64) {
+        let host_us = rd_run_host_segments(g_rd.v_seg, seg0) $(l : int64) {
             invoke(experts, l, reinterpret<float const?>(g_rd.hx_host.mapped), reinterpret<float const?>(g_rd.hlog_host.mapped), reinterpret<float?>(g_rd.hacc_host.mapped), 0l, n)
         }
-        var last = g_rd.hc_v_seg[seg0 + g_rd.nseg - 1l]
+        let t_seg = ref_time_ticks()
+        var last = g_rd.v_seg[seg0 + g_rd.nseg - 1l]
         let t = rd_submit_wait(last, n, picks_only, prof)
         rd_verify_land(n, hcd, picks_only, logits, picks, hid)
         if (prof) {
             rdq_host_add(g_rdq_verify_ledger, ts0, t1, t.t1, t.t3, ref_time_ticks())
-            g_rdq_verify_ledger.host_experts_us += double(host_us)
+            g_rdq_verify_ledger.submit_us -= rdq_segments_add(g_rdq_verify_ledger, t1, t_seg, host_us)
         }
     }
     rd_verify_close(n, guard)
@@ -4195,13 +4469,20 @@ def vk_rdec_verify(x, cossin, hemb, hcos, h0, side : array<float>; ids : array<i
     verify(pos >= 1l && long_length(logits) >= n * g_rd.vocab && long_length(picks) >= n && long_length(hid) >= n * dim,
         "vk_rdec_verify: a verify below row 1 (the head's first row is pos - 1), or a landing short of its rows")
     let vi = rd_v_idx(n)
-    if (!g_rd.v_recorded[vi]) {
+    let segmented = g_rd.experts_host
+    var seg0 = -1l
+    if (segmented) {
+        seg0 = rd_v_seg_first(n) $(s0 : int64) {
+            rd_record_verify(n, s0)
+        }
+    } elif (!g_rd.v_recorded[vi]) {
         rd_record_verify(n)
     }
-    let unsplit = g_rd.unsplit_on && pos + n - 1l < RD_UNSPLIT_POS
+    let unsplit = !segmented && g_rd.unsplit_on && pos + n - 1l < RD_UNSPLIT_POS
     let guard = rd_guard_rows(g_rd.tokens_served, n)
     let picks_only = pick_only && !guard
-    g_rd_verify_landed_logits = !picks_only
+    rd_sel_guard(guard)
+    g_rd_verify_landed_logits = !picks_only && !g_rd_sel_ask
     let prof = vk_prof()
     let ts0 = ref_time_ticks()
     let gather = rd_emb_on()   //! the recorded command gathers the trunk rows and the head's embed halves off the rows' ids
@@ -4217,11 +4498,27 @@ def vk_rdec_verify(x, cossin, hemb, hcos, h0, side : array<float>; ids : array<i
         }
         memcpy(reinterpret<void?>(cat + dim * 4l), addr<void?>(h0[0]), dim * 4l)
     }
-    var cmd = unsplit ? g_rd.v_cmd_unsplit[vi] : g_rd.v_cmd[vi]
+    var host_us = 0l
+    var cmd : VkCommandBuffer
+    let t_seg0 = ref_time_ticks()
+    if (segmented) {
+        unsafe {
+            host_us = rd_run_host_segments(g_rd.v_seg, seg0) $(l : int64) {
+                invoke(experts, l, reinterpret<float const?>(g_rd.hx_host.mapped), reinterpret<float const?>(g_rd.hlog_host.mapped), reinterpret<float?>(g_rd.hacc_host.mapped), 0l, n)
+            }
+        }
+        cmd = g_rd.v_seg[seg0 + g_rd.nseg - 1l]
+    } else {
+        cmd = unsplit ? g_rd.v_cmd_unsplit[vi] : g_rd.v_cmd[vi]
+    }
+    let t_seg = ref_time_ticks()
     let t = rd_submit_wait(cmd, n, picks_only, prof)
     rd_verify_land(n, dim, picks_only, logits, picks, hid)
     if (prof) {
         rdq_host_add(g_rdq_verify_ledger, ts0, t.t1, t.t2, t.t3, ref_time_ticks())
+        if (segmented) {
+            g_rdq_verify_ledger.memcpy_us -= rdq_segments_add(g_rdq_verify_ledger, t_seg0, t_seg, host_us)
+        }
     }
     if (unsplit) {
         g_rd.unsplit_served += n
@@ -4261,6 +4558,15 @@ def vk_rdec_rollback(a : int64) : bool {
             cmd_copy_range(raw, g_rd.roll_dev, src + L.roll_off, st.state_dev, st.state_byte_off, st.slot_state_bytes)
             cmd_copy_range(raw, g_rd.roll_dev, src + L.roll_off + st.slot_state_bytes, st.smalls_dev, st.hist_off * 4l, 2l * st.ring_image_bytes)
         }
+        if (g_rd.ring_roll_dev != 0ul) {
+            let rb = rd_ngram_ring_bytes()
+            cmd_copy_range(raw, g_rd.ring_roll_dev, 0l, g_rd.plehist_dev, r * rb, rb)
+            cmd_full_barrier(raw)
+            var h = VkHaz()
+            let hcd = g_rd.hc_n * g_rd.dim
+            var pcm = PleCommitArgs(dim = uint(g_rd.dim), hc = uint(g_rd.hc_n), nrows = uint(g_rd.ngram_nrows), rows = uint(a + 1l))
+            enc_ple_commit_cls(raw, h, g_rd.s_ple_commit, pcm, (hcd * (a + 1l) + 255l) / 256l)
+        }
     }
     for (_i in range64(g_rd.roll_vrows - a - 1l)) {
         rd_dn_advance_parity(r)
@@ -4270,13 +4576,17 @@ def vk_rdec_rollback(a : int64) : bool {
 }
 
 [cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#device-home-checkpoints")]
-def private rd_snap_alloc {
+def rd_snap_alloc {
     var off = 0l
     for (l in range64(long_length(g_rd.layers))) {
         var L & = unsafe(g_rd.layers[l])
         continue if (!L.recurrent)
         L.snap_off = off
         off += L.dn[0].slot_state_bytes + 2l * L.dn[0].ring_image_bytes
+    }
+    if (g_rd.ngram) {
+        g_rd.snap_ring_off = off
+        off += rd_ngram_ring_bytes()
     }
     g_rd.snap_row_bytes = off
     let rows = g_rd.regions * int64(RDEC_DN_SNAPS)
@@ -4305,8 +4615,31 @@ def vk_rdec_dn_snap_save(slot : int64) : bool {
             cmd_copy_range(raw, st.state_dev, st.state_byte_off, g_rd.snap_dev, dst + L.snap_off, st.slot_state_bytes)
             cmd_copy_range(raw, st.smalls_dev, st.hist_off * 4l, g_rd.snap_dev, dst + L.snap_off + st.slot_state_bytes, 2l * st.ring_image_bytes)
         }
+        if (g_rd.ngram) {
+            let rb = rd_ngram_ring_bytes()
+            cmd_copy_range(raw, g_rd.plehist_dev, r * rb, g_rd.snap_dev, dst + g_rd.snap_ring_off, rb)
+        }
     }
     g_rd.snap_par[row] = g_rd.dn_parity[r]
+    return true
+}
+
+//! the n-gram conv ring's bytes a region: `ngram_nrows` rows of hc x dim floats
+def private rd_ngram_ring_bytes() : int64 => g_rd.ngram_nrows * g_rd.hc_n * g_rd.dim * 4l
+
+//! checkpoint row `slot`'s n-gram conv ring (the live region's where `slot` < 0) read back into `host` (`RdecDnSnapRingFn`)
+[cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#device-home-checkpoints")]
+def vk_rdec_dn_snap_ring(slot : int64; var host : float?) : bool {
+    rd_chain_settle()
+    return false if (g_rd == null || !g_rd.ready || !g_rd.ngram || slot >= int64(RDEC_DN_SNAPS) || (slot >= 0l && g_rd.snap_dev == 0ul))
+    let rb = rd_ngram_ring_bytes()
+    var stage = make_host_buf(rb, false, [cached = true])
+    if (slot < 0l) {
+        readback_range(g_rd.plehist_dev, VHZ_DNSM, g_rd.region * rb, stage, host, rb)
+    } else {
+        readback_range(g_rd.snap_dev, VHZ_DNSM, (g_rd.region * int64(RDEC_DN_SNAPS) + slot) * g_rd.snap_row_bytes + g_rd.snap_ring_off, stage, host, rb)
+    }
+    destroy_host_buf(stage)
     return true
 }
 
@@ -4324,6 +4657,10 @@ def vk_rdec_dn_snap_load(slot : int64) : bool {
             let st & = unsafe(L.dn[r])
             cmd_copy_range(raw, g_rd.snap_dev, src + L.snap_off, st.state_dev, st.state_byte_off, st.slot_state_bytes)
             cmd_copy_range(raw, g_rd.snap_dev, src + L.snap_off + st.slot_state_bytes, st.smalls_dev, st.hist_off * 4l, 2l * st.ring_image_bytes)
+        }
+        if (g_rd.ngram) {
+            let rb = rd_ngram_ring_bytes()
+            cmd_copy_range(raw, g_rd.snap_dev, src + g_rd.snap_ring_off, g_rd.plehist_dev, r * rb, rb)
         }
     }
     if (g_rd.dn_parity[r] != g_rd.snap_par[row]) {
@@ -5604,21 +5941,12 @@ def vk_moe_qkv(var yq : float?; var yk : float?; var yv : float?; woq, wok, wov 
 // Per-layer slot pools live in the SYNTHETIC offset space, so the whole decode FFN GEMV rail
 // (find_stack, metas, FfnCmd) serves hit sets verbatim; uploads DMA-slice the pinned stream mirrors — no CPU gather on the decode path.
 
-def private heat_stream_src(base : int64; fmt : int) : int {
-    for (i in range(length(g_gpu.stream_stacks))) {
-        if (g_gpu.stream_stacks[i].base == base && g_gpu.stream_stacks[i].fmt == fmt) {
-            return i
-        }
-    }
-    return -1
-}
-
 def private heat_pool_make(l : int64; b1, b3, b2 : int64; f1, f3, f2 : int; n, nfe : int64) {
     ensure_batch_state()   // advise records its slice copies into batch_cmd
     var pool = HeatPool(ege = n * nfe)
-    let src1 = heat_stream_src(b1, f1)
-    let src3 = heat_stream_src(b3, f3)
-    let src2 = heat_stream_src(b2, f2)
+    let src1 = vk_stream_stack_at(b1, f1)
+    let src3 = vk_stream_stack_at(b3, f3)
+    let src2 = vk_stream_stack_at(b2, f2)
     let want = gpu_want_heat()
     // a gate and up of two activation forms each read their own image (`moe_gpu_image2`); the mid-step form follows the down
     if (src1 < 0 || src3 < 0 || src2 < 0 || want <= 0l
@@ -5660,17 +5988,18 @@ def private heat_pool_make(l : int64; b1, b3, b2 : int64; f1, f3, f2 : int; n, n
     g_gpu.heat_pools[l] <- pool
 }
 
-// one plane slice, mirror -> pool slot (quants + scales; per-row bytes are uniform by layout)
+//! one plane slice, the expert's cache slot -> pool slot (quants + scales; per-row bytes are uniform by layout)
+[unused_argument(rowlen, ege)]
 def private heat_record_slice(raw : VkCommandBuffer; src_si, dst_si : int; e, slot, rowlen, ege : int64) {
-    let rpe = ege / rowlen
-    let rows_src = g_gpu.stream_stacks[src_si].elems / rowlen
-    let rbq = g_gpu.stream_stacks[src_si].wqbytes / rows_src
-    let rbs = g_gpu.stream_stacks[src_si].wsbytes / rows_src
-    cmd_copy_range(raw, g_gpu.stream_stacks[src_si].hwq.buf, e * rpe * rbq,
-        g_gpu.stacks[dst_si].wqbuf, slot * rpe * rbq, rpe * rbq)
-    if (rbs > 0l) {
-        cmd_copy_range(raw, g_gpu.stream_stacks[src_si].hws.buf, e * rpe * rbs,
-            g_gpu.stacks[dst_si].wsbuf, slot * rpe * rbs, rpe * rbs)
+    let src = vk_stream_slot(src_si, e)
+    if (!src.present) {
+        panic("dasLLAMA vulkan tier: the heat pool asked for expert {e} of streamed stack {src_si}, which the expert cache does not hold")
+    }
+    let qlen = g_gpu.stream_stacks[src_si].qlen
+    let slen = g_gpu.stream_stacks[src_si].slen
+    cmd_copy_range(raw, src.qbuf, src.qoff, g_gpu.stacks[dst_si].wqbuf, slot * qlen, qlen)
+    if (slen > 0l) {
+        cmd_copy_range(raw, src.sbuf, src.soff, g_gpu.stacks[dst_si].wsbuf, slot * slen, slen)
     }
 }
 
@@ -6066,4 +6395,21 @@ def vk_moe_attn_dec(var xb2p : float?; var kp : float?; var vp : float?; woq, wo
             }
         }
     }
+}
+
+//! the DMA fill's say-once declines are a model's: the next model says its own
+def private rd_hot_dma_forget {
+    g_rd_hot_dma_said |> clear()
+}
+
+//! the last command's selection landing is the dropped driver's: the next driver's first step lands its own
+def private rd_sel_forget {
+    g_rd_sel_ask = false
+    g_rd_sel_landed = 0l
+}
+
+[init]
+def private rd_register_drop_hooks {
+    register_vk_drop_hook(@@rd_hot_dma_forget)
+    register_vk_drop_hook(@@rd_sel_forget)
 }

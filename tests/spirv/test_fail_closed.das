@@ -59,6 +59,8 @@ def private check_rejects_once(t : T?; fixture, needle : string) {
 [test]
 def test_fail_closed_rejections(t : T?) {   // nolint:STYLE038 — flat one-check-per-fixture list
     t |> run("emitter rejects shader-illegal constructs cleanly") <| @(t : T?) {
+        check_rejects(t, "_fc_texture_grad_array_gradient", "textureGrad")
+        check_rejects(t, "_fc_texture_grad_scalar_gradient", "textureGrad")
         check_rejects(t, "_fc_call", "cannot call 'safe_acos'")
         check_rejects(t, "_fc_global", "unsupported global 'g_scale'")
         check_rejects(t, "_fc_image_format", "unsupported @format")
@@ -66,7 +68,7 @@ def test_fail_closed_rejections(t : T?) {   // nolint:STYLE038 — flat one-chec
         // the same nested shape on the MEMORY path: a `var` struct local's undecorated OpTypeStruct
         // has no recursive plain-struct builder, so the field is refused rather than guessed at
         check_rejects(t, "_fc_local_struct_var_nested", "nested-struct fields are not yet supported")
-        check_rejects(t, "_fc_localtype", "type tInt64 is not supported")
+        check_rejects(t, "_fc_localtype", "type tRange is not supported")
         check_rejects(t, "_fc_stmt", "memzero is not supported in SPIR-V shaders")
         check_rejects(t, "_fc_deadcode", "unreachable code after a block terminator")
         check_rejects(t, "_fc_unroll_runtime", "the range must have literal bounds")
@@ -96,8 +98,8 @@ def test_fail_closed_rejections(t : T?) {   // nolint:STYLE038 — flat one-chec
         // user-defined function call rejections (Phase: shader functions)
         check_rejects(t, "_fc_recursion", "recursion is not supported")
         check_rejects(t, "_fc_mutual", "recursion is not supported")
-        check_rejects(t, "_fc_badparam", "parameter 'x' of type tInt64 is not supported")
-        check_rejects(t, "_fc_badret", "return type tInt64 is not supported")
+        check_rejects(t, "_fc_badparam", "parameter 'x' of type tRange is not supported")
+        check_rejects(t, "_fc_badret", "return type tRange is not supported")
         check_rejects(t, "_fc_inline_early_return",
             "an inlined function returns only from its last statement")
         check_rejects(t, "_fc_inline_array_struct",

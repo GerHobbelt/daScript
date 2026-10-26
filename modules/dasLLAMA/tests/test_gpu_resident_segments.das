@@ -13,7 +13,7 @@ require dasllama/dasllama_math
 require dasllama/dasllama_gpu_tier
 require dasllama/dasllama_gpu_resident
 require ?vulkan dasllama/dasllama_vulkan_prefill   // nolint:STYLE030,LINT019 - vk_rdec_prefill_segment_windows, read in the vulkan half
-require ?vulkan dasllama/dasllama_vulkan_common   // nolint:STYLE030,LINT019 - PF_WINDOW: the windows a long segmented call runs
+require dasllama/dasllama_env
 require _model_tier
 require _resident_feed
 
@@ -39,7 +39,13 @@ def private allow_cpu_prefill_intent() {
 let private OPEN_ROWS = 40l
 let private TAIL_A = 23l
 let private TAIL_B = 31l
-let private LONG_TAIL = 300l   //! two of them run past PF_WINDOW (512), so the segmented call runs two windows, the second holding B's rows alone
+let private SEG_WINDOW = 512l   //! the file's prompt window: two LONG_TAILs run past it, so the segmented call runs two windows, the second holding B's rows alone
+let private LONG_TAIL = 300l
+
+[init]
+def private window_intent() {
+    set_pf_window_rows_pin(SEG_WINDOW)   //! before every load of the file: the plan and the window chain read it
+}
 let private STEPS = 8l
 //! the bar a segment's rows hold against its solo window: the split bar, the routed bar on a routed model - its windows' expert
 //! tiles schedule other row counts than the solo window's, and the router's near-ties part the two (the 35B reads 0.56-0.88 of a
@@ -76,7 +82,7 @@ def private hold_rows(t : T?; what : string; got, want : array<array<float>>) {
 //! the windows of a segmented call that hold both segments - the one the boundary between A and B falls in; 0 with no vulkan module
 def private shared_windows(ta : int64) : int64 {
     static_if (typeinfo builtin_module_exists(vulkan)) {
-        return ta % PF_WINDOW != 0l ? 1l : 0l
+        return ta % pf_window_rows() != 0l ? 1l : 0l
     } else {
         return 0l
     }
@@ -106,7 +112,7 @@ def private tails_as_segments(t : T?; tr : Model; ta, tb : int64; what : string)
     chunks |> push_clone(tail_b)
     eval_segments_(tr, sess, chunks)
     sess |> clear()
-    t |> equal(segment_windows() - sw0, shared_windows(ta), "{what}: the two tails rode one segmented call, {shared_windows(ta)} window holding both segments")
+    t |> equal(segment_windows() - sw0, shared_windows(ta), "{what}: the two tails rode one segmented call, {shared_windows(ta)} window holding both segments at the {pf_window_rows()}-row window")
     t |> equal(moe_gpu_resident_prefills() - pf0, 2l, "{what}: the driver counted a prefill a segment")
     t |> equal(sa.n_past, OPEN_ROWS + ta, "{what}: session A's position moved by its tail")
     t |> equal(sb.n_past, OPEN_ROWS + tb, "{what}: session B's position moved by its tail")
@@ -417,6 +423,84 @@ def test_gpu_resident_segments_llama_1b_k(t : T?) {
 
 //! the segmented window on a recurrent model: each segment's recurrent rows conv and scan over its own region's slot, a tail
 //! shorter than the conv taps among them; a NextN carrier's carry lands a row a segment, a routed model routes every row
+//! a fresh device-home session adopts `claim` at `at` - a checkpoint row's position - continues the tail past it and takes `STEPS`
+//! fed steps, held to the solo form; its own parked claim comes back for the next adoption
+def private adopt_at_row(t : T?; tr : Model; claim, at : int64; opening, tail, toks : array<int64>; want : array<array<float>>; what : string) : int64 {
+    var s <- create_device_session(tr, gpu_device_session_dtype())
+    t |> success(gpu_device_kv_adopt(s, claim, at), "{what}: a fresh session adopts the claim at the checkpoint row ({at})")
+    let from = at - long_length(opening)
+    var rest <- [for (i in range64(long_length(tail) - from)); tail[from + i]]
+    eval_(tr, s, rest)
+    var got <- steps_after(tr, s, toks)
+    hold_rows(t, "{what}: the continuation off the checkpoint row", got, want)
+    log_argmax_rows(tr, "{what}: solo window, then the continuation off the checkpoint row", got, want)
+    let next = gpu_device_kv_park(s)
+    delete s
+    delete got
+    delete rest
+    return next
+}
+
+def private holds_rows(rows : array<int64>; a, b : int64) : bool =>
+    long_length(rows) == 2l && ((rows[0] == a && rows[1] == b) || (rows[0] == b && rows[1] == a))
+
+//! two device-home sessions' tails with checkpoint stops inside them as ONE segmented call, session A's region already keeping
+//! a checkpoint row at its opening, so the two segments' captures plan different rows of their regions: every stop's row adopts
+//! and continues as the solo form does - a landing that matched the call's records to a segment by a free row alone took
+//! another segment's record here and marked the wrong row
+def private captures_cell(t : T?; tr : Model) {
+    var open_a <- resident_prompt(OPEN_ROWS, 0l)
+    var open_b <- resident_prompt(OPEN_ROWS, 7l)
+    var tail_a <- ramp_ids(TAIL_A, 3l, 2000l, 53l, 4000l)
+    var tail_b <- ramp_ids(TAIL_B, 11l, 2000l, 53l, 4000l)
+    let toks <- resident_feed(STEPS)
+    var want_a <- solo_rows(tr, open_a, tail_a, toks)
+    var want_b <- solo_rows(tr, open_b, tail_b, toks)
+    var sa <- create_device_session(tr, gpu_device_session_dtype())
+    var sb <- create_device_session(tr, gpu_device_session_dtype())
+    eval_(tr, sa, open_a)
+    eval_(tr, sb, open_b)
+    t |> success(gpu_device_kv_checkpoint(sa), "captures: session A's region keeps a checkpoint row at its opening ({OPEN_ROWS})")
+    let stop_a = OPEN_ROWS + 10l
+    let stop_b0 = OPEN_ROWS + 8l
+    let stop_b1 = OPEN_ROWS + 20l
+    sa.dn_stops <- [stop_a]
+    sb.dn_stops <- [stop_b0, stop_b1]
+    let pf0 = moe_gpu_resident_prefills()
+    var sess <- [unsafe(addr(sa)), unsafe(addr(sb))]
+    var chunks : array<array<int64>>
+    chunks |> reserve(2l)
+    chunks |> push_clone(tail_a)
+    chunks |> push_clone(tail_b)
+    eval_segments_(tr, sess, chunks)
+    sess |> clear()
+    t |> equal(moe_gpu_resident_prefills() - pf0, 2l, "captures: the driver counted a prefill a segment")
+    t |> equal(long_length(sa.dn_captures), 1l, "captures: session A's stop captured inside the segmented call")
+    t |> equal(long_length(sb.dn_captures), 2l, "captures: session B's two stops captured inside the segmented call")
+    sa.dn_captures |> resize(0)
+    sb.dn_captures |> resize(0)
+    let claim_a = gpu_device_kv_park(sa)
+    let claim_b = gpu_device_kv_park(sb)
+    var rows_a <- gpu_device_kv_checkpoints(claim_a)
+    var rows_b <- gpu_device_kv_checkpoints(claim_b)
+    t |> success(holds_rows(rows_a, OPEN_ROWS, stop_a), "captures: region A keeps its opening's row and the stop's ({rows_a})")
+    t |> success(holds_rows(rows_b, stop_b0, stop_b1), "captures: region B keeps both stops' rows ({rows_b})")
+    let claim_b2 = adopt_at_row(t, tr, claim_b, stop_b1, open_b, tail_b, toks, want_b, "captures: session B's second stop")   //! the later stop first: an adoption keeps the rows at or under its position
+    let claim_a2 = adopt_at_row(t, tr, claim_a, stop_a, open_a, tail_a, toks, want_a, "captures: session A's stop")
+    let claim_b3 = adopt_at_row(t, tr, claim_b2, stop_b0, open_b, tail_b, toks, want_b, "captures: session B's first stop")
+    t |> success(claim_a2 != 0l && claim_b3 != 0l, "captures: every adopter parked its claim")
+    delete sa
+    delete sb
+    delete rows_a
+    delete rows_b
+    delete want_a
+    delete want_b
+    delete open_a
+    delete open_b
+    delete tail_a
+    delete tail_b
+}
+
 def private recurrent_segments_cells(t : T?; file : string) {
     let path = path_join(models_dir(), file)
     return if (!resident_ready(t, path))
@@ -431,6 +515,7 @@ def private recurrent_segments_cells(t : T?; file : string) {
         segments_cell(t, tr)
         tails_as_segments(t, tr, 2l, TAIL_B, "a tail under the conv taps")   //! the ring's leading rows off the history segment A continues
         tails_as_segments(t, tr, LONG_TAIL, LONG_TAIL, "tails past one window")
+        captures_cell(t, tr)
     }
     g_seg_bar_rel = SPLIT_BAR_REL
     set_resident_prefill_allowed(allowed)

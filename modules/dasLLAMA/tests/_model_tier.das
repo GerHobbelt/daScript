@@ -24,6 +24,7 @@ require dasllama/dasllama_tokenizer   // TokKind — a model loaded without its 
 require dasllama/dasllama_env
 require dasllama/dasllama_math
 require dasllama/dasllama_gpu_resident   // resident_mirror_dtype — the mirror codec the box arms
+require ../performance/model_specs.das   // prefix_match_len / fixture_ok — the fixture compare the board gates read too
 require _compares public
 
 // Models larger than this are large-tier. 6 GiB cleanly splits the ~5GB-and-under carriers
@@ -122,6 +123,30 @@ def log_logits_pair(m : Model; tag : string; got, want : array<float>; diff : fl
     to_log(LOG_INFO, "{tag}: argmax {pick_text(m, got)} against {pick_text(m, want)}, maxdiff {diff}\n")
 }
 
+//! a device-gathered run's rows against the host-embedded run's (`per_step` a step): the counts equal, every row's logits pair
+//! logged and its maxdiff 0
+def gathered_rows_bit_same(t : T?; m : Model; tag : string; dev, host : array<array<float>>; per_step : int64) {
+    t |> equal(long_length(dev), long_length(host), "{tag}: both runs stepped every row")
+    for (i in range64(min(long_length(dev), long_length(host)))) {
+        let diff = logits_maxdiff(dev[i], host[i])
+        let at = "{tag} step {i / per_step}, row {i % per_step}"
+        log_logits_pair(m, "{at}: the gathered row against the host row", dev[i], host[i], diff)
+        t |> equal(diff, 0.0, "{at}: the gathered rows' logits bit for bit the host rows' (maxdiff {diff})")
+    }
+}
+
+//! the first `n` ids of `ids` evaluated on `s` in calls of `chunk` ids or fewer
+def eval_chunked(t : Model; var s : Session; ids : array<int64>; n, chunk : int64) {
+    var p = 0l
+    while (p < n) {
+        let e = min(p + chunk, n)
+        var part <- [for (i in range64(p, e)); ids[i]]
+        eval_(t, s, part)
+        delete part
+        p = e
+    }
+}
+
 //! `prompt` greedily continued `n_gen` ids through `generate` on a fresh session: the prompt's echo past its first id, then the
 //! continuation
 def greedy_gen(tr : Model; prompt : array<int64>; n_gen : int) : array<int64> {
@@ -187,14 +212,14 @@ def with_pinned_kernels(body : block) {
 //! `prompt` greedily continued on a fresh session under the pinned kernels, the continuation against `want` token for token (the
 //! first generated id sits at `length(prompt) - 1`, past generate's echo); `eyeball` logs both decoded. Free of T?, so it JITs
 //! and the engine chain runs on the native stack.
-def parity_gen_ok(tr : Model; prompt, want : array<int64>; dn_chunked : bool = false; eyeball : bool = false) : bool {
+def parity_gen_ok(tr : Model; prompt, want : array<int64>; dn_chunked : bool = false; eyeball : bool = false; prefix_bar : bool = false) : bool {
     let n_gen = length(want)
     var ok = false
     with_pinned_kernels(dn_chunked) {
         let ids <- greedy_gen(tr, prompt, n_gen)
         let echo = length(prompt) - 1
         let got <- [for (i in range(n_gen)); ids[echo + i]; where echo + i < length(ids)]
-        ok = ids_equal(got, want)
+        ok = length(got) == n_gen && fixture_ok(prefix_bar, prefix_match_len(got, want), int64(n_gen))
         if (eyeball) {
             to_log(LOG_INFO, "eyeball want: {eyeball_text(tr, want)}\n")
             to_log(LOG_INFO, "eyeball got:  {eyeball_text(tr, got)}\n")

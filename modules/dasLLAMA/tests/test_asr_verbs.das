@@ -9,6 +9,8 @@ require dasllama/dasllama_canary
 require daslib/defer
 require dasllama/dasllama_gemma4a
 require dasllama/dasllama_qwen3a
+require dasllama/dasllama_asr   // set_asr_kv / get_asr_kv - the decoder K/V knob
+require dasllama/dasllama_common   // KVDtype
 require dasllama/dasllama_audio   // audio_tower_gpu_serves — the qwen3a lane policy's own predicate
 
 // The family-owned halves of the ASR facade verbs (asr_exec_fmt / asr_encode_bucket), fed
@@ -105,6 +107,16 @@ def test_audio_lane_knobs(t : T?) {
         }
         tt |> equal(parakeet_serves_q8(), !parakeet_gpu_serves(), "the pin's scope ends on the policy")
     }
+    t |> run("the ASR decoder's K/V dtype: f16 by default, the setter's value read back, put back as found") @(tt : T?) {
+        let found = get_asr_kv()
+        tt |> equal(KVDtype.f16, found, "the serving default")
+        set_asr_kv(KVDtype.f32)
+        tt |> equal(KVDtype.f32, get_asr_kv(), "the parity rail the oracle cells pin")
+        set_asr_kv(KVDtype.q8_0)
+        tt |> equal(KVDtype.q8_0, get_asr_kv(), "another codec")
+        set_asr_kv(found)
+        tt |> equal(found, get_asr_kv(), "put back as found")
+    }
 }
 
 [test]
@@ -113,6 +125,7 @@ def test_family_encode_buckets(t : T?) {
         t |> equal(whisper_encode_bucket(), "wh.encode_total")
         t |> equal(canary_encode_bucket(), "cn.encode")
         t |> equal(gemma4a_encode_bucket(), "g4a.encode")
+        t |> equal(parakeet_encode_bucket(), "pk.encode_total")
         t |> equal(qwen3a_encode_bucket(false), "q3a.encode")
         t |> equal(qwen3a_encode_bucket(true), "q3o.encode")
     }

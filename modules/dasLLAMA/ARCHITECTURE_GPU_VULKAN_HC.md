@@ -3,8 +3,10 @@
 Companion to `ARCHITECTURE_GPU_VULKAN.md`; a section is cited by its anchor. This document carries the
 whole-model driver's form for a hyper-connection model (qwen4exp, Qwen3.8-Flash-Next): the wide residual
 and its mixer seams on the device, the n-gram side input, the split token command whose routed
-experts run on the host, the hot expert pool beside it, and the NextN head riding the chain with its
-verify's rows. The heads the chain runs between its seams are
+experts run on the host, the streamed prompt window the host and the device meet in
+(`#hc-stream-window`), and the NextN head riding the chain with its verify's rows; the hot expert
+pool beside the split command is `ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool`. The heads the chain
+runs between its seams are
 `ARCHITECTURE_GPU_VULKAN_DECODE.md#hybrid-token-command`'s; the residency plan that admits the model is
 `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan`.
 
@@ -55,7 +57,7 @@ N-row command is not written, and its NextN verify is the split command's rows f
 
 **A plain MoE the card does not hold whole at a context asked whole takes the same split, layer by
 layer.** Where the plan puts some routed layers' experts on the host (`ResidentPlan.host_layers`: the first
-that many in layer order, `#hc-hot-pool`), those layers register with no expert blocks
+that many in layer order, `ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool`), those layers register with no expert blocks
 and the one-row recorder (`rd_encode_token` with a segment base) cuts at each: the router alone, the
 FFN-normed row and the logits landed, the command ended; the next segment opens on the host's sum
 (`rd_encode_routed_sum`, the pool's hits added) and takes the plain residual step over it - the
@@ -66,7 +68,8 @@ model with host layers (`rd_record_segments` records the hyper-connection chain 
 `vk_rdec_token` serves none), the host callback is the hyper-connection chain's (`rdec_host_experts_step`,
 the hot pool's split inside it), the segments' commands are built at the first token
 (`rd_host_segments_setup`). The split form of the attention is the one recorded (no unsplit or wide twin),
-the N-row command and the rows verify decline a host layer (the one-row split command serves), and the
+the N-row command declines a host layer (the one-row split command serves), the speculative verify runs its
+rows through the split command's segments (`#hc-verify-rows`), and the
 prefill window cuts the same way (`#hc-window-chain`). Regions are per segment, so a server's streams each
 keep their mirror region through the split. The plain form takes a routed model that is not a
 hyper-connection model (that model's own chain serves it) - the gemma-4 block among them, with its combine over the host's
@@ -80,97 +83,6 @@ one `moe_k` line - the layer, the session, the first pick and its weight, and th
 the routed sum (`moe_trace_row`) - from the split command's host segment (`moe_routed_sum_k`) and from the
 CPU forward (`moe_experts_apply`) alike. Over a forced feed, a split-command feed row whose L1 holds
 constant across fed tokens while the CPU chain's moves says the device fed every step the same row.
-
-### The hot expert pool {#hc-hot-pool}
-
-**A routed layer keeps its hot experts in device slots, and a step's picks split: the device runs the
-hits while the host sums the misses.** The carrier has a working set - a layer's picks fall on a few
-of its 512 experts far more often than on the rest - and the device decodes an expert's planes six to
-ten times faster than the host does (`iq3s4` at the gate shape: 7 us a cold plane on the reference
-card, the host's chain 61 us an expert), so the slots the card has room for pay. A pool is `slots`
-slots a routed layer (`RdHotLayer`: a gate, an up and a down plane pair, each `slots` experts in the
-plane's device layout, a slot's stride the expert's weight blocks), and the same count on every layer
-with host experts - every routed layer of a hyper-connection model, the first `host_layers` of a plain
-MoE the card does not hold whole at a context asked whole or that an ask names; a layer whose experts the
-card holds needs none. A host-layers ask (`set_gpu_host_layers`, `DASLLAMA_GPU_HOST_LAYERS`) moves the first
-that many routed layers' expert stacks to the host whatever the card holds, capped at the routed layer count
-(`resident_plan_pick`): the form, its split token command and its cut window chain run on any card, not only
-on one whose room forces them. Under a strict pin (`set_gpu_ctx_strict`, the server's `--ctx`), where the
-mirror at the asked context leaves no room for every expert stack, the plan (`resident_plan_host_layers`)
-moves the fewest routed layers' expert stacks - the first in layer order - for the rest to fit
-(`resident_host_layers_fit`), and never fewer than the ask; the pool over those layers takes what is left.
-With neither, a plain MoE the card does not hold whole stays with the per-op rails, which decode faster at every context (Qwen3-30B-A3B
-Q4_K_M on the reference card, `debug-jit`: tg128 64.0 against this form's 48.4, tg64 at 8192 positions 64.5
-against 46.8) and lose only the long prompt (pp8192 93.4 against this form's flat 431-534; `PERF_LEDGER.md`'s
-host-layers entry carries the rows).
-The count is the resident plan's (`ResidentPlan.hot_slots`, `resident_hot_slots`), sized with the
-mirror because the two share the card's room. Unasked, the pool takes 64 slots where they fit beside
-the mirror at the context asked; where they do not, it takes up to 32 out of the mirror's context,
-which keeps a floor of 32768 positions - a slot the device serves is worth more than context past the
-floor, and a plan that fills the card to its cap beside a desktop pages (the carrier's decode reads
-2.9 tok/s so, 30 with the pool and a mirror of 88 thousand positions). `DASLLAMA_GPU_HEAT` asks a
-count, served from the same floor's room, and 0 asks none. A context asked whole (`set_gpu_ctx_strict`,
-the server's `--ctx`) is the floor itself: the pool counts its slots out of what the asked mirror leaves
-(`resident_hot_floor_ctx`, scaled by eight sevenths for the re-plan's seven eighths), down to none, and
-the driver declines only where the dense planes and the asked mirror alone pass the card. The pick shortens the mirror's context to
-what the pool leaves and holds the pool at the count the first plan settled on, so the slack of the
-shortened context stays slack. Under four slots no pool arms. The chain a window's hits ride
-(`RDEC_HOT_CHAIN_BYTES`, 320 MB of scratch) is taken off the room before the slots are counted and
-charged to the plan only with a pool (`resident_hot_fit`): a plan with no pool - none asked, or none
-that fits - keeps the mirror's context and the room a model needs to fit.
-
-**The host owns the policy.** It holds, a layer, the slot of every expert and the expert of every slot
-(`HotLayer`) and a pick count an expert that halves every 256 routed rows. After a window's host step
-on a layer the rows' picks are counted and the free slots fill, hottest expert first
-(`rdec_hot_window`); a full pool swaps at most eight experts a window and one a decode step, and only
-an expert whose count passes twice the coldest slot's plus one - a swap costs a gather and an upload
-of 2.6 MiB, more than the host's sum of the same expert. An upload is the loader's gather of the
-expert's rows (`layout_gather_dispatch`, the bytes the arena would hold) written into the slot
-(`vk_rdec_hot_upload`); it runs between a segment's wait and the layer's hit chain, so no command reads
-a slot while it is written.
-
-**A decode step's hits run in a command of their own.** After a segment lands the FFN-mixed row and
-the router logits, the host selects, counts, admits, and splits the picks (`rdec_hot_step`): the hits'
-slots and weights go to the device (`vk_rdec_hot_submit` writes the region records of the three GEMVs
-and the weights into host-visible buffers the sets bind, zero weights past the hit count), the misses
-pack to the front of the session's picks and the host sums them (`moe_routed_sum_k`). The hit chain is
-the routed block's own - the row's feed requant in the gate plane's form, the gate and up GEMVs over
-`nhit` regions, the act with the down feed's requant, the down GEMV into the routed rows - recorded
-once a layer a hit count (`RdHotLayer.cmds`, k + 1 forms, on first use) and submitted with no fence, so
-it runs while the host sums. The next segment opens by copying the host's sum into the routed sum's row
-(`hacc_dev`) and adding the hit rows under their weights (`MoeCombine` with its slot window at 1 .. k
-over slot rows 1 .. k, so the sum accumulates onto the row instead of starting it; a zero weight skips
-its row, which is stale). The hit chain's rows are a compute write no fence covered, so that segment's
-hazard tracker starts with them pending and its first access takes a barrier
-(`rd_encode_routed_sum`). A step with no hit submits nothing and its zero weights leave the combine
-adding nothing.
-
-**A window's hits run through the tier's expert chain, beside the host.** The pool's planes are
-stacks of the tier (`make_stack_shell` at `HOT_BASE` plus the layer's stride, a plane a stack, a slot
-an expert's elements), so the batch arm's f16 chain (`vk_moe_ffn_batch_xf_begin`,
-`ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-expert-chain`) finds them by offset like any resident stack. At
-a routed layer's host step the host selects the window's rows, counts and fills or swaps the pool
-first - so the window that warmed a slot reads it - and splits the picks (`rdec_hot_regions`): the
-experts in the pool are the device's, their buckets its regions over the pool's planes (biggest
-first), their slot rows' weights in the device's plane and zero in the host's; the chain takes the
-window's rows, gathers the bucket rows as f16, runs the gate, up and down tiles over the regions,
-combines under the device's weights and lands the rows on the host, all in one submit the host does
-not wait for. The host sums the rest (`moe_routed_rows_sum` under `split`: the pool's experts take
-no chain, a zero weight's parked row is unread), joins the chain and adds its rows
-(`rdec_hot_rows_join`). A window under 32 rows, a window past the chain's one chunk, and a layer
-whose formats the chain's f16 feed does not admit stay the host's whole. A per-32 expert plane
-(q51, mx4, iq4nl32) takes the chain's s column alone (`batch_tile_edges`): its one cm2 stamp is the
-32-row tile.
-
-**The pool's policy is picked offline, on a trace of the routed picks.** Under
-`DASLLAMA_MOE_TRACE=<file>` every host expert step records its picks (`rdec_trace_picks`): a record
-is a layer, its row count, then k expert ids a row and k weights a row; a record of layer -1 with no
-rows marks a prompt that starts at position 0. The file (`rdec_trace_write`) opens with the magic
-`MOET` and three int32s - the routed layers, the expert count and k, set where the driver arms - and
-holds the records to its end: the first flush writes the header and every later flush appends, the
-last at the model drop. `harness/hot_pool_sim.das` replays a trace through a policy at a slot count;
-the live run's per-layer line under `DASLLAMA_GPU_PROF` (`rdec_hot_say`: a layer's hit share and
-swaps since the pool armed, where the misses sit) is its cross-check.
 
 ### The hyper-connection window chain {#hc-window-chain}
 
@@ -211,6 +123,32 @@ rows copy into the ring's slots (`pos % nrows`, the region the tok meta's `dnslo
 the window - the decode steps then advance the ring on the device (`Session.ple_ring_device`). A prompt
 served this way passes nothing to the CPU (the served-prefill counter `moe_gpu_resident_prefills` rises by one), and
 the deltanet state and the ring stay on the device as any other hybrid's do.
+
+### The window's experts streamed a layer at a time {#hc-stream-window}
+
+**Under `DASLLAMA_GPU_PF_STREAM` a routed layer's host step runs the window's picks on the device over
+the layer's whole expert stack, streamed into a device slot, and the host sums nothing.** The host's
+sum reads every expert of every layer once per window, so its cost is the window's rows times the
+stacks' bytes and a prompt's rate stays flat in its length; the stream carries each layer's stack over
+the link once per window instead, so a wider window (`DASLLAMA_GPU_PF_ROWS`) amortizes the same bytes
+over more rows: the sweep count is the prompt's rate (Qwen3.8-Flash-Next on the reference card, every
+expert resident: pp3000 368 at a 2048 window against 793 at 4096, one sweep instead of two; pp9000 663
+against 753, three sweeps instead of five), and the knob unset the driver takes the wide window where
+the plan fits with it and the narrow one otherwise (`resident_window_pick`, `PF_ROWS_WIDE` / `PF_ROWS_DEFAULT`),
+since the scratch the window sizes is the plan's third term. At load (`resident_stream_arm`) every routed layer's gate, up and down planes gather
+into pinned mirrors in device layout - the per-op tier's stream stacks (`gather_upload_group` with
+`stream` on, `vk_moe_stream_stack`), registered from the last routed layer down so the tier's prefetch
+of the group below a bound one is the next layer's copy; a mirror the pinned budget refuses stops the
+walk, and that layer and the ones below keep the host's sums. At the cut (`rdec_stream_rows`) the rows'
+picks bucket by expert as the pool's do, every touched expert is a region at the model's own plane
+offset in LPT order, and the tier's combined chain (`matmul_moe_gpu_ffn_combined_xf`) resolves the
+stream group from the offsets, binds a slot - the previous layer's prefetch filled it on the transfer
+queue, else the copy runs now - runs the gather, gate, up, act, down and combine in chunks of the
+chain's bucket-row cap, lands the combined rows, and prefetches the next layer's stack into the other
+slot; the rows copy into the host's routed sum whole. A window under the pool's row floor, or a format
+the chain's f16 feed does not admit, falls back to the host's sums with a line said once. The pool's
+decode arm is untouched; the two slots take the room a pool would (`DASLLAMA_GPU_HEAT=0` frees it on a
+card that holds no more).
 
 ### The NextN head on the chain {#hc-draft-head}
 
@@ -266,8 +204,9 @@ window of k slot rows (`r0 = 1`, `r1 = nrows x k + 1`) onto its accumulator row;
 pooled experts and `s.moe_w_cpu` zeroes their weights, so `moe_routed_rows_sum` sums the misses alone.
 The side input's rows form takes the panel (`PleGate` and `PleConv` at `rows > 0` with `pos0 =
 PLE_POS_TOK`, the window's first position read off the token record so the recorded command serves every
-position) and `PleCommit` lands the rows' normed gated rows in the ring's slots after the conv read them;
-at depth 1 a rejected row's slot is rewritten by the next token before any conv reads it. After the rows'
+position) and `PleCommit` lands the rows' normed gated rows in the ring's slots after the conv read them,
+the ring copied whole into `RDec.ring_roll_dev` just before, so a reject can put it back
+(`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`). After the rows'
 classifier the head warms over them (`rd_encode_hc_verify_warm`): row i pairs its embed row (`hemb_dev`)
 with the carry of the row before it - the parked carry for row 0, the rows' wide residual for the rest
 (`hcsrc_dev`) - normed per stream, the pairs as hc cat rows a head row, eh_proj with `hc x nrows` columns
@@ -277,12 +216,30 @@ rows' K/V. The seat (`vulkan_resident_verify_go`)
 widens its rows to the carry's width, gathers the rows' side rows through the arch's pre-step (which
 advances the n-gram window; `mtp_ple_window_snapshot` - the CPU round's own - and the rollback's re-advance
 over the accepted rows put it back on a reject) and hands the rows step as `RdecVerifyFn`'s `experts`. The
-rail (`rd_ensure_hc_v_rail`) serves depth 1 alone - two rows, the count the driver was prepared for; any
-other declines with its reason and the CPU verify serves - and builds the N-row command's stamps first (its
-GEMV leaves, the rows requant, the per-row top-k) and the hc leaves past them. The parity cell is `tests/test_gpu_resident_hc.das`'s verify
+rail (`rd_ensure_hc_v_rail`) serves every row count from two up to the rows the driver was prepared for -
+each count recorded once per region on its first use, as the plain chain's - declines where the model has
+an n-gram ring and no rollback copy of it, and builds the N-row command's stamps first (its GEMV leaves, the
+rows requant, the per-row top-k) and the hc leaves past them.
+
+**The plain chain's verify takes the same segments.** A plain MoE with host layers records its verify as the
+one-row recorder's rows form over the segments (`rd_record_verify` from a segment base: `rd_encode_token` under the verify
+flag with the segment base, the host cut at the rows' count, the resumed segment's combine over the host's rows
+at one slot a row under the identity map, the deltanet steps a row at a time with the roll copies between),
+once per (region, row count) in the verify segments both chains share (`RDec.v_seg`, `rd_v_seg_first`), so a
+round of any depth the driver prepared for records its own; its rail (`rd_ensure_v_rail`) builds the N-row
+rail's leaves alone and never asks the N-row command, which declines a host layer. The verify entry runs the
+segments with the host rows step between them and lands the last as the N-row verify does
+(`vk_rdec_verify`). The parity cell is `tests/test_gpu_resident_format_census.das`'s verify-rows cell on the
+35B: one round's two rows and carry rows against the split command's one-row steps, and four rounds'
+committed stream against the same tokens stepped, within the routed bar - and that cell compares two
+sessions' rounds only while their drafts agree, since a routed near-tie flips on the device's bucket order
+and the host sums' rounding run to run. On a box that holds one arm at a time the token step's parity runs
+through files (`harness/parity_dump.das`: the device arm's rows and routing tape dumped, the CPU arm run on
+them in its own process, the two files compared; `PERF_LEDGER.md`, the 2026-10-19 record).
+The parity cell is `tests/test_gpu_resident_hc.das`'s verify
 cell: one round on the device against the split command's own one-row steps on the same picks
 (`moe_pick_tape_lane`, a lane replay of a rows-form tape) at the split bar, and against the CPU's one-row
 steps at the wide bar - the CPU compare is the parity evidence, the device-vs-device compare a rounding
-control. Measured on the zen2 (`PERF_LEDGER.md`), the round does not pay while the pool's
-hits sit near 40% on real text - the verify rows' host sums cost more than a plain token - so a server slot
-leaves the round off on this form (`gpu_resident_experts_host`).
+control. Measured on the zen2 (`debug-jit`, the Flash-Next round entries in `PERF_LEDGER.md`), the round pays at depth 1 alone on this form - 1.07-1.11x
+(21.6 off to 22.0-24.0 on, tok/s) with the Q8_0 head under the expert cache, every deeper row's host sums costing more than its acceptance
+returns - so a server slot arms it at the NextN depth, 1, like any other whole-model slot (`mtp_auto_arms`).

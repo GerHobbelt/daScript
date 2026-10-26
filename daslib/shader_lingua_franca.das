@@ -152,6 +152,24 @@ def public textureLod(s : sampler3D; uv : float3; lod : float) : float4 =>
 def public textureLod(s : sampler2DArray; uv : float3; lod : float) : float4 =>
     float4(0.0, 0.0, 0.0, 0.0)
 
+//! Sample with explicit coordinate gradients. Array-layer coordinates
+//! have no derivatives.
+[unused_argument(s, uv, dx, dy), sideeffects]
+def public textureGrad(s : sampler2D; uv : float2; dx, dy : float2) : float4 =>
+    float4(0.0, 0.0, 0.0, 0.0)
+
+[unused_argument(s, uv, dx, dy), sideeffects]
+def public textureGrad(s : sampler3D; uv : float3; dx, dy : float3) : float4 =>
+    float4(0.0, 0.0, 0.0, 0.0)
+
+[unused_argument(s, uv, dx, dy), sideeffects]
+def public textureGrad(s : samplerCube; uv : float3; dx, dy : float3) : float4 =>
+    float4(0.0, 0.0, 0.0, 0.0)
+
+[unused_argument(s, uv, dx, dy), sideeffects]
+def public textureGrad(s : sampler2DArray; uv : float3; dx, dy : float2) : float4 =>
+    float4(0.0, 0.0, 0.0, 0.0)
+
 [unused_argument(s, coord, lod), sideeffects]
 def public texelFetch(s : sampler2D; coord : int2; lod : int) : float4 => float4(0.0, 0.0, 0.0, 0.0)
 
@@ -197,6 +215,22 @@ def public imageSize(img : image3D) : int3 => int3(0, 0, 0)
 
 [sideeffects]
 def public barrier() : void {}
+
+//! the atomic add on a @workgroup or @ssbo lvalue (on Metal, an
+//! element of such a member); returns the OLD value
+[sideeffects]
+def public atomicAdd(var mem : int&; value : int) : int {
+    let old = mem
+    mem += value
+    return old
+}
+
+[sideeffects]
+def public atomicAdd(var mem : uint&; value : uint) : uint {
+    let old = mem
+    mem += value
+    return old
+}
 
 [sideeffects]
 def public memoryBarrierShared() : void {}

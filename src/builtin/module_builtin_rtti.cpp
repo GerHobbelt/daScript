@@ -1090,6 +1090,7 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(jit_path_to_linker)>("jit_path_to_linker");
             addField<DAS_BIND_MANAGED_FIELD(module_cache)>("module_cache");
             addField<DAS_BIND_MANAGED_FIELD(max_fast_call_depth)>("max_fast_call_depth");
+            addField<DAS_BIND_MANAGED_FIELD(keep_symbol_tables)>("keep_symbol_tables");
         }
         virtual bool isLocal() const override { return true; }
     };
@@ -2183,7 +2184,7 @@ namespace das {
                 SideEffects::modifyExternal, "builtin_json_sprint_at")
                     ->args({"addr","type","humanReadable","context","at"})->setTempStringResult();
             addExtern<DAS_BIND_FUN(builtin_json_sscan_at)>(*this, lib, "sscan_json_at",
-                SideEffects::modifyArgumentAndExternal, "builtin_json_sscan_at")
+                SideEffects::modifyArgumentAndExternal|SideEffects::invoke, "builtin_json_sscan_at")
                     ->args({"json","addr","type","context","at"});
             // debug typeinfo
             addExtern<DAS_BIND_FUN(builtin_debug_type)>(*this, lib, "describe",

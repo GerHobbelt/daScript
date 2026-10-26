@@ -1,7 +1,8 @@
 # dasLLAMA Architecture - the prepared-image rail
 
 Companion to `ARCHITECTURE.md`; a section is cited by its anchor. The vulkan lane's mint off the gguf is
-`ARCHITECTURE_IMAGE_VULKAN.md`.
+`ARCHITECTURE_IMAGE_VULKAN.md`; the rail's ledgered cases - the drafter's non-image lane and the suite cells that mint an
+image by design - are `ARCHITECTURE_IMAGE_LEDGER.md`.
 
 ### There is ONE way to load a model {#there-is-one-way-to-load-a}
 
@@ -46,8 +47,11 @@ own tag (`whisper-f32`), with `-lut` / `-grid` on the CPU and metal lanes where 
 (`iq3s_serve_mode`: the pin, else `DASLLAMA_IQ3S_SERVE`) names the served form, `-devw` on the metal
 lane under the dev-W panel lever (`#image-devw-plane`; a coexisting knob, `devw` in the blob
 identity alone), `-yarn<s>` / `-linear<s>` / `-norope` where the rope scaling override rides (on the
-flavors whose identity carries it - a config-free family's does not), `-<quant>` off q8, and `-mtp`
-when a split head rides the load. `image_lane_name` spells it and `dlim_file_lane` reads it back off
+flavors whose identity carries it - a config-free family's does not), `-<quant>` off q8, and
+`-mtp-<head>` when a split head rides the load (the head file's stem with its `mtp-` prefix dropped,
+sanitized, so two heads on one trunk take two lanes; a superseding segment - it replaced the bare `-mtp`
+lane, whose images are version-stale under the `IMAGE_VERSION` that introduced it, and it lands on the
+flavors whose identity folds the head, `#image-identity-head-fold`). `image_lane_name` spells it and `dlim_file_lane` reads it back off
 a file name (a hash-named legacy image reads as no lane). The lane names the FILE; the header's
 identity still decides whether the file is current: tune winners, backend pins, pack and image
 versions stay in the identity and supersede within the lane, so a stale lane re-bakes in place (the
@@ -141,7 +145,8 @@ after which every instance the process asks for answers `ERROR_INCOMPATIBLE_DRIV
 the box profile first because that pin can change the backend, and the parse
 runs the same load select the gguf loader runs, before any kernel touches planes packed for that
 backend. A family whose plane bytes no box property shapes (the TTS f32 carrier: layouts minted
-from the model's own geometry) registers its tag config-free, and `image_config_for` keys its
+from the model's own geometry; every vision and audio tower's exact lane: the file's planes widened
+to f32 and the twin of its own halfwords, `#image-tower-twin-plane`) registers its tag config-free, and `image_config_for` keys its
 identity by the default configuration instead: one identity on every box, not one per tune
 state - two processes
 on one box with different tune manifests would otherwise bake different identities in the same
@@ -216,21 +221,14 @@ without it the f16 arm silently stays unavailable and every encode takes the f32
 
 **An image path folds in the split NextN head that rides the load.** `image_path_for` resolves
 `mtp_head_sidecar` for the gguf - the resolver excludes an assistant drafter (`gguf_is_assistant`),
-whose weights never enter the trunk's image - and, when a head exists, the lane carries `-mtp`, so a
-trunk loaded alone and the same trunk loaded with its head never share a `.dlim` path. The head's
-tensors are baked INSIDE the minted image - one file serves both - so two identities sharing a
-path would re-save over each other forever. Because the fold changes the path, the head's arrival
-needed no `IMAGE_VERSION` bump: no image at an unchanged path changed content. The fold lives in
-the path and not yet in the baked identity string (`followup_general.md` #99), so two different
-heads on one trunk share the lane and re-bake each other.
-
-### The assistant drafter is a ledgered non-image lane {#drafter-non-image-lane}
-
-**The gemma-4 assistant drafter (`dasllama_mtp_gemma.das`) reads its Q8_0 sidecar straight into
-its own blob and never mints a `.dlim`.** The sidecar is 440 MiB, its Q8_0 blocks are already the
-34-byte form the Metal encoder uploads unrepacked, and the copy takes a fraction of a second - an
-image would shorten nothing. The lane is optional (no sidecar, no drafter) and invisible to
-`dasllama-convert`'s list and GC by design.
+whose weights never enter the trunk's image - and, when a head exists, the lane carries
+`-mtp-<head>` (the head file's stem), so a trunk loaded alone, the same trunk with its head, and
+the same trunk with another head never share a `.dlim` path. The head's tensors are baked INSIDE
+the minted image - one file serves both - so two identities sharing a path would re-save over
+each other forever. Because the fold changes the path, a head's arrival or a swap needs no
+`IMAGE_VERSION` bump: no image at an unchanged path changes content. The fold lives in the path
+and not yet in the baked identity string (`followup_general.md` #99), so the direct-`.dlim` route
+still cannot tell a headed image from a head-less one by its header.
 
 ### The layout stamp is one hash over the code that places bytes {#image-layout-stamp}
 

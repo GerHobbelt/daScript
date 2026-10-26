@@ -40,12 +40,37 @@ def test_model_specs_invariants(t : T?) {
             if (!empty(s.parity.gen)) {
                 t |> success(empty(s.parity.prompt) != empty(s.parity.prompt_text),
                     "evidence carries exactly one prompt form (pinned ids, or text encoded in-model): {s.file}")
+                t |> success(!s.parity.prefix_bar || length(s.parity.gen) >= 2,
+                    "a prefix_bar fixture holds at least two ids, so its half-span bar is a token or more: {s.file}")
             } else {
                 t |> success(!(s.parity.kq_native || s.parity.dn_chunked || s.parity.moe_reference
-                        || s.parity.moe_per_expert || s.parity.require_dn_kq),
+                        || s.parity.moe_per_expert || s.parity.require_dn_kq || s.parity.prefix_bar),
                     "arm flags without evidence are dead data: {s.file}")
             }
         }
+    }
+}
+
+[test]
+def test_fixture_bar_rule(t : T?) {
+    t |> run("the fixture compare: token for token, or a matching prefix of half the span under prefix_bar") @(t : T?) {
+        let want <- [for (i in range(12)); 100l + int64(i)]
+        var got := want
+        t |> equal(prefix_match_len(got, want), 12l, "equal rows match whole")
+        t |> success(fixture_ok(false, 12l, 12l) && fixture_ok(true, 12l, 12l), "a whole match holds under both forms")
+        got[11] = 7l
+        t |> equal(prefix_match_len(got, want), 11l, "a flipped last id stops the prefix there")
+        t |> success(!fixture_ok(false, 11l, 12l), "the strict form reds a flipped last id")
+        t |> success(fixture_ok(true, 11l, 12l), "the half-span form holds a flipped last id")
+        t |> success(fixture_ok(true, 6l, 12l), "the bar sits at half the span: 6 of 12 hold")
+        t |> success(!fixture_ok(true, 5l, 12l), "5 of 12 red the half-span form")
+        got[11] = want[11]
+        got[3] = 7l
+        t |> equal(prefix_match_len(got, want), 3l, "a flip inside the first half stops the prefix there")
+        t |> success(!fixture_ok(true, 3l, 12l) && !fixture_ok(false, 3l, 12l), "a flip inside the first half reds both forms")
+        let short <- [for (i in range(5)); 100l + int64(i)]
+        t |> equal(prefix_match_len(short, want), 5l, "a shorter row matches no further than its own length")
+        t |> equal(prefix_match_len(want, short), 5l, "nor does a longer one")
     }
 }
 
@@ -180,6 +205,32 @@ def test_models_provenance_invariants(t : T?) {
         }
         t |> equal(length(entries), want, "the view carries every pin once and nothing else")
         delete asr_pins
+        delete names
+    }
+}
+
+[test]
+def test_board_provenance(t : T?) {
+    t |> run("a board box's fetch holds every file the board sweeps read, and no test-only carrier") @(t : T?) {
+        var names : table<string>
+        for (e in board_provenance()) {
+            names |> insert(e.name)
+        }
+        for (s in official_catalog()) {
+            t |> success(key_exists(names, s.file), "official row {s.file}")
+        }
+        t |> success(key_exists(names, bench_image_fixture()), "the image fixture")
+        for (a in asr_catalog()) {
+            t |> success(key_exists(names, a.das_model), "ASR carrier {a.das_model}")
+            t |> success(empty(a.das_mmproj) || key_exists(names, a.das_mmproj), "ASR mmproj {a.das_mmproj}")
+        }
+        for (s in tts_catalog()) {
+            t |> success(key_exists(names, s.file), "TTS model {s.file}")
+        }
+        t |> success(!key_exists(names, "Mistral-7B-Instruct-v0.3-Q8_0.gguf"), "a row off the board stays out")
+        for (n in keys(names)) {
+            t |> success(!(n |> starts_with("tts_oracle")), "the on-box parity oracles stay out: {n}")
+        }
         delete names
     }
 }

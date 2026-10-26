@@ -14,6 +14,7 @@ require dasllama/dasllama_kqformat
 require dasllama/dasllama_common   // kq_fmt_row_ok - the dense-row demotion
 require dasllama/dasllama_blocks   // kq_bytes_per_weight - the split estimate's per-format price
 require dasllama/dasllama_gguf   // ggml_type_bytes - the disk-byte oracle of the descriptor rows; gguf_need_tensor's refusal
+require dasllama/dasllama_load   // conv_row_name - the load report row a converted plane reads under
 require strings
 require dasllama/dasllama_gemm_schema   // the int-id delegation under test
 require ?vulkan dasllama/dasllama_vulkan_common   // DAT_KEY_FMTS, the decode block's layer-key radix
@@ -456,6 +457,14 @@ def test_gguf_decline_unread_types(t : T?) {
                 "{name}: the decline names the tensor, the type and the served type {target}: {why}")
             delete m
         }
+        let q8_1 = 9   //! ggml's Q8_1: the reader carries no arm for it, the nearest-type table no row
+        var unrowed <- GGUFMeta(tensors <- [GGUFTensorInfo(name = "blk.0.ffn_gate.weight", ggml_type = q8_1, n_elem = 256l)])
+        let why = panic_text() ${
+            gguf_decline_unread_types(unrowed)
+        }
+        t |> success(find(why, "blk.0.ffn_gate.weight") >= 0 && find(why, "type 9 on disk") >= 0 && find(why, "requantize it to a served type (Q8_0)") >= 0,
+            "a type with no nearest-type row names the tensor, its type id and the Q8_0 fallback: {why}")
+        delete unrowed
         var served <- GGUFMeta(tensors <- [for (gt in [GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_MXFP4]);
             GGUFTensorInfo(name = "t{gt}", ggml_type = gt, n_elem = 256l)])
         let none = panic_text() ${
@@ -487,6 +496,9 @@ def test_metal_b32_block_constants(t : T?) {
             "B32S = 2 on the q51 tile stamps, SH = 2 on MetalEmbedB32Q51")
         t |> equal(kq_ssb(KqFmt.iq4nl32), int64(1u * 2u), "B32S = 1 and SH = 1: one d")
         t |> equal(kq_elems(KqFmt.q51), int64(32u), "B32E = 32 on MetalKqMulMmB32TensorT: a per-32 block's elements")
+        for (f in [KqFmt.q51, KqFmt.iq4nl32, KqFmt.q4032, KqFmt.q5032]) {
+            t |> equal(kq_elems(f), 32l, "{f}: BE = 32 on MetalEmbedB32T (a row's blocks are dim / BE), and its four stamps' requires = \"ka.dim % 32\"")
+        }
     }
 }
 
@@ -503,4 +515,49 @@ def test_metal_kq_table_constants(t : T?) {
             t |> equal(kq_qsb(f), int64(32u * 4u), "SB_UINTS = 32 on the codebook tables: {f}")
         }
     }
+}
+
+//! a load report row names the plane's site beside its disk type and the form it serves in: a kq plane by its `KqFmt` member
+[test]
+def test_load_report_row_names_site(t : T?) {
+    t |> run("the GGUF role reads off a tensor name, and the site words off the role") @(t : T?) {
+        t |> equal(gguf_tensor_role("blk.12.attn_q.weight"), "attn_q")
+        t |> equal(gguf_tensor_role("token_embd.weight"), "token_embd")
+        t |> equal(gguf_tensor_role("blk.3.nextn.eh_proj.weight"), "nextn.eh_proj")
+        t |> equal(kq_site_words("ffn_down_exps"), "expert stack down")
+        t |> equal(kq_site_words("per_layer_token_embd"), "PLE table")
+        t |> equal(kq_site_words("nextn.eh_proj"), "nextn.eh_proj", "a role with no words is named as itself")
+    }
+    t |> run("a row names the site, the disk type and the served form") @(t : T?) {
+        t |> equal(conv_row_name("blk.3.attn_q.weight", GGML_TYPE_Q5_K, "kq transcode", ConvServed.kq, KqFmt.k5),
+            "attention q: Q5_K -> k5 plane", "a kq plane by its KqFmt member")
+        t |> equal(conv_row_name("token_embd.weight", GGML_TYPE_BF16, "q8 REQUANT (dequant+quant)", ConvServed.q8, KqFmt.q8),
+            "token table: BF16 -> q8 REQUANT (dequant+quant)", "a converted copy by the conversion that made it")
+        t |> equal(conv_row_name("blk.0.ffn_gate_exps.weight", GGML_TYPE_Q4_K, "kq transcode", ConvServed.kq, KqFmt.k4),
+            "expert stack gate: Q4_K -> k4 plane")
+    }
+}
+
+let private STAMPED_SKIP = "q8/b k4 !b32"
+let private STAMPED_TAILS = "a b"
+
+//! `kq_tile_stamped` answers the pairs a `kq_tile_stamp` over the same words arms: a pair word drops one tail of a member, a member
+//! word every tail, `!b32` every member but the per-32 ones; the same words without `!b32` keep a superblock member (the control)
+[test]
+def test_kq_tile_stamped(t : T?) {
+    let q51 = int(KqFmt.q51)
+    let q5032 = int(KqFmt.q5032)
+    let q8 = int(KqFmt.q8)
+    let k4 = int(KqFmt.k4)
+    let k6 = int(KqFmt.k6)
+    let a = 0
+    let b = 1
+    t |> success(kq_tile_stamped(q51, STAMPED_SKIP, a, STAMPED_TAILS), "a per-32 member keeps its first tail")
+    t |> success(kq_tile_stamped(q5032, STAMPED_SKIP, b, STAMPED_TAILS), "... and its second")
+    t |> success(!kq_tile_stamped(k6, STAMPED_SKIP, a, STAMPED_TAILS), "`!b32` drops a superblock member")
+    t |> success(!kq_tile_stamped(k4, STAMPED_SKIP, b, STAMPED_TAILS), "a member word drops every tail")
+    t |> success(!kq_tile_stamped(q8, STAMPED_SKIP, b, STAMPED_TAILS), "a pair word drops its tail")
+    t |> success(kq_tile_stamped(k6, "q8/b k4", a, STAMPED_TAILS), "without `!b32` the superblock member keeps its tails (the control)")
+    t |> success(kq_tile_stamped(q8, "q8/b k4", a, STAMPED_TAILS), "a pair word keeps the member's other tail")
+    t |> success(!kq_tile_stamped(k4, "q8/b k4", a, STAMPED_TAILS), "... and the member word still drops it")
 }

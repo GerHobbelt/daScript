@@ -105,6 +105,7 @@ struct Stream {
     max_new : int64
     n_gen : int64                           // tokens emitted so far
     cur_tok : int64 = -1l                   // sampled but not yet evaled — the next decode step's input
+    stop_row_tok : int64 = -1l              //! the stop token a speculative round's verify evaled before it finished the stream (its row stands); -1 = none
     think_budget : int64 = 0l               //! the request's reasoning budget (0 = none)
     think_marks : ThinkBudgetMarks = ThinkBudgetMarks()   //! the span's marks the budget acts on
     n_think : int64                         //! reasoning tokens emitted so far
@@ -165,15 +166,21 @@ def private prefill_chunk(m : Model; sch : Scheduler; head_end : int64) : int64 
 
 let DEFAULT_CHUNK_TOKENS = 512l   //! one prefill window: a window's cost is mostly fixed, so a smaller chunk runs a prompt at a fraction of the window's rate
 let CPU_CHUNK_TOKENS = 64l        //! the CPU's chunk while a stream decodes: a CPU chunk's time is its token count, so the stall follows it down - under 32 tokens a batch leaves the batched kernels
-let METAL_IDLE_CHUNK_TOKENS = 2048l   //! four windows in one call: within a few percent of the whole prompt's rate at a tick a quarter the length
+let GPU_IDLE_CHUNK_TOKENS = 2048l   //! the idle chunk's floor on a GPU: four windows in one call on Metal, within a few percent of the whole prompt's rate; on Vulkan the chunk follows the driver's prompt window (`idle_chunk_default`), since a window streams the routed layers' expert stacks through the device once and a chunk under it streams them again per chunk
 
 //! The chunk while a stream decodes on a backend: one window where a GPU prefills, `CPU_CHUNK_TOKENS` on the CPU.
 def chunk_default(on_gpu : bool) : int64
     => on_gpu ? DEFAULT_CHUNK_TOKENS : CPU_CHUNK_TOKENS
 
+//! The idle chunk where the device prefills `window` positions a call: the wider of the floor and the window
+def idle_chunk_default(on_gpu : bool; window : int64) : int64
+    => on_gpu ? max(GPU_IDLE_CHUNK_TOKENS, window) : DEFAULT_CHUNK_TOKENS
+
 //! The prefill quantum's two sizes on the backend `m` is served by: `chunk` while a stream decodes, `idle` while none does.
-def chunk_defaults(m : Model) : tuple<chunk : int64; idle : int64>
-    => (chunk = chunk_default(m.metal_blob || gpu_tier_status().supported), idle = m.metal_blob ? METAL_IDLE_CHUNK_TOKENS : DEFAULT_CHUNK_TOKENS)
+def chunk_defaults(m : Model) : tuple<chunk : int64; idle : int64> {
+    let on_gpu = m.metal_blob || gpu_tier_status().supported
+    return (chunk = chunk_default(on_gpu), idle = idle_chunk_default(on_gpu, gpu_device_prefill_window()))
+}
 
 //! A finished device-home stream's K/V rows - and a recurrent model's state at their end - kept on the device for the next request that opens with the same tokens.
 struct ParkedKv {
@@ -237,6 +244,7 @@ struct Scheduler {
     mtp_drafted : int64                     // self-spec telemetry across streams (drafts attempted / accepted)
     mtp_accepted : int64
     mtp_joined_max : int64                  // the most streams one joint verify carried in a tick (0 = every tick stepped its streams alone)
+    mtp_stop_rows : int64                   //! streams a round finished on an accepted draft among their stop ids (the stop's row stands in the session)
 }
 
 //! Create a scheduler over `model`: `max_streams` concurrent sessions, `max_queue` waiting
@@ -414,22 +422,17 @@ def submit(model : Model; var sch : Scheduler; var req : PendingReq) : bool {
     return true
 }
 
-//! the nearest checkpoint stop past the rows prefilled so far, 0 when none is left: the system text, the system opening, the request's own
-def private next_checkpoint(st : Stream) : int64 {
-    for (at in fixed_array(st.ckpt_head_at, st.ckpt_sys_at, st.ckpt_at, st.ckpt_end_at)) {
-        if (at > st.n_prefilled) {
-            return at
-        }
-    }
-    return 0l
-}
+//! the stream's checkpoint stops in row order, 0 for one not planned: the opening's head, the system opening, the request's own, the turn's end
+def private ckpt_stops(st : Stream) => fixed_array(st.ckpt_head_at, st.ckpt_sys_at, st.ckpt_at, st.ckpt_end_at)
 
-def private at_checkpoint(st : Stream) : bool =>
-    st.n_prefilled == st.ckpt_head_at || st.n_prefilled == st.ckpt_sys_at || st.n_prefilled == st.ckpt_at || st.n_prefilled == st.ckpt_end_at
+def private at_checkpoint(st : Stream) : bool => find_index(ckpt_stops(st), st.n_prefilled) >= 0
+
+//! a stop at row `at` this conversation's next turn attaches at, not an opening other requests share
+def private checkpoint_is_tail(st : Stream; at : int64) : bool => (st.ckpt_at_tail && at == st.ckpt_at) || at == st.ckpt_end_at
 
 //! a checkpoint stop inside the rows [lo, hi]: the span's one-call prefill cannot take them, since the stop needs the eval to end there
 def private checkpoint_within(st : Stream; lo, hi : int64) : bool {
-    for (at in fixed_array(st.ckpt_head_at, st.ckpt_sys_at, st.ckpt_at, st.ckpt_end_at)) {
+    for (at in ckpt_stops(st)) {
         if (at > lo && at <= hi) {
             return true
         }
@@ -583,6 +586,8 @@ def private advance_with(m : Model; var st : Stream; tok : int64; var events : a
 //! the stream's reasoning budget can still force a close: a token it emits may queue one, so its round drafts one token
 def private think_budget_armed(st : Stream) : bool => st.think_budget > 0l && !empty(st.think_marks.close) && st.think_state != 2
 
+def private round_depth_cap(st : Stream) : int64 => think_budget_armed(st) ? 1l : max(st.max_new - st.n_gen, 1l)
+
 //! Where the emitted token stands against the reasoning budget: the span's open token enters it, every token inside it counts,
 //! the close token the model writes leaves it, and the budget reached inside it - or the length cap drawing closer than the
 //! forced close is long - queues the forced close for the steps that follow.
@@ -710,7 +715,6 @@ def private reap_finished(m : Model; var sch : Scheduler) {
                 let t_park = prof_ticks()
                 park_stream(m, sch, sch.streams[i])
                 prof_add("sched_park", t_park)
-                to_log(LOG_INFO, "[stream {sch.streams[i].id}] parked\n")
             } elif (sch.paged) {
                 if (sch.streams[i].finish != "media_lost") {
                     donate_stream(m, sch, sch.streams[i])
@@ -750,7 +754,7 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         if (sch.device_kv) {
             let t_attach = prof_ticks()
             st.session <- create_device_session(m, gpu_device_session_dtype())
-            let hit = device_attach(m, sch, st.session, st.prompt)   // a model whose prefill cannot continue parks and pools nothing, so nothing matches
+            let hit = device_attach(m, sch, st.session, st.prompt)
             prof_add("sched_device_attach", t_attach)
             let matched = hit.n
             device_checkpoints_plan(st, sch.queue[0], matched)
@@ -865,8 +869,9 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
             // self-spec tick: the stream trades its cross-stream batch row for the round's positions per
             // tick, every stream's round verified together below.
             sch.streams[i].session.spec_params = unsafe(addr(sch.streams[i].params))
+            sch.streams[i].session.spec_stops = unsafe(addr(sch.streams[i].stop_ids))
             sch.streams[i].session.pick_asked = sampler_is_argmax(sch.streams[i].params)
-            sch.streams[i].session.mtp_depth_cap = think_budget_armed(sch.streams[i]) ? 1l : 0l
+            sch.streams[i].session.mtp_depth_cap = round_depth_cap(sch.streams[i])
         }
         sch.batch_rows |> push(unsafe(addr(sch.streams[i].session)))
         sch.batch_toks |> push(sch.streams[i].cur_tok)
@@ -876,7 +881,7 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         let ts_step = prof_ticks()
         let before = mtp_totals(sch)
         let joined = mtp_spec_eval_batch(m, sch.batch_rows, sch.batch_toks, sch.mtp_acc)
-        note_batch_step(joined == long_length(sch.batch_rows))   //! the census: one device step when every stream's rows rode the joint verify
+        note_batch_step(joined == long_length(sch.batch_rows))
         sch.mtp_joined_max = max(sch.mtp_joined_max, joined)
         prof_add("sched_eval_batch", ts_step)
         for (i, acc in sch.batch_idx, sch.mtp_acc) {
@@ -887,6 +892,10 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
                 }
                 if (sch.streams[i].state == StreamState.done) {
                     sch.streams[i].cur_tok = -1l   //! the accepted draft is evaled already: the close has nothing pending
+                    if (sch.streams[i].finish == "stop") {
+                        sch.streams[i].stop_row_tok = sch.streams[i].session.mtp_vbatch[j]
+                        sch.mtp_stop_rows ++
+                    }
                 }
             }
             if (sch.streams[i].state == StreamState.decoding) {
@@ -894,7 +903,8 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
                     sch.gen_tokens ++
                 }
             }
-            sch.streams[i].session.spec_params = null   // the pointer aims into `streams`, which admission and reaping move
+            sch.streams[i].session.spec_params = null   // the pointers aim into `streams`, which admission and reaping move
+            sch.streams[i].session.spec_stops = null
             sch.streams[i].session.pick_asked = false
         }
         let after = mtp_totals(sch)
@@ -955,11 +965,53 @@ def private any_prefilling_before_a_shared_checkpoint(sch : Scheduler) : bool {
 //! whether a media span's K/V is still to stand for the stream: its body, and the text around it, eval as one call of their own
 def private stream_has_span_ahead(st : Stream) : bool => next_span(st.spans) >= 0
 
-//! the rows a stream's next text chunk takes of `chunk`, never past `prompt_end`; a checkpoint within a chunk and a half
-//! ends the chunk there: stopping a chunk short of it would add a window, and a window's cost is mostly fixed
-def private chunk_take(st : Stream; chunk, prompt_end : int64) : int64 {
-    let to_ckpt = next_checkpoint(st) - st.n_prefilled
-    return min(to_ckpt > 0l && to_ckpt <= chunk + chunk / 2l ? to_ckpt : chunk, prompt_end - st.n_prefilled)
+def private chunk_take(st : Stream; chunk, prompt_end : int64) : int64 => min(chunk, prompt_end - st.n_prefilled)
+
+[arch(at="../ARCHITECTURE_ENGINE_SERVING.md#prefix-recurrent-checkpoints")]
+def private window_stops(var st : Stream; take : int64) {
+    st.session.dn_stops |> clear()
+    let lo = st.n_prefilled
+    let hi = lo + take
+    for (at in ckpt_stops(st)) {
+        if (at > lo && at < hi && find_index(st.session.dn_stops, at) < 0) {
+            st.session.dn_stops |> push(at)
+        }
+    }
+    sort(st.session.dn_stops)
+}
+
+[arch(at="../ARCHITECTURE_ENGINE_SERVING.md#prefix-recurrent-checkpoints")]
+def private file_captures(m : Model; var sch : Scheduler; i : int64) {
+    for (k in range64(long_length(sch.streams[i].session.dn_captures))) {
+        file_checkpoint(m, sch, i, sch.streams[i].session.dn_captures[k].pos, k)
+    }
+    sch.streams[i].session.dn_captures |> resize(0)
+    sch.streams[i].session.dn_stops |> clear()
+}
+
+//! Stream `i`'s checkpoint at row `at` is filed: a device-home stream notes a stop its region kept for the park's host
+//! pool copy, a host-cached one inserts the state into the prefix pool - capture `cap` of the window's `dn_captures`,
+//! or the session's own state at the window's end when `cap` is -1.
+[arch(at="../ARCHITECTURE_ENGINE_SERVING.md#prefix-recurrent-checkpoints")]
+def private file_checkpoint(m : Model; var sch : Scheduler; i, at, cap : int64) {
+    var st & = unsafe(sch.streams[i])
+    let site = cap >= 0l ? "inside the window" : "at the window's end"
+    if (st.session.device_kv) {
+        let kept = cap >= 0l || gpu_device_kv_checkpoint(st.session)
+        if (kept && device_pool_on(m, sch, st.session)) {   //! the host pool's copy waits for the park: nothing crosses the bus before the first token
+            st.pool_stops |> push((at = at, opening = at <= st.ckpt_shared_to))
+        }
+        to_log(LOG_INFO, "[stream {st.id}] device checkpoint at {at} tok {site}: {kept ? "the region keeps the recurrent state here" : "not kept"}\n")
+        return
+    }
+    let tail = checkpoint_is_tail(st, at)
+    if (cap >= 0l) {
+        prefix_insert_snapshot(sch.prefix, sch.pool, st.session, st.prompt, st.session.dn_captures[cap], !tail, at)
+    } else {
+        moe_gpu_hydrate_session(m, st.session)   //! the pages the checkpoint holds come down from a GPU driver's copy first
+        prefix_insert(sch.prefix, sch.pool, st.session, st.prompt, "", !tail)
+    }
+    to_log(LOG_INFO, "[stream {st.id}] prefix checkpoint at {at} tok {site}: {tail ? "this conversation's next turn" : "the next prompt on this opening"} attaches here ({length(sch.prefix.states)} checkpoints, {sch.prefix.state_bytes / 1048576l} MB)\n")
 }
 
 [arch(at="../ARCHITECTURE_ENGINE_SERVING.md#scheduler-step")]
@@ -981,6 +1033,7 @@ def private prefill_tick(m : Model; var sch : Scheduler; var events : array<Sche
         continue if (st.state != StreamState.prefilling || stream_has_span_ahead(st))
         let take = chunk_take(st, min(budget, quantum), long_length(st.prompt))
         continue if (take <= 0l)
+        window_stops(st, take)
         let k = long_length(sch.seg_stream_idx)
         sch.seg_toks |> resize(k + 1l)
         sch.seg_toks[k] |> resize(take)
@@ -1005,18 +1058,11 @@ def private prefill_tick(m : Model; var sch : Scheduler; var events : array<Sche
 def private note_prefilled(m : Model; var sch : Scheduler; var events : array<SchedEvent>; i, take : int64) {
     sch.streams[i].n_prefilled += take
     sch.prefill_tokens += take
-    if (at_checkpoint(sch.streams[i]) && sch.streams[i].session.device_kv) {
-        let kept = gpu_device_kv_checkpoint(sch.streams[i].session)
-        let at = sch.streams[i].n_prefilled
-        if (kept && device_pool_on(m, sch, sch.streams[i].session)) {   //! the host pool's copy waits for the park: nothing crosses the bus before the first token
-            sch.streams[i].pool_stops |> push((at = at, opening = at <= sch.streams[i].ckpt_shared_to))
-        }
-        to_log(LOG_INFO, "[stream {sch.streams[i].id}] device checkpoint at {at} tok: {kept ? "the region keeps the recurrent state here" : "not kept"}\n")
-    } elif (at_checkpoint(sch.streams[i])) {
-        let tail = (sch.streams[i].ckpt_at_tail && sch.streams[i].n_prefilled == sch.streams[i].ckpt_at) || sch.streams[i].n_prefilled == sch.streams[i].ckpt_end_at
-        moe_gpu_hydrate_session(m, sch.streams[i].session)   //! the pages the checkpoint holds come down from a GPU driver's copy first
-        prefix_insert(sch.prefix, sch.pool, sch.streams[i].session, sch.streams[i].prompt, "", !tail)
-        to_log(LOG_INFO, "[stream {sch.streams[i].id}] prefix checkpoint at {sch.streams[i].n_prefilled} tok: {tail ? "this conversation's next turn" : "the next prompt on this opening"} attaches here ({length(sch.prefix.states)} checkpoints, {sch.prefix.state_bytes / 1048576l} MB)\n")
+    if (!empty(sch.streams[i].session.dn_captures)) {
+        file_captures(m, sch, i)
+    }
+    if (at_checkpoint(sch.streams[i])) {
+        file_checkpoint(m, sch, i, sch.streams[i].n_prefilled, -1l)
     }
     begin_decoding_if_prefilled(m, sch, events, i)
 }
@@ -1059,6 +1105,7 @@ def private prefill_one_chunk(m : Model; var sch : Scheduler; var events : array
         } else {
             let head_end = si >= 0 ? sch.streams[i].spans[si].at : np   //! never past the next media span's start: a stop inside or past a span waits for the span's own eval
             let take = chunk_take(sch.streams[i], prefill_chunk(m, sch, head_end), head_end)
+            window_stops(sch.streams[i], take)
             sch.chunk |> resize(take)
             for (k in range64(take)) {
                 sch.chunk[k] = sch.streams[i].prompt[sch.streams[i].n_prefilled + k]
@@ -1143,7 +1190,11 @@ def private adopt_spans(var st : Stream; matched : int64) {
 def private donate_stream(m : Model; var sch : Scheduler; var st : Stream) {
     close_turn(m, sch, st)
     moe_gpu_hydrate_session(m, st.session)   //! rows a GPU driver stepped live on its copy alone until they come down into the pages
-    prefix_insert(sch.prefix, sch.pool, st.session, sch.donate_toks, st.prompt_head)
+    let why = prefix_insert(sch.prefix, sch.pool, st.session, sch.donate_toks, st.prompt_head)
+    if (!empty(st.session.dn_state_prefix)) {
+        let kept = empty(why) ? "this conversation's next turn attaches here" : "not kept - " + why
+        to_log(LOG_INFO, "[stream {st.id}] finished turn checkpoint at {st.session.n_past} tok: {kept} ({length(sch.prefix.states)} checkpoints, {sch.prefix.state_bytes / 1048576l} MB)\n")
+    }
 }
 
 def private park_stream(m : Model; var sch : Scheduler; var st : Stream) {
@@ -1236,16 +1287,19 @@ def private parked_best(sch : Scheduler; prompt : array<int64>) : tuple<at : int
 def private parked_adopt(var sch : Scheduler; var session : Session; at : int; n : int64) : int64 {
     return 0l if (at < 0)
     let adopted = gpu_device_kv_adopt(session, sch.parked[at].claim, n)
+    if (adopted && !empty(session.ple_prev)) {
+        ple_window_seed(session.ple_prev, sch.parked[at].tokens, n)
+    }
     drop_parked(sch, at)
     return adopted ? n : 0l
 }
 
 //! The host pool serves device mode: a paged scheduler, the pool's pages in the device's codec, a draft head only where the
-//! driver runs its whole round on the device (its rows ride the moves beside the trunk's), no n-gram side input (its ring may
-//! sit on the device), and a model whose device prefill continues past zero
+//! driver runs its whole round on the device (its rows ride the moves beside the trunk's), and a model whose device prefill
+//! continues past zero (a hyper-connection model's n-gram ring rides its checkpoints and snapshots)
 def private device_pool_on(m : Model; sch : Scheduler; session : Session) : bool
     => (gpu_device_kv_pool_armed() && sch.paged && (!sch.mtp || gpu_resident_mtp_device_home(m)) && sch.pool.kdt == gpu_device_session_dtype()
-        && empty(session.ple_conv_hist) && gpu_device_prefill_continues(m)
+        && gpu_device_prefill_continues(m)
         && (empty(session.dn_state_prefix) || sch.prefix.max_states > 0l))
 
 //! the scheduler's carrier session, made at its first move and pointed at the pool where the scheduler stands now (a moved
@@ -1290,8 +1344,12 @@ def private pool_keep(m : Model; var sch : Scheduler; claim : int64; tokens : ar
         delete snap
         return
     }
+    pool_carrier(m, sch)   //! made before the seed reads its id window: the first opening a fresh scheduler pools has no carrier yet
+    if (recurrent && !empty(sch.pool_host.ple_prev)) {
+        snap.ple_prev |> resize(long_length(sch.pool_host.ple_prev))
+        ple_window_seed(snap.ple_prev, tokens, n)
+    }
     let t0 = prof_ticks()
-    pool_carrier(m, sch)
     let held = prefix_share_pages(sch.prefix, sch.pool, sch.pool_host, tokens, n)
     let moved = gpu_device_kv_export(m, claim, sch.pool_host, held, n)
     if (moved && recurrent) {
@@ -1404,12 +1462,17 @@ def private drop_parked(var sch : Scheduler; at : int) {
 
 //! Eval the turn's closing tokens and leave in `donate_toks` the token list the session's rows hold.
 def private close_turn(m : Model; var sch : Scheduler; var st : Stream) {
+    let stop_closes = st.stop_row_tok >= 0l && !empty(st.close_toks) && st.close_toks[0] == st.stop_row_tok
+    let close_from = st.stop_row_tok < 0l ? 0l : (stop_closes ? 1l : long_length(st.close_toks))
     if (st.finish != "evicted") {
         sch.donate_toks |> clear()
+        sch.donate_toks |> reserve(length(st.close_toks) + 1)
         if (st.finish == "length" && st.cur_tok >= 0l) {
             sch.donate_toks |> push(st.cur_tok)
         }
-        sch.donate_toks |> push_from(st.close_toks)
+        for (k in range64(close_from, long_length(st.close_toks))) {
+            sch.donate_toks |> push(st.close_toks[k])
+        }
         if (!empty(sch.donate_toks)
                 && st.session.n_past + long_length(sch.donate_toks) <= m.config.seq_len) {
             eval(m, st.session, sch.donate_toks)
@@ -1420,5 +1483,8 @@ def private close_turn(m : Model; var sch : Scheduler; var st : Stream) {
     for (k in range64(st.n_prefilled)) {
         sch.donate_toks |> push(st.prompt[k])
     }
-    sch.donate_toks |> push_from(st.session.recent, st.close_toks)
+    sch.donate_toks |> push_from(st.session.recent)
+    if (close_from < long_length(st.close_toks)) {
+        sch.donate_toks |> push_from(st.close_toks)
+    }
 }

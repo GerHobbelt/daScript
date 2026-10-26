@@ -16,7 +16,10 @@ cold constants (conv taps, out-norm weights, the `a` and `dt` rows), the beta an
 parity ring pair per region (`ARCHITECTURE_GPU_VULKAN_DECODE.md#hybrid-token-command`). A call enters on the image the region's
 parity word names (`pf_dn_begin`; a prompt from position zero resets the word and zero-fills the slot's state and that image,
 `pf_dn_zero_region`): its first window reads that image per-channel (`DnConvArgs.hist_mode` 1), the later windows and the tail
-use the other, which the word names after the call (`pf_dn_end`) - the parity the owner handoff hands the session. The weight planes stay in their file
+use the other, which the word names after the call (`pf_dn_end`) - the parity the owner handoff hands the session. A window is
+one deltanet chunk: `pf_window_len` cuts a recurrent model's window at `DN_WINDOW` rows, since the smalls' beta and g rows and the
+scan workspace hold that many and a longer window copied its rows past them into the next plane (`dn_window_parts_enc` asserts
+every part inside it); a prompt window asked past it runs as windows of that length. The weight planes stay in their file
 formats where the loader tags them natively (`ARCHITECTURE_GPU_VULKAN_DECODE.md#hybrid-token-command`
 carries the tagging condition), so a Q5_K/Q6_K file rides the k5/k6 tiles.
 
@@ -65,12 +68,28 @@ chain (a sixth of the scan's time there). The conv, the scan and the requant fam
 fold map their 32-lane blocks and clusters from the invocation id, never from the subgroup id:
 every shuffle in them carries an xor mask under 32, which stays inside such a block on any
 subgroup width the tier admits (32 or more), so the kernels hold on a 64-lane device as on a
-32-lane one; only the KHR tile keys on the width itself (`ARCHITECTURE_GPU_VULKAN_GEMM.md#khr-mm-kq-tile`). The conv and smalls bindings are NonWritable, as every
+32-lane one; only the KHR tile keys on the width itself (`ARCHITECTURE_GPU_VULKAN_KHR.md#khr-mm-kq-tile`). The conv and smalls bindings are NonWritable, as every
 binding no kernel of a class writes is (`ARCHITECTURE_GPU_VULKAN.md#vk-readonly-lens`). The decoration is load-bearing: without it the driver orders each token's k and q
 loads behind the previous token's o store (the two buffers may alias), and the same kernel ran
 2.35x slower (19004 against 8084 us over the 0.8B's 18 layers on the Linux RTX 5080; the staged
 two-column form it replaced 8854). The raw o rows land in the per-op tier's workspace, for the
 gated out-norm's one workgroup per position.
+
+A checkpoint stop inside a window is a capture. The tier plans one checkpoint row a stop in the segment's region
+(`rdec_caps_plan`: an empty row, else the least recently touched, marked pending) and hands the call its captures
+(`rdec_prefill_caps`, `RdecPfCap`: the segment, the row the state stands after, the row). Each window uploads the records of its
+parts (`pf_window_caps` into `pf_cap_dev`: two words a capture, the row inside the part and the checkpoint row's float base), and
+the scan's pushes name a part's records (`DnScanArgs.cap_n`, `cap_rec`, `cap_state_off`): the walk writes its register state after
+that row into the checkpoint row (`snap_dev`, the layer's `snap_off`) and walks on over the live slot untouched; `dn_cap_tail_cls`
+writes the taps projected rows before the row - the entry image under the taps - into the row's ring image 0, whose parity the
+call marks 0 (`pf_caps_done`). The hyper-connection chain copies each capture's n-gram ring rows into the row ahead of the ring's
+own update (`pf_hc_side`). After the call the tier lands them (`rdec_caps_land`, each segment its own records of the call's
+list, in order): a device-home session keeps each row at its
+stop's position, as `gpu_device_kv_checkpoint` would have saved it; a host-cached session peeks the row into its snapshot
+(`rdec_peek_snapshot`) and frees it. The token-command peel keeps no state at an interior row, so a call with a capture takes
+the window chain. The checkpoint rows exist from the first save or the first capture (`rd_snap_alloc`); until then each
+recurrent layer's scan and cap-tail sets bind the smalls in their place, unread, since a window with no capture never reads
+that binding, and `vk_rdec_prefill_caps` rebinds the layers' sets onto the rows when it makes them.
 
 The conv history crosses windows position-major in the image the call did not enter on; the last window transposes the
 tail into the decode step's per-channel layout (`dn_tail_cls`; the handoff is stated in
@@ -98,7 +117,7 @@ too, each over its own region's state slot and ring (`DnConvArgs.row0`, `DnScanA
 and the gated out-norm stay window-wide), the region's ring image advancing a window part at a time
 (`ARCHITECTURE_GPU_VULKAN_WINDOW.md#vk-prefill-dn-block`). Under a block-codec mirror the window holds one
 segment: the codec stages the window's rows window-local (the rope-and-store's `pos0` is the segment's window
-row), so its store and shadow run once over the whole window. A window past `PF_WINDOW` rows loops as the
+row), so its store and shadow run once over the whole window. A window past the prompt window's rows (`pf_window_rows`) loops as the
 one-session chain does, the parts of the segments inside each window the window's own (`pf_window_segs`).
 Every segment whose last row a window holds takes the final requant and the classifier at that row, its logits
 landing at its slot of the host buffer (`pf_logits_host`, `regions` slots of `vocab`); a segmented window runs

@@ -354,7 +354,7 @@ Ordered roughly by user-visible value; re-rank against zen2 measurements before 
    it cannot satisfy.
 
 17. **The residency plan off Windows still guesses.** On Windows the plan sizes against the OS
-   video memory budget (`ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan`, the `os_video_memory`
+   video memory budget (`ARCHITECTURE_GPU_VULKAN_ROOM.md#vk-plan-room`, the `os_video_memory`
    boost helper); elsewhere the 27% headroom share stands, measured on the tagged arm and never
    re-measured. Two tails: (a) Linux NVIDIA fails an allocation past the card with
    `OUT_OF_DEVICE_MEMORY`, which `vk_check` turns into a process death - the arena reserve and
@@ -374,9 +374,12 @@ Ordered roughly by user-visible value; re-rank against zen2 measurements before 
    uploads, unmapped device-local) restored 6584 immediately, same session. The morning
    half of the session served the mapped heap at full speed, so the hazard ARMS with some
    driver/desktop state (ngfx profiling sessions and the Parsec virtual display both ran
-   that day). Design consequence to rule on: long-lived weight planes out of the mapped
-   heap by default (ReBAR kept for transient staging), with this item's runtime priority
-   as the second layer and a Metal-style residency heartbeat in reserve.
+   that day). Long-lived weight planes stay out of the mapped heap by default -
+   `DASLLAMA_VK_REBAR` ships off, the mapped type is the opt-in
+   (`ARCHITECTURE_GPU_VULKAN_ROOM.md#vk-plan-room`); the hazard arms on gemma-4
+   26B-A4B's host-experts plan too (8.1 tok/s mapped against 32.7 staged, same session, same
+   room: `debug-jit`, the ReBAR entry in `PERF_LEDGER.md`). What stays open is the runtime
+   layer: the residency heartbeat in reserve, and the two non-Windows tails above.
 
 18. **`rsqrt` vs `1.0/sqrt` - the RMS-norm parity spelling (ledgered 2026-08-07, found by
    the cross-backend similarity audit).** The three rails spell the same inverse norm two
@@ -768,7 +771,7 @@ module) is independent and can land any time - it is pure structure.
     kq-only file. A card without NV_coopmat2 (every AMD and Intel part, the GTX line)
     prefilled a 27B at a third of the reference exe's rate. The fix was the format decode on
     the mul_mm L-tile, the way it moved onto the cm2 template.
-    THE KHR kq TILE LANDED (2026-09-07 evening, `ARCHITECTURE_GPU_VULKAN_GEMM.md#khr-mm-kq-tile`): the
+    THE KHR kq TILE LANDED (2026-09-07 evening, `ARCHITECTURE_GPU_VULKAN_KHR.md#khr-mm-kq-tile`): the
     cm2 template's KHR arm, every kq format, 0 of 89600 off on all thirteen; the 4B Q4_K_M mm
     row 1564 -> 2378 (0.56x of the reference exe's `mul_mm.comp` 4221), the 27B UD-IQ4_XS
     221 -> 395 (0.59x of the same tile's 675), decode unchanged. Its three measured steps: the
@@ -779,7 +782,7 @@ module) is independent and can land any time - it is pure structure.
     edge-store slab the shipped class carried beside its two 10 KB staging arrays - a probe arm
     of that evening (since retired), the copy plus that one array touched on a path no dispatch
     takes, read 28.5: 8 KB more shared memory per workgroup is one workgroup fewer per SM (the
-    two-array footprint is now the tile's own, `ARCHITECTURE_GPU_VULKAN_GEMM.md#khr-mm-kq-tile`). The staging arrays are
+    two-array footprint is now the tile's own, `ARCHITECTURE_GPU_VULKAN_KHR.md#khr-mm-kq-tile`). The staging arrays are
     now `uint` f16 pairs (the activation words stored as they arrive, no unpack) and the edge
     tile's f32 fragments bounce through the weight array once the k loop is done, the row guards
     hoisted out of the loop: the shipped class 25.6 -> 32.1 / 23.9 -> 31.4 / 25.6 -> 32.2 on the
@@ -1891,43 +1894,6 @@ module) is independent and can land any time - it is pure structure.
     ping-pong, the concat when the width differs, the head-block loop - is identical and could run
     once over an encoder interface, about 450 lines.
 
-116. **The NextN speculative round has no Vulkan round seat.** The round's four backend seats
-    (`register_mtp_spec_override`, `_spec_batch_`, `_round_`, `_seam_` in `dasllama_common.das`)
-    are filled by the Metal decode driver alone; the gemma assistant drafter's rounds ride their own seams on both
-    homes (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-assistant-drafter`). The resident driver
-    homes the NextN draft head and serves the round's draft through its own seat
-    (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`), under the Vulkan owner
-    (`register_mtp_seat_owner`, "the resident driver is armed on t"), serves the round's
-    two-row verify as same-slab rows of the N-row command with the head's re-warm in the same
-    command - the k-head store alone, no q GEMV - landing the rows' picks and hidden and, under a
-    bare-argmax caller's pick ask, no logits, the committed row's pick published for `sample_`
-    as a plain step's is (`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`), the draft's pick
-    answered from the device and the round's head rows staying on the device until a pass
-    hydrates them (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`), and warms the head's
-    slab over a prompt it serves as the window chain's extra layer, the prompt's rows read back
-    to the host (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-head-prompt-warm`; the CPU warm stands
-    down behind a driver that landed the logits, so it never reads the host `x_b` rows such a
-    driver leaves unwritten); the resident overrides land the
-    post-norm hidden carry (`ARCHITECTURE_GPU_VULKAN_LANDING.md#logits-transfer-queue`), so with
-    `set_mtp_spec` or the server's `--mtp` the round's cold gate passes and the CPU round runs
-    around the device draft and verify, and a reject of a verify the seat served rolls the region
-    back on the device from the copies the verify command took - no snapshot, no replayed step
-    (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`, the rollback seat). A verify the
-    seat declines runs the CPU two-row prefill over the snapshot the round then takes, inside the
-    verify window the resident prefill declines by name
-    (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-window`): a hybrid's passes to the CPU rails,
-    and a routed-head carrier (GLM-4.5-Air's shape - no recurrent layer, a head the driver
-    declines) is served by the CPU verify under the window with its trunk resident.
-    `test_mtp.das`'s sessions carry f32 K/V, so they reach the driver only under
-    `DASLLAMA_VK_KV32=1`. What is still owed, in Metal's shape (`ARCHITECTURE_GPU_MTP.md`) on the
-    resident driver: the Vulkan round seat (`register_mtp_round_override("vulkan", ...)`) - a
-    round at depth k > 1 (the verify's per-row planes and the rollback scratch already hold the
-    box knob's depth plus one, sixteen rows at most, and the scratch's rows serve a reject to any
-    `a < k`) and the joint verify across streams. Carriers: Qwen3.5-0.8B-MTP first,
-    Qwen3.8-27B with its split Q8_0 head for the rate (Metal reads 1.23x at depth 1, 1.31x at
-    depth 3 on the M5 Max); the invariance cells of `tests/test_mtp.das` and the scheduler arm hold the speculating run to
-    the plain one (the driver against itself, not a parity), `lcpp_bench --mtp-ab` on the pod the rate, a CUDA reference
-    row per carrier beside it.
 118. **Two vulkan-lane arms still bake from RAM with the planar families kept.** The streaming mint
     (`ARCHITECTURE_IMAGE_VULKAN.md#image-vulkan-mint`) serves the cold load; a planar image already
     mapped (a CPU-mode load's lane found under an armed tier) and the eager rail (a gguf that would
@@ -1935,8 +1901,7 @@ module) is independent and can land any time - it is pure structure.
     `vulkan_bake_flavor` off the mapping or the loaded planes - one file, but the families ride it,
     the eager rail writes the CPU lane beside it and serves that, and under `DASLLAMA_TRIM` the
     lane's identity says trimmed while its meta says not (the image serves, with the extra planes;
-    the arm warns). The untrimmed lane is the default, so the mint's lane carries the planar families
-    unless the lever is on, and an fp32 token table rides `fblob` whole under the trim (nothing packs
+    the arm warns). An fp32 token table rides `fblob` whole under the trim (nothing packs
     it). `vulkan_bake_begin` on those arms collects the twin into RAM even under
     `DASLLAMA_IMAGE_SAVE=0`, where `vulkan_bake_flavor` deletes it unsaved. Done = both arms re-read
     the gguf through the streaming mint, the collect skipped where nothing saves, and the trimmed
@@ -1945,11 +1910,9 @@ module) is independent and can land any time - it is pure structure.
     `dasllama-convert -f vulkan --trim` (`trim_model_planes`) refuses a NextN head, while the cold
     load's trimmed mint (`resident_would_serve`) admits one the driver's draft seat serves - the
     0.8B-MTP trims at runtime and is refused offline - and both write the lane under the same
-    trim-folded tag; the converter's streamed `-f vulkan` rail still refuses with a text that
-    predates the mint ("collects whole planes"). Done = one admission predicate on both rails
-    (`resident_would_serve` with `planes_trimmed` set before the converter's save), the refusal text
-    naming what still holds, and `dasllama-convert --trim` proven on a q8, a K-quant and a
-    third-format model.
+    trim-folded tag. Done = one admission predicate on both rails
+    (`resident_would_serve` with `planes_trimmed` set before the converter's save), and
+    `dasllama-convert --trim` proven on a q8, a K-quant and a third-format model.
 120. **The served one-stream round on a Vulkan device is unmeasured.** `dasllama-server` arms the
     speculative round by default on a one-stream slot whose whole model is resident
     (`mtp_auto_arms`, `utils/dasllama-server/openai_server.das`), and an armed slot serves
@@ -1974,7 +1937,7 @@ module) is independent and can land any time - it is pure structure.
     no profile roles. Done = the attention twins recorded per segment, the regions and rows forms as the
     serving shapes ask for them, and the window's `--prof` roles.
 123. **A window's pool hits ride the batch arm's chain, with a host round trip and one tile column.**
-    `ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool` runs a window's hits through `vk_moe_ffn_batch_xf_begin`:
+    `ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool` runs a window's hits through `vk_moe_ffn_batch_xf_begin`:
     the window's rows go up (5 MB at 512 rows), the combined rows come back (5 MB) and the host adds
     them, and each plane's regions take one cm2 column (`batch_tile_edges`) where the resident block's
     own schedule takes the e and s columns per bucket (`ARCHITECTURE_GPU_VULKAN_MOE.md#vk-prefill-moe-block`).
@@ -2033,12 +1996,6 @@ module) is independent and can land any time - it is pure structure.
     over a co-occurrence table, or the next token's picks prefetched during this token's segments -
     placing fewer experts for the same hits. Done = each policy tried in the sim against the trace
     before its live run, the winner's hits and token wall on the ledger.
-129. **The rows' side panel commits at depth 1 alone.** `PleCommit` lands every verify row's normed gated
-    row in the ring's slot of its position after the conv read them, and a rejected row's slot is
-    rewritten by the next token before any conv reads it - true at depth 1, where one row past the
-    accepted prefix is at stake, so `rd_ensure_hc_v_rail` declines every other row count and the CPU
-    verify serves a deeper draft. Done = a depth past 1 commits the accepted rows alone, or the rollback
-    restores the slots it rewrote, and the rail admits the depth.
 130. **The device draft accepts 14 points under the CPU draft.** The device's draft and the verify rows
     route their near-ties apart (65.8% against the CPU rail's 79.9% on the same eight prompts,
     `PERF_LEDGER.md`'s NextN entry, the `--mtp-ab` rows), and every
@@ -2136,3 +2093,89 @@ module) is independent and can land any time - it is pure structure.
     per-op block binds the sink rows and the sliding window and serves gpt-oss's attention layers, and the span, the tail
     fusion and the f16 chain take the routed form, each held by a cell against the CPU chain; this is
     the gpt-oss leg's.
+
+149. **The cm2 pick never splits k under 2048, so a narrow K-quant GEMM pays one dispatch's latency a window.** On the
+    RTX PRO 4500 (driver 580.159.04, no decode-vector) the per-layer-embedding gate over q8 and q4_0 planes reads 1090 and
+    1270 us a 512-row window - eight workgroups whose one-dispatch latency the window pays - where the f32 planes' split
+    staged gate reads 718 (`DASLLAMA_GPU_PROF=1 DAS_LOG_LEVEL=info DASLLAMA_IMAGE_SAVE=0 ./bin/daslang -jit
+    modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /workspace/models/<file> -p 512 -n 0 -r 3 --for-debug-purposes` at
+    5e46f3acb3 on gemma-4-E2B-it-Q8_0, -Q4_0 and -Q4_K_M). The fix is a split-k arm in `cm2_gemm_pick` for a GEMM whose
+    workgroups cannot fill the card, with the reduce the f32 path carries, raced per format one dispatch at a time; it
+    lands with the next Vulkan window pass, where every window stage is measured again. Done = the
+    pick raced per format at whole and partial windows on both decode arms, the winners in `cm2_gemm_pick`, the E2B
+    Q8_0 and Q4_0 rows re-read. A window off the l column (the E2B gate at 500 rows) runs the m stamp's edge path, where
+    the staged KHR tile reads 2-11% under it (the figures beside the pick rule in `ARCHITECTURE_GPU_VULKAN_GEMM.md`);
+    that stays as measured - a tail shape, one stage, a shape-keyed switch between two tile families is not worth it.
+
+155. **A short prompt's rate under the streamed layers is unmeasured against the code before them.** Every rate the
+    prefill rotation arc reads is pp3000 and pp9000 (the rows under "From the prefill rotation arc" in `PERF_LEDGER.md`):
+    the expert cache, the ring slot, the pool prefix and the meet pay their fixed costs a window - the reader threads'
+    fetches, the per-expert chain's bundles, the host-first claim - and a 256- or 512-row prompt pays them against a
+    window that holds few rows, where the whole-layer slot and the host sums before the arc had none. Done = pp256 and
+    pp512 on Qwen3.6-35B UD-Q4_K_M and Qwen3.8-Flash-Next UD-IQ4_XS, the arc's tip against a28ffe7e83 (the commit before
+    it), the same box and the frozen fixture's gate, as ledger rows; where the old rate wins at a short prompt, a short-
+    prompt path - the whole-layer slot or the host sums for a window under a row count the race names - keyed on the
+    window's rows, raced in, and the knee it switches at in the row beside it.
+
+156. **A prompt window past 4096 rows: the scan kernel's staging and the window's panels.** The window runs at 4096
+    rows where the plan fits with it (`resident_window_pick`; on the reference card Qwen3.8-Flash-Next pp3000 793 against
+    368 at 2048, pp9000 753 against 663, scratch 3962 MB against 2417, the pool 27 slots against 32 - `debug-jit`, the
+    window-pick entry in `PERF_LEDGER.md`), and 8192 is held by
+    two things. The scan kernel (`DnScan`) stages two `@workgroup` arrays of `DN_WINDOW` floats a head - the per-token
+    decay and the sigmoid of beta - 32 KB at 4096 and 64 KB at 8192 against the 48 KB `maxComputeSharedMemorySize` of
+    every NVIDIA driver, so the staging has to go in 2048-row parts inside the kernel before the cap moves. And the
+    window's scratch (`rdec_scratch_bytes`) is about 650 KB a row on a hyper-connection model - the four-stream panels of
+    `rdec_hc_row_bytes` the widest - so 8192 rows ask about 7 GB beside 4.5 GB of weights, the streamed slot and the
+    mirror: no pool and no room on a 16 GB card, where the per-layer transient panels (q, k, v, o, the FFN hidden rows)
+    could run in row parts and only the residual streams need the whole window. Done = the scan staged in parts, the
+    transient panels sized to a part, and pp9000 at 8192 beside the 4096 row above on the same card; the one-sweep-a-prompt
+    form on a card the window cannot grow on is a layer-major walk (bind a layer's stack once, every window's segment of that
+    layer against it, each window's residual streams kept between layers - about 100 MB a window), a restructure of the window
+    chain's recording, not a knob.
+152. **tq4 on Vulkan pays two latency-bound dispatches a layer a token.** The tq4 store (`KvTq4StoreT`, four barriers)
+    and the un-rotation after attention (`KvTq4Unrot`) are each a dispatch a layer a token, 8 us together on the RTX PRO
+    4500 (`PERF_LEDGER.md`, the 2026-10-19 long-prompt entry), where q8_0's store is one. Done = the tq4 rotation folded
+    into the rope stamp and the un-rotation into the output projection's prologue, raced on the token command's profile.
+153. **Less of the host-form step on the CPU: the pool's slots ranked across layers, and a miss read by the device straight
+    out of pinned RAM.** On the reference card the host's expert sums are the Flash-Next step (43.5 of a 65.7 ms token on
+    real text, `PERF_LEDGER.md`), 16 threads draw the DRAM bandwidth already (64 threads read 14% slower) and a served
+    decode sits at half of a CUDA engine's on the same shards whose device cache holds 3754 experts against the pool's
+    1568 and whose CPU share is a third of the picks. Two levers, the cache arc's: (a) the pool's slot budget allocated
+    across the routed layers by one global heat ranking - a hot layer's concentrated picks earn it more slots, a flat
+    layer fewer - seeded from a base profile shipped per model so a fresh lane never starts cold (the lane's `.heat`
+    orders experts within a layer today and every layer takes the same count, `resident_hot_slots`), the runtime's own
+    counts moving it on; (b) a miss summed on the device out of the pinned mirror: the hit chain reaches a slot's planes
+    by buffer device address, so a second slot region whose planes sit in a host-visible system-memory arena serves a
+    share of the misses at the link's rate (an IQ4_XS expert about 1.3 MB, 0.09 ms over the link against the host's
+    0.18) with no host work, the share bounded by the link as the DMA fill's admission is. Done = the real-text token step
+    on Flash-Next with the host's share of the picks under a third, measured against the served rows of 2026-10-19.
+157. **Flash-Next's served prompt has not been read with the checkpoint captures.** The window chain writes the state into
+    the region's checkpoint rows as the scan passes a stop's row (`ARCHITECTURE_GPU_VULKAN_WINDOW.md#vk-prefill-dn-block`),
+    which on Flash-Next ends the three window chains a 3k prompt took (2966, 22 and 7 rows on 2026-10-19: 5.9 s against the
+    bench's one window at 3.8, the 9k prompt 16.0 against 11.7; the served entry of 2026-10-19 in `PERF_LEDGER.md`). The
+    capture cells and the 35B's served reading ran on the pod (the entry of 2026-10-21); Flash-Next's three shards do not fit
+    the pod's card, so its served rows stay owed on zen2. Done = the served 3k and 9k cold prefill on Flash-Next within the
+    35B's fixed turn cost of `lcpp_bench`'s window at the same chunk, against the 2026-10-19 rows.
+158. **The shared selection template's Vulkan stamp has run on no device.** `ClsSelect` stamps `GkClsSelect`
+    (`dasllama_gpu_kernels_common.das`) and its cell `test_vkd_cls_select` builds `GkClsSelArgs`; both are compile-checked on
+    the Mac (the SPIR-V emission runs at compile time) and the stamp's subgroup-aggregated histogram, uniform vocab loops and
+    `gk_subgroup_bcast0_u` shim have not been dispatched. Done = on a Vulkan device `test_vkd_cls_select` green, the
+    `test_gpu_resident_hybrid_sampled_selection` cell green, and the SPIR-V dump diff (`harness/vk_spv_diff.das`) against
+    master naming the selection stamp as the only moved module.
+
+159. **The whole-model driver seats the NextN head with speculation off.** `resident_head_on`
+    (`dasllama_gpu_resident.das`) reads only the file's head and the decline list, never the speculation knob
+    (`ARCHITECTURE_GPU_VULKAN_MTP.md` rules it "never the plan"): on an MTP file served with speculation off the arena
+    takes the head's eh_proj, attention and shared-expert planes and, past the host-layer split, its whole routed
+    expert stacks (always counted resident, never the layer the fit moves off), a head K/V slab in every region and
+    the verify rows' rollback scratch - room the trunk's streamed layers and the hot pool would otherwise take, for a
+    head that never runs. Speculation is opt-in and off by default, so its cost is opt-in too. Done = the plan seats
+    the head only when speculation is asked at the load (a load-time opt-in a tool-driven session can set before it
+    loads, with turning the round on and off mid-session left to that opted-in plan); with it off the arena, the
+    regions and the scratch carry no head, the trunk and the pool take the room, and the load log says the head stayed
+    off and why; the `.dlim` keeps the head's planes either way, so the opt-in needs no re-mint; the architecture
+    section restated. Cells: a plan cell on a NextN shell - speculation off seats no head planes, slab or verify scratch
+    and charges none of them, speculation on seats all three (the control); a served cell on Qwen3.5-0.8B-MTP - with
+    speculation off a plain stream reads token for token a plan without the head and asks no draft seat, and the same
+    image with speculation on drafts and verifies on the device without a re-mint; the existing
+    `test_gpu_resident_hybrid_mtp_*` cells run under the opt-in.

@@ -3,15 +3,16 @@
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
 doc: `../ARCHITECTURE.md`. Planned work: `../followup_general.md`.
 
-A cell is one `t |> run` subtest, or a `[test]` function that runs no subtest; a helper's
-asserts belong to every cell that calls it. A pinned test cell is a cell the pinned set lists,
+A cell is one `t |> run` subtest, or a `[test]` function that runs no subtest, and owns the asserts
+of every helper it calls. A pinned test cell is a cell the pinned set lists,
 or any cell of a file the pinned set lists whole - a file entry, one naming the file and no cell -
 and the pinned set is the only test of whether a cell is one; a named-cell entry names a `[test]`
 function and pins every cell that function runs. The pinned set, one entry a line, each with what it
 must keep holding:
 
-- `test_run_suites.das` must hold the per-PR split, the folder census, the area tables and the
-  `--exclude` filter.
+- `test_run_suites.das` must hold the per-PR split, the folder census, the area tables, the
+  `--exclude` filter, and the `options persistent_heap` line in every test file `run.das`'s
+  `stocked` suite lists.
 - `test_program_roots.das` must hold the `ROOT_DIRS` sweep, `options stack = 524288` and the
   prefill intent.
 - `test_env_registry.das` must hold the `../ENVIRONMENT.md` knob contract.
@@ -28,21 +29,36 @@ must keep holding:
     under the global scale times the expert's down scale - the kernel's fold order;
   - under the global scale, the swapped fold order (down scale, then global scale) parting from
     the kernel's order on the fixture and missing the device's weights - a reference-side
-    control: the Metal compiler reorders the two multiplies, so a swap of them in the kernel's
-    source reads the same bits on the device and this cell cannot see it, while a wrong fold
-    value reds every weight;
+    control (the compiler reorders the kernel's two multiplies, so a kernel-side swap reads the
+    same bits);
   - the global scale on the softmax_weight picks;
   - `moe_comb_g4_gate` at the decode row and the 26B's row;
-  - `ple_proj_bf16_gate` on both stamps, exact, with its poisoned lead element;
+  - `ple_proj_bf16_gate` on the pair stamps and on the halfword stamps - an odd dim and an odd
+    base among its arms - exact, with its poisoned lead element;
+  - `f32_rows_gate` on the float4 router and on the element-walk stamps at a dim and a base off
+    the float4 lattice;
   - `geglu_side_gate` over the position-major side rows, the contiguous read its control;
   - `ple_finish_gate` on the position-major side rows (`ple_fin_args`), at the E2B's slices
-    (35 x 256) too, the finish without the prescale its control.
-  The PLE side-row gather and the gemma-4 down-scale fold left this cell: the gather is
-  `test_metal_misc_kernels`' embed gates (entry below), the fold the select's down-scale arms.
-- `test_metal_misc_kernels.das`'s `test_metal_misc_kernels` cell must hold its token-table
-  gathers bit for bit: `embed_q8_gate`, `embed_b32_gate` on q51, iq4nl32, q4032 and q5032 at 96
-  wide and at 2048 wide past a whole other table's blocks, `embed_kq_gate` on every K-quant
-  format it lists, and `embed_f32_gate` past a lead of foreign floats.
+    (35 x 256), at a ple width past 1024 and at one off the 32-lane step, the finish without
+    the prescale its control.
+- `test_metal_prefill_kernels.das`'s `test_pf_bf16_tile_pick` cell must hold the window
+  projection's tile pick: the bf16 tile only where layers x ple is a multiple of 64 and the dim a
+  multiple of 32.
+- `test_metal_misc_kernels.das`'s `test_metal_misc_kernels` cell must hold every kernel gate it
+  calls, at the bar each gate sets; and by name: its token-table gathers bit for bit: `embed_q8_gate`, `embed_b32_gate` on q51, iq4nl32, q4032 and q5032 at 96
+  wide, at 2048 wide past a whole other table's blocks, and at a lead off a superblock boundary
+  (the bind's block skip), `embed_kq_gate` on every K-quant format it lists, and `embed_f32_gate`
+  past a lead of foreign floats; the residual seam's `add_rms_gate` on every stamp at every
+  shipped width, 5376 and 8192 past the slab among them; and `cls_select_gate` at a wide, a
+  narrow and the served vocab: the ids at or above the row's K-th largest logit and their logits
+  exact against the host oracle, the row's max logit, the overflow flag and the recent ids'
+  logits, the denominator within 2e-5, a poisoned id and a poisoned denominator its controls.
+- `test_metal_gemm_kernels.das`'s `test_metal_gemm_kernels` cell must hold every kernel gate it calls, at the bar
+  each gate sets - the census's evidence among them: `kq_mulmm_gate`, `kq_devw_gate`, `kq_dbuf_gate`,
+  `moe_mulmm_kq_gate`, `moe_mulmm_split_gate`, `attn_qk_mm_gate` and `attn_dev_pair_gate`.
+- `test_metal_gemv_kernels.das`'s `test_metal_kq_gemv_kernels` cell must hold every GEMV gate it calls, at the bar
+  each gate sets - `kq_mvb_gate` and `moe_kq_gemv_gate` among them - and its `test_metal_kq_half_forms` cell every
+  format's half-x route against the CPU reference at every row count the dispatcher serves.
 - `test_site_records.das` must hold the byte-compare of `site/files/dasllama/bench_records.json`
   and of `site/files/dasllama/bench_cells.json` (repo root) - the smaller copy the site page loads
   first - against a fresh `merge_site_records` run, and `bench_cells.json` keeping every field
@@ -75,9 +91,24 @@ must keep holding:
 - `test_vulkan_kernels.das`'s `test_vkd_ple_bf16_cvt` cell must hold the bf16 rows as f16 bit
   for bit the widened value's half, saturated past the half range, the elements past the count
   kept.
+- `test_vulkan_kernels.das`'s `test_vkd_dn_cap_tail` cell must hold the checkpoint capture's history
+  write (`dn_cap_tail_cls`) bit for bit to the ring hand-off's CPU form for a window cut at the
+  capture's row - two captures in one dispatch, one past the taps and one under them reading its
+  first row off the entry image - the words between the two rows' images keeping their sentinel.
+- `test_vulkan_kernels.das`'s `test_vkd_cls_select` cell must hold the selection kernel's landing
+  against the host oracle on every row: the ids at or above the K-th largest logit with their
+  logits, the max, the denominator at the row's temperature, the overflow flag past the slots and
+  the recent ids' logits, at a wide and a narrow vocabulary, a poisoned denominator reddening the
+  bar.
 - `test_vulkan_kernels.das`'s `test_vkd_router_gemv_bf16` cell must hold the bf16 router-form
   rows against the CPU dot at a row base and an output base, the two-base form and the
   norm-folded form.
+- `test_vulkan_kernels.das`'s `test_vkd_router_gemv_cols` cell must hold the router GEMV over x
+  rows as columns against the one-row dispatch bit for bit and the CPU dot, the bf16 rows'
+  halfword stamp at an odd dim among its arms.
+- `test_vulkan_kernels.das`'s `test_vkd_f32_khr_batch` cell must hold the staged KHR tile over
+  f32 rows against the CPU oracle with each weight rounded to f16, whole and in two k chunks
+  through the reduce.
 - `test_vulkan_kernels.das`'s `test_vkd_kq_gemv_k4_gu` cell must hold the fused gate + up + act
   + requant on Q4_K, IQ4_XS, iq3s4 and IQ2_S against the three-kernel path byte for byte and the
   CPU chain.
@@ -86,6 +117,22 @@ must keep holding:
   format's GEMV against its scalar dot, and its summed twin (`per32_sum_rows_cell`) over one,
   two and four token rows - every row its slots' dots under their weights, a poisoned last row
   the control, a wider dispatch's rows bit for bit the narrower one's.
+- `test_vulkan_kernels.das`'s `test_vkd_q51_cm2_batch`, `test_vkd_mx4_cm2_batch`, `test_vkd_iq4nl32_cm2_batch`,
+  `test_vkd_iq3s4_cm2_batch`, `test_vkd_mx4_gemv_gu`, `test_vkd_gemv_ncol`, `test_vkd_q8_gemv_gu_n`,
+  `test_vkd_q8_gemv_pleact`, `test_vkd_act_family`, `test_vkd_moe_routing`, `test_vkd_dn_family`, `test_vkd_hc_seams`,
+  `test_vkd_hc_rows`, `test_vkd_ple_side`, `test_vkd_f16_gemm_khr`, `test_vkd_fa_cm2`, `test_vkd_fa_khr`,
+  `test_vkd_fa_khr_h256_softcap`, `test_vkd_da_attn`, `test_vkd_da_attn_rqk`, `test_vkd_da_attn_bw`,
+  `test_vkd_moe_gather_row` and `test_vkd_combine_row` cells - the census's evidence for the classes no zoo row
+  dispatches - must hold each class against its CPU oracle at the bar the cell sets, with the cell's poisoned-element
+  control.
+- `test_vulkan_tower_kernels.das`'s `test_vkt_fa_bidir`, `test_vkt_tower_rows`, `test_vkt_tower_ln_rows`,
+  `test_vkt_tower_f16_feeds`, `test_vkt_tower_vision_rows`, `test_vkt_tower_win_rows`, `test_vkt_tower_tail_rows`,
+  `test_vkt_tower_front_movers`, `test_vkt_tower_front_mel`, `test_vkt_tower_cn_attn_rel_plane`,
+  `test_vkt_tower_conformer`, `test_vkt_tower_fastconformer`, `test_vkt_tower_dw2d`, `test_vkt_wdec_classes` and
+  `test_vkt_wdec_fused_rq` cells - the census's evidence for the tower classes - must hold each class against its
+  CPU oracle at the bar the cell sets, with the cell's poisoned-element control.
+- `test_vulkan_kv_codec_kernels.das`'s `test_vkc_q8_da_attn` and `test_vkc_tq4_da_attn` cells must hold the codec
+  attention arms (`codec_attn_arms`) against the CPU attention over the codec's rows, each arm with its controls.
 - `test_gpu_tier.das`'s `test_override_announces` cell must hold every override line the GPU
   homes announce - its setter and env spellings - in step with the knob list
   (`../ENVIRONMENT.md`), and no line where the override takes no effect.
@@ -103,26 +150,42 @@ must keep holding:
   voices and speaking.
 - `test_tts_pocket.das`'s `test_pocket_quiet_floor` cell must hold the served lane's quiet floor
   against the f32 lane's.
+- `test_whisper.das`'s `test_canary_qwen_oracle` cell, an external-reference compare, must hold the forced walk over
+  `../harness/canary_qwen_expected.tsv`'s ids within `CN_TIE_BAR` of our argmax at every step of its
+  three clips, on the CPU chain and on the Metal tower, its control the same walk fed each id one step early
+  with the oracle id outside the bar at every step that input moved, and the greedy ids equal to the
+  oracle's up to the first tie.
 
-**A diff that changes the contract a pinned test cell holds fixed - what its asserts hold, an
-axis gained or lost - updates that cell's entry in the pinned set in the same change; a diff
-adding a cell to a file with a file entry adds to that entry each axis the cell asserts that the
-entry does not name.**
+**A diff that changes the contract a pinned test cell holds fixed - what its entry says it must
+keep holding, an axis gained or lost - updates that cell's entry in the pinned set in the same
+change; a diff adding a cell to a file with a file entry adds to that entry each axis the cell
+asserts that the entry does not name.**
 An axis is one distinct behaviour the cell asserts - an output form, a refusal path, an argument's
-order; a new input row on an axis the cell already asserts is not an axis gained.
+order; a new input row is an axis gained only where it runs a kernel stamp, an output form or a
+branch of the kernel or its router that no earlier row of the cell ran.
 
-**A diff that widens a pinned test cell's tolerance, swaps its comparison for one more outputs
-pass, rewrites an expected value without updating the cell's entry under the contract-change rule
-above, drops its input, or drops a `run.das` suite listing that reaches it is a defect - keep the
-cell's asserts and fix the code that fails them instead; so is a diff that removes a pinned
-test cell's assert without adding to the same cell, in the same change, an assert that holds the
-same values to an equal or tighter bound, with its control (an extra assert in the same cell
-proving the compare can fail).**
+**A diff that widens a pinned test cell's tolerance, swaps its comparison for a looser one,
+rewrites an expected value its entry ties to an outside source (a document, a checked-in table, a
+knob list) to a value that source does not state, drops its input, or drops a `run.das` suite
+listing that reaches it is a defect - fix the code that fails the cell instead.**
+
+**A diff that removes a pinned test cell's assert while the code it checks stays adds to the same
+cell, in the same change, an assert that holds the same values to an equal or tighter bound, with
+its control (an extra assert in the same cell proving the compare can fail).**
+
+**A diff that deletes the kernel or function a pinned test cell's assert checks and routes its
+callers to other code - the replacement - adds, in the same change, an assert holding the
+replacement's output to the deleted assert's bound or tighter, with its control, to a pinned cell
+testing the replacement, or names in the old cell's pinned-set entry the pinned cell that already
+asserts the replacement's output to that bound.**
 
 **A diff that adds a cell or an assert whose expected value must be kept in step with something
 maintained outside the cell - a document, a checked-in table, a committed artifact's form, a
-roster, a knob list; not a value the cell's own claim defines - or that a checked-in table names
-as its evidence, adds the cell carrying it to the pinned set in the same change** - as a named
-cell, or, when the new cell leaves every cell of its file pinned, by replacing the file's named
-cells with one file entry naming what it pins. A new entry in an existing cell's expectation list
-is not a new assert.
+roster, a knob list; not a value the cell's own claim defines - or that a checked-in table - the
+model table in `../README.md`, or a list of kernel names whose coverage note names a test cell as
+the evidence for each - names as its evidence, adds the cell carrying it to the pinned set in the
+same change** - as a named cell, or, when the new cell
+leaves every cell of its file pinned, by replacing the file's named cells with one file entry
+naming what it pins. A new entry in an existing cell's expectation list is not a new assert, and
+an assert that compares against a `../dasllama/` constant by name, not against a literal copy of
+it, keeps nothing in step.

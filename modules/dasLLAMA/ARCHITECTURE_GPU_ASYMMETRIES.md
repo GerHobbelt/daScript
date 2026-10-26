@@ -25,7 +25,12 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
   leaves a hyper-connection MoE's expert stacks on the host by construction (`resident_host_experts`, the
   model's shape, not the card's room), so it cuts its command at every routed block and the host sums the experts between the segments; Metal serves the
   same model whole from unified memory and its drivers split nothing.
-- **The hot expert pool is Vulkan-only** (`ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool`, the tier's four hot
+- **The window's f32 per-layer-embedding gate and projection run through an f16 stage on Vulkan alone**
+  (`ARCHITECTURE_GPU_VULKAN_KHR.md#f32-rows-staged-tile`, the knob `DASLLAMA_VK_PLE_F32_TILE`, Vulkan's alone): the
+  staged KHR tile reads the file's f32 rows, rounds each weight to f16 on its stage, feeds f16 rows and accumulates in
+  f16, because the f32 scalar tile is the only f32-exact form the Vulkan tier has and runs at a twenty-fifth of its rate; Metal
+  serves the same planes on its f32-exact tile, and has no form to pick between.
+- **The hot expert pool is Vulkan-only** (`ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool`, the tier's four hot
   seats, `DASLLAMA_GPU_HEAT`): where routed experts live on the host the Vulkan driver keeps the hottest in
   per-layer device slots; Metal has every expert resident, so nothing is hot or cold.
 - **A plain MoE's host-layer form is Vulkan-only** (`ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command`,
@@ -34,9 +39,19 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
   the token command and the window cut at those layers; Metal holds the model whole from unified memory and
   cuts nothing.
 - **The host-layers ask is read by the Vulkan plan alone** (`set_gpu_host_layers`,
-  `DASLLAMA_GPU_HOST_LAYERS`, `ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool`): it names how many routed
+  `DASLLAMA_GPU_HOST_LAYERS`, `ARCHITECTURE_GPU_VULKAN_POOL.md#hc-hot-pool`): it names how many routed
   layers' experts the Vulkan plan moves to the host whatever the card holds; Metal moves no expert off the
   device, so the ask has nothing to move.
+- **The streamed prompt and its levers are the Vulkan driver's alone** (`set_gpu_want_pf_stream`,
+  `DASLLAMA_GPU_PF_STREAM`, `DASLLAMA_GPU_PF_STREAM_LAYERS`, `set_pf_window_rows_pin`, `DASLLAMA_GPU_PF_ROWS`,
+  `set_expert_cache_mb`, `DASLLAMA_EXPERT_CACHE_MB`, `DASLLAMA_EXPERT_RING`, `DASLLAMA_EXPERT_READERS`,
+  `DASLLAMA_VK_XF_BUNDLE`, `DASLLAMA_GPU_HOT_DMA`, `DASLLAMA_GPU_DEC_MEET`,
+  `ARCHITECTURE_GPU_VULKAN_STREAM.md#streamed-layer-split`, `#expert-cache`,
+  `ARCHITECTURE_GPU_VULKAN_POOL.md#pool-dma-fill`): a routed layer whose experts serve on the host streams
+  its stack to the device for the prompt window, the window's rows cut at `DASLLAMA_GPU_PF_ROWS`, the
+  stacks held in pinned memory under the expert cache's budget and read off the lane by its readers, the
+  pool's misses filled by DMA and a decode token's picks met over the pool under the two experiment knobs;
+  Metal holds every expert in unified memory, streams nothing and reads none of these.
 - **The strict context pin is read by the Vulkan plan alone** (`set_gpu_ctx_strict`,
   `DASLLAMA_GPU_CTX_STRICT`, `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan`): Metal's mirror is the
   model's own context in unified memory, so no plan shortens it and the pin has nothing to hold.
@@ -78,6 +93,11 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
   reload story stays the unmap notify (`set_moe_gpu_unmap_notify`) - a different seam for a different ownership model.
 - **`vulkan_tts_stats` / `vulkan_tts_declines` have no Metal twin**: the Vulkan TTS driver counts its encodes
   and its declines by reason in its own pair, where Metal's TTS seats report through `metal_tower_stats` beside `styletts2_gpu_stats`.
+- **The Vulkan block-codec decode attention quantizes the query to q8_0 blocks; Metal's keeps it f32**
+  (`DaAttnT`'s `KVBLK` stamps, `ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs`, against `MetalSqAttnDQuantT`):
+  Vulkan scores a K word against a query word in one packed integer dot, the CPU chain's own query quantization, so
+  the two agree to it; Metal's per-key loop dequantizes the block into float multiplies against the f32 query. The
+  codec cells of each home hold their own chain to the CPU's.
 - **The batched pre-encoded step is Metal-only**: the batch driver encodes the next step under the
   current one's GPU run (`ARCHITECTURE_GPU_MTP_DECODE.md#batch-pre-encode`, `DASLLAMA_METAL_BATCH_PRE`);
   Vulkan's N-row token command records once and resubmits, so it has no encode to move.
@@ -101,14 +121,11 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
   flips one form between two steps and drops the pre-encoded step; the Vulkan driver builds its token commands' sets at
   the load and resubmits them, so its counterparts are load-time pins over every command - `set_gpu_resident_embed(0)` for the host-embedded
   rows, the `g_vk_fuse` pin of `DASLLAMA_VK_FUSE` for the split MoE tail - and no per-step setter.
-- **The NextN speculative round is Metal-only.** `register_mtp_round_override("metal", ...)` has one registrant, `metal_mtp_spec_round`;
-  Vulkan serves the CPU round around its draft and verify seats (`ARCHITECTURE_GPU_MTP.md`). The assistant drafter's rounds ride
-  `MtpAssistantSeams` on both homes (`ARCHITECTURE_GPU_MTP_ASSISTANT.md#assistant-drafter-step`, `ARCHITECTURE_GPU_VULKAN_MTP.md#resident-assistant-drafter`).
-- **The same-slab verify seat is Vulkan-only.** `register_mtp_verify_override("vulkan", ...)` has one registrant, the resident driver's same-slab verify (`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`), which the CPU round takes in place of its two-row prefill; a verify the seat declines runs the CPU two-row prefill inside a window the resident prefill declines by name (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-window`). Metal's same-slab verify runs inside its round seat.
-- **The device rollback seat is Vulkan-only.** `register_mtp_rollback_override("vulkan", ...)` has one registrant, the reject of a verify the resident seat served - the region's recurrent slots back from the copies the verify command took, no snapshot and no replayed step (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`; the tier seat is `install_rdec_rollback`). Metal's reject replays on its shadow region inside its round seat.
-- **The joint NextN speculative tick is Metal-only.** `register_mtp_spec_batch_override("metal", ...)`
-  has one registrant, `metal_mtp_spec_eval_batch`: the scheduler's tick hands every speculative
-  stream to it and one same-slab verify carries all their rows (`ARCHITECTURE_GPU_MTP.md#mtp-joint-verify`); on Vulkan and the CPU the tick steps each NextN stream through its own round. An assistant drafter's tick verifies every stream's rows together on both homes.
+- **The round's cold seat is Metal-only.** `register_mtp_cold_override("metal", ...)` has one registrant, `metal_mtp_cold_why`
+  (`ARCHITECTURE_GPU_MTP.md#mtp-round-one-join`): a blob model has no CPU rails, so a round the Metal seats cannot take steps
+  plain before any seat is reached; the Vulkan seats decline per call into the CPU verify window instead
+  (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-window`). The draft, verify, verify-rows and rollback seats have a registrant
+  on both homes, and the round is the common one (`mtp_spec_round_k`) everywhere.
 - **The assistant drafter's drafts reach its verify on the device on Metal alone.** Metal's verify gathers the draft rows' embeds off
   the chain's token buffer, so drafts and verify run behind one another with no join between
   (`ARCHITECTURE_GPU_MTP.md#mtp-round-one-join`). The Vulkan N-row command takes host-staged ids and rope rows - each row's id
@@ -155,7 +172,9 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
   `ARCHITECTURE_GPU_VULKAN_PEROP.md`), and the
   per-call resident overrides say each pass-to-CPU reason once per armed model
   (`rdec_pass_once`) and count every pass by reason in the tier (`gpu_cpu_passes`, zeroed as a
-  model arms), which the server's `/v1/stats` carries as `gpu_cpu_passes`. The gap is `followup_vulkan.md` item 1, not a precedent to copy.
+  model arms), which the server's `/v1/stats` carries as `gpu_cpu_passes`; the tier hands out each reason with a
+  reader-facing sentence beside its count (`rdec_pass_words`; `REVIEW.das`'s `check_rdec_pass_words` holds every `RdecPass` value to an arm there,
+  licensing no names). The gap is `followup_vulkan.md` item 1, not a precedent to copy.
 - **Device-home sessions are Vulkan-only.** A session whose K/V lives only in a region of the
   resident driver's mirror (`create_device_session`, the scheduler's device mode, park and
   adopt: `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan`) has no Metal twin, and
@@ -193,12 +212,10 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
   handoff), so a tier without the seats declines a recurrent layer by name
   (`resident_layer_decline`) and the per-op rails serve it. Metal has no seat to install: its
   whole-forward driver carries the recurrent branch inside its layer encoder.
-- **The device argmax pick is Vulkan-only** (`ARCHITECTURE_GPU_VULKAN_LANDING.md#logits-transfer-queue`): a
-  bare-argmax stream's token id lands in place of its logits row, its speculative round's rows too; Metal lands every row's logits.
 - **The short window's gathered expert route and its knee are Metal-only** (`set_metal_moe_gemv_max`, the
   sidecar's `metal_moe_gemv_max`, `ARCHITECTURE_GPU_PREFILL_MOE.md#prefill-moe-gemv-route`): the Metal prefill
   serves a routed block of few tokens through the decode step's gathered GEMVs instead of its bucketed tiles; the
   Vulkan window chain's routed block rides its expert tiles over a device-side gather at every window size - the
   cm2 expert chain (`ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-expert-chain`), the KHR tile
-  (`ARCHITECTURE_GPU_VULKAN_GEMM.md#khr-mm-kq-tile`) or, on a device with neither, the Q8-fed chain's batch tiles
+  (`ARCHITECTURE_GPU_VULKAN_KHR.md#khr-mm-kq-tile`) or, on a device with neither, the Q8-fed chain's batch tiles
   (`ARCHITECTURE_GPU_VULKAN_MOE.md#vk-moe-q8-chain`) - and has no tile-per-expert form to route away from.

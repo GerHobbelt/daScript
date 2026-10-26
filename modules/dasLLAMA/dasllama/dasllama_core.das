@@ -71,23 +71,23 @@ def load_model(path : string; mode : QuantMode = QuantMode.fp32) : Model {
 }
 
 def create_session(model : Model; kv_dtype : KVDtype = KVDtype.f16) : Session {
-    //! Create a fresh session (KV cache + scratch) sized to ``model.config.seq_len`` — one model,
-    //! many independent conversations. ``kv_dtype`` picks the KV-cache codec: ``f16`` (default,
-    //! near-lossless) halves bytes, ``q8_0`` halves again (needs head_size/kv_dim % 32 == 0).
+    //! Create a fresh session (KV cache + scratch) sized to ``model.config.seq_len`` — one model, many independent conversations.
+    //! ``kv_dtype`` picks the KV-cache codec: ``f16`` (default), ``q8_0`` (whole 32-blocks a head), ``tq4`` (a power-of-two head).
+    //! A codec the model cannot serve steps down to ``q8_0``, else ``f16``, with one logged line - ``kv_codec_served`` says which.
     return <- create_session_(model, kv_dtype, kv_dtype)
 }
 
 def create_device_session(model : Model; kv_dtype : KVDtype = KVDtype.f16) : Session {
     //! Create a DEVICE-HOME session: its K/V cache lives only in the armed GPU driver's region - no host cache, nothing over the bus per token.
     //! Hold at most ``gpu_device_sessions()`` live ones, in the driver's codec (``gpu_device_session_dtype``).
-    //! A call the device cannot serve panics.
+    //! A codec the model cannot serve steps down as ``create_session``'s does. A call the device cannot serve panics.
     return <- create_device_session_(model, kv_dtype)
 }
 
 def create_kv_pool(model : Model; page_rows : int64 = 64l; kv_dtype : KVDtype = KVDtype.f16) : KVPool {
-    //! Create a caller-owned PAGED KV pool over ``model``'s cache geometry. Sessions created over it
-    //! allocate cache pages of ``page_rows`` positions on demand instead of the full ``seq_len`` slab
-    //! up front, so many sessions share one elastic pool. Keep the pool alive as long as sessions live.
+    //! Create a caller-owned PAGED KV pool over ``model``'s cache geometry: sessions over it allocate pages of ``page_rows``
+    //! positions on demand instead of the full ``seq_len`` slab, so many sessions share one elastic pool; keep it alive as
+    //! long as sessions live. A codec the model cannot serve steps down as ``create_session``'s does.
     return <- create_kv_pool_(model.config, page_rows, kv_dtype, kv_dtype)
 }
 
@@ -132,11 +132,11 @@ def prefix_attach(var cache : PrefixCache; var pool : KVPool; var session : Sess
     return prefix_attach_(cache, pool, session, prompt)
 }
 
-def prefix_insert(var cache : PrefixCache; var pool : KVPool; var session : Session; tokens : array<int64>; preview : string = ""; opening : bool = false) {
+def prefix_insert(var cache : PrefixCache; var pool : KVPool; var session : Session; tokens : array<int64>; preview : string = ""; opening : bool = false) : string {
     //! Donate a session's KV pages to the cache: ``tokens`` is its EVALED history (the first ``n_past`` rows exist), every
-    //! full page not already cached survives ``release_kv_pages``, ``preview`` labels the chain. A recurrent model donates
-    //! one checkpoint at ``n_past``: ``opening`` marks one taken between prefill calls, kept ahead of finished turns' tails.
-    prefix_insert_(cache, pool, session, tokens, preview, opening)
+    //! full page not already cached survives ``release_kv_pages``, ``preview`` labels the chain. A recurrent model donates one
+    //! checkpoint at ``n_past`` (``opening``: taken between prefill calls, kept ahead of tails); "" = held, else why not.
+    return prefix_insert_(cache, pool, session, tokens, preview, opening)
 }
 
 def prefix_chain_list(cache : PrefixCache) : array<PrefixChain> {
@@ -720,6 +720,12 @@ def attach_mtp_drafter(model : Model; path : string) : bool {
     return empty(attach_mtp_drafter_(model, path))
 }
 
+def attach_mtp_sidecar(model : Model; model_path : string) : string {
+    //! Attach the assistant drafter that sits beside the model at `model_path` (`mtp_drafter_sidecar`): the drafter's path
+    //! where it attached, "" where none sits there or every driver refused it (each refusal logged).
+    return attach_mtp_sidecar_(model, model_path)
+}
+
 def detach_mtp_drafter(model : Model) {
     //! Detach `model`'s assistant drafter, if one is attached; its rounds stop and plain decode serves.
     detach_mtp_drafter_(model)
@@ -819,8 +825,8 @@ def gpu_host_layers_pin() : int64 {
 
 def set_gpu_kv_dtype(dt : KVDtype) {
     //! Ask the whole-model GPU driver to hold its K/V mirror in codec ``dt`` for the models loaded next - the codec of
-    //! their sessions (``gpu_device_session_dtype`` reads what armed). ``q8_0`` is about half the default ``f16`` mirror's
-    //! bytes, ``tq4`` about a quarter; ``f32`` reads as ``f16``, and so does a model whose heads the codec cannot hold.
+    //! their sessions (``gpu_device_session_dtype`` reads what armed; ``q8_0`` is about half the ``f16`` mirror's bytes,
+    //! ``tq4`` a quarter; ``f32`` reads as ``f16``). A model that cannot serve it serves what it can (``kv_codec_served``).
     set_gpu_kv_dtype_(dt)
 }
 
@@ -856,7 +862,7 @@ def gpu_resident_decline() : string {
 def gpu_resident_experts_host() : bool {
     //! Whether the whole-model driver serving the model loaded last sums some routed layers' experts on the host (a
     //! hyper-connection MoE, a plain MoE the card does not hold whole, or one whose host-layers ask - ``set_gpu_host_layers``,
-    //! ``DASLLAMA_GPU_HOST_LAYERS`` - moved them) - the form whose speculative round does not pay, so a server slot leaves it off.
+    //! ``DASLLAMA_GPU_HOST_LAYERS`` - moved them): the form whose speculative round pays at the NextN depth alone (`mtp_auto_arms`).
     return gpu_resident_experts_host_()
 }
 
@@ -875,8 +881,8 @@ def gpu_resident_mtp_device_home(model : Model) : bool {
 
 def gpu_device_prefill_continues(model : Model) : bool {
     //! A device-home session of ``model`` prefills from a position past zero - a prompt in chunks,
-    //! a turn over the turns before it. False for a recurrent hyper-connection model: prefill each prompt whole,
-    //! from position zero, and adopt no earlier rows.
+    //! a turn over the turns before it. True for every model the driver serves: a recurrent hyper-connection
+    //! model's n-gram ring rides its checkpoints and snapshots, so its continuation reads the history too.
     return gpu_device_prefill_continues_(model)
 }
 
@@ -1001,10 +1007,11 @@ def prefix_share_pages(var cache : PrefixCache; var pool : KVPool; var session :
     return prefix_share_pages_(cache, pool, session, tokens, n)
 }
 
-def prefix_insert_snapshot(var cache : PrefixCache; var pool : KVPool; session : Session; tokens : array<int64>; var snap : DnSnapshot; opening : bool = false) {
+def prefix_insert_snapshot(var cache : PrefixCache; var pool : KVPool; session : Session; tokens : array<int64>; var snap : DnSnapshot; opening : bool = false; upto : int64 = 0l) {
     //! A recurrent checkpoint of the first ``n_past`` of ``tokens`` out of ``session``'s pages, its state ``snap``
-    //! (moved in) taken elsewhere - a device's slots. ``opening`` kinds it as shared, else as a conversation's tail.
-    prefix_insert_snapshot_(cache, pool, session, tokens, snap, opening)
+    //! (moved in) taken elsewhere - a device's slots, or a window's capture at ``upto`` (0 = the tokens' end).
+    //! ``opening`` kinds it as shared, else as a conversation's tail.
+    prefix_insert_snapshot_(cache, pool, session, tokens, snap, opening, upto)
 }
 
 def gpu_device_session_ctx() : int64 {

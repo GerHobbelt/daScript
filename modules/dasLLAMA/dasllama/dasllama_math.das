@@ -18,6 +18,7 @@ require dasllama/dasllama_tune_scope  // nolint:STYLE030 — the dasllama [tune_
 require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id kq plane strides
 require dasllama/dasllama_gpu_tier public  // the device-cooperation seam (split out 2026-07-29) — re-exported for the 112 requirers
 require dasllama/dasllama_gpu_math  // silu_f32: the one SiLU form the CPU and the kernel homes share
+require daslib/cmp
 
 // dasLLAMA numeric primitives — naive fp32 baseline (curriculum step 1).
 // Correctness first; optimization (blocking, float4, threading) comes later.
@@ -207,7 +208,7 @@ def get_jobque_spin_in_force_() : int64 => g_dispatch_gpu_served ? g_jobque_spin
 
 def public get_dispatch_gpu_served() : bool => g_dispatch_gpu_served
 
-[arch(at="../ARCHITECTURE_RUNTIME.md#browser-workers-spin")]
+[arch(at="../ARCHITECTURE_RUNTIME_JOBQUE.md#browser-workers-spin")]
 def public set_dispatch_gpu_served(on : bool) {
     g_dispatch_gpu_served = on
     if (is_job_que_available()) {
@@ -309,7 +310,7 @@ def private register_trace_categories() {
 //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
 //! batched dispatch, spin-before-park window, join-poll level. Call INSIDE `with_job_que` (or
 //! after `create_job_que`) — the queue must exist. Engine spelling of `setup_dasllama_jobque`.
-[arch(at="../ARCHITECTURE_RUNTIME.md#browser-workers-spin")]
+[arch(at="../ARCHITECTURE_RUNTIME_JOBQUE.md#browser-workers-spin")]
 def setup_dasllama_jobque_() {
     set_jobque_fork_pool(true, true)
     set_jobque_batch_dispatch(true)
@@ -338,7 +339,7 @@ def with_dasllama_jobque_(blk : block<void>) {
     }
 }
 
-[init, arch(at="../ARCHITECTURE_RUNTIME.md#hybrid-pool-policy")]
+[init, arch(at="../ARCHITECTURE_RUNTIME_JOBQUE.md#hybrid-pool-policy")]
 def dasllama_jobque_threads_cap() {
     if (get_running_platform_name() == "emscripten") {   // a browser's core count can be a fingerprint cap of 2: the runtime's floor and cap size the pool there
         return
@@ -452,14 +453,14 @@ def public get_phase_decode_workers() : int => g_phase_decode_workers
 def private phase_parking_armed() : bool =>
     g_phase_decode_workers >= 0 && g_dispatch_worker_limit <= 0 && is_job_que_available() && !get_single_thread_()
 
-[arch(at="../ARCHITECTURE_RUNTIME.md#hybrid-pool-policy")]
+[arch(at="../ARCHITECTURE_RUNTIME_JOBQUE.md#hybrid-pool-policy")]
 def public dispatch_phase_decode {
     if (phase_parking_armed()) {
         set_jobque_worker_limit(g_phase_decode_workers)
     }
 }
 
-[arch(at="../ARCHITECTURE_RUNTIME.md#hybrid-pool-policy")]
+[arch(at="../ARCHITECTURE_RUNTIME_JOBQUE.md#hybrid-pool-policy")]
 def public dispatch_phase_batch {
     if (phase_parking_armed()) {
         set_jobque_worker_limit(-1)
@@ -469,7 +470,7 @@ def public dispatch_phase_batch {
 //! A CPU encode is batch-shaped work: a tower/ASR encode entry calls this with its row count
 //! so a preceding decode's parked pool wakes for it; under 32 rows the slow tier cannot fill
 //! past the dispatch grain, so short encodes keep the parked pool (the prefill guard's shape).
-[arch(at="../ARCHITECTURE_RUNTIME.md#hybrid-pool-policy")]
+[arch(at="../ARCHITECTURE_RUNTIME_JOBQUE.md#hybrid-pool-policy")]
 def public dispatch_phase_encode(rows : int64) {
     if (rows >= 32l) {
         dispatch_phase_batch()
@@ -617,7 +618,7 @@ def public matmul_chunks_gemv(rows : int; oversplit : int; work : int64) : int {
 //! per-region costs: sort (id, cost) biggest-cost first (ties: lowest id) so the self-serve chunk
 //! queue front-loads expensive regions and drains cheap ones last. Use whenever cost is known at build time.
 def public lpt_order(var ord : array<int2>) {
-    ord |> sort() $(a, b) => a.y != b.y ? a.y > b.y : a.x < b.x
+    ord |> sort() <| cmp_by(-_.y, _.x)
 }
 
 //! Chunk count for a fused-chain stage over `groups` 32-row quant groups: the GEMV shaper's count,
@@ -1177,6 +1178,9 @@ struct KernelBackend {
     kq_batch_groupn : MatmulKqBatchGroupNFn = @@kq_unset_batch_groupn
     repack_kq : RepackKqFn = @@repack_kq_identity
     needs_repack : bool
+    //! true for a GPU donor of the batch slots alone (its single-row GEMV panics): reachable through
+    //! select_batch_backend only, never activated or pinned as the whole backend
+    batch_only : bool = false
     // mx4_expand_interleaved: true when repack_mx4/repack Q8 layouts satisfy the byte-for-byte
     // interleave map (expand_mx4_region_q8's direct branch) — nibble byte `off` of group bg maps
     // positionally onto Q8 bytes. False on a row-major mx4 backend: prefill expands + repacks via `repack`.
@@ -1662,6 +1666,10 @@ def select_kernel_backend(name : string) {
     if (!key_exists(g_kernel_backends, name)) {
         return
     }
+    if (g_kernel_backends[name].batch_only) {
+        to_log(LOG_WARNING, "dasLLAMA: select_kernel_backend('{name}') - a batch-only backend (select_batch_backend); keeping '{g_active_backend}'\n")
+        return
+    }
     if (!invoke(g_kernel_backends[name].available)) {
         to_log(LOG_WARNING, "dasLLAMA: select_kernel_backend('{name}') - backend reports itself unavailable in this configuration; keeping '{g_active_backend}'\n")
         return
@@ -1677,6 +1685,10 @@ def pin_kernel_backend(name : string) {
     // silently degrading to whatever is currently active. Keep the current backend and warn instead.
     if (!key_exists(g_kernel_backends, name)) {
         to_log(LOG_WARNING, "dasLLAMA: pin_kernel_backend('{name}') - no such backend registered; keeping '{g_active_backend}'\n")
+        return
+    }
+    if (g_kernel_backends[name].batch_only) {
+        to_log(LOG_WARNING, "dasLLAMA: pin_kernel_backend('{name}') - a batch-only backend (select_batch_backend); keeping '{g_active_backend}'\n")
         return
     }
     if (!invoke(g_kernel_backends[name].available)) {
@@ -1933,6 +1945,15 @@ def repack_mx4_weight(var mxq : array<uint8>; var mxs : array<uint8>; woff, n, d
     unsafe {
         invoke(g_repack_mx4, addr(mxq[woff / 2l]), addr(mxs[woff / 32l]), n, d)
     }
+}
+
+//! True for a registered backend that serves the batch slots alone - never the whole backend.
+def kernel_backend_batch_only(name : string) : bool {
+    var r = false
+    g_kernel_backends |> get(name) $(be) {
+        r = be.batch_only
+    }
+    return r
 }
 
 //! Does backend `name` read an interleaved (repacked) weight layout? false for unknown names.
@@ -2315,6 +2336,12 @@ def hmax(x : float const?; n : int64) : float {
         }
         return maxv
     }
+}
+
+//! the softmax probability of `id` over the raw row `logits`: exp(x[id] - max) / Σ exp(x - max), the sum in double ([[hlse]])
+def token_prob(logits : array<float>; id : int64) : float {
+    let mx = hmax(unsafe(addr<float const?>(logits[0])), long_length(logits))
+    return float(exp(double(logits[id]) - double(mx) - log(hlse(logits, mx))))
 }
 
 //! Σ exp(x[i] − mx) — exp4-vectorized, groups of 4 accumulated in double (the mel dot's

@@ -12,6 +12,7 @@ require dasllama/dasllama_parity   // nolint:STYLE030,LINT019 — cached_ids/cac
 require ?das_metal dasllama/dasllama_metal_decode  // stats/declines/shutdown rails
 require ?das_metal dasllama/dasllama_metal_prefill  // prefill stats/declines rails
 require ?das_metal dasllama/dasllama_metal_common  // the kernel coverage census (tensor-twin cell)
+require ?das_metal dasllama/dasllama_metal_kernels  // metal_residual_lanes - the past-slab seam census's lane witness
 require ?das_metal metal/das_metal_boost  // device probe + metal_live_object_count
 require daslib/jobque_boost
 require daslib/fio   // nolint:STYLE030,LINT019 — used only inside the Apple static_if half
@@ -506,7 +507,7 @@ def test_metal_support_matrix(t : T?) {
             }
 
             // ===== the dim ladder (M2.6): batch dim caps retired =====
-            // past ADD_RMS_MAX_DIM the batched add+rms runs as the unfused pair, and past the
+            // past ADD_RMS_MAX_DIM the batched add+rms re-reads the columns past its slab, and past the
             // mv8 probe's dim 3072 the B > 4 GEMM tier serves any width — an 8B (dim 4096)
             // batches at every B and a 70B-class kq model (dim 8192) serves all three paths.
             // Both are large-tier: they run only under DASLLAMA_PARITY_FULL (the pre-commit gate).
@@ -582,7 +583,7 @@ def private cont_logits_cell(t : T?; tr, trg : Model; tag : string; tol : float)
             select_prefill_override("")
             served = metal_prefill_stats().prefills - pf0
             for (i in range64(vocab)) {
-                d = max(d, abs(sb.logits[i] - sc.logits[i]))
+                d = max(d, nan_wide_diff(sb.logits[i], sc.logits[i]))
             }
             cpk = argmax_of(sc.logits, vocab)
             gpk = argmax_of(sb.logits, vocab)
@@ -743,14 +744,14 @@ def private qwen35_row(t : T?; path, family, tag : string; expect_needs : uint; 
                 t |> equal(metal_batch_decode_stats().steps - ba1, 1l, "{tag} batch kv={kdt}: the driver served the step")
                 var bmaxd = 0.0
                 for (i in range64(vocab)) {
-                    bmaxd = max(bmaxd, abs(sa.logits[i] - sa2.logits[i]))
-                    bmaxd = max(bmaxd, abs(sb.logits[i] - sb2.logits[i]))
+                    bmaxd = max(bmaxd, nan_wide_diff(sa.logits[i], sa2.logits[i]))
+                    bmaxd = max(bmaxd, nan_wide_diff(sb.logits[i], sb2.logits[i]))
                 }
                 to_log(LOG_INFO, "{tag} batched step kv={kdt}: single-row next '{eyeball_str(piece_(tr, argmax_of(sa2.logits, vocab)))}' / '{eyeball_str(piece_(tr, argmax_of(sb2.logits, vocab)))}' vs batched next '{eyeball_str(piece_(tr, argmax_of(sa.logits, vocab)))}' / '{eyeball_str(piece_(tr, argmax_of(sb.logits, vocab)))}' (maxd {bmaxd})\n")
                 t |> success(bmaxd <= 2.0, "{tag} kv={kdt}: batched-step logits within 2.0 of the single-row GPU step, both rows (maxd {bmaxd})")
                 var xmaxd = 0.0   //! the control: row A against row B lands outside the bar, so a step that bound one row's slice to the other would red
                 for (i in range64(vocab)) {
-                    xmaxd = max(xmaxd, abs(sa.logits[i] - sb2.logits[i]))
+                    xmaxd = max(xmaxd, nan_wide_diff(sa.logits[i], sb2.logits[i]))
                 }
                 t |> success(xmaxd > 2.0, "{tag} kv={kdt}: the cross-row compare lands outside the bar (maxd {xmaxd})")
                 select_decode_override("")
@@ -1125,16 +1126,93 @@ def private depth_cell(t : T?; tr, trg : Model; tag : string; bar : float; stamp
 
 //! the residual step's seam stamps (`GkAddRmsRows`) the device ran, and the split chain's norm pass
 def private seam_counts : int4 {
-    return int4(int(metal_kernel_count_compiled("metal_pre_add_rms") + metal_kernel_count_compiled("metal_pre_add_rms_hx")),
-        int(metal_kernel_count_compiled("metal_pre_add")), int(metal_kernel_count_compiled("metal_add_rms") + metal_kernel_count_compiled("metal_add_rms_hx")),
-        int(metal_kernel_count_compiled("MetalRmsNorm_metal_rmsnorm") + metal_kernel_count_compiled("MetalRmsNormHX_metal_rmsnorm")))
+    return int4(int(kernels_sum(["metal_pre_add_rms", "metal_pre_add_rms_hx"])), int(kernels_sum(["metal_pre_add"])),
+        int(kernels_sum(["metal_add_rms", "metal_add_rms_hx"])), int(kernels_sum(["MetalRmsNorm_metal_rmsnorm", "MetalRmsNormHX_metal_rmsnorm"])))
+}
+
+//! past the 4096-float slab (`ADD_RMS_MAX_DIM`) the residual seams of the blob twin `trg`'s decode, two single steps and a batched
+//! step over device-prefilled prompts: the fuse rail pinned on, every seam one dispatch on the 1024-lane builders and no split
+//! chain; pinned off, every seam's split chain norm passes over the fused run's and no one-dispatch seam (the control); the
+//! rail and the overrides put back
+[unused_argument(t, trg, tag)]   // off-Apple the gated body is empty
+def private past_slab_seam_cell(t : T?; var trg : Model; tag : string) {
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        let c = trg.config
+        let nl = int(c.n_layers)
+        let vocab = c.vocab_size
+        t |> success(c.dim > ADD_RMS_MAX_DIM, "{tag}: the row is past the slab (dim {c.dim})")
+        let pa <- encode(trg, counting_prompt(1, 30), true, false)
+        let pb <- encode(trg, counting_prompt(7, 36), true, false)
+        let seat = metal_overrides_seat()
+        let fuse = get_metal_decode_fuse()
+        t |> success(select_prefill_override("metal"), "{tag}: prefill override registered")
+        t |> success(select_decode_override("metal"), "{tag}: decode override registered")
+        set_metal_prefill_min_npos(1l)
+        var fused_stacks = 0
+        var fused_norms = 0
+        for (on in fixed_array(true, false)) {
+            set_metal_decode_fuse(on ? 1 : 0)
+            var sa = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            var sb = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            eval_(trg, sa, pa)
+            eval_(trg, sb, pb)
+            let sm0 = seam_counts()
+            let ln0 = metal_residual_lanes()
+            let st0 = metal_decode_stats().decodes
+            let ba0 = metal_batch_decode_stats().steps
+            for (_i in range(2)) {
+                var one <- [argmax_of(sa.logits, vocab)]
+                eval_(trg, sa, one)
+                delete one
+            }
+            var ws <- create_batch_workspace_(trg)
+            var sess : array<Session?>
+            unsafe {
+                sess |> push(addr(sa))
+                sess |> push(addr(sb))
+            }
+            var cur <- [argmax_of(sa.logits, vocab), argmax_of(sb.logits, vocab)]
+            eval_batch_(trg, ws, sess, cur)
+            let sm = seam_counts() - sm0
+            let ln = metal_residual_lanes()
+            let narrow = ln.narrow - ln0.narrow
+            let wide = ln.wide - ln0.wide
+            let nst = metal_decode_stats().decodes - st0
+            let nba = metal_batch_decode_stats().steps - ba0
+            let fused = on ? "fused" : "split"
+            to_log(LOG_INFO, "{tag} past the slab, {fused}: {nst} steps, {nba} batched - pre_add_rms {sm.x}, pre_add {sm.y}, add_rms {sm.z}, rms {sm.w}; one dispatches on 256 lanes {narrow}, on 1024 lanes {wide}\n")
+            t |> success(nst >= 2l && nba == 1l, "{tag} {fused}: the steps and the batched step ran on the device ({nst}, {nba})")
+            if (on) {
+                let nenc = (sm.x + sm.y) / (2 * nl)   //! the encoded layer stacks: two seams a layer
+                t |> success(int64(nenc) >= nst + nba && sm.x + sm.y == nenc * 2 * nl,
+                    "{tag} fused: every seam one dispatch ({sm.x} + {sm.y} over {nenc} stacks of {nl} layers)")
+                t |> equal(sm.z, 0, "{tag} fused: no plain seam on the sandwich")
+                fused_stacks = nenc
+                fused_norms = sm.w
+                t |> equal(wide, int64(sm.x + sm.y), "{tag} fused: every seam on the decode rows' 1024-lane builders")
+                t |> equal(narrow, 0l, "{tag} fused: no seam on the 256-lane builders")
+            } else {
+                t |> equal(sm.x + sm.y, 0, "{tag} split: no one-dispatch seam - the control")
+                t |> equal(narrow + wide, 0l, "{tag} split: no residual one dispatch on either lane width")
+                t |> equal(sm.w - fused_norms, fused_stacks * (4 * nl - 1),
+                    "{tag} split: every seam's split chain norm passes past the fused run's ({sm.w} against {fused_norms}, {fused_stacks} stacks)")
+            }
+            sess |> clear()   // drop the borrowed handles: delete of array<T?> cascades to the pointees
+            unsafe {
+                delete ws
+                delete sess
+            }
+            delete cur
+            delete sa
+            delete sb
+        }
+        set_metal_decode_fuse(fuse)
+        restore_metal_overrides(seat)
+    }
 }
 
 //! the E-series side rows' projections the device ran: the bf16 word form's two stamps and the f32 router's
-def private ple_proj_count : int64 {
-    return (metal_kernel_count_compiled("metal_ple_proj_bf16") + metal_kernel_count_compiled("metal_ple_proj_bf16_one")
-        + metal_kernel_count_compiled("metal_moe_router"))
-}
+def private ple_proj_count : int64 => kernels_sum(["metal_ple_proj_bf16", "metal_ple_proj_bf16_one", "metal_moe_router"])
 
 //! the summed census counts of `names` (`metal_kernel_count_compiled`): the dispatches of a format's stamps at a site
 def private kernels_sum(names : array<string>) : int64 {
@@ -1145,10 +1223,11 @@ def private kernels_sum(names : array<string>) : int64 {
     return n
 }
 
-//! `kernels`: the stamps only the carrier's format at its site dispatches - their summed count rises over the row
-[cold_path, unused_argument(t, path, tag, hetero_hidden, tokexact, bar, arm, kernels)]   // off-Apple the gated body is empty
+//! `kernels`: the stamps only the carrier's format at its site dispatches - their summed count rises over the row; `ple_fmt`,
+//! where set, the PLE table's disk format, whose tag the load keeps
+[cold_path, unused_argument(t, path, tag, hetero_hidden, tokexact, bar, arm, kernels, ple_fmt)]   // off-Apple the gated body is empty
 def private gemma4e_row(t : T?; path, tag : string; hetero_hidden : bool = false; tokexact : bool = true; bar : float = 8.0;
-                        arm : string = "fam-gemma4e"; kernels : array<string> = array<string>()) {
+                        arm : string = "fam-gemma4e"; kernels : array<string> = array<string>(); ple_fmt : int = -1) {
     // gemma-4 E-series (E4B): PLE (per-layer embeddings — MetalNeed.ple) + cross-layer KV
     // sharing (the last 18 layers are Q-only and alias layer 22/23's slab/panels). Decode,
     // prefill and the batched step ENGAGE on the blob twin; the batched step is compared row
@@ -1159,6 +1238,10 @@ def private gemma4e_row(t : T?; path, tag : string; hetero_hidden : bool = false
         }
         var tr <- load_model_(path, QuantMode.q8)
         tr.config.seq_len = min(tr.config.seq_len, 512l)
+        if (ple_fmt >= 0) {
+            to_log(LOG_INFO, "{tag}: the PLE table's format tag {tr.ple_emb_fmt}\n")
+            t |> equal(int(tr.ple_emb_fmt), ple_fmt, "{tag}: the PLE table keeps its disk format's tag ({tr.ple_emb_fmt})")
+        }
         let want_bits = (MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.v_norm | MetalNeed.attn_scale |
             MetalNeed.sliding | MetalNeed.pre_post_norm | MetalNeed.out_scale | MetalNeed.geglu |
             MetalNeed.ple | MetalNeed.qd_neq_dim)
@@ -1382,6 +1465,7 @@ def private gemma4e_row(t : T?; path, tag : string; hetero_hidden : bool = false
         cont_logits_cell(t, tr, trg, "{tag}/q8/f16", bar)
         if (!empty(kernels)) {
             let fk = kernels_sum(kernels) - fk0
+            to_log(LOG_INFO, "{tag}: the site's format stamps dispatched ({kernels}: {fk})\n")
             t |> success(fk > 0l, "{tag}: the site's format stamps dispatched ({kernels}: {fk})")
         }
         delete trg
@@ -1594,14 +1678,14 @@ def private gptoss_row(t : T?; path : string) {
             var s = make_run_state(trg.config, KVDtype.f16, KVDtype.f16)
             eval_(trg, s, prompt)
             for (v in range64(vocab)) {
-                mpf = max(mpf, abs(lg0[v] - s.logits[v]))
+                mpf = max(mpf, nan_wide_diff(lg0[v], s.logits[v]))
             }
             gpk0 = argmax_of(s.logits, vocab)
             var one <- [t0]
             eval_(trg, s, one)
             delete one
             for (v in range64(vocab)) {
-                m1 = max(m1, abs(lg1[v] - s.logits[v]))
+                m1 = max(m1, nan_wide_diff(lg1[v], s.logits[v]))
             }
             gpk1 = argmax_of(s.logits, vocab)
             served = (metal_prefill_stats().prefills - pf0) + (metal_decode_stats().decodes - d0)
@@ -1725,14 +1809,7 @@ def private metal_release_row(t : T?; path, tag : string) {
 //! `prompt` evaluated `chunk` rows a call, then `steps` greedy picks each fed back: the prompt's ids and the picks
 def private ring_row_walk(t : Model; var s : Session; prompt : array<int64>; chunk : int64; steps : int) : array<int64> {
     var out := prompt
-    var p = 0l
-    while (p < long_length(prompt)) {
-        let e = min(p + chunk, long_length(prompt))
-        var part <- [for (i in range64(p, e)); prompt[i]]
-        eval_(t, s, part)
-        delete part
-        p = e
-    }
+    eval_chunked(t, s, prompt, long_length(prompt), chunk)
     out |> reserve(length(out) + steps)
     for (_i in range(steps)) {
         let pick = argmax_of(s.logits, t.config.vocab_size)
@@ -1948,7 +2025,7 @@ def private gemma4_hetero_q8_row(t : T?; path : string) {
             select_decode_override("")
             served_bat = metal_batch_decode_stats().steps - ba0
             for (i in range(length(cpu_bl))) {
-                d4 = max(d4, abs(cpu_bl[i] - gpu_bl[i]))
+                d4 = max(d4, nan_wide_diff(cpu_bl[i], gpu_bl[i]))
             }
             let vocab = tr.config.vocab_size
             for (s4 in range64(4l)) {
@@ -2097,6 +2174,9 @@ def private gemma4_hetero_row(t : T?; path : string; tag : string = "gemma4-12b/
             gpu_bat <- batch_pair_steps(tr, trg, count_prompt, count_prompt2, 4)   // nolint:PERF030,LINT019 — fresh empty target, single move; fires only on the das_metal arm
             restore_metal_overrides(seat)
             served_bat = metal_batch_decode_stats().steps - ba0
+            if (trg.config.dim > ADD_RMS_MAX_DIM) {
+                past_slab_seam_cell(t, trg, tag)
+            }
         }
         to_log(LOG_INFO, "{tag} freeform CPU text (prompt echo + cont): {eyeball_text(tr, cpu_ids)}\n")
         to_log(LOG_INFO, "{tag} freeform GPU greedy-would-be cont (fmaxd {fmaxd} at row {fmax_at}, CPU max |logit| there {fmax_peak}): {eyeball_text(tr, gpu_picks)}\n")
@@ -2273,17 +2353,24 @@ def test_metal_family_matrix(t : T?) {
             // the file's rows sit closer together (the batch cell's two rows 6.6 apart), so its bar is 4.0 (reads 0.6 to 1.3)
             gemma4e_row(t, path_join(models_dir(), "gemma-4-E2B-it-Q4_0.gguf"), "gemma4e-e2b-q40", true, false, 4.0, "fam-gemma4e-q40",
                 ["MetalKqGemvQ40_metal_kq_gemv_iq4", "MetalKqMvB2Q40_metal_kq_mv_iq4", "MetalKqMvB2Q40H_metal_kq_mv_iq4"])
-            // ... and the format carriers off the E2B Q8_0: the token and PLE tables Q6_K and IQ4_XS (the gather family's K-quant and
-            // IQ stamps at width layers x ple, which the token table's gather shares), the per-layer gate and projection planes Q6_K and
-            // Q5_0 (no other plane of the file carries the format, so the stamps count the site alone)
-            for (carrier in [(file = "gemma-4-E2B-it-emb-Q6_K-local.gguf", tag = "gemma4e-e2b-emb-q6k", kernels <- ["MetalEmbedK6_metal_embed_kq"]),
-                             (file = "gemma-4-E2B-it-emb-IQ4_XS-local.gguf", tag = "gemma4e-e2b-emb-iq4xs", kernels <- ["MetalEmbedIq4xs_metal_embed_kq"]),
+            // ... and the format carriers off the E2B Q8_0: the token and PLE tables Q6_K, IQ4_XS, Q5_0 and Q5_1 (the gather family's
+            // K-quant, IQ and per-32 stamps at width layers x ple, which the token table's gather shares), the per-layer gate and
+            // projection planes Q6_K and Q5_0 (no other plane of the file carries the format, so the stamps count the site alone)
+            for (carrier in [(file = "gemma-4-E2B-it-emb-Q6_K-local.gguf", tag = "gemma4e-e2b-emb-q6k", kernels <- ["MetalEmbedK6_metal_embed_kq"],
+                              fmt = int(KqFmt.k6)),
+                             (file = "gemma-4-E2B-it-emb-IQ4_XS-local.gguf", tag = "gemma4e-e2b-emb-iq4xs", kernels <- ["MetalEmbedIq4xs_metal_embed_kq"],
+                              fmt = int(KqFmt.iq4xs)),
+                             (file = "gemma-4-E2B-it-emb-Q5_0-local.gguf", tag = "gemma4e-e2b-emb-q50",
+                              kernels <- ["MetalEmbedB32Q5032_metal_embed_b32"], fmt = int(KqFmt.q5032)),
+                             (file = "gemma-4-E2B-it-emb-Q5_1-local.gguf", tag = "gemma4e-e2b-emb-q51",
+                              kernels <- ["MetalEmbedB32Q51_metal_embed_b32"], fmt = int(KqFmt.q51)),
                              (file = "gemma-4-E2B-it-ple-Q6_K-local.gguf", tag = "gemma4e-e2b-ple-q6k",
-                              kernels <- ["metal_kq_gemv_k6", "MetalKqMvB2K6_metal_kq_mv_k6"]),
+                              kernels <- ["metal_kq_gemv_k6", "MetalKqMvB2K6_metal_kq_mv_k6"], fmt = -1),
                              (file = "gemma-4-E2B-it-ple-Q5_0-local.gguf", tag = "gemma4e-e2b-ple-q50",
                               kernels <- ["metal_kq_gemv_q5032", "metal_kq_gemv_q5032_ks", "MetalB32MvB2Q5032_metal_b32_mvb",
-                                          "MetalB32MvB2Q5032Ks_metal_b32_mvb"])]) {
-                gemma4e_row(t, path_join(models_dir(), carrier.file), carrier.tag, true, false, 4.0, "fam-{carrier.tag}", carrier.kernels)
+                                          "MetalB32MvB2Q5032Ks_metal_b32_mvb"], fmt = -1)]) {
+                gemma4e_row(t, path_join(models_dir(), carrier.file), carrier.tag, true, false, 4.0, "fam-{carrier.tag}", carrier.kernels,
+                    carrier.fmt)
             }
             // gpt-oss-20b (Wave C stage 4): mx4 experts + sinks + softmax_weight + biases
             gptoss_row(t, path_join(models_dir(), "gpt-oss-20b-mxfp4.gguf"))

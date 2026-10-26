@@ -51,8 +51,10 @@ the window's rows, so the ring holds every key a window's queries read once the 
 (`RdecRegion.hw`, the most positions its rows ever reached) puts its floor at `hw - slack` (`rdec_ring_floor`): a continuation
 from that position or later finds its window whole, one from earlier does not, and no copy of the overwritten rows exists - a
 host-cached session's cache took only what the ring held when it hydrated. So the floor travels with the history:
-`Session.kv_ring_floor` rises as the driver writes (`rdec_rows_hold`), a call at a position under it panics
-(`kv_ring_floor_check`; a call at position zero rebuilds the history and clears it), a device-home adopt or a pool export under
+`Session.kv_ring_floor` is set when a prompt claims its region from the start (`rdec_claim`, a one-window prompt past the slack
+included) and rises as the driver writes (`rdec_rows_hold`), a call at a position under it panics
+(`kv_ring_floor_check`; a call at position zero - a prefill from it or a decode of row zero - rebuilds the history, drops
+the claim's high-water mark to the rows it writes and clears the floor), a device-home adopt or a pool export under
 it refuses (`gpu_device_kv_adopt_`, `gpu_device_kv_export_`), a pool import under the carrier's refuses, and a prefix-cache page
 records its donor's floor (`PrefixEntry.ring_floor`), so an attach is cut to the longest run of pages whose floors it reaches
 (`prefix_plan_floor_cut`) and the session it fills carries their floor. A conversation's next turn continues from the turn

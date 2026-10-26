@@ -24,6 +24,17 @@ def iq3s_signed(g, nib : uint) : uint {
 //! gemma's soft cap cap * tanh(v / cap) in softcap4's exp form: a shader tanh NaNs past ~44, while exp(INF) zeroes the term and saturates.
 def softcap_exp(v, cap : float) : float => cap * (1.0 - 2.0 / (1.0 + exp(2.0 * v / cap)))
 
+//! the row a decode GEMV lane serves in row group `grp` (a workgroup, or one turn of one): `lpr` lanes a row, `sgs` lanes a subgroup,
+//! `nsg` subgroups a group
+def gemv_lane_row(grp, sg, lane, lpr, sgs, nsg : uint) : uint => (grp * nsg + sg) * (sgs / lpr) + lane / lpr
+
+//! the slot (`sg * sgs + lane`) of the first lane serving row `j` in row group `grp` (`gemv_lane_row`), for `j` among that group's rows
+def gemv_lane_row_slot(j, grp, lpr, sgs, nsg : uint) : uint {
+    let per_sg = sgs / lpr
+    let q = j - grp * nsg * per_sg
+    return (q / per_sg) * sgs + (q % per_sg) * lpr
+}
+
 //! a K/V mirror position's row in its layer's slab: the position itself, or its slot of a sliding layer's ring of `ring` rows; the
 //! modulo never divides by zero, since a shader compiler may take a division as proof its divisor is not zero and drop the flat arm
 [arch(at="../ARCHITECTURE_GPU_KV_RING.md#kv-sliding-ring")]
@@ -65,6 +76,10 @@ def sig_gate(x, g : float) : float => x / (1.0 + exp(-g))
 
 //! the inverse rms of a mean square `ms` (eps added): `rsqrt` where `rsq`, else the CPU rmsnorm's `1 / sqrt`
 def rms_inv(ms : float; rsq : bool) : float => rsq ? rsqrt(ms) : 1.0 / sqrt(ms)
+
+//! a logit as the classifier tail's lanes read it: NaN and anything under the lowest finite read as the lowest finite (-3.4e38, the
+//! literal because a kernel body reads no module constant) - the kernel's lane and the CPU oracle's one reading
+def sel_lane_val(v : float) : float => !(v == v) || v < -3.4e38 ? -3.4e38 : v   // nolint:LINT007 — the NaN test: a NaN is the one float that is not equal to itself
 
 //! the selected routing weights' sum as their renorm divides by it: clamped at f16's smallest normal, the CPU select's floor
 def moe_renorm_sum(ws : float) : float => max(ws, 6.103515625e-5)

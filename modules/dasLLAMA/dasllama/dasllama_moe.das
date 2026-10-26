@@ -12,6 +12,7 @@ require dasllama/dasllama_par
 require dasllama/dasllama_convert   // the q8_0/q8_k row quantizers the expert dispatch feeds
 require dasllama/dasllama_env       // the g_env_* knob globals ([EnvConfig] declarations; ENVIRONMENT.md is generated from them)
 require math
+require daslib/cmp
 
 // MoE expert routing and dispatch: the top-k router, the per-expert FFN accumulation, the shared
 // expert, and the two opt-in decode instruments (cross-token expert reuse, GPU heat pinning).
@@ -120,7 +121,7 @@ def private heat_advise_layer(t : Model; l : int64; h : HeatLayer) {
         return
     }
     var ids <- [for (i in range(length(h.cnt))); int64(i)]
-    ids |> sort() $(a, b) => h.cnt[a] > h.cnt[b]
+    ids |> sort() <| cmp_by(-h.cnt[_])
     var want = min(g_heat_want, long_length(ids))
     while (want > 0l && h.cnt[ids[want - 1l]] <= 0.0) {   // never pin never-picked experts
         want--
@@ -250,7 +251,7 @@ def expert_reuse_report(verbose : bool = true) {
         toks = max(toks, r.tokens)
         // static top-C coverage: sort a frequency copy descending, prefix-sum at each capacity
         var inscope f := r.freq
-        f |> sort() $(a, b) => a > b
+        f |> sort() <| cmp_by(-_)
         var cov : int64[4]
         var acc = 0l
         var fi = 0
@@ -429,11 +430,8 @@ def private moe_gather_feed(xq : array<int8>; xs : array<float>; k, dim, unit : 
 //! `experts_mx4`), so the format is mx4 for every routed stack of such a model
 def public expert_fmt(t : Model; tags : array<KqFmt>; l : int64) : KqFmt => t.experts_mx4 ? KqFmt.mx4 : fmt_at(tags, l)
 
-//! an expert plane format the per-op expert chain reads: q8, a superblock format, a per-32 one (the GEMVs and the batch tiles)
-def public expert_chain_fmt_ok(f : KqFmt) : bool => f == KqFmt.q8 || kq_sb(f) || kq_dense_b32(f) || f == KqFmt.mx4
-
 [arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command")]
-def private moe_trace_row(s : Session; l, k, dim : int64) {
+def moe_trace_row(s : Session; l, k, dim : int64) {
     return if (!g_env_gpu.gpu_prof)
     var xb_l1 = 0.0
     var acc_l1 = 0.0
@@ -694,7 +692,7 @@ def moe_experts_apply(t : Model; var s : Session; l : int64) { // nolint:STYLE03
 }
 
 //! s.xb quantized once into the dedicated moe_xq / moe_xs, which the down requant does not clobber: a q8 shared expert downstream reads that Q8_0 image
-def private moe_quant_feed(t : Model; var s : Session; l : int64; layer_kq : bool) {
+def moe_quant_feed(t : Model; var s : Session; l : int64; layer_kq : bool) {
     let c = t.config
     let ts_rq = prof_ticks()
     let k1 = kq_sb(fmt_at(t.we1_fmt, l))
@@ -753,7 +751,7 @@ def private moe_routed_plain(t : Model; var s : Session; l, k : int64; biased : 
 }
 
 //! s.moe_acc += the k down rows under their routing weights, in slot order - the sum is bit-identical to the per-expert loop's
-def private moe_routed_reduce(var s : Session; k, dim : int64) {
+def moe_routed_reduce(var s : Session; k, dim : int64) {
     let ts_red = prof_ticks()
     for (j in range64(k)) {
         axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_dn[j * dim])), s.moe_w[j], dim)
@@ -1025,6 +1023,16 @@ def moe_pick_tape_lane(first, stride, k : int64) {
 
 //! the replay's selects so far, and the own picks the tape did not carry
 def moe_pick_tape_stats() : tuple<seen : int64; miss : int64> => (seen = g_moe_tape_seen, miss = g_moe_tape_miss)
+
+//! the tape as recorded so far, copied out - a dump carries it to another process's replay ([[moe_pick_tape_replay_from]])
+def moe_pick_tape_picks() : array<int64> => <- clone_to_move(g_moe_tape)
+
+[arch(at="../ARCHITECTURE_ENGINE_MECHANISMS.md#moe-pick-tape")]
+def moe_pick_tape_replay_from(picks : array<int64>) {
+    g_moe_tape |> clear()
+    g_moe_tape |> push_from(picks)
+    moe_pick_tape(MoePickTape.replay)
+}
 
 //! the tape's mode, and a lane replay's stride (1 outside a lane)
 def moe_pick_tape_mode() : tuple<mode : MoePickTape; stride : int64> => (mode = g_moe_tape_mode, stride = g_moe_tape_stride)

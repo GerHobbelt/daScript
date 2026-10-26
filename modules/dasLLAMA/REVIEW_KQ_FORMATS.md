@@ -44,10 +44,14 @@ superblocks), written outside a Metal or SPIR-V kernel body and outside a defini
 kernel class, the pins of `tests/test_kqformat.das` - is a defect: read it through a `KqFmt` accessor
 (`kq_elems`, `kq_disk_bytes`, ...), through `kq_qsb` / `kq_ssb` on a format id, or through a named
 constant a definition home declares, declared there in the same change when none exists.** A
-literal `32` reads like a tile width.
+number derived from several formats' sizes is such a literal; a kernel builder's `requires =`
+alignment string takes a literal integer alone (the lens accepts no name there), so that literal is
+pinned in `tests/test_kqformat.das` against the format's block length; a test's expected-message
+text is not a literal of this rule. A literal `32` reads
+like a tile width.
 
-**A diff that writes a per-format quantity as a bare literal in a Metal or SPIR-V kernel body is a
-defect - read it through a `@template_constant` declared on the shared base of its class family, or
+**A diff that writes a per-format quantity of a `KqFmt` member as a bare literal in a Metal or
+SPIR-V kernel body is a defect - read it through a `@template_constant` declared on the shared base of its class family, or
 on the class when it has none; a diff that declares such a constant pins its value against the
 format's `kq_desc` row in `tests/test_kqformat.das` in the same change.**
 
@@ -58,29 +62,32 @@ value, and its `disk_bytes` inside the walk that checks every row against `ggml_
 Narrowing the row's literal pins or the `ggml_type_bytes` walk is a defect.
 
 A site is a weight plane a backend's (CPU, Metal, Vulkan) serving call reads. A lever is an env
-knob or setter that changes which form a site reads. A format's served form is a re-layout of its
-own quantized values, value-exact against the disk form, with no wider element type (a `KqFmt`
-member over the same GGUF type, `ARCHITECTURE_ENGINE_FORMATS.md#served-form`). A converted copy is
-any other form of the weights whose bytes outlive the one kernel call or window that made them,
-or reach the `.dlim` image.
+knob or setter that changes which form a site reads. A converted copy is any form of the weights -
+other than a re-encoding of their own quantized values that is value-exact against the disk form
+and has no wider element type (`ARCHITECTURE_ENGINE_FORMATS.md#served-form`) - whose bytes outlive
+the one kernel call or window that made them, or reach the `.dlim` image.
 
 **A diff that makes a site read a weight format through a converted copy, or hands a GPU site to
 the CPU's kernels, on a run with every lever at its default is a defect - add that backend's
 kernels for the format at the site instead.**
 
-**A diff that adds a site, or adds a backend's serving call to a site, serves at it every `KqFmt`
-member that can occur at the site's row length (a superblock member needs the length on the 256
-lattice, a per-32 member on the 32 lattice) on that backend in the same change, or makes the load
-decline a format it does not serve there with a reason naming the site and the format.** A site
-that serves the formats its author's files carried and transcodes the rest serves a format matrix
-nobody chose, and the next file finds the gap at load time with no line saying so.
+**A diff that adds a site, adds a backend's serving call to a site, or changes which `KqFmt`
+members a site serves, serves at it, on each backend whose serving call reaches the site, in the
+same change, every `KqFmt` member whose block length divides the site's row length (256 for a
+superblock member, 32 for a per-32 member), or makes the load decline a member it does not serve
+there with a reason naming the site and the member.** A site that serves only the formats its
+author's files carried converts the rest without saying so, and the first file in another format
+fails or converts at load with no message naming the site.
 
-**A diff that adds or changes a site reading a weight plane whose format is a literal `KqFmt`
-member, or a plane the loader converts to one form whatever its disk type (a `load_big` call with
-no format), is a defect - the loader tags the plane from its disk type through `kq_tag` /
-`kq_fmt_of`, and the site reads the tag.** A literal at the site is a conversion no report names:
-every disk type the file carries becomes the literal's form, and every home that copies the
-literal agrees on the same wrong answer.
+**A diff that adds or changes a site that names, with a literal `KqFmt` member, the format of a
+weight plane whose disk type some `KqFmt` member describes is a defect: tag the plane from its
+disk type with `kq_tag` / `kq_fmt_of` (`dasllama/dasllama_load.das`) and read that tag at the
+site instead.** A literal at the site is a conversion no report names: every disk type the file carries becomes the literal's form, and each
+backend that copies the literal serves that form in place of the file's.
+
+**Weakening `REVIEW.das`'s `check_load_big_format` is a defect.** That check fails every `load_big`
+call in `dasllama/dasllama_load.das` that passes no format: such a call converts the plane to one
+form, whatever its disk type, and no report names the conversion.
 
 **A diff that states a backend serves a weight format - in any document, PR description, test
 name, or a predicate that returns true for "this backend runs this format" - while, on a run with
@@ -88,11 +95,14 @@ every lever at its default, a site that backend's serving call reaches reads the
 converted copy or hands a GPU site to the CPU's kernels is a defect - state that site as a gap
 instead, or cite the follow-up row that ledgers it.**
 
-**A diff that states a backend serves a weight format at a site lands, or cites, a cell that loads
-a file whose plane at that site carries that format - a requantized local file
-(`performance/model_specs.das`, the `-local` recipe rows) where no catalogued file does - and
-asserts both the plane's load tag against the disk type and that the backend's kernel counter for
-the site rose.** A cell that asserts engagement alone passes with the site on a converted copy or
+**A diff that states, in any document, PR description, test name or predicate, that a backend
+serves a weight format at a site lands or cites a subtest that loads a file whose plane at that
+site is in that format on disk, and asserts that the loader's format tag for that plane
+equals its disk type and that a kernel counter (`metal_kernel_count(name)` on Metal, the Vulkan
+driver's per-kernel census count) that no other plane of that file moves rose during the run.**
+The file is a downloaded `performance/model_specs.das` row's file, or, when no downloaded row
+carries the format, a row whose `file` ends `-local.gguf` and whose `recipe` requantizes into it. A
+subtest that only asserts the backend ran still passes when the site reads a converted copy or runs
 on the CPU pre-step.
 
 **A diff that adds a lever, off by default, that makes a site read a weight format through a

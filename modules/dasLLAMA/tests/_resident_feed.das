@@ -12,16 +12,22 @@ require dasllama/dasllama_lint public
 require dastest/testing_boost public
 require dasllama/dasllama_common   // Model, Session, forward_prefill, forward
 require dasllama/dasllama   // create_session, moe_gpu_drop_model
+require dasllama/dasllama_image
 require dasllama/dasllama_gpu_resident   // moe_gpu_resident_active / moe_gpu_resident_prefills: the driver's witnesses
 require dasllama/dasllama_gpu_tier   // gpu_cpu_passes_: the calls the driver handed to the CPU rails, by reason
 require dasllama/dasllama_kv_dtype   // kv_row_bytes / kv_layer_kbase: the head's K row
 require ?vulkan dasllama/dasllama_vulkan_common   // the resolved coopmat mode, where the module exists
 require ?vulkan dasllama/dasllama_vulkan_decode   // the greedy chain's mode pin and its hits and misses
 require dasllama/dasllama_math   // with_dasllama_jobque_
+require dasllama/dasllama_sampling   // sample_, set_seed_: the sampled speculative stream
+require dasllama/dasllama_env   // nolint:STYLE030,LINT019 — pf_window_rows / the pins: read under the vulkan static_if, unused in the darwin world
+require _compares   // argmax_of: the row's peak a red names; logits_of: the session's row copied
 require _model_tier   // logits_maxdiff, mirror_kv_dtype, live_maxabs, SUPPRESSED_LOGIT
 require _format_census   // census_plane, SiteCensus: a plane's tag against the file's tensor type
 require dasllama/dasllama_gguf   // parse_gguf_meta
 require daslib/fio   // fopen, fmap
+require daslib/f16_cvt   // f16_to_f32: the stored f16 rows' distance
+require math   // abs
 
 //! the served tile arm, so a red names which prefill tile it came from
 def tile_arm_tag() : string {
@@ -32,13 +38,17 @@ def tile_arm_tag() : string {
     }
 }
 
-let PF_WINDOW_ROWS = 512l   //! the engine's PF_WINDOW, asserted equal by the two-window cells: a prompt past it runs as sequential windows
+let PF_WINDOW_ROWS = 2048l   //! the prompt window the cells size their prompts against: `load_resident` pins it where no file pinned one, since the engine's own pick (the wide window where the plan fits) would run a two-window prompt as one
 
-//! the engine's prefill window is `PF_WINDOW_ROWS`, where the vulkan module exists: a cell sizing its prompt past the window holds it
-def assert_pf_window(t : T?) {
+//! the engine's prefill window is `rows` (the default `PF_WINDOW_ROWS`, or the window a file pins), where the vulkan module exists: a cell sizing its prompt past the window holds it
+def assert_pf_window(t : T?; rows : int64 = PF_WINDOW_ROWS) : bool {
     static_if (typeinfo builtin_module_exists(vulkan)) {
-        t |> equal(PF_WINDOW, PF_WINDOW_ROWS, "the prompt is sized past the engine's own window")
+        if (pf_window_rows() != rows) {   //! the knob or a pin moved the window: the cell's prompt is sized against `rows`, so it skips rather than reads another shape
+            t |> skip("the prompt window is {pf_window_rows()} rows (DASLLAMA_GPU_PF_ROWS / set_pf_window_rows_pin), not the {rows} this cell sizes its prompt past")
+            return false
+        }
     }
+    return true
 }
 
 //! `n` ramp ids `base + ((i + salt) * stride) % span`: a prompt or a fed run no tokenizer is needed for
@@ -105,20 +115,21 @@ def resident_ready(t : T?; path : string) : bool {
 
 //! the levers a resident load pins, as the cell found them: the whole-model route's lever (never `gpu_want_resident`, which
 //! folds the environment's knob in and would pin the lever off under DASLLAMA_GPU_RESIDENT=0), the mirror regions asked
-//! for, the context pins, the host-layers pin, and the Vulkan fuse pin where the module exists
+//! for, the context pins, the host-layers pin, the prompt-window pin, and the Vulkan fuse pin where the module exists
 struct ResidentLevers {
     route : bool
     regions : int64
     ctx_max : int64
     ctx_strict : bool
     host_layers : int64
+    pf_rows : int64
     fuse : int
 }
 
 def resident_levers() : ResidentLevers {
     let pins = gpu_ctx_pins()
     var l = ResidentLevers(route = gpu_resident_route_lever(), regions = gpu_resident_regions_want(), ctx_max = pins.ctx_max, ctx_strict = pins.strict,
-                           host_layers = gpu_host_layers_pin(), fuse = -1)
+                           host_layers = gpu_host_layers_pin(), pf_rows = pf_window_rows_pin(), fuse = -1)
     static_if (typeinfo builtin_module_exists(vulkan)) {
         l.fuse = g_vk_fuse
     }
@@ -131,6 +142,7 @@ def restore_resident_levers(l : ResidentLevers) {
     set_gpu_ctx_max(l.ctx_max)
     set_gpu_ctx_strict(l.ctx_strict)
     set_gpu_host_layers(l.host_layers)
+    set_pf_window_rows_pin(l.pf_rows)
     static_if (typeinfo builtin_module_exists(vulkan)) {
         g_vk_fuse = l.fuse
     }
@@ -222,21 +234,29 @@ def census(kernel : string) : int64 {
 }
 
 //! `path` loaded at q8 with the whole-model route pinned on - at `regions` mirror regions where it is past 0, the context
-//! pinned and asked whole at `strict_ctx` positions where it is past 0, else at the caller's own context pin, never strict -
-//! and `host_layers` routed layers' experts asked onto the host (0: the plan's own count, pinned so the environment's ask
-//! does not reach the load) whatever an earlier cell left; every lever put back after
-def load_resident(path : string; regions : int64 = 0l; strict_ctx : int64 = 0l; host_layers : int64 = 0l) : Model {
+//! pinned and asked whole at `strict_ctx` positions where it is past 0, else at the caller's own context pins (its strict
+//! ask included) - and `host_layers` routed layers' experts asked onto the host (0: the plan's own count, pinned so the
+//! environment's ask does not reach the load) whatever an earlier cell left; every lever put back after
+def load_resident(path : string; regions : int64 = 0l; strict_ctx : int64 = 0l; host_layers : int64 = 0l; image : bool = false) : Model {
     let levers = resident_levers()
+    if (pf_window_rows_pin() <= 0l) {
+        set_pf_window_rows_pin(PF_WINDOW_ROWS)
+    }
     if (regions > 0l) {
         set_gpu_resident_regions_(regions)
     }
     if (strict_ctx > 0l) {
         set_gpu_ctx_max(strict_ctx)
+        set_gpu_ctx_strict(true)
     }
-    set_gpu_ctx_strict(strict_ctx > 0l)
     set_gpu_host_layers(host_layers)
     set_gpu_resident_route(true)
-    var tr <- load_model_(path, QuantMode.q8)
+    var tr <- Model()
+    if (image) {
+        tr <- load_model_cached(path, QuantMode.q8)
+    } else {
+        tr <- load_model_(path, QuantMode.q8)
+    }
     restore_resident_levers(levers)
     return <- tr
 }
@@ -324,6 +344,118 @@ def with_batch_rows(tr : Model; var sess : array<Session?>; body : block<(var ws
     delete ws
 }
 
+//! a session a prompt on codec `kv`, every session stepped `steps` batched steps on its feed's tokens: every row's logits a step,
+//! the batched driver's own step count (`steps_of`) up by every step
+def batched_logits_rows(t : T?; tr : Model; prompts, feeds : array<array<int64>>; kv : KVDtype; steps : int64;
+                        steps_of : block<() : int64>) : array<array<float>> {
+    let n = length(prompts)
+    var sessions : array<Session>
+    sessions |> reserve(n)
+    for (p in prompts) {
+        sessions |> emplace <| create_session(tr, kv)
+        eval(tr, sessions[length(sessions) - 1], p)
+    }
+    var sess <- [for (i in range(n)); unsafe(addr(sessions[i]))]
+    var rows : array<array<float>>
+    rows |> reserve(int64(n) * steps)
+    let steps0 = invoke(steps_of)
+    with_batch_rows(tr, sess) $(var ws; var sx) {
+        for (st in range64(steps)) {
+            var toks <- [for (i in range(n)); feeds[i][st]]
+            eval_batch(tr, ws, sx, toks)
+            delete toks
+            for (s in sessions) {
+                rows |> push_clone(s.logits)
+            }
+        }
+    }
+    t |> equal(invoke(steps_of) - steps0, steps, "every batched step went through the batched driver")
+    unsafe {
+        delete sess
+    }
+    delete sessions
+    return <- rows
+}
+
+//! speculative rounds on `s` while `more(round, committed)` holds: each round's token is `next(round)`, pushed onto `ids` with
+//! the drafts the round accepted after it
+def spec_rounds_into(tr : Model; var s : Session; var ids : array<int64>; more : block<(round, committed : int64) : bool>; next : block<(round : int64) : int64>) {
+    var r = 0l
+    while (invoke(more, r, long_length(ids))) {
+        let tok = invoke(next, r)
+        ids |> push(tok)
+        let a = mtp_spec_round(tr, s, tok)
+        for (i in range64(a)) {
+            ids |> push(s.mtp_vbatch[i + 1l])   // nolint:PERF006 — the caller reserves `ids` for its rounds' worth of rows
+        }
+        r++
+    }
+}
+
+//! a sampled speculative stream: the tokens the rounds committed, the rounds run, the drafts the walk drafted and accepted, the
+//! device's selections it asked and the sampler's late landings it took
+struct SampledStream {
+    ids : array<int64>
+    rounds : int64
+    drafted : int64
+    accepted : int64
+    selections : int64
+    late_landings : int64
+}
+
+//! a sampled speculative stream of `reply` tokens on `tr` at depth 2, seeded: `open` prefills the prompt onto the session it is
+//! handed (each home's own prefill), then the first token and every round's next drawn with `sp` off the session; the
+//! speculative gate and the depth put back after
+def sampled_stream(tr : Model; reply : int64; var sp : SamplingParams; seed : int; kdt : KVDtype; open : block<(var s : Session) : void>) : SampledStream {
+    var r : SampledStream
+    r.ids |> reserve(reply + MTP_MAX_ROWS)
+    var s <- create_session(tr, kdt)
+    let spec0 = get_mtp_spec()
+    let depth0 = mtp_depth_pin()
+    set_mtp_spec(true)
+    set_mtp_depth(2l)
+    invoke(open, s)
+    set_seed_(s, seed)
+    s.spec_params = unsafe(addr(sp))
+    let sel0 = sel_selections()
+    let fb0 = sel_fallbacks()
+    spec_rounds_into(tr, s, r.ids, $(round, committed) : bool { r.rounds = round; return committed < reply }, $(_round) => sample_(s, sp))
+    r.ids |> resize(reply)
+    r.selections = sel_selections() - sel0
+    r.late_landings = sel_fallbacks() - fb0
+    r.drafted = s.mtp_drafted
+    r.accepted = s.mtp_accepted
+    s.spec_params = null
+    restore_mtp_depth(depth0)
+    set_mtp_spec(spec0)
+    delete s
+    return <- r
+}
+
+//! the resident driver's sampled stream: the prompt prefilled through the engine's prefill on the mirror's codec
+def sampled_stream(tr : Model; prompt : array<int64>; reply : int64; var sp : SamplingParams; seed : int) : SampledStream {
+    return <- sampled_stream(tr, reply, sp, seed, mirror_kv_dtype()) $(var s : Session) {
+        let np = long_length(prompt)
+        forward_prefill(tr, s, prompt, np, 0l)
+        s.n_past = np
+    }
+}
+
+//! the selection landing's agreement, both homes' one reading: the rows-landed stream asked no selection, the selection served
+//! the other's steps with no late landing, the two agree token for token (they share the device's logits and the seed and
+//! part only through the sampler's input; `test_sampling_landed.das` holds the landed draw's equivalence to the row draw) and
+//! the walk accepts the same drafts (a stale carry under the selection drafts garbage the walk rejects: the tokens stay alike
+//! and the acceptance drops)
+def selection_agrees(t : T?; tr : Model; tag : string; rows, sel : SampledStream) {
+    log_gen_texts(tr, "{tag} the sampled stream: rows landed, the selection landed", rows.ids, sel.ids)
+    t |> equal(rows.selections, 0l, "{tag} select: the rows-landed stream asked no selection")
+    t |> success(sel.drafted > sel.rounds, "{tag} select: the rounds drafted past depth 1 ({sel.drafted} drafts over {sel.rounds} rounds)")
+    t |> success(sel.selections > 0l, "{tag} select: the selection served the stream's steps ({sel.selections} selections over {sel.drafted} drafts)")
+    t |> equal(sel.late_landings, 0l, "{tag} select: no step's sampler reached past the landing ({sel.late_landings} late landings)")
+    t |> success(ids_equal(rows.ids, sel.ids), "{tag} select: the two streams agree token for token ({length(sel.ids)} tokens; {sel.accepted} of {sel.drafted} drafts accepted under the selection, {rows.accepted} of {rows.drafted} without)")
+    t |> success(sel.accepted == rows.accepted && sel.drafted == rows.drafted, "{tag} select: the walk accepts the same drafts under the selection ({sel.accepted} of {sel.drafted} against {rows.accepted} of {rows.drafted})")
+}
+
 //! one speculative round of `tok` on `s` with its draft forced to reject, the reject cadence put back after; true where it accepted
 def forced_reject_round(tr : Model; var s : Session; tok : int64) : bool {
     let reject0 = get_mtp_force_reject_every()
@@ -353,10 +485,20 @@ def row_within(t : T?; what : string; got, want : array<float>; bar : float) : f
     return diff
 }
 
-//! the control that gives a row bar its teeth: `got` against `control`, a row one token or step off, past `bars` bars; the difference back
+//! `row_within` with each side's argmax and its decoded piece logged under `what` first, so a red names what the rows said
+def row_within_say(t : T?; tr : Model; what : string; got, want : array<float>; bar : float) : float {
+    let pg = argmax_of(got)
+    let pw = argmax_of(want)
+    to_log(LOG_INFO, "{what}: argmax {pg} '{piece(tr, pg)}' ({got[pg]}) against {pw} '{piece(tr, pw)}' ({want[pw]})\n")
+    return row_within(t, what, got, want, bar)
+}
+
+//! the control that gives a row bar its teeth: `got` against `control`, a row one token or step off, past `bars` bars and
+//! finite (a NaN difference reads past every bar and proves nothing); the difference back
 def control_past(t : T?; what : string; got, control : array<float>; bar : float; bars : float = 1.0) : float {
     let off = logits_maxdiff(got, control)
-    t |> success(off > bars * bar, "{what} control: the row one off misses by {bars} bars (maxdiff {off}, bar {bar})")
+    let finite = is_finite(off) && off < 1e30
+    t |> success(finite && off > bars * bar, "{what} control: the row one off misses by {bars} bars (maxdiff {off}, bar {bar})")
     return off
 }
 
@@ -431,9 +573,6 @@ def feed_logits(tr : Model; var s : Session; prompt : array<int64>; toks : array
     }
     return <- out
 }
-
-//! the session's first `vocab` logits, copied
-def logits_of(s : Session; vocab : int64) : array<float> => <- [for (i in range64(vocab)); s.logits[i]]
 
 //! the prefill's logits, then each fed step's, through `s`
 def feed_logits(tr : Model; var s : Session; prompt : array<int64>; toks : array<int64>) : array<array<float>> => <- feed_logits(tr, s, prompt, toks) $ {}
@@ -589,7 +728,20 @@ def bytes_differing(a, b : array<uint8>; a_at, b_at, n : int64) : float {
     return float(differing) / float(n)
 }
 
-let CHAIN_STEPS = 24l   //! the greedy chain cell's fed steps a walk
+//! the summed distance of `n` bytes of f16 rows in `a` from byte `a_at` to `b`'s from byte `b_at`, of `b`'s summed magnitude
+def f16_rows_distance(a, b : array<uint8>; a_at, b_at, n : int64) : float {
+    var dist = 0.0
+    var mag = 0.0
+    for (i in range64(n / 2l)) {
+        let x = f16_to_f32(uint(a[a_at + 2l * i]) | (uint(a[a_at + 2l * i + 1l]) << 8u))
+        let y = f16_to_f32(uint(b[b_at + 2l * i]) | (uint(b[b_at + 2l * i + 1l]) << 8u))
+        dist += abs(x - y)
+        mag += abs(y)
+    }
+    return mag > 0.0 ? dist / mag : (dist > 0.0 ? INFINITE_DIFF : 0.0)
+}
+
+let private CHAIN_STEPS = 24l   //! the greedy chain cell's fed steps a walk
 
 //! one walk of `steps` steps after `prompt` on a fresh session under the greedy chain's mode `mode`: each step fed the last
 //! step's argmax, every `off_every`-th one a token off it (0 = never); the fed tokens and every step's logits

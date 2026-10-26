@@ -238,7 +238,8 @@ struct ModelSlot {
     opts : SlotOpts = SlotOpts()
     backend_effective : string = "cpu"   // arm outcome: cpu | gpu:rails | gpu:resident
     gpu_regions : int64             //! K/V regions the whole-model driver armed for this slot, one per device-home stream; 0 = not that driver
-    gpu_ask_streams : int64         //! the K/V regions and the context this slot's load asked the whole-model driver for:
+    experts_host : bool             //! the driver sums some routed layers' experts on the host for this slot (read while its marks are installed: the live predicate reads false once they are parked)
+    gpu_ask_streams : int64        //! the K/V regions and the context this slot's load asked the whole-model driver for:
     gpu_ask_ctx : int64             //! the engine keeps one process-wide ask, so a rearm restores the slot's own first
     gpu_ask_kv : KVDtype = KVDtype.f16   //! the K/V codec this slot's load asked the device mirror in
     resident_decline : string               //! why the whole-model GPU driver does not serve this slot (its decline, with the remedy where one exists); "" when it does, or no GPU was asked for
@@ -409,8 +410,10 @@ def add_model(var m : Model; name : string; opts : SlotOpts = SlotOpts(); path :
     // capture it, so two models' offset-keyed marks never mix. Whichever slot is stepped gets
     // its set re-installed (install_slot_marks); an armed capture makes this slot the GPU owner.
     slot.gpu_regions = gpu_device_sessions()
+    slot.experts_host = gpu_resident_experts_host()
     slot.backend_effective = gpu_slot_capture(slot.gpu_marks)
     slot.resident_decline = slot.backend_effective == "gpu:resident" ? "" : gpu_resident_decline()
+    refuse_recurrent_in_part(slot)
     let was_gpu = slot.backend_effective != "cpu"
     var probe <- create_chat_renderer(slot.model, "", 1l)
     // reporting the raw template default would show the page a checked box for a family whose
@@ -529,12 +532,22 @@ def private bind_gpu_slot(si : int) {
     slot_default_chunk(g_slots[si])
     slot_clamp_ctx_to_region(g_slots[si])
     g_slots[si].resident_decline = g_slots[si].backend_effective == "gpu:resident" ? "" : gpu_resident_decline()
+    refuse_recurrent_in_part(g_slots[si])
     g_slots[si].gpu_regions = gpu_device_sessions()
+    g_slots[si].experts_host = gpu_resident_experts_host()
     g_gpu_owner = si
     let us = int64(get_time_usec(t0))
     g_slots[si].sw_count ++
     g_slots[si].sw_us += us
     to_log(LOG_INFO, "dasllama-server: GPU tier -> {g_slots[si].name} ({prev_note}{us / 1000l}ms, {g_slots[si].backend_effective})\n")
+}
+
+//! a recurrent model's prompt leaves its checkpoints inside the window on the whole-model driver and on Metal alone: a slot the
+//! GPU serves in part would run its prompts on the per-op rail, which keeps no state at an interior row, so the load is refused
+def private refuse_recurrent_in_part(s : ModelSlot) {
+    if (s.model.config.recr_mask != 0ul && s.backend_effective == "gpu:rails") {
+        panic("dasllama-server: {s.name}: a recurrent model the GPU serves in part - its prompts would run on the per-op rail, which keeps no checkpoint inside a window; the whole-model driver's decline: {s.resident_decline}")
+    }
 }
 
 //! Read with the slot's marks installed, so the facade answers for THIS model.
@@ -1636,9 +1649,9 @@ def private handle_catalog_download(req : FrontReq; var resp : Reply) : http_sta
     if (!empty(tower) && tower != "vision" && tower != "drafter") {
         return resp |> JSON(error_body("unknown tower '{tower}' (vision | drafter | asr | tts)", "invalid_request_error"), http_status.BAD_REQUEST)
     }
-    for (e in model_catalog()) {
+    for (e in catalog_download_rows()) {
         if (e.name == want) {
-            let kind = tower == "vision" ? CatalogCompanionKind.vision : CatalogCompanionKind.drafter
+            let kind = catalog_companion_kind(tower)
             let refusal = empty(tower) ? catalog_download_start(g_catalog_dir, e) : catalog_download_start_companion(g_catalog_dir, e, kind)
             if (!empty(refusal)) {
                 return resp |> JSON(error_body(refusal, "invalid_request_error"), http_status.CONFLICT)
@@ -1753,11 +1766,21 @@ def private ram_gb_from_meminfo(text : string) : int {
     return 0
 }
 
-let SERVER_PREFIX_STATES = 256l   //! the server's checkpoint count cap under its byte budget - a library caller keeps `DEFAULT_PREFIX_STATES`
+let SERVER_PREFIX_STATES_MIN = 256l   //! under its byte budget - a library caller keeps `DEFAULT_PREFIX_STATES`
+let SERVER_PREFIX_STATES_MAX = 1024l   //! the count the budget may raise it to: every attach scans each checkpoint's tokens against the prompt
+let PREFIX_STATES_AUTO = -1l   //! `--prefix-states` unset: each slot's count is its byte budget over its model's checkpoint (`slot_prefix_states`)
+let CHECKPOINT_TOKEN_LIST_BYTES = 32768l   //! a checkpoint's token list, charged beside its recurrent state
+
+//! a budget of 0 (unbounded) takes the cap
+def slot_prefix_states(c : Config; budget_bytes : int64) : int64 {
+    return SERVER_PREFIX_STATES_MAX if (budget_bytes <= 0l)
+    let checkpoint_bytes = 4l * dn_state_floats(c) + CHECKPOINT_TOKEN_LIST_BYTES
+    return clamp(budget_bytes / checkpoint_bytes, SERVER_PREFIX_STATES_MIN, SERVER_PREFIX_STATES_MAX)
+}
 
 //! The recurrent checkpoints' byte budget in MB: the one asked for, else a quarter of the box's RAM - what a 64 GB
-//! serving box gives a prompt cache - and 4 GB when the box's RAM is unknown. The count cap (`--prefix-states`) still
-//! binds first when it is the smaller.
+//! serving box gives a prompt cache - and 4 GB when the box's RAM is unknown. A count set by hand (`--prefix-states`)
+//! binds first when it is the smaller; unset, the count follows this budget (`slot_prefix_states`).
 def prefix_state_budget_mb(requested_mb, ram_gb : int64) : int64 {
     return requested_mb if (requested_mb > 0l)
     return ram_gb > 0l ? ram_gb * 1024l / 4l : 4096l
@@ -2179,13 +2202,14 @@ def private utf8_hold_bytes(s : string) : int {
 
 // One chat.completion.chunk SSE event. role-only for the opening delta, content and/or
 // reasoning_content for each token, empty delta + finish_reason for the terminating chunk.
+[arch(at="README.md#utf8-replies")]
 def private send_chat_chunk(srv : FrontLink; writer : WriterRef;
                             id : string; created : int64; role, content, finish : string;
                             reasoning : string = "") {
     var chunk = OaiStreamChunk(id = id, _object = "chat.completion.chunk", created = created, model = cur_name())
     chunk.choices |> emplace(OaiStreamChoice(index = 0,
-                                             delta <- OaiDelta(role = role, content = content,
-                                                               reasoning_content = reasoning),
+                                             delta <- OaiDelta(role = role, content = utf8_sanitize(content),
+                                                               reasoning_content = utf8_sanitize(reasoning)),
                                              finish_reason = finish))
     sse_event(srv, writer, sprint_json(chunk, false), "")
     delete chunk
@@ -2262,7 +2286,7 @@ def parse_tool_calls(full : string; open_mark, close_mark, id_base : string;
     calls |> reserve(length(calls) + length(tr.calls))
     for (c in tr.calls) {
         calls |> push(OaiToolCall(id = "{id_base}_{length(calls)}", _type = "function",
-                                  _function = OaiToolCallFn(name = c.name, arguments = c.args)))
+                                  _function = OaiToolCallFn(name = utf8_sanitize(c.name), arguments = utf8_sanitize(c.args))))
     }
     let content = tr.content
     delete tr
@@ -2305,7 +2329,7 @@ def private append_json_tool_body(body : JsonValue?; id_base : string;
         return false
     }
     calls |> push(OaiToolCall(id = "{id_base}_{length(calls)}", _type = "function",
-                              _function = OaiToolCallFn(name = cname, arguments = tool_args_text(body))))
+                              _function = OaiToolCallFn(name = utf8_sanitize(cname), arguments = utf8_sanitize(tool_args_text(body)))))
     return true
 }
 
@@ -2378,10 +2402,11 @@ def parse_tool_calls_auto(full : string; declared_open, declared_close, id_base 
     return full
 }
 
+[arch(at="README.md#utf8-replies")]
 def private send_compl_chunk(srv : FrontLink; writer : WriterRef;
                              id : string; created : int64; text, finish : string) {
     var chunk = OaiComplStreamChunk(id = id, _object = "text_completion", created = created, model = cur_name())
-    chunk.choices |> push(OaiComplStreamChoice(index = 0, text = text, finish_reason = finish))
+    chunk.choices |> push(OaiComplStreamChoice(index = 0, text = utf8_sanitize(text), finish_reason = finish))
     sse_event(srv, writer, sprint_json(chunk, false), "")
     delete chunk
 }
@@ -3919,7 +3944,7 @@ def private oai_calls_of(tcs : array<ToolCall>; id_base : string; var calls : ar
     for (tc in tcs) {
         let id = empty(tc.id) ? "{id_base}_{i}" : tc.id
         calls |> emplace(OaiToolCall(id = id, _type = "function",
-                                     _function = OaiToolCallFn(name = tc.name, arguments = tc.args)))
+                                     _function = OaiToolCallFn(name = utf8_sanitize(tc.name), arguments = utf8_sanitize(tc.args))))
         i ++
     }
 }
@@ -3967,6 +3992,7 @@ def private parse_wire_tools(var w : StreamWire?; full, id_base : string;
 // Route drained SchedEvents to their writers: streaming wires emit SSE chunks, buffered wires
 // accumulate pieces and respond once at finish. "evicted" releases the writer with no bytes —
 // the client is gone (reap_disconnected produced it). Finished wires unregister.
+[arch(at="README.md#utf8-replies")]
 def private flush_events(srv : FrontLink) {   // nolint:STYLE037,STYLE038 — one arm per (event kind x wire flavor); the arms share the wire's UTF-8 hold and reply buffer
     for (e in g_events) {
         // interior pointer into g_wires — nothing inserts into the table between here and the erase
@@ -4023,9 +4049,21 @@ def private flush_events(srv : FrontLink) {   // nolint:STYLE037,STYLE038 — on
         } elif (w.streaming) {
             set_writer_keepalive_timeout(srv, w.writer, DEFAULT_WRITER_KEEPALIVE_MS)
             if (!empty(w.utf8_tail)) {
-                // generation ended mid-character (max-tokens cut): the held bytes can never
-                // complete, and emitting them would put invalid UTF-8 on the wire — drop loudly
-                to_log(LOG_WARNING, "dasllama-server: stream {w.id} ended mid-UTF-8-sequence; dropped {length(w.utf8_tail)} byte(s)\n")
+                //! the generation ended inside a character (a max-tokens cut): the held bytes complete nothing, so they go out as U+FFFD
+                to_log(LOG_WARNING, "dasllama-server: stream {w.id} ended mid-UTF-8-sequence; {length(w.utf8_tail)} held byte(s) sent as U+FFFD\n")
+                let last = utf8_sanitize(w.utf8_tail)
+                if (w.is_chat) {
+                    //! the replacement rides the wire's splitter like any delta: inside a reasoning span it is reasoning, under a call envelope the call's
+                    var rsn = ""
+                    var cnt = ""
+                    think_feed(w.think, last, rsn, cnt)
+                    if (w.has_tools) {
+                        cnt = call_hold_pass(*w, cnt)
+                    }
+                    send_chat_halves(srv, *w, rsn, cnt)
+                } else {
+                    send_compl_chunk(srv, w.writer, w.id, w.created, last, "")
+                }
             }
             var finish = e.finish
             if (w.has_tools) {
@@ -4098,8 +4136,8 @@ def private flush_events(srv : FrontLink) {   // nolint:STYLE037,STYLE038 — on
             }
             var out = OaiChatResponse(id = w.id, _object = "chat.completion", created = w.created, model = cur_name())
             out.choices |> emplace(OaiChoice(index = 0,
-                                             message <- OaiMessage(role = "assistant", content = content,
-                                                                   reasoning_content = rsn,
+                                             message <- OaiMessage(role = "assistant", content = utf8_sanitize(content),
+                                                                   reasoning_content = utf8_sanitize(rsn),
                                                                    tool_calls <- calls),
                                              finish_reason = finish))
             out.usage = usage_of(e)
@@ -4108,7 +4146,7 @@ def private flush_events(srv : FrontLink) {   // nolint:STYLE037,STYLE038 — on
             delete out
         } else {
             var out = OaiComplResponse(id = w.id, _object = "text_completion", created = w.created, model = cur_name())
-            out.choices |> push(OaiComplChoice(index = 0, text = join(w.reply_parts, ""), finish_reason = e.finish))
+            out.choices |> push(OaiComplChoice(index = 0, text = utf8_sanitize(join(w.reply_parts, "")), finish_reason = e.finish))
             out.usage = usage_of(e)
             set_writer_keepalive_timeout(srv, w.writer, DEFAULT_WRITER_KEEPALIVE_MS)
             respond(srv, w.writer, int(http_status.OK), "application/json", sprint_json(out, false))
@@ -5047,8 +5085,8 @@ def private process_asr_job(
         transcribe(model, session, samples) $(seg) {
             vt.segments |> push(OaiVerboseSegment(
                 id = sid, start = float(seg.t0) / 100.0,
-                end = float(seg.t1) / 100.0, text = seg.text))
-            full |> push(seg.text)
+                end = float(seg.t1) / 100.0, text = utf8_sanitize(seg.text)))
+            full |> push(utf8_sanitize(seg.text))
             sid++
         }
         vt.text = join(full, "")
@@ -5061,7 +5099,7 @@ def private process_asr_job(
         delete vt
         return
     }
-    let text = transcribe(model, session, samples)
+    let text = utf8_sanitize(transcribe(model, session, samples))
     let content_type = job.response_format == "text" ? "text/plain; charset=utf-8" : "application/json"
     let body = job.response_format == "text" ? text : sprint_json(OaiTranscription(text = text), false)
     emit_asr_event(events, AsrEvent(
@@ -6986,9 +7024,9 @@ struct private SchedDefaults {
 
 var private g_sched_defaults = SchedDefaults()
 
-//! Whether an unset `mtp` arms a slot: one stream whose decode runs on a GPU - the Metal flavor, or the whole model resident on a Vulkan device (`backend_effective` "gpu:resident"). On the CPU, on a slot the device serves in part, and where the resident driver sums the routed experts on the host (`experts_host`: a hyper-connection MoE, a plain MoE the card does not hold whole, or one whose host-layers ask moved them - `PERF_LEDGER.md`'s NextN entry), the verify round costs more than the accepted drafts return. Non-private: test_openai_server_mtp.das gates it.
-def mtp_auto_arms(streams : int64; on_metal : bool; backend_effective : string; experts_host : bool = false; platforms : string = "") : bool
-    => streams == 1l && decodes_on_gpu(on_metal, backend_effective, experts_host) && mtp_platform_listed(platforms, on_metal ? "metal" : "vulkan")
+//! Whether an unset `mtp` arms a slot: one stream whose decode runs on a GPU - the Metal flavor, or the whole-model driver on a Vulkan device (`backend_effective` "gpu:resident"), its routed experts on the card or summed on the host alike (the round wins at the NextN depth on both) - and whose catalog row lists the platform. On the CPU and on a slot the device serves in part, the verify round costs more than the accepted drafts return. Non-private: test_openai_server_mtp.das gates it.
+def mtp_auto_arms(streams : int64; on_metal : bool; backend_effective : string; platforms : string = "") : bool
+    => streams == 1l && decodes_on_gpu(on_metal, backend_effective) && mtp_platform_listed(platforms, on_metal ? "metal" : "vulkan")
 
 //! The model file's catalog `serve_mtp`, read off its base name; ""
 //! for a file with no catalog row. Non-private: a test gates it.
@@ -7011,11 +7049,9 @@ def slot_mtp_want(opts : SlotOpts; server_mtp : int) : int
 //! Whether a slot speculates: asked on, or unset where
 //! `mtp_auto_arms` arms it over the slot's catalog platforms.
 //! Non-private: a test gates it.
-def slot_mtp_arms(opts : SlotOpts; server_mtp : int; streams : int64; on_metal : bool;
-                  backend_effective : string; experts_host : bool) : bool {
+def slot_mtp_arms(opts : SlotOpts; server_mtp : int; streams : int64; on_metal : bool; backend_effective : string) : bool {
     let want = slot_mtp_want(opts, server_mtp)
-    return want > 0 || (want < 0 && mtp_auto_arms(streams, on_metal, backend_effective,
-                                                  experts_host, opts.mtp_platforms))
+    return want > 0 || (want < 0 && mtp_auto_arms(streams, on_metal, backend_effective, opts.mtp_platforms))
 }
 
 //! Whether `platforms`, a catalog `serve_mtp` comma list, names `platform`; "" names none. Non-private: test_server_flags.das gates it.
@@ -7039,10 +7075,9 @@ def speech_team_dispatch(team_dispatch : bool; asr_team, llm_slots, gpu_slots : 
     => (asr = team_dispatch && (asr_team > 0 || (asr_team < 0 && asr_auto_team(llm_slots, gpu_slots))), tts = team_dispatch && asr_team > 0)
 
 def private gpu_decoding_slots : int {
-    let experts_host = gpu_resident_experts_host()
     var n = 0
     for (s in g_slots) {
-        if (decodes_on_gpu(slot_flavor(s) == "metal", s.backend_effective, experts_host)) {
+        if (decodes_on_gpu(slot_flavor(s) == "metal", s.backend_effective, s.experts_host)) {
             n++
         }
     }
@@ -7080,11 +7115,10 @@ def private init_one_scheduler(var s : ModelSlot) {
     }
     let s_kv = slot_kv_dtype(s.opts)
     let want = slot_mtp_want(s.opts, g_sched_defaults.mtp)
-    var spec = slot_mtp_arms(s.opts, g_sched_defaults.mtp, s_streams, slot_flavor(s) == "metal",
-                             s.backend_effective, gpu_resident_experts_host())
+    var spec = slot_mtp_arms(s.opts, g_sched_defaults.mtp, s_streams, slot_flavor(s) == "metal", s.backend_effective)
     if (spec && s.model.config.n_layer_nextn <= 0l) {
-        let side = mtp_drafter_sidecar(s.path)
-        if (!empty(side) && attach_mtp_drafter(s.model, side)) {
+        let side = attach_mtp_sidecar(s.model, s.path)
+        if (!empty(side)) {
             to_log(LOG_INFO, "dasllama-server: {s.name} speculates through the assistant drafter {base_name(side)}\n")
         } elif (want > 0) {
             to_log(LOG_WARNING, "dasllama-server: mtp requested for {s.name} but the model has no NextN head and no assistant drafter beside it — self-spec stays off\n")
@@ -7094,8 +7128,12 @@ def private init_one_scheduler(var s : ModelSlot) {
             spec = false
         }
     }
+    let states = g_sched_defaults.prefix_states >= 0l ? g_sched_defaults.prefix_states : slot_prefix_states(s.model.config, g_sched_defaults.prefix_state_bytes)
+    if (s_pages > 0l && s.model.config.recr_mask != 0ul) {
+        to_log(LOG_INFO, "dasllama-server: {s.name}: a recurrent model's checkpoints: up to {states} within {g_sched_defaults.prefix_state_bytes / 1048576l} MB\n")
+    }
     s.sched <- create_scheduler(s.model, s_streams, g_sched_defaults.max_queue, s_chunk, s_pages, pfx, s_kv, spec, s_idle,
-                                g_sched_defaults.prefix_states, g_sched_defaults.prefix_state_bytes)
+                                states, g_sched_defaults.prefix_state_bytes)
     slot_default_chunk(s)
 }
 
@@ -7103,12 +7141,26 @@ def private init_one_scheduler(var s : ModelSlot) {
 def prefills_on_gpu(on_metal : bool; backend_effective : string) : bool
     => on_metal || backend_effective != "cpu"
 
-//! A slot's unset chunk follows the backend that prefills THIS slot now. The scheduler's own default reads the
+//! The prefill quantum's two sizes for a slot the backend `backend_effective` (and the Metal flavor) prefills: `chunk` while a
+//! stream decodes, `idle` while none does - the resident driver's own prompt window widens the idle chunk, any other backend
+//! takes the floor. Non-private: test_server_flags.das gates it.
+def slot_chunk_defaults(on_metal : bool; backend_effective : string) : tuple<chunk : int64; idle : int64> {
+    let on_gpu = prefills_on_gpu(on_metal, backend_effective)
+    let window = backend_effective == "gpu:resident" ? gpu_device_prefill_window() : 0l
+    return (chunk = chunk_default(on_gpu), idle = idle_chunk_default(on_gpu, window))
+}
+
+//! A slot's unset chunk and idle chunk follow the backend that prefills THIS slot now. The scheduler's own default reads the
 //! tier's one process-wide status, which beside another slot's armed model is that model's answer.
 def private slot_default_chunk(var s : ModelSlot) {
+    let dflt = slot_chunk_defaults(slot_flavor(s) == "metal", s.backend_effective)
     let set_chunk = s.opts.chunk >= 0l ? s.opts.chunk : g_sched_defaults.chunk_tokens
     if (set_chunk <= 0l) {
-        s.sched.chunk_tokens = chunk_default(prefills_on_gpu(slot_flavor(s) == "metal", s.backend_effective))
+        s.sched.chunk_tokens = dflt.chunk
+    }
+    let set_idle = s.opts.chunk_idle != -2l ? s.opts.chunk_idle : g_sched_defaults.idle_chunk_tokens
+    if (set_idle < 0l) {
+        s.sched.idle_chunk_tokens = dflt.idle
     }
 }
 
@@ -7135,7 +7187,7 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
                 page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
                 team_dispatch : bool = true; asr_team : int = -1; mtp : int = -1;
                 idle_chunk_tokens : int64 = -1l; host : string = DEFAULT_BIND_HOST;
-                prefix_states : int64 = SERVER_PREFIX_STATES; prefix_state_mb : int64 = 0l) : bool {
+                prefix_states : int64 = PREFIX_STATES_AUTO; prefix_state_mb : int64 = 0l) : bool {
     if (g_front_up || g_jobque_owned) {
         to_log(LOG_ERROR, "dasllama-server: init_server called while already initialized\n")
         return false
@@ -7174,7 +7226,6 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
     }
     g_box_ram_gb = box_ram_gb()   // probed once: a probe spawns sysctl, wmic or powershell
     let state_mb = prefix_state_budget_mb(prefix_state_mb, int64(g_box_ram_gb))
-    to_log(LOG_INFO, "dasllama-server: a recurrent model's checkpoints: up to {prefix_states} within {state_mb} MB\n")
     init_slot_schedulers(max_streams, max_queue, chunk_tokens, idle_chunk_tokens, page_rows, prefix_groups,
                          prefix_states, state_mb * 1048576l, kv_dtype, mtp)
     g_active = g_default_slot
@@ -7447,7 +7498,7 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
                page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
                team_dispatch : bool = true; asr_team : int = -1; mtp : int = -1;
                idle_chunk_tokens : int64 = -1l; host : string = DEFAULT_BIND_HOST;
-               prefix_states : int64 = SERVER_PREFIX_STATES; prefix_state_mb : int64 = 0l) {
+               prefix_states : int64 = PREFIX_STATES_AUTO; prefix_state_mb : int64 = 0l) {
     if (init_server(port, max_streams, max_queue, chunk_tokens, page_rows, prefix_groups, kv_dtype,
             team_dispatch, asr_team, mtp, idle_chunk_tokens, host, prefix_states, prefix_state_mb)) {
         while (update_server()) {

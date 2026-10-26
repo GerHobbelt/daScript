@@ -12,6 +12,7 @@ require dasllama/dasllama_math
 require _compares
 require _kernel_oracles   // rope_tab_ref: the rope and KV-writer cells' oracle
 require _attn_oracle   // attn_row_oracle: the batched decode attention cells' oracle
+require _sel_oracle   // select_rows_oracle, sel_words, SelRow: the selection cell's oracle and its result shape (vulkan-free)
 require _vk_kq_fixtures
 require _kq_fixtures
 require ?vulkan _vkd_toy
@@ -37,7 +38,18 @@ require dasllama/dasllama_arch_qwen35
 require ?vulkan dasllama/dasllama_moe   // moe_select_core: the host select the window's per-row top-k mirrors
 require daslib/strings_boost   // join: the spawned fixture's source
 require daslib/math_bits   // float_bits_to_uint / uint_bits_to_float: the NaN sentinel by bit pattern, the read-back planes as floats
+require daslib/f16_cvt   // nolint:STYLE030,LINT019 — the half conversions of the vulkan cells, unused in the darwin world
 
+//! The Vulkan tier's kernel classes against their CPU oracles, one cell a class family: the decode GEMVs, the tile families
+//! (the cm2 l, m, s and e stamps, the KHR staged tile over every format and over a file's f32 rows, the sdot4 tiles), the
+//! acts, requants and combines, the attention, rope and K/V stores, the routing and schedules, the router GEMV's stamps
+//! (f32, bf16 word pairs, bf16 halfwords at an odd dim), the per-layer-embedding classes, the tile and split picks and the
+//! device roster. Skips: every cell without dasVulkan or a Vulkan device; the cm2 arms off a coopmat2 device created in cm2
+//! mode; the KHR arms (the KHR tiles, the staged f32 tile) without KHR cooperative matrices at subgroup 32; the tile-pick
+//! cell where DASLLAMA_CM2_TILE or DASLLAMA_CM2_SPLITK forces the pick; a class rail a device declines.
+
+let private NAN_HALF = 0x7E00   //! the sentinel half no kernel writes: a NaN
+let private NAN_HALF_PAIR = 0x7E007E00u   //! ... in both lanes of a word
 let private TILE_SLACK_ROWS = int(TILE_READ_SLACK)   //! the cm2 fixtures' rows past the last region, the engine's count: a stamp that loads partial columns unclamped (`STILE`) reads the last region's column rounded up to its BN, so the slack holds while every such stamp keeps BN <= slack + 1
 let private TILE_CELL_K = 768   //! every per-format tile cell's K: three unrolled superblock passes on both depths (a K-quant width is a multiple of 256, so no K-quant stamp ever takes the k loop's tail; the q8 s and e cells' Q8_CELL_K takes the edge path)
 let private Q8_CELL_K = 544     //! the q8 cm2 s and e cells' K: 512 + 32, off the 64-deep stamp's k grid, so the tile takes its padded edge path (the l and m cells run K = 576, the fast path)
@@ -62,7 +74,7 @@ def private cell_arm_name(arm : int) : string {
 
 //! the arm helpers stay generic on purpose - a build without the vulkan module must never infer these bodies
 //! 256 is the l stamps' BN default, a column no schedule constant names (the l column is never a schedule piece)
-def private cell_arm_rows_per_wg(arm) => arm == ARM_CM2_L || arm >= ARM_TOY_STRIP ? 256 : int(arm == ARM_CM2_S ? SCHED_S_ROWS : SCHED_M_ROWS)
+def private cell_arm_rows_per_wg(arm) => arm == ARM_CM2_L || arm == ARM_TOY_STRIP || arm == ARM_TOY_TWIN ? 256 : int(arm == ARM_CM2_S ? SCHED_S_ROWS : SCHED_M_ROWS)
 
 def private cell_arm_tc(arm) => arm == ARM_CM2_E ? CM2_TC_E : int64(cell_arm_rows_per_wg(arm))
 
@@ -1399,6 +1411,68 @@ def test_vkd_cls_argmax(t0 : T?) {
     }
 }
 
+//! the device selection of every row of a [rows x vocab] plane under the sampler words `sel`, each row's landing sorted by id
+def private cls_select_run(y : array<float>; sel : array<uint>; vocab, rows : int64; tag : string) : array<SelRow> {
+    var out : array<SelRow>
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let cap = SEL_CAP
+        let hdrw = int64(CLS_SEL_HDR)
+        let recw = int64(CLS_SELECT_RECENT)
+        with_cell_planes() $(var cp : CellPlanes) {
+            let py = cp |> in_(y)
+            let ps = cp |> in_plain(sel)
+            let ph = cp |> out_words(hdrw * rows * 4l, 0xFFFFFFFFu)
+            let pi = cp |> out_words(cap * rows * 4l, 0xFFFFFFFFu)
+            let pv = cp |> out_(int(cap * rows))
+            let pr = cp |> out_(int(recw * rows))
+            var st = cp |> cls_set(fixed_array(py, ps, ph, pi, pv, pr), @@set_cls_select)
+            var pc = GkClsSelArgs(vocab = uint(vocab))
+            cp |> cell_record_timed(tag, "cls_select: {rows} rows x {vocab}") $(raw : VkCommandBuffer; var h : VkHaz) {
+                enc_cls_select(raw, h, st, pc, rows)
+            }
+            var inscope hdr <- cp |> plane_as(ph, type<uint>, int(hdrw * rows))
+            var inscope ids <- cp |> plane_as(pi, type<uint>, int(cap * rows))
+            var inscope vals <- cp |> plane_as(pv, type<float>, int(cap * rows))
+            var inscope rec <- cp |> plane_as(pr, type<float>, int(recw * rows))
+            out <- sel_unpack(hdr, ids, vals, rec, sel, rows)
+        }
+    }
+    return <- out
+}
+
+[test]
+def test_vkd_cls_select(t0 : T?) {
+    t0 |> run("cls_select: every row lands the ids at or above its 1024th largest logit with their logits, its max and its denominator at its temperature, at a 262144 and a 1000 vocab - ties at the K-th kept, a row whose ties overflow the landing flagged, NaN and -inf lanes, an all-equal and an all-NaN row, the recent window's logits beside") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!ensure_cls_select()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            for (vocab in fixed_array(262144l, 1000l)) {   //! the shared six-row fixture and the shared gate: the Metal cell's reading
+                var inscope f <- sel_fixture(vocab)
+                var inscope got <- cls_select_run(f.y, f.words, vocab, f.rows, "cls_select vocab {vocab}")
+                var inscope want <- select_rows_oracle(f.y, f.temps, f.recent, vocab, f.rows, int64(CLS_SELECT_K), SEL_CAP)
+                sel_gate_compare(t, "cls_select vocab {vocab}", got, want, vocab)
+            }
+            // the served shape's time: three plain rows (a depth-2 verify) at Qwen3.6-35B's vocabulary, no row overflowing
+            let served_vocab = 248320l
+            var inscope yp : array<float>
+            yp |> resize(served_vocab * 3l)
+            for (i in range64(served_vocab * 3l)) {
+                yp[i] = hash_unit(uint(i) * 13u + 1u) * 20.0 + hash_unit(uint(i) * 3u + 7u) * 0.01
+            }
+            var inscope tp <- [0.7, 0.7, 0.7]
+            var inscope rp <- [[1l], [2l], [3l]]
+            var inscope wp <- sel_words(tp, rp)
+            var inscope gp <- cls_select_run(yp, wp, served_vocab, 3l, "cls_select served shape")
+            var inscope wantp <- select_rows_oracle(yp, tp, rp, served_vocab, 3l, int64(CLS_SELECT_K), SEL_CAP)
+            t |> equal(mismatch_exact(gp[1].ids, wantp[1].ids), 0, "the served shape's middle row lands the host's survivors ({length(gp[1].ids)}; first mismatch at {first_mismatch(gp[1].ids, wantp[1].ids)})")
+        } else {
+            t |> skip("no vulkan module")
+        }
+    }
+}
+
 [test]
 def test_vkd_cls_ar_row0(t0 : T?) {
     t0 |> run("cls_ar with a row base lands on the rows from row0 and leaves the rows below untouched") <| @(t : T?) {
@@ -1545,9 +1619,53 @@ def test_vkd_act_gelu_past_clamp(t0 : T?) {
     }
 }
 
+//! the f16 act over the per-layer-embedding side rows (the projection's f16 feed): gelu(gate) x layer 1's slice of four
+//! position-major side rows of three layers (`ubase` / `ustride` / `ulen`) against the CPU form, each half within the act's
+//! approx bar; then the same base with no stride, the contiguous row from `ubase` against its own CPU form (`gk_up_at`'s
+//! stride-0 arm: a form that drops the base reads the row from zero and misses), which misses the strided form - the control
+[test]
+def test_vkd_actf16_strided(t0 : T?) {
+    t0 |> run("actf16 over the strided side rows == gelu(gate) x the layer's side slice") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!ensure_actf16_cls()) {
+                t |> skip("no Vulkan device, or the actf16 pipeline failed to build")
+                return
+            }
+            let nelem = 1024
+            let ple = 256
+            let all = 3 * ple
+            var gh <- row_fill(nelem, 29, 0, 0.21, 6.0, 61)
+            var side <- row_fill(4 * all, 13, 0, 0.19, 3.0, 53)
+            let want <- [for (i in range(nelem)); act_mul_ref(gh[i], side[(i / ple) * all + ple + i % ple], ACT_GELU)]
+            var got <- actf16_halves(gh, side, nelem, 0, ple, all, ple)
+            var flat <- actf16_halves(gh, side, nelem, 0, ple, 0, 0)   //! the side read as one contiguous row from ubase
+            let want_flat <- [for (i in range(nelem)); act_mul_ref(gh[i], side[ple + i], ACT_GELU)]
+            var bad = 0
+            var flat_bad = 0
+            var flat_off = 0
+            for (i in range(nelem)) {
+                let v = unpackHalf2x16(got[i / 2])[i % 2]
+                let fv = unpackHalf2x16(flat[i / 2])[i % 2]
+                bad += abs(v - want[i]) > 2e-3 * max(abs(want[i]), 1.0) ? 1 : 0
+                flat_bad += abs(fv - want_flat[i]) > 2e-3 * max(abs(want_flat[i]), 1.0) ? 1 : 0
+                flat_off += abs(fv - want[i]) > 2e-3 * max(abs(want[i]), 1.0) ? 1 : 0
+            }
+            t |> equal(bad, 0, "every half within the bar of the CPU form over the layer's slice")
+            t |> equal(flat_bad, 0, "with no stride every half reads the contiguous row from ubase")
+            t |> success(flat_off > 0, "the control: the contiguous read misses the strided form ({flat_off} of {nelem})")
+            delete gh
+            delete side
+            delete got
+            delete flat
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
 //! one actf16 dispatch of `nelem` elements from element `elem0` of `g` and `u`: the whole half plane back, every half it was
 //! not written left at -inf
-def private actf16_halves(g, u : array<float>; nelem, elem0 : int) : array<uint> {
+def private actf16_halves(g, u : array<float>; nelem, elem0 : int; ubase : int = 0; ustride : int = 0; ulen : int = 0) : array<uint> {
     var halves : array<uint>
     static_if (typeinfo builtin_module_exists(vulkan)) {
         with_cell_planes() $(var cp : CellPlanes) {
@@ -1555,7 +1673,7 @@ def private actf16_halves(g, u : array<float>; nelem, elem0 : int) : array<uint>
             let pu = cp |> in_(u)
             let ph = cp |> out_words(long_length(g) * 2l, 0xFC00FC00u)
             var sc = cp |> cls_set(fixed_array(pg, pu, ph), @@set_actf16_cls)
-            var pc = ActArgs(nelem = uint(nelem), act = ACT_GELU, nblk = 0u, elem0 = uint(elem0))
+            var pc = ActArgs(nelem = uint(nelem), act = ACT_GELU, nblk = 0u, elem0 = uint(elem0), ubase = uint(ubase), ustride = uint(ustride), ulen = uint(ulen))
             cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                 enc_actf16_cls(raw, h, sc, pc, int64((nelem / 4 + 255) / 256))
             }
@@ -1820,7 +1938,8 @@ def private per32_sum_rows_cell(t : T?; fmt : KqFmt; n, wq_words : int; wq_seed,
             for (wi in range(3)) {
                 let w = widths[wi]
                 var inscope want <- [for (i in range(w * d)); ys_ref[i]]
-                check(t, "{fmt} GEMV summed over {w} token row(s) at n {n}: every row its k slots' dots under their weights", outs[wi], want, BAR_APPROX, Shape(row_width = d))
+                check(t, "{fmt} GEMV summed over {w} token row(s) at n {n}: every row its k slots' dots under their weights", outs[wi], want,
+                    Bar(rel = APPROX_REL, poison = 2.0, poison_of_max = true, poison_abs = 1.0), Shape(row_width = d))
                 if (wi > 0) {
                     let pw = widths[wi - 1]
                     var inscope head <- [for (i in range(pw * d)); outs[wi][i]]
@@ -2828,6 +2947,39 @@ def test_vkd_kq_q40_cm_batch(t0 : T?) {
     }
 }
 
+//! a KHR stamp's split arm over a tile fixture: its first region alone under two 256-aligned k chunks (`want_ck` and the rest) into
+//! the partial planes, then the reduce into the y plane, against the oracle's first region - the k0 / k1 / ybase prologue every KHR
+//! stamp shares with the cm2 tiles; `nsplit` 1 is the whole GEMM, its one partial plane through the reduce
+def private khr_split_arm(t : T?; tag : string; f : TileFixture; y_ref : array<float>; want_ck : int64; set_fn; enc_fn; nsplit : int = 2) {
+    verify(ensure_splitk_reduce_cls(), "the split-k reduce's class rail must engage")
+    let ck = nsplit > 1 ? cm2_chunk(int64(f.n), int64(nsplit)) : 0l
+    if (nsplit > 1) {
+        t |> equal(ck, want_ck, "the engine's chunk: K {f.n} in two 256-aligned chunks, {want_ck} and {int64(f.n) - want_ck} deep")
+    }
+    let cnt0 = TILE_CELL_ROWS0
+    let d = TILE_CELL_D
+    let swgs = ((cnt0 + 127) / 128) * ((d + 127) / 128) * nsplit
+    var y_ref0 <- copy_span(y_ref, 0, cnt0 * d)   // the oracle's first region is the split arm's whole answer
+    with_cell_planes() $(var cp : CellPlanes) {
+        let pwq = cp |> in_plain(f.wqh)
+        let pws = cp |> in_plain(f.wsh)
+        let psc = cp |> in_plain(one_region_words(cnt0, swgs))   // one region at row 0 over the first weight plane
+        let pxf = cp |> in_plain(f.xfh)
+        let pp = cp |> out_(cnt0 * d * nsplit)
+        let py = cp |> out_(cnt0 * d)
+        var scs = cp |> cls_set(fixed_array(pwq, pws, psc, pxf, pp), set_fn)
+        var srd = cp |> cls_set(fixed_array(pp, py), @@set_splitk_reduce_cls)
+        var pcs = BatchArgs(n = uint(f.n), d = uint(d), map_off = 4u, ksplit = uint(ck))
+        cp |> cell_record() $(raw3 : VkCommandBuffer; var h3 : VkHaz) {
+            invoke(enc_fn, raw3, h3, scs, pcs, int64(swgs))
+            splitk_reduce_enc(raw3, h3, srd, int64(cnt0 * d), int64(nsplit))
+        }
+        let form = nsplit > 1 ? "split in two k chunks + the reduce" : "whole, one region"
+        check_rows(t, "{tag} {form} vs the CPU oracle", cp |> plane_run(py), y_ref0, cm_bar(y_ref0), d)
+    }
+    delete y_ref0
+}
+
 [test]
 def test_vkd_q8_khr_batch(t0 : T?) {
     t0 |> run("the KHR kq tile over Q8_0 blocks (q8_batch_khr) == the CPU oracle") <| @(t : T?) {
@@ -2846,31 +2998,44 @@ def test_vkd_q8_khr_batch(t0 : T?) {
             var y_ref <- tile_cell_arms(t, "q8", int(KqFmt.q8), f, [ARM_KHR], @@q8f16_gemm_oracle)
             // the split arm: the first region alone under two 256-aligned k chunks (512 and 64 deep) into the partial
             // planes, then the reduce into the y plane - the k0 / k1 / ybase prologue the KHR stamp shares with the cm2 tiles
-            verify(ensure_splitk_reduce_cls(), "the split-k reduce's class rail must engage")
-            let nsplit = 2
-            let ck = cm2_chunk(int64(f.n), int64(nsplit))
-            t |> equal(ck, 512l, "the engine's chunk: K 576 in two 256-aligned chunks, 512 and 64 deep")
-            let cnt0 = TILE_CELL_ROWS0
-            let d = TILE_CELL_D
-            let swgs = ((cnt0 + 127) / 128) * ((d + 127) / 128) * nsplit
-            var y_ref0 <- copy_span(y_ref, 0, cnt0 * d)   // the oracle's first region is the split arm's whole answer
-            with_cell_planes() $(var cp : CellPlanes) {
-                let pwq = cp |> in_plain(f.wqh)
-                let pws = cp |> in_plain(f.wsh)
-                let psc = cp |> in_plain(one_region_words(cnt0, swgs))   // one region at row 0 over the first weight plane
-                let pxf = cp |> in_plain(f.xfh)
-                let pp = cp |> out_(cnt0 * d * nsplit)
-                let py = cp |> out_(cnt0 * d)
-                var scs = cp |> cls_set(fixed_array(pwq, pws, psc, pxf, pp), @@set_q8_batch_khr_cls)
-                var srd = cp |> cls_set(fixed_array(pp, py), @@set_splitk_reduce_cls)
-                var pcs = BatchArgs(n = uint(f.n), d = uint(d), map_off = 4u, ksplit = uint(ck))
-                cp |> cell_record() $(raw3 : VkCommandBuffer; var h3 : VkHaz) {
-                    enc_q8_batch_khr_cls(raw3, h3, scs, pcs, int64(swgs))
-                    splitk_reduce_enc(raw3, h3, srd, int64(cnt0 * d), int64(nsplit))
-                }
-                check_rows(t, "q8 KHR tile split in two k chunks + the reduce vs the CPU oracle", cp |> plane_run(py), y_ref0, cm_bar(y_ref0), d)
+            khr_split_arm(t, "q8 KHR tile", f, y_ref, 512l, @@set_q8_batch_khr_cls, @@enc_q8_batch_khr_cls)
+            delete y_ref
+            delete f
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+//! the f32 stamp's set off the KHR arm's five planes: it binds no scale plane, so the second plane stays unbound
+def private set_f32_khr_wo_scales(bufs; sizes; gbits) => set_f32_batch_khr_cls(fixed_array(bufs[0], bufs[2], bufs[3], bufs[4]),
+    fixed_array(sizes[0], sizes[2], sizes[3], sizes[4]), fixed_array(gbits[0], gbits[2], gbits[3], gbits[4]))
+
+[test]
+def test_vkd_f32_khr_batch(t0 : T?) {
+    t0 |> run("the staged KHR tile over a file's f32 rows (f32_batch_khr) == the CPU oracle") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!ensure_q8_batch_cls()) {   // engage the device without touching coopmat rails
+                t |> skip("no Vulkan device")
+                return
             }
-            delete y_ref0
+            if (!khr_kq_tile_on()) {
+                t |> skip("the staged f32 tile needs KHR cooperative matrices at subgroup 32")
+                return
+            }
+            verify(ensure_f32_batch_khr_cls(), "the staged f32 tile's class rail must engage on a coopmat device")
+            let n = 544   //! seventeen 32-deep k steps, off every 64 and 256 lattice
+            var wqh <- [for (i in range(2 * TILE_CELL_D * n)); float_bits_to_uint(float(hash_word(uint(i) + 71u) % 4001u) * 0.0000317 - 0.0634)]   //! f32 words whose low mantissa bits the stage rounds away
+            var wsh <- [0u, 0u, 0u, 0u]   //! the fixture's scale plane, which the f32 stamp binds no slot for
+            var f <- tile_fixture(n, 4, wqh, wsh, 3u, 5u)
+            let d = TILE_CELL_D
+            var y_ref : array<float>
+            y_ref |> resize(f.rows * d)
+            var recs <- one_region_words(TILE_CELL_ROWS0, ((TILE_CELL_ROWS0 + 127) / 128) * ((d + 127) / 128))
+            f32f16_gemm_oracle(f.wqh, f.wsh, f.xfh, recs, 1, n, d, y_ref)   //! the stamp's one schedule form: a region at row 0, its map at word 4
+            khr_split_arm(t, "the staged f32 tile", f, y_ref, 0l, @@ < (bufs : uint64 const[5]; sizes : int64 const[5]; gbits : uint const[5]) : VkDescriptorSet > set_f32_khr_wo_scales, @@enc_f32_batch_khr_cls, 1)//! the projection's whole form
+            khr_split_arm(t, "the staged f32 tile", f, y_ref, 512l, @@ < (bufs : uint64 const[5]; sizes : int64 const[5]; gbits : uint const[5]) : VkDescriptorSet > set_f32_khr_wo_scales, @@enc_f32_batch_khr_cls)//! the window gate's split form
+            delete recs
             delete y_ref
             delete f
         } else {
@@ -6803,6 +6968,7 @@ def private dn_delta_ref(convh, sth, smh : array<float>; npos, nkh, nvh, ds, bet
     let di = nvh * ds
     let cd = 2 * kd + di
     var ref : array<float>
+    ref |> reserve(npos * di + nvh * ds * ds)   //! the whole-window arm's rows pass the unreserved-growth guard
     ref |> resize(npos * di + nvh * ds * ds)
     var st_h, dvn : array<float>
     st_h |> resize(ds * ds)
@@ -6840,6 +7006,66 @@ def private dn_tail_oracle(src, smalls : array<float>; cd, taps, row0, old_rows,
         }
     }
     return <- want
+}
+
+[test]
+def test_vkd_dn_cap_tail(t0 : T?) {
+    t0 |> run("dn_cap_tail == the ring hand-off of a window cut at the capture's row, into the checkpoint row") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!vk_moe_init()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            verify(ensure_dn_cap_tail_cls(), "the dn_cap_tail class rail must engage on a live device")
+            let cd = 200
+            let taps = 3
+            let img = cd * taps
+            let old_off = 16
+            let wlen = 5
+            let rows <- [4, 2]   //! a capture past the taps, and one under them (its first row off the entry image)
+            var src <- hash_fill(wlen * cd, 523u, 1000u, 500.0, 1.0)
+            var smalls <- hash_fill(old_off + 2 * img + 8, 911u, 1000u, 250.0, 2.0)   //! the oracle writes the cut ring's image past the entry image
+            var inscope capw <- [uint(rows[0]), 0u, uint(rows[1]), uint(img + 4)]   //! the second row's base four floats past the first's image
+            with_cell_planes() $(var cp : CellPlanes) {
+                let ps = cp |> in_plain(src)
+                let pm = cp |> in_plain(smalls)
+                let pc = cp |> in_plain(capw)
+                let pd = cp |> out_(2 * img + 4)
+                var sc = cp |> cls_set(fixed_array(ps, pm, pc, pd), @@set_dn_cap_tail_cls)
+                let wg = (img + 255) / 256
+                var pa = DnCapTailArgs(cd = uint(cd), taps = uint(taps), row0 = 0u, entry_off = uint(old_off), cap_rec = 0u, cap_hist_off = 0u, wg_per_cap = uint(wg))
+                cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
+                    enc_dn_cap_tail_cls(raw, h, sc, pa, int64(wg * 2))
+                }
+                var got <- cp |> plane_run(pd)
+                for (ci in range(2)) {
+                    let r = rows[ci]
+                    var want_all <- dn_tail_oracle(src, smalls, cd, taps, max(r - taps, 0), max(taps - r, 0), old_off, old_off + img + 4)
+                    var want <- [for (i in range(img)); want_all[old_off + img + 4 + i]]
+                    var mine <- [for (i in range(img)); got[ci * (img + 4) + i]]
+                    check_exact(t, "dn_cap_tail capture after {r} rows", mine, want)
+                    delete mine
+                    delete want
+                    delete want_all
+                }
+                var lost = 0
+                var first_lost = -1
+                for (i in range(4)) {
+                    if (float_bits_to_uint(got[img + i]) != NAN_SENTINEL_BITS) {
+                        first_lost = first_lost < 0 ? img + i : first_lost
+                        lost++
+                    }
+                }
+                to_log(LOG_INFO, "dn_cap_tail gap: {lost} of 4 words lost their sentinel, first at word {first_lost}\n")
+                t |> equal(lost, 0, "dn_cap_tail: the words between the two rows' images keep their sentinel ({lost} lost, first at word {first_lost})")
+                delete got
+            }
+            delete smalls
+            delete src
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
 }
 
 //! the window chain's conv-history hand-off: the call's last window's rows into the per-channel ring image, and a window shorter
@@ -6960,6 +7186,7 @@ def test_vkd_dn_rows_base(t0 : T?) {
             let dt_off = a_off + nvh
             var inscope bg <- row_fill((lead + npos) * nvh, 17, 0, 0.03, 0.6, 43)
             var inscope scans : array<array<float>>
+            var inscope cap_got, st_half, cap_ref : array<float>
             for (base in fixed_array(0, lead)) {
                 var inscope smv : array<float>
                 smv |> resize(dt_off + nvh)
@@ -6977,15 +7204,18 @@ def test_vkd_dn_rows_base(t0 : T?) {
                     convh[base * cd + i] = (float((i * 19) % 79) * 0.025 - 0.9) * 0.15
                 }
                 var inscope sth <- row_fill(nvh * ds * ds, 13, 0, 0.02, 0.5, 53)
+                var inscope capw <- [uint(npos / 2), 0u]
                 with_cell_planes() $(var cp : CellPlanes) {
                     let pconv = cp |> in_(convh)
                     let pst = cp |> io_(sth)
                     let psm = cp |> in_(smv)
                     let po = cp |> out_((base + npos) * di)
-                    var sc = cp |> cls_set(fixed_array(pconv, pst, psm, po), @@set_dn_scan_cls)
+                    let pcaps = cp |> in_plain(capw)
+                    let pcap = cp |> out_(nvh * ds * ds)
+                    var sc = cp |> cls_set(fixed_array(pconv, pst, psm, po, pcaps, pcap), @@set_dn_scan_cls)
                     var pcs = DnScanArgs(npos = uint(npos), cd = uint(cd), kd = uint(kd), nvh = uint(nvh), nkh = uint(nkh), ds = uint(ds),
                         beta_off = uint(beta_off), g_off = uint(g_off), a_off = uint(a_off), dt_off = uint(dt_off), o_off = 0u,
-                        di = uint(di), row0 = uint(base))
+                        di = uint(di), row0 = uint(base), cap_n = base == 0 ? 1u : 0u, cap_rec = 0u, cap_state_off = 0u)
                     cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                         enc_dn_scan_cls(raw, h, sc, pcs, dn_scan_wgs(int64(nvh), int64(ds)))
                     }
@@ -6999,9 +7229,45 @@ def test_vkd_dn_rows_base(t0 : T?) {
                     var got <- [for (i in range(npos * di)); o[base * di + i]]
                     got |> push_from(st_got)
                     scans |> emplace(got)
+                    if (base == 0) {
+                        delete cap_got
+                        cap_got <- cp |> plane_run(pcap)
+                    }
+                }
+                if (base == 0) {   //! the capture's references over the same fixture: the scan over the first half alone, and the CPU oracle
+                    var inscope nocap <- [0u, 0u]
+                    with_cell_planes() $(var cp : CellPlanes) {
+                        let pconv = cp |> in_(convh)
+                        let pst = cp |> io_(sth)
+                        let psm = cp |> in_(smv)
+                        let po = cp |> out_(npos * di)
+                        let pcaps = cp |> in_plain(nocap)
+                        let pcap = cp |> out_(nvh * ds * ds)
+                        var sc = cp |> cls_set(fixed_array(pconv, pst, psm, po, pcaps, pcap), @@set_dn_scan_cls)
+                        var pcs = DnScanArgs(npos = uint(npos / 2), cd = uint(cd), kd = uint(kd), nvh = uint(nvh), nkh = uint(nkh), ds = uint(ds),
+                            beta_off = uint(beta_off), g_off = uint(g_off), a_off = uint(a_off), dt_off = uint(dt_off), o_off = 0u,
+                            di = uint(di), row0 = 0u, cap_n = 0u, cap_rec = 0u, cap_state_off = 0u)
+                        cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
+                            enc_dn_scan_cls(raw, h, sc, pcs, dn_scan_wgs(int64(nvh), int64(ds)))
+                        }
+                        delete st_half
+                        st_half <- cp |> plane_run(pst)
+                    }
+                    t |> success(moved_off(st_half, sth, 0, BAR_EXACT), "dn_scan half run: the in-place state moved off its input at element 0 ({st_half[0]} from {sth[0]})")
+                    var inscope ref <- dn_delta_ref(convh, sth, smv, npos / 2, nkh, nvh, ds, beta_off, g_off, a_off, dt_off)
+                    delete cap_ref
+                    cap_ref <- [for (i in range(nvh * ds * ds)); ref[(npos / 2) * di + i]]
                 }
             }
             check_exact(t, "dn_scan at row base {lead} against row 0 (the o rows, then the state)", scans[1], scans[0])
+            check_exact(t, "dn_scan capture after {npos / 2} rows against the scan over those rows alone (the state)", cap_got, st_half)
+            //! the chunked WY form equals the sequential rule in exact arithmetic: the drift is reassociation, which the peak-floored bar absorbs
+            let cap_floor = 1e-2 * logits_maxabs(cap_ref)
+            check_rows(t, "dn_scan capture after {npos / 2} rows against the sequential CPU oracle (the state)", cap_got, cap_ref,
+                Bar(rel = 1e-2, abs_floor = cap_floor, poison_of_max = true, poison_abs = 0.5), ds)
+            var inscope st_whole <- [for (i in range(nvh * ds * ds)); scans[0][npos * di + i]]
+            t |> success(all_finite(cap_got) && all_finite(st_whole), "dn_scan capture control: every value it reads is finite")
+            t |> success(mismatch_exact(cap_got, st_whole) > 0, "dn_scan capture control: the captured state is not the whole run's")
         } else {
             t |> skip("dasVulkan not present")
         }
@@ -7246,7 +7512,10 @@ def test_vkd_dn_family(t0 : T?) {
                     let pst = cp |> io_(sth)
                     let psm = cp |> in_(smh)
                     let pslab = cp |> out_(npos * di, o_off)   //! the o rows past the scan's workspace under the sentinel: a row the scan or the out-norm skips reds
-                    var sc1 = cp |> cls_set(fixed_array(pconv, pst, psm, pslab), @@set_dn_scan_cls)
+                    var inscope nocap <- [0u, 0u]
+                    let pcaps = cp |> in_plain(nocap)
+                    let pcap = cp |> out_(16)
+                    var sc1 = cp |> cls_set(fixed_array(pconv, pst, psm, pslab, pcaps, pcap), @@set_dn_scan_cls)
                     for (sig in fixed_array(false, true)) {
                         if (sig) {
                             verify(ensure_dn_scan_p3_sig_cls(), "the sigmoid out-norm stamp must compile on a device that compiled the silu one")
@@ -7697,6 +7966,7 @@ def private dn_scan_cell(t : T?; tag : string; ds, nkh, nvh, npos : int) {
             let sm_n = dt_off + nvh
             let o_off = 64   // the o rows sit past a header the kernel must leave alone
             var convh : array<float>
+            convh |> reserve(npos * cd)   //! the whole-window arm's conv plane passes the unreserved-growth guard
             convh |> resize(npos * cd)
             for (i in range(npos * cd)) {   // unit-scale q/k rows keep the 512-step recurrence bounded
                 convh[i] = (float((i * 19) % 79) * 0.025 - 0.9) * 0.15
@@ -7714,7 +7984,10 @@ def private dn_scan_cell(t : T?; tag : string; ds, nkh, nvh, npos : int) {
                 let pst = cp |> io_(sth)
                 let psm = cp |> in_(smh)
                 let po = cp |> out_(npos * di, o_off)
-                var sc = cp |> cls_set(fixed_array(pconv, pst, psm, po), @@set_dn_scan_cls)
+                var inscope nocap <- [0u, 0u]
+                let pcaps = cp |> in_plain(nocap)
+                let pcap = cp |> out_(16)
+                var sc = cp |> cls_set(fixed_array(pconv, pst, psm, po, pcaps, pcap), @@set_dn_scan_cls)
                 var pcs = DnScanArgs(npos = uint(npos), cd = uint(cd), kd = uint(kd),
                     nvh = uint(nvh), nkh = uint(nkh), ds = uint(ds),
                     beta_off = uint(beta_off), g_off = uint(g_off), a_off = uint(a_off),
@@ -7907,7 +8180,7 @@ def test_vkd_router_gemv_bf16(t0 : T?) {
                 }
                 var inscope g4 <- [for (i in range(ne)); got4[obase + i]]
                 var inscope w4 <- [for (i in range(ne)); want4[obase + i]]
-                check(t, "router_gemv_bf16 under the output scale: every output the dot scaled", g4, w4, Bar(rel = 1e-3, abs_floor = 1e-3), FLAT_SHAPE)
+                check(t, "router_gemv_bf16 under the output scale: every output the dot scaled", g4, w4, Bar(rel = 1e-3, abs_floor = 1e-3, poison_scaled = true), FLAT_SHAPE)
                 t |> success(rel_mismatches(got4, want, obase, ne) > 0, "router_gemv_bf16 under the output scale: the control - the unscaled dot must miss")
                 delete got4
                 delete want4
@@ -8300,6 +8573,208 @@ def test_vkd_hot_combine(t0 : T?) {
 }
 
 [test]
+def test_vkd_moe_gather_row(t0 : T?) {
+    t0 |> run("the per-expert chain's by-row gather (moe_gather_f16_row_cls): window row b takes its grid entry's position row as halves, chunk-local; the rows past the window keep their sentinel") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!ensure_moe_gather_f16_row_cls()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            let npos = 7
+            let k = 3
+            let nk = npos * k
+            let r0 = 5      //! the window [5, 14) of the 21 bucket rows
+            let rows = 9
+            let slack = 2   //! rows past the window the dispatch never writes
+            var entry_of_bucket_row : array<uint>   // a permutation of the 21 entries: 5 is coprime to 21
+            entry_of_bucket_row |> resize(nk)
+            for (b in range(nk)) {
+                entry_of_bucket_row[b] = uint((b * 5) % nk)
+            }
+            for (n in [100, 256, 300]) {   //! under one stride of the 256 threads, whole strides, a tail
+                var x <- hash_steps(npos * n, 91u)
+                var halves : array<uint16>
+                with_cell_planes() $(var cp : CellPlanes) {
+                    let px = cp |> in_(x)
+                    let pb = cp |> in_plain(entry_of_bucket_row)
+                    let pg = cp |> out_words(int64((rows + slack) * n) * 2l, NAN_HALF_PAIR)
+                    var sg = cp |> cls_set(fixed_array(px, pb, pg), @@set_moe_gather_f16_row_cls)
+                    var pc = GatherArgs(n = uint(n), k = uint(k), r0 = uint(r0), r1 = uint(r0 + rows))
+                    cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
+                        enc_moe_gather_f16_row_cls(raw, h, sg, pc, int64(rows))
+                    }
+                    delete halves
+                    halves <- cp |> plane_as(pg, type<uint16>, (rows + slack) * n)
+                }
+                var got : array<float>
+                got |> resize(rows * n)
+                for (i in range(rows * n)) {
+                    got[i] = f16_to_f32(uint(halves[i]))
+                }
+                //! the oracle: row b of the window reads its grid entry's position, rounded to half; the oracle with the
+                //! window at 0 reads other entries and must miss
+                var want, want0 : array<float>
+                want |> resize(rows * n)
+                want0 |> resize(rows * n)
+                for (b in range(rows)) {
+                    let p = int(entry_of_bucket_row[r0 + b]) / k
+                    let p0 = int(entry_of_bucket_row[b]) / k
+                    for (i in range(n)) {
+                        want[b * n + i] = f16r(x[p * n + i])
+                        want0[b * n + i] = f16r(x[p0 * n + i])
+                    }
+                }
+                //! within 1e-3 of the largest magnitude: a half's step at |x| < 1 is under 1e-3, the two conversions round at
+                //! most a step apart; the control moves one expected element by 0.05
+                let bar = Bar(kind = BarKind.rel_of_max, rel = 1e-3, poison_abs = 0.05, poison_at = 0)
+                check(t, "gather row n {n}: the window's rows", got, want, bar, Shape(row_width = n))
+                t |> success(check_count(got, want0, bar) > n, "gather row n {n}: control - the window at 0 reads other positions ({check_count(got, want0, bar)} of {rows * n} off)")
+                var strayed = 0
+                var first_stray = -1
+                for (i in range(rows * n, (rows + slack) * n)) {
+                    if (halves[i] != uint16(NAN_HALF)) {
+                        strayed++
+                        if (first_stray < 0) {
+                            first_stray = i
+                        }
+                    }
+                }
+                t |> equal(strayed, 0, "gather row n {n}: the rows past the window keep their sentinel ({strayed} of {slack * n} written, the first at {first_stray})")
+                delete x
+                delete halves
+                delete got
+                delete want
+                delete want0
+            }
+            delete entry_of_bucket_row
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+[test]
+def test_vkd_combine_row(t0 : T?) {
+    t0 |> run("the per-expert chain's by-row combine (combine_row_cls): window row b adds its weighted down row onto its position's accumulated row at every stride regime, a position no row reaches untouched") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!ensure_combine_row_cls()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            let npos = 7   //! position 6 is reached by no window row and keeps its accumulated row
+            let k = 2
+            let nk = npos * k
+            let r0 = 4
+            let rows = 6   //! the window [4, 10): rows of one expert, one a position, at alternating slots
+            var entry_of_bucket_row : array<uint>   // the window's rows to positions 0..5 at alternating slots, the rest to the entries left
+            entry_of_bucket_row |> resize(nk)
+            var taken : array<bool>
+            taken |> resize(nk)
+            for (b in range(r0, r0 + rows)) {
+                let g = (b - r0) * k + (b % k)
+                entry_of_bucket_row[b] = uint(g)
+                taken[g] = true
+            }
+            var next = 0
+            for (b in range(nk)) {
+                continue if (b >= r0 && b < r0 + rows)
+                while (taken[next]) {
+                    next++
+                }
+                entry_of_bucket_row[b] = uint(next)
+                taken[next] = true
+            }
+            delete taken
+            var w_packed <- hash_steps(nk, 97u)   // a position's k weights in a row: the layout every dispatch ships
+            for (n in [100, 256, 300]) {   //! under one stride of the 256 threads, whole strides, a tail
+                var acc <- hash_steps(npos * n, 71u)
+                var down <- hash_steps(rows * n, 83u)
+                var y : array<float>
+                with_cell_planes() $(var cp : CellPlanes) {
+                    let pa = cp |> io_(acc)
+                    let pw = cp |> in_(w_packed)
+                    let pd = cp |> in_(down)
+                    let pb = cp |> in_plain(entry_of_bucket_row)
+                    var sp = cp |> cls_set(fixed_array(pa, pw, pd, pb), @@set_combine_row_cls)
+                    var pc = GkMoeCombArgs(n = uint(n), k = uint(k), r0 = uint(r0), r1 = uint(r0 + rows))
+                    cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
+                        enc_combine_row_cls(raw, h, sp, pc, int64(rows))
+                    }
+                    delete y
+                    y <- cp |> plane_run(pa)
+                }
+                //! the oracle: each window row's weighted down row onto its position; the oracle over the window at 0 (other
+                //! rows, other positions) must miss
+                var want := acc
+                var want0 := acc
+                for (b in range(rows)) {
+                    let g = int(entry_of_bucket_row[r0 + b])
+                    let g0 = int(entry_of_bucket_row[b])
+                    for (i in range(n)) {
+                        want[(g / k) * n + i] += w_packed[g] * down[b * n + i]
+                        want0[(g0 / k) * n + i] += w_packed[g0] * down[b * n + i]
+                    }
+                }
+                //! within 1e-5 of the largest magnitude: one multiply-add per element against the f32 oracle, fused or not,
+                //! rounds the product and the sum once each - under 1e-6 of the magnitude; the control moves one expected
+                //! element by 0.01
+                let bar = Bar(kind = BarKind.rel_of_max, rel = 1e-5, abs_floor = 1e-6, poison_abs = 0.01, poison_at = 2 * n + 3)
+                let tag = "combine row n {n}"
+                check(t, tag, y, want, bar, Shape(row_width = n))
+                t |> success(check_count(y, want0, bar) > n, "{tag}: control - the window at 0 adds other rows onto other positions ({check_count(y, want0, bar)} of {npos * n} off)")
+                var moved = 0
+                for (i in range(n)) {
+                    moved++ if (y[i] != acc[i])
+                }
+                t |> success(moved > n / 2, "{tag}: position 0's row moved off its accumulated input ({moved} of {n})")
+                delete y
+                delete want
+                delete want0
+                //! the region-base arm (`goff`): a bundle's second region starts at chunk row 2 of the dispatch's down rows and at
+                //! grid entry r0 + 2 of the list, so the dispatch over rows 2..5 reads `down_rows[(2 + b) * n]`; the oracle over
+                //! the same rows read from chunk row 0 must miss
+                let rb = 2
+                var yb : array<float>
+                with_cell_planes() $(var cp : CellPlanes) {
+                    let pa = cp |> io_(acc)
+                    let pw = cp |> in_(w_packed)
+                    let pd = cp |> in_(down)
+                    let pb = cp |> in_plain(entry_of_bucket_row)
+                    var sp = cp |> cls_set(fixed_array(pa, pw, pd, pb), @@set_combine_row_cls)
+                    var pc = GkMoeCombArgs(n = uint(n), k = uint(k), r0 = uint(r0 + rb), r1 = uint(r0 + rows), goff = uint(rb))
+                    cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
+                        enc_combine_row_cls(raw, h, sp, pc, int64(rows - rb))
+                    }
+                    delete yb
+                    yb <- cp |> plane_run(pa)
+                }
+                var wantb := acc
+                var wantb0 := acc
+                for (b in range(rb, rows)) {
+                    let g = int(entry_of_bucket_row[r0 + b])
+                    for (i in range(n)) {
+                        wantb[(g / k) * n + i] += w_packed[g] * down[b * n + i]
+                        wantb0[(g / k) * n + i] += w_packed[g] * down[(b - rb) * n + i]
+                    }
+                }
+                let barb = Bar(kind = BarKind.rel_of_max, rel = 1e-5, abs_floor = 1e-6, poison_abs = 0.01, poison_at = 3 * n + 5)
+                check(t, "{tag}, region base 2", yb, wantb, barb, Shape(row_width = n))
+                t |> success(check_count(yb, wantb0, barb) > n, "{tag}, region base 2: control - the rows read from chunk row 0 miss ({check_count(yb, wantb0, barb)} of {npos * n} off)")
+                delete yb
+                delete wantb
+                delete wantb0
+                delete acc
+                delete down
+            }
+            delete w_packed
+            delete entry_of_bucket_row
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+[test]
 def test_vkd_dec_combine_pair(t0 : T?) {
     t0 |> run("decode combine class kernels (routed, routed + shared gated and ungated) == the CPU sum") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
@@ -8577,6 +9052,15 @@ def test_vk_coopmat_default_and_tile_pick(t0 : T?) {
             t |> equal(cm2_tile_cols(256l, 512l), 32l, "gemma-3-1b's k/v shape (8 m tiles of 84): the s column")
             t |> equal(cm2_tile_cols(1024l, 512l), 128l, "... its q shape (32 m tiles): m")
             g_gpu.sm_count = 82
+            //! the narrow rule at the gemma-4 E2B's K-quant k/v widths on 82 SMs (`narrow:<fmt>`'s one-dispatch rows): every K-quant's s stamp
+            //! under its m stamp through 640, the m stamp under s past it
+            t |> equal(cm2_tile_cols(256l, 512l), 32l, "E2B's 256-wide k/v (8 m tiles of 82): the s column")
+            t |> equal(cm2_tile_cols(512l, 512l), 32l, "... its 512-wide k/v (16 m tiles): s")
+            t |> equal(cm2_tile_cols(640l, 512l), 32l, "... the widest plane the rule takes (20 m tiles, 80 of 82)")
+            t |> equal(cm2_tile_cols(768l, 512l), 128l, "... the first it leaves to the wave model (24 m tiles): m")
+            t |> equal(cm2_tile_cols(256l, 300l), 32l, "... a 300-row window's 256-wide k/v: s")
+            t |> equal(cm2_split_fit(224l, 224l / 256l), 1l, "a K under one 256-aligned chunk (224) asks no chunk and runs whole, never zero pieces")
+            t |> equal(cm2_split_fit(1536l, 6l, 512l * 256l * 4l, 2l * 512l * 256l * 4l), 2l, "the chunk count fits the scratch: two planes of room, two chunks")
             let SPLIT_K_SCRATCH_PER_SM = 262_144l   //! the split-k scratch the prefill allocates an SM
             let scratch82 = SPLIT_K_SCRATCH_PER_SM * 82l
             t |> equal(pick_str(cm2_gemm_pick(1536l, 512l, 12288l, 0l, scratch82)), "256x3x4096", "E2B's 12288-deep down on 82 SMs: three l chunks")
@@ -9263,11 +9747,16 @@ def test_vkd_topk_n(t0 : T?) {
 }
 
 //! the router GEMV's descriptor set on the stamp `bf16` names
-def private router_set(bf16 : bool; bufs; sizes) => bf16 ? set_router_gemv_bf16_cls(bufs, sizes, fixed_array(0u, 1u, 2u, 0u)) : set_router_gemv_cls(bufs, sizes, fixed_array(0u, 1u, 2u, 0u))
+def private router_set(bf16 : bool; bufs; sizes; hw : bool = false) {
+    if (bf16 && hw) return set_router_gemv_bf16_hw_cls(bufs, sizes, fixed_array(0u, 1u, 2u, 0u))
+    return bf16 ? set_router_gemv_bf16_cls(bufs, sizes, fixed_array(0u, 1u, 2u, 0u)) : set_router_gemv_cls(bufs, sizes, fixed_array(0u, 1u, 2u, 0u))
+}
 
 //! the router GEMV recorded on the stamp `bf16` names
-def private router_enc(bf16 : bool; raw; var h; var sc; var pc; groups : int64) {
-    if (bf16) {
+def private router_enc(bf16 : bool; raw; var h; var sc; var pc; groups : int64; hw : bool = false) {
+    if (bf16 && hw) {
+        enc_router_gemv_bf16_hw_cls(raw, h, sc, pc, groups)
+    } elif (bf16) {
         enc_router_gemv_bf16_cls(raw, h, sc, pc, groups)
     } else {
         enc_router_gemv_cls(raw, h, sc, pc, groups)
@@ -9298,16 +9787,17 @@ def private router_cols_oracle(t : T?; arm : string; got, xh, nh, wdev : array<f
 //! the router GEMV over `ncols` x rows against the one-row dispatch a row at a time (word for word through `nform_cols_cell`:
 //! one kernel body, the same order) and against a CPU oracle of the same dot - the bf16 stamp's weights truncated as the device
 //! reads them, and under `norm_on` each row's rms under a norm row, as the gemma-4 MoE router reads its input
-def private router_cols_arm(t : T?; ncols : int; norm_on, bf16 : bool) {
+def private router_cols_arm(t : T?; ncols : int; norm_on, bf16 : bool; hw : bool = false) {
     static_if (typeinfo builtin_module_exists(vulkan)) {
-        let stamp = bf16 ? "bf16" : "f32"
+        let stamp = bf16 ? (hw ? "bf16 halfword" : "bf16") : "f32"
         let form = "router_gemv {stamp}{norm_on ? " under the fused rms" : ""}"
         let arm = "{form} over {ncols} columns"
-        if (bf16 ? !ensure_router_gemv_bf16_cls() : !ensure_router_gemv_cls()) {
+        let rail = (bf16 ? (hw ? ensure_router_gemv_bf16_hw_cls() : ensure_router_gemv_bf16_cls()) : ensure_router_gemv_cls())
+        if (!rail) {
             t |> skip("{arm}: the class rail declined on this device")
             return
         }
-        let dim = 2048
+        let dim = hw ? 2049 : 2048   //! the halfword stamp's odd dim: every other row starts mid-word
         let ne = 24
         let obase = 8
         let ncol_max = max(ncols, 8)
@@ -9342,14 +9832,14 @@ def private router_cols_arm(t : T?; ncols : int; norm_on, bf16 : bool) {
         var planes <- nform_cols_cell(t, form, [ncols], ncol_max, [NformPlane(name = "the logits", words = ne, head = obase)], 2u,
             $(c : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
                 upload_region_at(xd1, 0l, unsafe(addr<uint8 const?>(xh[c * dim])), x1_bytes)
-                var sc1 = router_set(bf16, fixed_array(wd, xd1, o.bufs[0], nd), fixed_array(w_bytes, x1_bytes, o.bytes[0], n_bytes))
+                var sc1 = router_set(bf16, fixed_array(wd, xd1, o.bufs[0], nd), fixed_array(w_bytes, x1_bytes, o.bytes[0], n_bytes), hw)
                 var pc1 = GkRouterArgs(ne = uint(ne), dim = uint(dim), woff = 0u, obase = uint(obase), norm_on = non, nwoff = 0u, eps = eps)
-                router_enc(bf16, raw, h, sc1, pc1, int64(ne))
+                router_enc(bf16, raw, h, sc1, pc1, int64(ne), hw)
             },
             $(nc : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
-                var sc = router_set(bf16, fixed_array(wd, xd, o.bufs[0], nd), fixed_array(w_bytes, x_bytes, o.bytes[0], n_bytes))
+                var sc = router_set(bf16, fixed_array(wd, xd, o.bufs[0], nd), fixed_array(w_bytes, x_bytes, o.bytes[0], n_bytes), hw)
                 var pc = GkRouterArgs(ne = uint(ne), dim = uint(dim), woff = 0u, obase = uint(obase), norm_on = non, nwoff = 0u, eps = eps, ncols = uint(nc))
-                router_enc_cols(bf16, raw, h, sc, pc, int64(ne))   //! past eight columns, two tiles (the second's `col0` at eight)
+                router_enc_cols(bf16, raw, h, sc, pc, int64(ne), hw)   //! past eight columns, two tiles (the second's `col0` at eight)
             })
         var got <- plane_floats(planes.nf[0])
         router_cols_oracle(t, arm, got, xh, nh, wdev, ncols, ne, dim, obase, norm_on, eps)
@@ -9432,7 +9922,7 @@ def test_vkd_ple_bf16_cvt(t0 : T?) {
             var src <- [for (i in range(n)); 0.37 * float(i % 61) - 11.0]
             src[7] = 1.0e6   //! past the half range: saturates at 65504
             src[8] = -1.0e6
-            var w16 <- [for (v in src); bf16_bits_truncated(v)]
+            var w16 <- pack_bf16(src)
             var want <- [for (h in w16); float(float16(clamp(bf16_value(h), -65504.0, 65504.0)))]
             with_cell_planes() $(var cp : CellPlanes) {
                 let pw = cp |> in_plain(w16)
@@ -9475,6 +9965,8 @@ def test_vkd_router_gemv_cols(t0 : T?) {
             router_cols_arm(t, 8, true, false)    // ... at the extent, every partial slot live
             router_cols_arm(t, 12, true, false)   // ... past it, in two column tiles
             router_cols_arm(t, 12, false, true)   // ... the bf16 stamp the same
+            router_cols_arm(t, 3, false, true, true)    // the bf16 rows' halfword stamp at an odd dim
+            router_cols_arm(t, 12, false, true, true)   // ... past the extent, in two column tiles
         } else {
             t |> skip("dasVulkan not present")
         }
@@ -9532,6 +10024,159 @@ def test_vkd_gemv_lane_rule(t0 : T?) {
             }
         } else {
             t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+//! the fused gate + up GEMV's publish (`KqGemvLeafT.gu_shell`) re-derived on the CPU: each turn's lanes write their rows' dots at their own
+//! slots, and subgroup 0's lane j gathers row j off the slot `gemv_lane_row_slot` names - row j's own dots, on the turn that serves it,
+//! for every row of the block, at every subgroup width and lanes-per-row split the shell runs; the rows each lane serves are the
+//! shell's earlier inline mapping, and the row's own index read as a slot is the control that misses
+[test]
+def test_vkd_gu_publish_slots(t0 : T?) {
+    t0 |> run("gu_shell: the slot each row's dots are gathered from holds that row") <| @(t : T?) {
+        for (sgs in fixed_array(32u, 64u)) {
+            let nsg = 256u / sgs
+            for (lpr in fixed_array(8u, 16u, sgs)) {
+                let per_sg = sgs / lpr
+                let per_turn = nsg * per_sg
+                var gathered, hits : uint[32]
+                var flat_misses = 0
+                var slab : uint[256]
+                var turn = 0u
+                while (turn * per_turn < 32u) {
+                    for (sg in urange(nsg)) {
+                        for (lane in urange(sgs)) {
+                            let lr = gemv_lane_row(turn, sg, lane, lpr, sgs, nsg)
+                            t |> equal(lr, turn * per_turn + sg * per_sg + lane / lpr, "sgs {int(sgs)} lpr {int(lpr)}: the shell's row mapping")
+                            slab[sg * sgs + lane] = lr
+                        }
+                    }
+                    for (j in urange(32u)) {
+                        if (j >= turn * per_turn && j < (turn + 1u) * per_turn) {
+                            gathered[j] = slab[gemv_lane_row_slot(j, turn, lpr, sgs, nsg)]
+                            hits[j]++
+                            flat_misses += slab[j] != j ? 1 : 0
+                        }
+                    }
+                    turn++
+                }
+                for (j in urange(32u)) {
+                    t |> equal(hits[j], 1u, "sgs {int(sgs)} lpr {int(lpr)}: row {int(j)} gathered on exactly one turn")
+                    t |> equal(gathered[j], j, "sgs {int(sgs)} lpr {int(lpr)}: row {int(j)} gathered off its own lane's slot")
+                }
+                t |> success(flat_misses > 0, "sgs {int(sgs)} lpr {int(lpr)}: the row's own index read as a slot holds another row (the control)")
+            }
+        }
+    }
+}
+
+[test]
+def test_vkd_upload_batch(t0 : T?) {
+    t0 |> run("the staging batch: uploads opened as one batch land in one submit at their offsets, byte for byte, and the batch is closed after") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!vk_moe_init()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            let total = 4096l
+            let dev = make_device_buf(total)
+            var zero : array<uint8>
+            zero |> resize(int(total))
+            upload_region_at(dev, 0l, unsafe(addr<uint8 const?>(zero[0])), total)
+            var want : array<uint8>
+            want |> resize(int(total))
+            let pieces = fixed_array((off = 0l, n = 96l, seed = 3), (off = 100l, n = 1l, seed = 5), (off = 777l, n = 1001l, seed = 7), (off = 2048l, n = 2048l, seed = 11), (off = 1800l, n = 200l, seed = 13))
+            t |> success(!upload_batch_is_open(), "no batch is open before the cell")
+            upload_batch_open()
+            for (p in pieces) {
+                var inscope piece : array<uint8>
+                piece |> resize(int(p.n))
+                for (i in range64(p.n)) {
+                    piece[i] = uint8((i * 31l + int64(p.seed) * 7l) % 256l)
+                    want[p.off + i] = piece[i]
+                }
+                upload_region_at(dev, p.off, unsafe(addr<uint8 const?>(piece[0])), p.n)
+            }
+            t |> success(upload_batch_is_open(), "the batch stays open across the uploads")
+            upload_batch_close()
+            t |> success(!upload_batch_is_open(), "the close leaves no batch open")
+            var back <- make_host_buf(total, false)
+            run_cmd_sync(g_gpu.device, g_gpu.pool, g_gpu.queue) $(cmd) {
+                cmd_copy_range(boost_value_to_vk(cmd), dev, 0l, back.buf, 0l, total)
+            }
+            var wrong = 0l
+            unsafe {
+                let got = reinterpret<uint8?>(back.mapped)
+                for (i in range64(total)) {
+                    if (got[i] != want[i]) {
+                        wrong++
+                    }
+                }
+            }
+            t |> equal(wrong, 0l, "every byte of every piece landed at its offset, the later piece over the earlier where they overlap")
+            destroy_host_buf(back)
+            destroy_device_buf(dev)
+        } else {
+            t |> skip("no vulkan module")
+        }
+    }
+    t0 |> run("the staging batch past its buffer: regions whose sum exceeds the staging bytes flush mid-bracket, a single region past them lands through the chunked path, and every byte of each lands") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!vk_moe_init()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            let piece_bytes = STAGING_BYTES * 5l / 8l   // three such regions: the second and third each overflow the buffer and flush what sits before them
+            let big_bytes = STAGING_BYTES + STAGING_BYTES / 16l   // one region past the buffer: the chunked path, the batch flushed before it
+            let total = 3l * piece_bytes
+            let dev = make_device_buf(total)
+            var want : array<uint8>
+            want |> reserve(total)
+            want |> resize(total)
+            var piece : array<uint8>
+            piece |> reserve(big_bytes)
+            piece |> resize(big_bytes)
+            t |> success(!upload_batch_is_open(), "no batch is open before the cell")
+            upload_batch_open()
+            for (p in range64(3l)) {
+                for (i in range64(piece_bytes)) {
+                    piece[i] = uint8((i * 31l + p * 7l + 3l) % 256l)
+                    want[p * piece_bytes + i] = piece[i]
+                }
+                upload_region_at(dev, p * piece_bytes, unsafe(addr<uint8 const?>(piece[0])), piece_bytes)
+            }
+            let big_off = piece_bytes / 2l
+            for (i in range64(big_bytes)) {
+                piece[i] = uint8((i * 17l + 11l) % 256l)
+                want[big_off + i] = piece[i]
+            }
+            upload_region_at(dev, big_off, unsafe(addr<uint8 const?>(piece[0])), big_bytes)
+            t |> success(upload_batch_is_open(), "the batch stays open across the flushes")
+            upload_batch_close()
+            t |> success(!upload_batch_is_open(), "the close leaves no batch open")
+            var back <- make_host_buf(total, false)
+            run_cmd_sync(g_gpu.device, g_gpu.pool, g_gpu.queue) $(cmd) {
+                cmd_copy_range(boost_value_to_vk(cmd), dev, 0l, back.buf, 0l, total)
+            }
+            var wrong = 0l
+            var first_wrong = -1l
+            unsafe {
+                let got = reinterpret<uint8?>(back.mapped)
+                for (i in range64(total)) {
+                    if (got[i] != want[i]) {
+                        first_wrong = wrong == 0l ? i : first_wrong
+                        wrong++
+                    }
+                }
+            }
+            t |> equal(wrong, 0l, "every byte of the three regions and of the oversize region landed at its offset ({wrong} wrong, the first at {first_wrong})")
+            destroy_host_buf(back)
+            destroy_device_buf(dev)
+            delete piece
+            delete want
+        } else {
+            t |> skip("no vulkan module")
         }
     }
 }

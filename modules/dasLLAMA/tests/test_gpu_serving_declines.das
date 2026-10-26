@@ -5,11 +5,22 @@ options persistent_heap   // a dastest root frees what it deletes only on this h
 
 require dastest/testing_boost public
 require dasllama/dasllama_common
+require _override_probes   // decode_declines: the fake override's step
 require dasllama/dasllama_sampling
 require dasllama/dasllama_gpu_resident
 require dasllama/dasllama_gpu_tier   // install_moe_gpu_resident_bias - the bias seat a served qwen2 needs
+require dasllama/dasllama_env   // set_pf_window_rows_pin - the ring cells' 512-row window
 require ?vulkan dasllama/dasllama_vulkan_decode   // rd_routed_slots_fit - the N-row command's slot cap, where the module exists
+require ?vulkan dasllama/dasllama_vulkan_prefill  // ple_proj_gemv_why - the window projection's tile gate, where the module exists
+require dasllama/dasllama_gpu_kernels_common  // gk_bf16_pairs - the bf16 projection's stamp pick on both homes
+require ?vulkan dasllama/dasllama_vulkan_classes   // ple_proj_bf16_hw - the resident projection's halfword pick, where the module exists
+require ?vulkan dasllama/dasllama_vulkan_common   // GpuState / g_gpu - the device shell ple_proj_gemv_why reads, where the module exists
+require ?vulkan dasllama/dasllama_vulkan_tower   // vulkan_tower_front_route - the fronts' route asked before any device is up, where the module exists
 require dasllama/dasllama_metal_shapes   // moe_metal_ok - the Metal routed block's admission, portable
+require ?das_metal dasllama/dasllama_metal_common   // decline - the required-mode panic, where the module exists
+require ?das_metal dasllama/dasllama_metal_decode   // the metal decode override `set_metal_mode` selects
+require ?das_metal dasllama/dasllama_metal_prefill   // the metal prefill override beside it
+require dasllama/dasllama_math   // kernel_backend_seat / restore_kernel_backend - the backend pin the metal mode sets, put back
 require dasllama/dasllama_image   // save_model_image / load_model_image / image_identity - the trimmed lane's map under the ring pin
 require dasllama/dasllama_arch_llama   // the arch the trimmed lane's shell names, registered for its map
 require daslib/fio
@@ -203,7 +214,7 @@ def test_perop_dense_ffn_mixed_forms(t : T?) {
         m.w1_fmt[0] = KqFmt.k4
         t |> equal(perop_dense_ffn_decline(m, 0l), "", "one activation form rides the rail")
         m.w3_fmt[0] = KqFmt.mx4
-        t |> success(contains(perop_dense_ffn_decline(m, 0l), "not tier-servable"), "an mx4 up plane is named (the control)")
+        t |> equal(perop_dense_ffn_decline(m, 0l), "FFN gate/up/down formats k4/mx4/k6 not tier-servable", "an mx4 up plane is named by site and member (the control)")
         delete m
     }
 }
@@ -560,6 +571,128 @@ def test_decode_shape_dense_width(t : T?) {
     }
 }
 
+//! a plane format the Metal kernels do not read declines with a line naming the site and the `KqFmt` member: a dense plane under
+//! `kquant_native`, a routed stack under `graph`; the enum value the declines-by-reason table counts stays the gate's
+[test]
+def test_metal_fmt_decline_names_site(t : T?) {
+    t |> run("a dense plane's unserved format names its layer, site and member; the decode gate still answers kquant_native") @(t : T?) {
+        var m <- shell(2l, 0ul)
+        m.quant = QuantMode.q8
+        m.kquant_native = true
+        m.wq_fmt <- [KqFmt.k4, KqFmt.k4]
+        m.wk_fmt <- [KqFmt.k4, KqFmt.k4]
+        m.wv_fmt <- [KqFmt.k6, KqFmt.k6]
+        m.wo_fmt <- [KqFmt.k4, KqFmt.k4]
+        m.w1_fmt <- [KqFmt.k4, KqFmt.k4]
+        m.w3_fmt <- [KqFmt.k4, KqFmt.k4]
+        m.w2_fmt <- [KqFmt.k6, KqFmt.k6]
+        t |> equal(kq_load_gpu_unserved(m), "", "every plane in a served format: nothing to name")
+        t |> equal(metal_fmt_decline_line("decode", "kquant_native", m), "", "and no line")
+        m.w3_fmt[1] = KqFmt.mx4
+        t |> equal(kq_load_gpu_unserved(m), "layer 1's FFN up plane is mx4")
+        t |> equal(decode_shape_decline(m, DECODE_NEEDS_OK, true, false, false, mint_time = true), MetalDecodeDecline.kquant_native,
+            "the gate's reason is the enum value the declines table counts")
+        t |> equal(metal_fmt_decline_line("decode", "{MetalDecodeDecline.kquant_native}", m),
+            "dasLLAMA metal decode: declined kquant_native - layer 1's FFN up plane is mx4, a format the Metal kernels do not read there; the CPU serves the call")
+        t |> equal(metal_fmt_decline_line("decode", "{MetalDecodeDecline.shape}", m), "", "a decline no plane format decided says no format line")
+        m.w3_fmt[1] = KqFmt.k4
+        m.emb_fmt = KqFmt.mx4
+        t |> equal(kq_load_gpu_unserved(m), "the token table plane is mx4")
+        m.emb_fmt = KqFmt.q8
+        m.wcls_fmt = KqFmt.mx4
+        t |> equal(kq_load_gpu_unserved(m), "the classifier plane is mx4")
+        delete m
+    }
+    t |> run("a routed stack's unserved format names its layer, site and member under graph") @(t : T?) {
+        var m <- moe_shell(KqFmt.k4)
+        t |> equal(moe_fmts_unserved(m), "", "a k4 stack has the routed block's kernels")
+        m.we2_fmt[1] = KqFmt.mx4
+        t |> success(!moe_metal_ok(m), "the routed block declines the stack")
+        t |> equal(moe_fmts_unserved(m), "layer 1's expert stack down plane is mx4")
+        t |> equal(metal_fmt_decline_line("prefill", "{MetalPrefillDecline.graph}", m),
+            "dasLLAMA metal prefill: declined graph - layer 1's expert stack down plane is mx4, a format the Metal kernels do not read there; the CPU serves the call")
+        delete m
+    }
+}
+
+//! the routed block's other `graph` declines name their plane the same way: a sigmoid-gated shared expert's, a deltanet plane's
+[test]
+def test_metal_graph_decline_names_site(t : T?) {
+    t |> run("a sigmoid-gated shared expert's unserved format names its layer, site and member under graph") @(t : T?) {
+        var m <- moe_shell(KqFmt.k4)
+        m.config.n_ff_shexp = 256l
+        m.config.moe_shexp_gated = true
+        m.wshk1_offs <- [0l, 0l]
+        m.wshk2_offs <- [0l, 0l]
+        m.wshk3_offs <- [0l, 0l]
+        m.wsh1_fmt <- [KqFmt.k4, KqFmt.k4]
+        m.wsh2_fmt <- [KqFmt.k4, KqFmt.k4]
+        m.wsh3_fmt <- [KqFmt.k4, KqFmt.k4]
+        t |> equal(shexp_fmts_unserved(m), "", "k4 shared-expert planes have their one-row GEMVs")
+        m.wsh3_fmt[1] = KqFmt.mx4
+        t |> success(!moe_metal_ok(m), "the routed block declines the shared expert's plane")
+        t |> equal(shexp_fmts_unserved(m), "layer 1's shared expert up plane is mx4")
+        t |> equal(metal_fmt_decline_line("decode", "{MetalDecodeDecline.graph}", m),
+            "dasLLAMA metal decode: declined graph - layer 1's shared expert up plane is mx4, a format the Metal kernels do not read there; the CPU serves the call")
+        delete m
+    }
+    t |> run("a deltanet plane's unserved format names its layer, site and member under graph") @(t : T?) {
+        var m <- shell(3l, 2ul)
+        m.config.dim = 256l
+        m.config.ssm_d_inner = 256l
+        m.config.ssm_d_state = 128l
+        m.config.ssm_d_conv = 4l
+        m.dnqkv_fmt <- [KqFmt.q8, KqFmt.k4, KqFmt.q8]
+        m.dngate_fmt <- [KqFmt.q8, KqFmt.k4, KqFmt.q8]
+        m.dnout_fmt <- [KqFmt.q8, KqFmt.k4, KqFmt.q8]
+        m.dnbeta_fmt <- [KqFmt.q8, KqFmt.k4, KqFmt.q8]
+        m.dnalpha_fmt <- [KqFmt.q8, KqFmt.k4, KqFmt.q8]
+        t |> equal(dn_fmts_unserved(m), "", "k4 deltanet planes have their one-row GEMVs")
+        t |> equal(dn_ba_window_fmts_unserved(m), "", "and the beta/alpha planes their expert-form GEMV")
+        m.dngate_fmt[1] = KqFmt.mx4
+        t |> success(!dn_metal_ok(m), "the deltanet gate declines the hybrid")
+        t |> equal(dn_fmts_unserved(m), "layer 1's deltanet gate plane is mx4")
+        t |> equal(metal_fmt_decline_line("prefill", "{MetalPrefillDecline.graph}", m),
+            "dasLLAMA metal prefill: declined graph - layer 1's deltanet gate plane is mx4, a format the Metal kernels do not read there; the CPU serves the call")
+        m.dngate_fmt[1] = KqFmt.k4
+        m.dnalpha_fmt[1] = KqFmt.mx4
+        t |> success(!dn_ba_metal_window_ok(m), "the window's beta/alpha gate declines an mx4 alpha plane")
+        t |> equal(dn_ba_window_fmts_unserved(m), "layer 1's deltanet alpha plane is mx4")
+        delete m
+    }
+}
+
+//! under `MetalMode.required` a plane-format decline panics with the words its warning line logs, not the bare reason
+[test]
+def test_metal_decline_panic_names_site(t : T?) {
+    t |> run("the required-mode panic carries the site and member the warning line names") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            var m <- shell(2l, 0ul)
+            m.quant = QuantMode.q8
+            m.kquant_native = true
+            m.w3_fmt <- [KqFmt.k4, KqFmt.mx4]
+            let words = metal_fmt_decline_words("decode", "{MetalDecodeDecline.kquant_native}", m)
+            t |> equal(words, "kquant_native - layer 1's FFN up plane is mx4, a format the Metal kernels do not read there")
+            let mode0 = get_metal_mode()
+            let seat = kernel_backend_seat()
+            let pf0 = active_prefill_override()
+            let dc0 = active_decode_override()
+            set_metal_mode(MetalMode.required)
+            let why = panic_text() $ { decline(MetalDecodeDecline.kquant_native, words) }
+            let bare = panic_text() $ { decline(MetalDecodeDecline.shape) }
+            set_metal_mode(mode0)
+            select_prefill_override(pf0)
+            select_decode_override(dc0)
+            restore_kernel_backend(seat)
+            t |> success(find(why, "decode declined: {words} (the GPU cannot serve this call)") >= 0, "the panic names the site and member: {why}")
+            t |> success(find(bare, "decode declined: shape (") >= 0, "a decline no plane format decided panics with its reason alone (the control): {bare}")
+            delete m
+        } else {
+            t |> skip("the required-mode panic is the Metal drivers' - no das_metal in this build")
+        }
+    }
+}
+
 [test]
 def test_mm_tile_widths_64_dense_width(t : T?) {
     t |> run("the mul_mm tile gate reads the dense FFN width only where a dense FFN dispatches: a routed model's odd dense width gates nothing") @(t : T?) {
@@ -773,6 +906,7 @@ def test_trim_decline_kind(t : T?) {
         t |> success(resident_trim_decline_is_run_mode("the residency plan does not fit the card"), "the card's room is the run's")
         t |> success(resident_trim_decline_is_run_mode("the tier installed no resident-driver seams"), "the tier's seams are the run's")
         t |> success(resident_trim_decline_is_run_mode("routed experts (64) - the tier installed no MoE seats; the per-op tier's expert rails serve"), "the MoE seats are the run's")
+        t |> success(resident_trim_decline_is_run_mode("{TRIM_SPLIT_DECLINE} (18 routed layers' experts on the host in the lane, 20 in this run's plan)"), "a lane minted under another host-layer split is this run's decline: the mint holds")
         t |> success(!resident_trim_decline_is_run_mode("the trim serves dense models without a hyper-connection residual or per-layer embeddings"), "the model's shape is the model's")
         t |> success(!resident_trim_decline_is_run_mode("no arm for: sinks"), "a feature is the model's")
         t |> success(!resident_trim_decline_is_run_mode(""), "an empty decline is no decline")
@@ -802,7 +936,7 @@ def test_resident_mirror_codec_ask(t : T?) {
         t |> success(empty(kv_codec_geometry_why(m.config, KVDtype.f16)), "a scalar codec holds any head")
         delete m
     }
-    t |> run("the mirror codec the plan arms: the ask where the model holds it, f16 where it does not, f16 for an f32 ask") @(t : T?) {
+    t |> run("the mirror codec the plan arms: the ask where the model holds it, the served codec where it does not, f16 for an f32 ask") @(t : T?) {
         let pin0 = gpu_kv_dtype_pin_()
         set_gpu_kv_dtype_(KVDtype.tq4)
         if (resident_mirror_dtype() != KVDtype.tq4) {
@@ -811,7 +945,14 @@ def test_resident_mirror_codec_ask(t : T?) {
             var m <- shell(2l, 0ul)
             t |> equal(resident_mirror_dtype_of(m), KVDtype.tq4, "tq4 asked of a 32-wide head arms tq4")
             m.config.head_size = 96l
-            t |> equal(resident_mirror_dtype_of(m), KVDtype.f16, "tq4 asked of a 96-wide head arms f16")
+            t |> equal(resident_mirror_dtype_of(m), KVDtype.q8_0, "tq4 asked of a 96-wide head arms q8_0, the codec the sessions step down to")
+            m.config.head_size = 32l
+            m.config.attn_qkv_bias = true
+            t |> equal(resident_mirror_dtype_of(m), KVDtype.q8_0, "tq4 asked of a Q/K/V-biased attention arms q8_0")
+            m.config.attn_qkv_bias = false
+            m.config.head_size = 48l
+            t |> equal(resident_mirror_dtype_of(m), KVDtype.f16, "tq4 asked of a 48-wide head arms f16: no block codec holds it")
+            m.config.head_size = 96l
             set_gpu_kv_dtype_(KVDtype.q8_0)
             t |> equal(resident_mirror_dtype_of(m), KVDtype.q8_0, "control: q8_0 holds the same head")
             set_gpu_kv_dtype_(KVDtype.f32)
@@ -875,13 +1016,14 @@ def test_plan_room(t : T?) {
 
 [test]
 def test_resident_hot_slots(t : T?) {
-    t |> run("the hot expert pool's slots: 64 beside the whole mirror, up to 32 out of the mirror's context, a count asked from the floor's room, none under four") @(t : T?) {
+    t |> run("the hot expert pool's slots: every slot that fits beside the whole mirror, up to 32 out of the mirror's context, a count asked from the floor's room, none under four") @(t : T?) {
         let mib = 1_048_576l
         let column = 125l * mib
-        t |> equal(64l, resident_hot_slots(-1l, 9000l * mib, 12000l * mib, column, 512l), "unasked, 64 slots fit beside the whole mirror: the pool takes them and the mirror keeps its context")
+        t |> equal(72l, resident_hot_slots(-1l, 9000l * mib, 12000l * mib, column, 512l), "unasked, 72 slots fit beside the whole mirror: the pool takes every one and the mirror keeps its context")
         t |> equal(40l, resident_hot_slots(-1l, 5000l * mib, 12000l * mib, column, 512l), "unasked, 40 fit beside the mirror: past 32, the mirror yields nothing")
         t |> equal(32l, resident_hot_slots(-1l, 681l * mib, 5600l * mib, column, 512l), "unasked, five fit beside the mirror: the mirror's context yields the room of 32")
         t |> equal(20l, resident_hot_slots(-1l, 681l * mib, 2500l * mib, column, 512l), "... and no more than the floor's room holds")
+        t |> equal(31l, resident_hot_slots(-1l, 31l * column, -500l * mib, column, 512l), "unasked, 31 fit beside the mirror and the floor's room is past the plan: the yield never takes the slots beside the mirror away")
         t |> equal(44l, resident_hot_slots(48l, 681l * mib, 5600l * mib, column, 512l), "a count asked is served from the floor's room")
         t |> equal(16l, resident_hot_slots(16l, 9000l * mib, 12000l * mib, column, 512l), "a count asked under the room stands")
         t |> equal(0l, resident_hot_slots(0l, 9000l * mib, 12000l * mib, column, 512l), "0 asks no pool")
@@ -978,46 +1120,39 @@ let private PROBE_UNOWNED = "mtp_seat_probe_unowned"   //! ... and one whose sea
 var private g_probe_owns = false
 var private g_probe_seat_calls = 0l
 
-[unused_argument(t, s, token, pos)]
-def private probe_decode(t : Model; var s : Session; token, pos : int64) : bool => false
-
 [unused_argument(t)]
 def private probe_owner(t : Model) : bool => g_probe_owns
 
-[unused_argument(t, s, tok, accepted)]
-def private probe_spec(t : Model; var s : Session; tok : int64; var accepted : int64&) : bool {
+[unused_argument(t)]
+def private probe_rows(t : Model) : int64 {
     g_probe_seat_calls++
-    return false
+    return 5l
 }
 
-[unused_argument(t, s, tok, k)]
-def private probe_round(t : Model; var s : Session; tok : int64; k : int64) : int64 {
+[unused_argument(t, s, pos, k)]
+def private probe_cold(t : Model; s : Session; pos, k : int64) : string {
     g_probe_seat_calls++
-    return 0l
+    return "the probe's own cold reason"
 }
 
-[unused_argument(t, sessions, toks, accepted)]
-def private probe_batch(t : Model; var sessions : array<Session?>; toks : array<int64>; var accepted : array<int64>) : int64 {
-    g_probe_seat_calls++
-    return 7l
-}
-
-//! how many of `mtp_spec_eval`, `mtp_spec_round` and `mtp_spec_eval_batch` reached a seat, how many opened the CPU round, and the batch tick's answer
+//! how many seat reads reached the probe's seats, how many round entries opened the CPU round, the batch tick's answer, and the
+//! two seat answers the engine read back (the verify-rows cap and the cold reason)
 struct private SeatDispatch {
     seat : int64
     cpu : int64
     batch : int64
+    rows : int64
+    cold : string
 }
 
-//! the three seat-taking entries once each under the fake override `name` (its owner answering `owns`) on a Model shell;
+//! the round entries and the seat reads once each under the fake override `name` (its owner answering `owns`) on a Model shell;
 //! the session carries a parked token, so the CPU round's opening refuses it before any forward and counts as a CPU call
 [cold_path]
 def private seat_dispatch(name : string; owns : bool) : SeatDispatch {
     for (nm in [PROBE_OWNED, PROBE_UNOWNED]) {
-        register_decode_override(nm, @@probe_decode)
-        register_mtp_spec_override(nm, @@probe_spec)
-        register_mtp_round_override(nm, @@probe_round)
-        register_mtp_spec_batch_override(nm, @@probe_batch)
+        register_decode_override(nm, @@decode_declines)
+        register_mtp_verify_rows_override(nm, @@probe_rows)
+        register_mtp_cold_override(nm, @@probe_cold)
     }
     register_mtp_seat_owner(PROBE_OWNED, @@probe_owner)
     g_probe_owns = owns
@@ -1043,7 +1178,12 @@ def private seat_dispatch(name : string; owns : bool) : SeatDispatch {
     let toks : array<int64>
     var accepted : array<int64>
     out.batch = mtp_spec_eval_batch(m, sessions, toks, accepted)
+    out.rows = mtp_verify_rows_cap(m)
+    out.cold = mtp_round_cold_seat(m, s, 1l, 1l)
     select_decode_override(prev)
+    for (nm in [PROBE_OWNED, PROBE_UNOWNED]) {
+        unregister_decode_override(nm)
+    }
     out.seat = g_probe_seat_calls
     delete s
     delete m
@@ -1053,25 +1193,30 @@ def private seat_dispatch(name : string; owns : bool) : SeatDispatch {
 
 [test]
 def test_mtp_seat_owner(t : T?) {
-    t |> run("the speculative seats serve only a model the active decode override's owner claims; otherwise the CPU round runs") @(t : T?) {
+    t |> run("the speculative seats serve only a model the active decode override's owner claims; the round itself is the common one on every home") @(t : T?) {
         let refused = seat_dispatch(PROBE_OWNED, false)
         t |> equal(refused.seat, 0l, "an owner refusing the model reaches no seat")
-        t |> equal(refused.cpu, 2l, "mtp_spec_eval and mtp_spec_round open the CPU round")
+        t |> equal(refused.cpu, 2l, "mtp_spec_eval and mtp_spec_round open the common round")
         t |> equal(refused.batch, 0l, "the batch tick steps each stream alone")
+        t |> equal(refused.rows, 0l, "the verify-rows cap reads no cap")
+        t |> equal(refused.cold, "", "the cold seat answers no reason")
         let unowned = seat_dispatch(PROBE_UNOWNED, true)
-        t |> equal(unowned.seat, 0l, "seats registered with no owner never take a round")
-        t |> equal(unowned.cpu, 2l, "... and the CPU round runs")
+        t |> equal(unowned.seat, 0l, "seats registered with no owner are never read")
+        t |> equal(unowned.cpu, 2l, "... and the common round runs")
+        t |> equal(unowned.rows, 0l, "... reading no cap")
         let owned = seat_dispatch(PROBE_OWNED, true)
-        t |> equal(owned.seat, 3l, "an owner claiming the model hands every entry to its seat")
-        t |> equal(owned.cpu, 0l, "no entry opened the CPU round")
-        t |> equal(owned.batch, 7l, "the batch tick answers the seat's count")
+        t |> equal(owned.seat, 2l, "an owner claiming the model hands every seat read to its seat")
+        t |> equal(owned.cpu, 2l, "the round entries still open the common round - no home registers a round of its own")
+        t |> equal(owned.batch, 0l, "the batch tick steps each stream through the common round")
+        t |> equal(owned.rows, 5l, "the verify-rows cap is the seat's answer")
+        t |> equal(owned.cold, "the probe's own cold reason", "the cold reason is the seat's answer")
     }
 }
 
 //! the CPU round's opening on a session carrying an unconsumed landed pick, under the unowned probe override
 [cold_path]
 def private round_refuses_pick() : bool {
-    register_decode_override(PROBE_UNOWNED, @@probe_decode)
+    register_decode_override(PROBE_UNOWNED, @@decode_declines)
     let prev = active_decode_override()
     select_decode_override(PROBE_UNOWNED)
     var m = Model()
@@ -1138,8 +1283,8 @@ def private round_draft(t : Model; var s : Session; token, pos : int64; pick_onl
     return g_round_pick
 }
 
-//! the fake verify: serves, every row's pick landed (row 0's `g_round_truth`), row 0's hidden a constant row, the carry's
-//! watermark past its rows as the real seat leaves it
+//! the fake verify: serves, every row's pick landed (row 0's `g_round_truth`), every row's hidden a constant row in `mtp_hrows`
+//! (row 0's copied to `mtp_h0` as the real seat does), the carry's watermark past its rows as the real seat leaves it
 [unused_argument(toks, pick_only)]
 def private round_verify(t : Model; var s : Session; toks : array<int64>; n, pos : int64; pick_only : bool) : bool {
     g_round_verify_calls++
@@ -1149,10 +1294,14 @@ def private round_verify(t : Model; var s : Session; toks : array<int64>; n, pos
     for (i in range64(1l, n)) {
         s.mtp_picks[i] = 9l + i
     }
-    s.mtp_h0 |> resize(t.config.dim)
-    for (i in range64(t.config.dim)) {
-        s.mtp_h0[i] = 0.25
+    let dim = t.config.dim
+    s.mtp_hrows |> reserve(n * dim)
+    s.mtp_hrows |> resize(n * dim)
+    for (i in range64(n * dim)) {
+        s.mtp_hrows[i] = 0.25
     }
+    s.mtp_h0 |> resize(dim)
+    copy_floats(s.mtp_hrows, 0l, s.mtp_h0, 0l, dim)
     return true
 }
 
@@ -1191,7 +1340,7 @@ def private round_session() : Session {
 //! row-0 `truth`, the rollback seat's answer
 def private round_seats_arm(pick, truth : int64; rollback_ok : bool) {
     for (nm in [ROUND_SEATS, ROUND_SEATS_NO_ROLLBACK]) {
-        register_decode_override(nm, @@probe_decode)
+        register_decode_override(nm, @@decode_declines)
         register_mtp_seat_owner(nm, @@round_owner)
         register_mtp_draft_override(nm, @@round_draft)
         register_mtp_verify_override(nm, @@round_verify)
@@ -1331,14 +1480,18 @@ def private gemma4_26b_shell() : Model {
 let private HOUSE_26B_FLAT_PLAN_MB = 39949l   //! the 26B UD-IQ3_XXS's strict 32768 x 4 plan with every mirror row flat, read on the pod's 32 GB card
 let private HOUSE_32GB_ROOM_MB = 28527l       //! that card's plan room, read in the same load log
 
+let private RING_CELL_WINDOW = 512l   //! the ring cells' prompt window: the rows a sliding ring holds past its window
+
 //! the sliding layers' rings in the plan (`../ARCHITECTURE_GPU_KV_RING.md#kv-sliding-ring`): on the 26B at 32768 positions over four
-//! regions - the house shape - a sliding layer holds its window and the window chain's 512 rows, rounded to 64, and a global layer
-//! every position; the flat pin charges every layer the whole context, and the ring bytes are what the context does not scale;
-//! the pod's flat plan less the flat mirror plus the ringed one fits that card's room
+//! regions - the house shape - a sliding layer holds its window and the window chain's rows (pinned at 512 here), rounded to 64, and a
+//! global layer every position; the flat pin charges every layer the whole context, and the ring bytes are what the context does not
+//! scale; the pod's flat plan less the flat mirror plus the ringed one fits that card's room
 [test]
 def test_resident_ring_mirror(t : T?) {
     t |> run("the 26B's mirror at 32768 x 4 under the rings: 1536 rows a sliding layer, every position a global one") @(t : T?) {
         var m <- gemma4_26b_shell()
+        let window_was = pf_window_rows_pin()
+        set_pf_window_rows_pin(RING_CELL_WINDOW)
         with_gpu_kv_ring(1) {
             t |> equal(kv_ring_rows(m.config, 0l, 32768l, 512l), 1536l, "a sliding layer: its 1024-position window and the 512 rows a window writes")
             t |> equal(kv_ring_rows(m.config, 5l, 32768l, 512l), 0l, "a global layer keeps every position")
@@ -1360,6 +1513,7 @@ def test_resident_ring_mirror(t : T?) {
             t |> success((ringed >> 20l) + rest < HOUSE_32GB_ROOM_MB,
                 "the house plan fits the 32 GB card's room under the rings: {(ringed >> 20l) + rest} MB of {HOUSE_32GB_ROOM_MB} (flat {HOUSE_26B_FLAT_PLAN_MB})")
         }
+        set_pf_window_rows_pin(window_was)
         delete m
     }
 }
@@ -1373,12 +1527,15 @@ def test_trim_lane_ring_pin(t : T?) {
         var m <- gemma4_26b_shell()
         var ids : array<string>
         var mirrors : array<int64>
+        let window_was = pf_window_rows_pin()
+        set_pf_window_rows_pin(RING_CELL_WINDOW)
         for (pin in [1, 0]) {
             with_gpu_kv_ring(pin) {
                 ids |> push(image_identity(moe_gpu_bake_tag()))
                 mirrors |> push(resident_mirror_bytes(m, 32768l, KVDtype.f16, 4l))
             }
         }
+        set_pf_window_rows_pin(window_was)
         t |> equal(ids[0], ids[1], "the lane's identity reads the same under either pin: the image holds no K/V row")
         t |> success(mirrors[0] * 7l < mirrors[1], "the plan charges the ringed mirror under one pin and the flat one under the other ({mirrors[0] >> 20l} MB against {mirrors[1] >> 20l} MB)")
         var terr = ""
@@ -1458,5 +1615,180 @@ def test_resident_host_layers_pin(t : T?) {
         t |> equal(resident_host_layers_want(hc, 24l, 4l), -1l, "a hyper-connection model takes no ask: every routed layer serves on the host regardless")
         let dense = Config()
         t |> equal(resident_host_layers_want(dense, 0l, 4l), -1l, "a dense model takes no ask")
+    }
+}
+
+//! the E-series pre-step's shape gates: Metal's `metal_ple_dev_ok` serves any model dim on either projection form, any ple width,
+//! and a table bound on its own format's blocks, naming a table off them; Vulkan's bf16 projection takes the word-pair stamp at an
+//! even dim and base and the halfword stamp off them (`gk_bf16_pairs`)
+[test]
+def test_ple_proj_dim_gates(t : T?) {
+    t |> run("the pre-step's shapes on each home") @(t : T?) {
+        var m = Model()
+        m.config.n_layers = 2l
+        m.config.n_embd_per_layer = 256l
+        m.metal_blob = true
+        m.ple_model_bf16 = true
+        m.config.dim = 1536l
+        t |> success(metal_ple_dev_ok(m), "the bf16 rows serve an even dim (the E2B's 1536)")
+        m.config.dim = 1537l
+        t |> success(metal_ple_dev_ok(m), "... and an odd one")
+        m.ple_model_bf16 = false
+        t |> success(metal_ple_dev_ok(m), "the f32 rows serve a dim off the float4 lattice")
+        m.config.n_embd_per_layer = 2048l
+        t |> success(metal_ple_dev_ok(m), "a ple width past 1024 serves")
+        m.config.n_embd_per_layer = 48l
+        t |> success(metal_ple_dev_ok(m), "... and one off the 32-lane step")
+        m.config.n_embd_per_layer = 0l
+        t |> equal(metal_ple_pre_unserved(m), "", "a model with no PLE has nothing to decline")
+        t |> success(!metal_ple_dev_ok(m), "... and no device pre-step")
+        m.config.n_embd_per_layer = 48l
+        m.ple_emb_fmt = KqFmt.q51
+        m.ple_emb_off = 96l
+        t |> success(metal_ple_dev_ok(m), "a per-32 table off a superblock serves on its own blocks (96 elements a row at 96)")
+        m.ple_emb_off = 112l
+        let off = metal_ple_pre_unserved(m)
+        t |> success(find(off, "PLE table") >= 0 && find(off, "q51") >= 0 && find(off, "112") >= 0 && find(off, "32-element") >= 0,
+            "... a base off them is named by site, format, offset and block: '{off}'")
+        t |> success(!metal_ple_dev_said("decode", m), "the driver's verdict is the predicate's, its reason logged")
+        m.ple_emb_off = 0l
+        m.config.n_embd_per_layer = 40l
+        t |> success(find(metal_ple_pre_unserved(m), "80 elements a row") >= 0, "... and a row off them")
+        m.ple_emb_fmt = KqFmt.k4
+        m.config.n_embd_per_layer = 128l
+        t |> success(metal_ple_dev_ok(m), "a superblock table on its superblocks serves (256 elements a row)")
+        m.ple_emb_off = 32l
+        t |> success(find(metal_ple_pre_unserved(m), "256-element") >= 0, "... off them is named at the superblock")
+        t |> success(gk_bf16_pairs(1536l, 0l), "the bf16 rows step word pairs at an even dim (the E2B's 1536)")
+        t |> success(!gk_bf16_pairs(1537l, 0l), "... and halfwords at an odd one")
+        t |> success(!gk_bf16_pairs(1536l, 3l), "... or off an odd base")
+    }
+    t |> run("the window's projection names an f16 panel past the device's storage range") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            var shell = GpuState(coopmat_mode = COOPMAT_CM2, msr = 1l << 20l)   //! a cm2 device shell whose storage range is 1 MiB
+            var live = g_gpu
+            g_gpu = unsafe(addr(shell))
+            let dim = int64(F16G_BK) * F16G_SPLIT
+            t |> equal(ple_proj_gemv_why(dim, 256l, 1l << 20l), "", "the control: a panel at the range takes the tile")
+            let past = ple_proj_gemv_why(dim, 256l, (1l << 20l) + 2l)
+            t |> success(find(past, "f16 panel ({(1l << 20l) + 2l} bytes) passes the device's storage range {1l << 20l}") >= 0,
+                "a panel two bytes past the range names both: '{past}'")
+            t |> success(find(ple_proj_gemv_why(dim + 1l, 256l, (1l << 20l) + 2l), "no f16 tile serves it") >= 0,
+                "an off-lattice width names the tile first")
+            g_gpu = live
+        } else {
+            t |> skip("no dasVulkan module on this build")
+        }
+    }
+}
+
+//! the window's f32 per-layer rows: the staged tile on its k step under the knob, the scalar tile off either; the gate's k chunks
+//! fit the split-k scratch; the resident projection's bf16 rows take the halfword stamp at an odd dim
+[test]
+def test_ple_f32_tile_gates(t : T?) {
+    t |> run("the window's f32 per-layer rows take the staged tile only on its k step") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            var shell = GpuState(coopmat_mode = COOPMAT_CM2, has_coopmat = true, subgroup_size = 32l)   //! a KHR-capable shell at subgroup 32
+            var live = g_gpu
+            g_gpu = unsafe(addr(shell))
+            t |> success(ple_f32_tile_ok(1536l, 256l, true), "the control: the E2B's dim and ple take the staged tile")
+            t |> success(!ple_f32_tile_ok(1536l, 256l, false), "... and the knob off (DASLLAMA_VK_PLE_F32_TILE=0) keeps the scalar f32 tile")
+            let roomy = 1l << 30l
+            t |> equal(pf_f32_split(1536l, 512l, 256l, roomy), 6l, "the E2B gate's K 1536 splits six ways, a chunk of 256 each")
+            t |> equal(pf_f32_split(2560l, 512l, 256l, roomy), 5l, "the E4B gate's K 2560 five ways, the most chunks of 512 cm2_chunk admits")
+            t |> equal(pf_f32_split(256l, 512l, 256l, roomy), 1l, "the projection's K 256 runs whole")
+            t |> equal(pf_f32_split(1536l, 512l, 256l, 3l * 512l * 256l * 4l), 3l, "a scratch of three 512-row partial planes cuts the E2B gate to three chunks")
+            t |> equal(pf_f32_split(1536l, 512l, 256l, 512l * 256l * 4l), 1l, "... one plane's room runs it whole - never a split past the scratch")
+            t |> success(!ple_f32_tile_ok(1544l, 256l, true), "a dim off the 32-deep k step keeps the scalar f32 tile (its last row read would pass the plane)")
+            t |> success(!ple_f32_tile_ok(1536l, 48l, true), "... and so does a ple width off it")
+            shell.subgroup_size = 64l
+            t |> success(!ple_f32_tile_ok(1536l, 256l, true), "... and a wave64 device, which has no KHR kq tile")
+            t |> success(!ple_proj_bf16_hw(1536l), "the resident projection's bf16 rows take the word-pair stamp at the E2B's even dim")
+            t |> success(ple_proj_bf16_hw(1537l), "... and the halfword stamp at an odd one")
+            g_gpu = live
+        }
+    }
+}
+
+//! the expert cache's profile beside the lane: a file the writer made reads back whole for its model's shape, and another
+//! model's shape, a bad magic or a short file reads empty (the cache then keeps the first ids)
+[test]
+def test_expert_heat_profile(t : T?) {
+    let path = path_join(test_temp_dir(), "expert_heat_probe.heat")
+    var heat <- [for (i in range64(3l * 4l)); i * 7l + 1l]
+    t |> success(expert_heat_write_to(path, 3l, 4l, heat), "the profile wrote")
+    let back <- expert_heat_read(path, 3l, 4l)
+    t |> equal(long_length(back), 12l, "the model's shape reads every pick")
+    var same = long_length(back) == 12l
+    for (b, h in back, heat) {
+        same = same && b == h
+    }
+    t |> success(same, "... as written")
+    t |> equal(long_length(expert_heat_read(path, 4l, 3l)), 0l, "another model's shape reads empty")
+    t |> equal(long_length(expert_heat_read(path_join(test_temp_dir(), "expert_heat_none.heat"), 3l, 4l)), 0l, "a missing profile reads empty")
+    fopen(path, "wb") $(f) {
+        fwrite(f, [int64(0x12345678), 3l, 4l])
+        fwrite(f, heat)
+    }
+    t |> equal(long_length(expert_heat_read(path, 3l, 4l)), 0l, "a bad magic reads empty")
+    var short_heat <- [for (i in range64(5l)); i]
+    t |> success(expert_heat_write_to(path, 3l, 4l, short_heat), "a short profile wrote")
+    t |> equal(long_length(expert_heat_read(path, 3l, 4l)), 0l, "a short profile reads empty")
+    remove(path)
+}
+
+[test]
+def test_kv_codec_serving_rule(t : T?) {
+    t |> run("the serving rule: tq4 steps down to q8_0 on a Q/K/V-biased attention and on a head it cannot rotate, to f16 where q8_0 holds no block either") @(t : T?) {
+        var m <- shell(2l, 0ul)
+        var why = ""
+        t |> equal(kv_codec_served(m.config, KVDtype.tq4, why), KVDtype.tq4, "a 32-wide head without a bias serves tq4 as asked")
+        t |> success(empty(why), "and names no step down")
+        m.config.attn_qkv_bias = true
+        t |> equal(kv_codec_served(m.config, KVDtype.tq4, why), KVDtype.q8_0, "a Q/K/V bias steps tq4 down to q8_0")
+        t |> success(find(why, "Q/K/V bias") >= 0, "and names the bias ({why})")
+        t |> equal(kv_codec_served(m.config, KVDtype.q8_0, why), KVDtype.q8_0, "q8_0 serves a biased attention")
+        t |> success(empty(why) && empty(kv_codec_serving_why(m.config, KVDtype.f16)), "as does f16, neither naming a step")
+        m.config.attn_qkv_bias = false
+        m.config.head_size = 96l
+        t |> equal(kv_codec_served(m.config, KVDtype.tq4, why), KVDtype.q8_0, "a 96-wide head steps tq4 down to q8_0")
+        t |> success(find(why, "power-of-two") >= 0, "naming the rotation ({why})")
+        m.config.head_size = 48l
+        t |> equal(kv_codec_served(m.config, KVDtype.tq4, why), KVDtype.f16, "a 48-wide head holds no block codec: tq4 lands at f16")
+        t |> equal(kv_codec_served(m.config, KVDtype.q8_0, why), KVDtype.f16, "and so does q8_0")
+        delete m
+    }
+}
+
+[test]
+def test_baked_host_layers(t : T?) {
+    t |> run("a lane's host-layer split read off its plan's marker entry: the host_split entry's woff, -1 where the lane carries none") @(t : T?) {
+        let arena = int(VkBakeRole.arena)
+        let iq4xs = int(KqFmt.iq4xs)
+        var plan <- [VkPlanEntry(fmt = iq4xs, role = arena, woff = 3000l, n = 2048l, rows = 131072l),
+                     VkPlanEntry(fmt = -1, role = int(VkBakeRole.host_split), woff = 18l, n = 0l, rows = 0l),
+                     VkPlanEntry(fmt = iq4xs, role = arena, woff = 4000l, n = 2048l, rows = 131072l)]
+        t |> equal(vk_baked_host_layers(plan), 18l, "the marker's woff is the split")
+        var old <- [VkPlanEntry(fmt = iq4xs, role = arena, woff = 3000l, n = 2048l, rows = 131072l)]
+        t |> equal(vk_baked_host_layers(old), -1l, "a lane minted before the marker answers -1")
+        let none : array<VkPlanEntry>
+        t |> equal(vk_baked_host_layers(none), -1l, "an empty plan answers -1")
+        delete plan
+        delete old
+    }
+}
+
+[test]
+def test_vulkan_tower_route_before_a_device(t : T?) {
+    t |> run("the audio fronts' route answers off before a device is up - the scratch sizing asks it ahead of the arm") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (g_gpu != null) {
+                t |> skip("a device is up in this process - the no-device answer is not reachable here")
+                return
+            }
+            t |> success(!vulkan_tower_front_route(), "no device - no f16 GEMM feed, and no null dereference")
+        } else {
+            t |> skip("a build without dasVulkan has no Vulkan tower")
+        }
     }
 }

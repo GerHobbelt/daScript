@@ -76,8 +76,8 @@ reused as-is.
 | `src/dasMetal.h` | hand | The C++ header `src/dasMetal.mm` and any embedder share: the opaque handle struct declarations and the `DAS_MOD_API` prototype of every extern below. Declarations only - no implementation, no Obj-C, no binding registration. |
 | `src/dasMetal.mm` | hand | `Module("das_metal")` - Obj-C++ shim over Metal.framework. Opaque annotated handles (device, queue, command buffer, compute encoder, pipeline state, library, function, buffer) + the extern surface below. Compiled with ARC; handles cross to das as `__bridge_retained void*`; `metal_release` = `__bridge_transfer`. Shim-side live-object counter for the leak gate. APPLE-only; links `-framework Metal -framework Foundation`. |
 | `metal/msl_types.das` | hand | daslang `TypeDecl` -> MSL type name: 32-bit scalars/bool plus the 16- and 8-bit scalars (`half`/`short`/`char` in MSL) and their 2/3/4 vectors, classified via the shared `daslib/shader_block_layout` rails. `msl_buffer_elem_name` gives the layout-bearing spelling: 3-lane elements take MSL's `packed_T3` (das packs tightly; unified memory means the das array IS the buffer). |
-| `metal/metal_builtins.das` | hand | Metal-only builtin surface over the shared lingua franca (the spirv_builtins pattern): re-exports `daslib/shader_lingua_franca` (whence `gl_WorkGroupSize` and the four `gl_Subgroup*` IDs, shared with dasSpirv) and adds the `simd_sum`/`simd_max`/`simd_shuffle*` intrinsics (Metal spellings, float/int/uint). The CPU bodies return their argument unchanged - on the CPU a simdgroup is one lane. |
-| `metal/msl_emit.das` | hand | The text emitter: `generate_msl(fn, var errors, cfg, var census, var tgmem) : string`. Manual recursion (`emit_value`/`emit_stmt`, mirroring `spirv_emit`). Kernel-signature synthesis from `@ssbo` globals (the one structural novelty - below). Records the construct census at every emit site. |
+| `metal/metal_builtins.das` | hand | Metal-only builtin surface over the shared lingua franca (the spirv_builtins pattern): re-exports `daslib/shader_lingua_franca` (whence `gl_WorkGroupSize` and the four `gl_Subgroup*` IDs, shared with dasSpirv) and adds the `simd_sum`/`simd_max`/`simd_shuffle*` intrinsics (Metal spellings, float/int/uint). The CPU bodies return their argument unchanged - on the CPU a simdgroup is one lane. The int and uint `atomicAdd` both emitters lower sit in the lingua franca with a CPU body that adds and returns the old value. |
+| `metal/msl_emit.das` | hand | The text emitter: `generate_msl(fn, var errors, cfg, var census, var tgmem) : string`. Manual recursion (`emit_value`/`emit_stmt`, mirroring `spirv_emit`). Kernel-signature synthesis from `@ssbo` globals (the one structural novelty - below). Records the construct census at every emit site. An `atomicAdd` on an `@ssbo` or `@workgroup` element lowers to a relaxed `atomic_fetch_add_explicit` through the element's address space; a local, a state member or a float element is refused by name. |
 | `metal/msl_shader.das` | hand | `[metal_kernel]` function-macro (`MetalKernel : AstFunctionAnnotation`, modeled on `SpirvShader`), applied to a **class method**; args: `name`, `fastmath` (default **true**). `apply` declares the public MSL-text global - the `name=` argument, or `<Class>_<method>_msl` derived from the method - plus a `<name>_fastmath : bool` companion feeding the pipeline-compile options; **`fixup` fills `glob.init = new ExprConstString(...)`** - the initializer is a constant string, so nothing has to be called to build it and the late `fixup` pass is enough. Does `require msl_emit public` + `require metal_builtins public`. |
 | `metal/das_metal_boost.das` | hand | Host sugar over `das_metal`: `with_metal_device`, `pipeline_from_kernel` (compile + error surfacing), unified-memory buffer helpers, `run_compute_1d` one-liner, live-object leak assert. `require das_metal` -> usable only where the C++ module exists. |
 | `CMakeLists.txt` | hand | `ADD_MODULE_DAS_FROM_DESCRIPTOR(metal metal)` unconditional (rows derived from `.das_module`, emitter everywhere); `IF(APPLE)`: `ADD_MODULE_CPP(DasMetal)` + `ADD_MODULE_LIB` + frameworks. Install rule mirrors dasSpirv's. |
@@ -144,62 +144,9 @@ Three behavioral layers + enforcement gates:
 
 ## 5. Cross-backend parity - the kernel-model asymmetry ledger {#kernel-model-asymmetry-ledger}
 
-This ledger holds every kernel-model capability one emitter has and the other lacks, for both
-backends; `modules/REVIEW_SHADER_EMITTERS.md` routes a diff here. The primary correctness oracle
-is the CPU-reference run of the same das body - cheaper and stricter than a second GPU.
-Cross-GPU parity of one source is secondary. Current entries:
-
-- **`family=` surface sharing is Vulkan-only.** Both emitters accept N kernel methods per class
-  with `kernel=` picking per instance (the sibling fixtures are
-  `modules/dasLLAMA/tests/_mtl_toy.das` and `modules/dasLLAMA/tests/_vkd_toy.das`); `family=`
-  has no Metal counterpart because Metal's `enc_*` builder is the whole generated surface, so a
-  family has nothing to share.
-- **Method flattening, scope splicing, and plain-member thread-local state are Metal-only.**
-  `msl_emit` splices method bodies inline (statically devirtualized, value and statement
-  position) and lowers plain class members to kernel-entry thread-locals (scalar-with-init,
-  fixed array, carried pointer walk - the state contract is per-thread); `spirv_emit` rejects an unannotated member and
-  lowers a call as a call, but a `[spirv_inline]` helper's body in place (`msl_emit` ignores the mark). Deliberate.
-- **The SSBO access decorations - `@readonly`, `@maybe_readonly`, `@coherent` - are Vulkan-only, and
-  the asymmetry is deliberate.** `spirv_emit` decorates the `OpVariable` (`NonWritable`, `Coherent`);
-  MSL has no per-buffer qualifier for either - a `device` buffer's stores reach another threadgroup
-  through the device-scope fence the kernel already issues, so the last-arriving-workgroup hand-off
-  needs no decoration there, and `msl_emit` reads the three annotations as no-ops.
-- **The tmm2d tensor-GEMM builtin family is Metal-only; the asymmetry is pending, not
-  deliberate.** The family - whole-GEMM helpers plus the staged threadgroup protocol - lowers
-  MPP `matmul2d` cooperative tensors, and the CPU-replay bodies are its only cross-checked
-  twin.
-- **Grid-literal validation is asymmetric; pending, not deliberate.** Vulkan rejects a
-  non-int64 ceil-div grid parameter at macro apply; the Metal emitter accepts it and infers a
-  type silently.
-- **cm2 decode-in-load is Vulkan-only by hardware.** `[spirv_decode]`'s callback form lowers
-  SPV_NV_cooperative_matrix2 tensor loads. Metal-4 tensors have no decode-callback analogue, so
-  the Metal quant GEMMs stage dequant through threadgroup memory instead. Deliberate,
-  target-specific - not a pending port.
-- **The workgroup-scope cooperative-matrix tile family is Vulkan-only by hardware.** The
-  `coopmatWg{A|B|Acc}_*` marker structs, their `coopmatMulAdd` / `coopmatConvert` overloads and
-  the tensor-layout loads and stores lower SPV_NV_cooperative_matrix2 workgroup tiles; Metal-4
-  tensors carry no workgroup-scope tile of that form, so the Metal GEMMs stage through
-  threadgroup memory. Deliberate, target-specific - a new tile shape (a marker struct and the
-  overload that types its call) is a member of this family, not a new asymmetry.
-- **A kernel body calling a `[spirv_decode]` method directly is Vulkan-only; pending, not
-  deliberate.** dasSpirv emits the call as an ordinary function - on a plane element the
-  callee takes the element's index and chains through the plane, on a copy the struct
-  parameter spills to a local (`dasSpirv/ARCHITECTURE_COOPMAT.md` sec.3.5). An MSL function takes a
-  struct by value with its members addressable as written, so Metal needs no spill; the
-  direct-call form itself has no MSL fixture yet, and a Metal kernel wanting one decode body
-  for a staged tile is what would land it.
-- **Literal fixed-array hoisting is Metal-only; pending, not deliberate.** `msl_emit` lowers a
-  `let` fixed-array local whose elements are all literals to a program-scope `constant` table
-  (renamed on a same-name/different-content collision); `spirv_emit` keeps such a local in
-  Function storage, where a dynamically indexed read spills to private memory - the codebook
-  and grid quant kernels on Vulkan therefore pack their tables into `uint4` words by hand.
-  Done = the SPIR-V twin (a constant-storage array for the same shape) or a lint on a
-  dynamically indexed fixed-array local inside a kernel class.
-- **No-contraction is a compile option on Metal and a decoration on Vulkan; deliberate.** Metal
-  carries it by `[metal_kernel(fastmath=false)]`, the library's `fastmath=false` compile option,
-  and writes no MSL text for it; the SPIR-V emitter's `precise` mark decorates each float result
-  `NoContraction` (`modules/dasSpirv/ARCHITECTURE.md`, the `precise` section), so the mark has no
-  Metal twin - a body ported between the emitters carries the property on its annotation.
+The [shared asymmetry ledger](ARCHITECTURE_PARITY.md) records capabilities one shader
+backend has and the other lacks, including whether each difference is deliberate or pending.
+`modules/REVIEW_SHADER_EMITTERS.md` routes cross-backend capability changes to that ledger.
 
 ## 7. `@uniform` structs - the kargs form
 

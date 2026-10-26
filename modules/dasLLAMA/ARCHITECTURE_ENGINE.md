@@ -50,8 +50,8 @@ the module declares every such buffer `@exact_size` and sizes it through a reser
   `SamplingParams` (the struct a `Session` points at, so a speculative round draws with its
   caller's sampler), `TokenConstraint` (the abstract token admission a `Session` borrows a pointer
   to) and `TokenConstraintBox` (its owner, freed with the request or stream that holds it), and the
-  MTP per-position accept telemetry (`mtp_pos_*`) the round-override
-  registry's rounds feed. The standard attention's Config-keyed arms live beside it - the gated
+  MTP per-position accept telemetry (`mtp_pos_*`) the speculative
+  round feeds. The standard attention's Config-keyed arms live beside it - the gated
   projection (`q_gated`: a 2x-wide q whose second half sigmoid-gates the output) among them - one
   kernel every arch shares, its arms chosen by the model's flags. **Not** the load walk (`ARCHITECTURE_ENGINE_FORMATS.md#the-load-and-image-rail`) and **not** GPU residency
   (`ARCHITECTURE_GPU.md#gpu-backends`) - both left; the seam each left is a registered hook, so neither comes back.
@@ -69,7 +69,9 @@ the module declares every such buffer `@exact_size` and sizes it through a reser
   (`metal_st2_src_{low,cumsum,sines}_{torch,onnx}_msl`, gated by `st2_source_gate`), and the per-32
   GEMV with its small-batch form (`metal_kq_gemv_<fmt>_msl` for q51, iq4nl32, q4032 and q5032, their
   `_ks_msl` K-split stamps, `metal_b32_mvb` by its method - gated by `b32_mvb_gate`, whose
-  bit-for-bit compare fast math breaks); an entrant ships its failing-under-fastmath test too.
+  bit-for-bit compare fast math breaks), and the classifier tail's selection (`metal_cls_select_msl`,
+  gated by `cls_select_gate`: fast math lets a NaN lane through the ordered compare that floors it); an
+  entrant ships its failing-under-fastmath test too.
 - **`dasllama_transformer.das`** - the block-composition seam, and the require umbrella: the
   `[init]`-only side-effect requires (arch registrations, GPU tiers, and any module that
   requires the engine back, which the umbrella therefore hosts to break the cycle).
@@ -116,9 +118,10 @@ the module declares every such buffer `@exact_size` and sizes it through a reser
   survive), and the temperature, softmax, nucleus and min-p cuts and the one draw run over those
   survivors in `Session.cand`, so a sampled decode costs what a greedy one does at a 250K vocab;
   top-k off or past the cap takes the vocab-wide reference path, which is also the fast path's
-  parity oracle in `tests/test_sampling.das`. It registers the accept walk's row sampler
-  (`register_mtp_sample_row`) at init, and that registration is the only way the engine reaches
-  this file. A `Session` may carry a `TokenConstraint` (`dasllama_common`'s abstract class: `admits`
+  parity oracle in `tests/test_sampling.das`. It registers the accept walk's row judge
+  (`register_mtp_judge`) and the rejection-sampling drafter's draw (`register_mtp_draft_draw`) at
+  init, and those two registrations are the only way the engine reaches this file
+  (`ARCHITECTURE_GPU_MTP_ACCEPT.md#mtp-accept-modes`). A `Session` may carry a `TokenConstraint` (`dasllama_common`'s abstract class: `admits`
   asks whether a token may come next, `commit` advances past the one emitted); the sampler never
   emits a token it refuses - the greedy pick probes the argmax, then the `CONSTRAINED_PROBE_K`
   largest, then the whole row in logit order, and the sampled path draws over its candidate list
@@ -145,7 +148,7 @@ the module declares every such buffer `@exact_size` and sizes it through a reser
 - **`dasllama_chat.das`** - conversation turns and chat-template application. Per-arch template
   *content* is registered by the arch file (`ARCHITECTURE_ENGINE.md#architecture-registrations`), not written here.
 - **`dasllama_par.das`** - `maybe_parallel_for` plus the dispatch counters its arms call at RUN
-  time, so the module AOTs, and the single-thread gate those arms read (`set_single_thread_`, `ARCHITECTURE_RUNTIME.md#single-thread`). Threading policy (job counts, thresholds) belongs to the caller.
+  time, so the module AOTs, and the single-thread gate those arms read (`set_single_thread_`, `ARCHITECTURE_RUNTIME_JOBQUE.md#single-thread`). Threading policy (job counts, thresholds) belongs to the caller.
 - **`dasllama_boot_restore.das`** - the `[boot_restore]` function annotation: on a module's
   empty `[init]` function it writes the boot-restore guard of every global the module initializes
   `= @@fn`, so the restore list cannot miss a seat; `dasllama_gpu_tier.das` restores its seats
@@ -262,3 +265,24 @@ names `dasllama.io`: the exchange module is the sidecar exchange host's one clie
 tool reaches it through `dasllama/dasllama_exchange`. It licenses no names.
 
 The decode pick tape: `ARCHITECTURE_ENGINE_MECHANISMS.md#moe-pick-tape`.
+
+### The test folder's documents track its files {#test-folder-gates}
+
+`tests/CLAUDE.md` is the map a reader finds a cell or an arm in, `tests/REVIEW_PINNED_GATES.md` the set of cells whose
+asserts hold fixed, and `tests/_compares.das` the compares the bars read. `REVIEW.das` holds each to the files, and each
+check licenses no names:
+
+- `check_arm_tokens_documented` - every literal `arm_on` token a tests file filters on (an interpolated one by the prefix
+  ahead of its first `{`) is a word of a backtick span in `tests/CLAUDE.md`.
+- `check_doc_names_resolve` - every backticked `test_*` / `cell_*` name in `tests/CLAUDE.md` is a `.das` file or a
+  `def` under the module or under a folder the document names by a `.das` path; a pattern (`*`, `<...>`, `{...}`)
+  names none.
+- `check_doc_cites_no_ledger` - `tests/CLAUDE.md` cites no `followup_*.md`, whose items move or close under it.
+- `check_regions_entries` - every `cell_*` a `test_gpu_resident_regions*.das` file calls is named in that file's entry:
+  by its function name, by the name the `_resident_regions.das` list gives it (the phrase ahead of its parenthetical),
+  or by the head of the bullet that holds it.
+- `check_census_evidence_pinned` - every `test_vk*` / `test_metal_*` cell and `*_gate` a census table's comments in
+  `tests/test_kernel_coverage.das` cite as a blind spot's evidence is in the pinned set: named in an entry, in a file a
+  file entry pins, or a gate a pinned cell calls.
+- `check_running_max_nan` - no tests file keeps a running largest difference as `max(m, abs(a - b))`: `max` drops a
+  NaN a later finite element follows, and `nan_wide_diff(a, b)` reads a NaN on either side as infinite.

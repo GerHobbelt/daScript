@@ -43,7 +43,21 @@ struct ParityEvidence {
     moe_reference : bool   // + a per-position reference MoE-prefill arm
     moe_per_expert : bool  // + a per-expert-chain (fused expert GEMMs off) prefill arm
     require_dn_kq : bool   // assert deltanet planes engaged kq-native, not silently demoted
+    prefix_bar : bool      // the gates hold the fixture as a matching prefix of half the span, never token for token: the carrier's routing amplifies an ulp of rounding into whole logits, so a later token is a coin flip on any engine
 }
+
+//! how many of `got`'s leading ids equal `want`'s - the one compare every fixture gate reads
+def prefix_match_len(got, want : array<int64>) : int64 {
+    var same = 0l
+    while (same < long_length(got) && same < long_length(want) && got[same] == want[same]) {
+        same++
+    }
+    return same
+}
+
+//! whether `same` matching opening tokens of `n_check` pass the fixture's bar: half the span as a prefix under
+//! `prefix_bar` (the timed run's fixture gate asks that form of every carrier), else every token
+def fixture_ok(prefix_bar : bool; same, n_check : int64) : bool => prefix_bar ? same * 2l >= n_check : same == n_check
 
 //! One model of the set — the union row behind every view. A facet left empty means the model
 //! does not participate in that view: `display` (the profiled catalog, [[llm_catalog]]),
@@ -77,6 +91,8 @@ struct ModelSpec {
     serve_drafter : string          //! the assistant drafter companion NAME the server attaches beside the file ("" = none); [[serve_companion]] resolves it
     serve_tts : bool = false        // a speech model of the served text-to-speech set ([[serve_tts_set]]); its packs ride the companions
     serve_mtp : string              //! the platforms ("metal", "vulkan", comma list) where the model's self-speculation measured a win at one stream (PERF_LEDGER.md); "" = the server's unset `mtp` decodes plain
+    mlx_repo : string               //! the MLX checkpoint (HF repo) of the same model the board's mlx-lm reference leg runs on Apple boxes; "" = no MLX leg
+    mlx_fmt : string                //! that checkpoint's precision, stamped as the MLX row's exec_fmt
 }
 
 // ===== Parity fixture ids (simple_ids, harness/parity.sh) =====
@@ -276,20 +292,23 @@ def private ev_gemma4_dense() : ParityEvidence {
                 236743l, 236800l, 236778l, 236832l, 236764l, 236743l, 236800l, 236778l, 236828l, 236764l])
 }
 
-// the gemma4 MoE continuations, capped short: the 26B routes a DISCRETE top-8-of-128 per
-// layer, and past the cap the *oracle itself* is near-tied (top-1 vs top-2 gap ~0.5-2.2) — an
-// irreducible router coin-flip no float engine can pin, not a forward bug. Q8 holds 11
-// oracle-confident tokens (gap >6), the Q4_K_M recipe 12.
+// the gemma4 MoE continuations hold as a half-span prefix (`prefix_bar`): the 26B routes a DISCRETE
+// top-8-of-128 per layer and its forward amplifies an ulp of rounding about tenfold a layer, so the
+// logits of any float engine move by whole points under a change of accumulation order alone - the
+// reference engine's own between thread counts or micro-batch sizes, ours between JIT routes - and
+// a token past the opening is a coin flip, not a forward bug; the oracle's top-1 margin at a step is
+// itself a function of that order
 def private ev_gemma4_26b() : ParityEvidence {
     return <- ParityEvidence(prompt_text = gemma4_counting_prompt(),
-        gen <- [236743l, 236800l, 236778l, 236770l, 236764l, 236743l, 236800l, 236778l, 236778l, 236764l, 236743l])
+        gen <- [236743l, 236800l, 236778l, 236770l, 236764l, 236743l, 236800l, 236778l, 236778l, 236764l, 236743l],
+        prefix_bar = true)
 }
 
 def private ev_gemma4_26b_q4km() : ParityEvidence {
     return <- ParityEvidence(prompt_text = gemma4_counting_prompt(),
         gen <- [236743l, 236800l, 236778l, 236770l, 236764l, 236743l, 236800l, 236778l, 236778l, 236764l,
                 236743l, 236800l],
-        moe_per_expert = true)
+        moe_per_expert = true, prefix_bar = true)
 }
 
 // Mistral-Small-3.1-24B Q4_K_M, "1, 2, 3, 4, 5, 6, 7," (tekken BPE, BOS=1) — frozen from
@@ -475,14 +494,14 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             bytes = 16947541728l, sha256 = "f2c28b3dc4776931ac6f879e11f203dec637ea0f14267a86ec8f6165f63f293f",
             serve_name = "gemma-4-26b-a4b", serve_display = "Gemma 4 26B-A4B",
             serve_note = "the MoE - 26B quality at 4B active weights per token",
-            serve_ctx = 131072, serve_vram_gb = 19.0, serve_mtp = "metal",
+            serve_ctx = 131072, serve_vram_gb = 19.0, serve_mtp = "metal, vulkan",
             serve_drafter = "mtp-gemma-4-26B-A4B-it-Q8_0.gguf"),
         ModelSpec(file = "Qwen3.8-27B-UD-Q4_K_M.gguf",
             url = "{HF}/unsloth/Qwen3.8-27B-GGUF/resolve/27af057ecb382ddfea5d12837360a8980560e3ed/Qwen3.8-27B-UD-Q4_K_M.gguf",
             bytes = 16464440224l, sha256 = "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
             serve_name = "qwen3.8-27b", serve_display = "Qwen 3.8 27B",
             serve_note = "the newest dense Qwen - thinking model, strong at code",
-            serve_ctx = 262144, serve_vram_gb = 18.5, serve_mtp = "metal",
+            serve_ctx = 262144, serve_vram_gb = 18.5, serve_mtp = "metal, vulkan",
             parity <- ev_qwen_count([dn_chunked = true])),
         ModelSpec(file = "gemma-3-4b-it-Q8_0.gguf", display = "gemma-3-4B",
             // the vision mmproj rides as a companion: the gemma3v tower tests and the image chat
@@ -520,7 +539,7 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         // this row owns the carrier's provenance and PINS its mmproj companion (the serving
         // Q4_K_M row consumes the same tower by name via serve_vision); asr_catalog keeps
         // only the pairing
-        ModelSpec(file = "gemma-4-E2B-it-Q8_0.gguf", display = "gemma-4-E2B", official = true,
+        ModelSpec(file = "gemma-4-E2B-it-Q8_0.gguf", display = "gemma-4-E2B", official = false,
             url = "{HF}/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q8_0.gguf",
             bytes = 4967497152l, sha256 = "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
             companions <- [
@@ -645,7 +664,7 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
                     url = "{HF}/ggml-org/gemma-3-12b-it-GGUF/resolve/main/mmproj-model-f16.gguf",
                     bytes = 854200224l, sha256 = "30c02d056410848227001830866e0a269fcc28aaf8ca971bded494003de9f5a5")],
             parity <- ev_gemma_count([kq_native = true])),
-        ModelSpec(file = "gemma-4-12B-it-Q4_K_M.gguf", official = true,
+        ModelSpec(file = "gemma-4-12B-it-Q4_K_M.gguf", official = false,
             url = "{HF}/lmstudio-community/gemma-4-12B-it-GGUF/resolve/main/gemma-4-12B-it-Q4_K_M.gguf",
             bytes = 7381382944l, sha256 = "95d83ba36642b1f385fb906b5962a71763361be3bac930a709945f72d97473f8",
             // this file's own oracle (2026-08-18) continues the dense fixture byte-identically
@@ -653,18 +672,19 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             companions <- [
                 ProvEntry(name = "mmproj-gemma-4-12B-it-BF16.gguf", root = "llm",
                     url = "{HF}/ggml-org/gemma-4-12B-it-GGUF/resolve/main/mmproj-gemma-4-12B-it-BF16.gguf",
-                    bytes = 175115616l, sha256 = "9b1edfa05b634728ca4bfd60b4e6b278e95166c078fa54ae4fa83e680112fd1d"),
-                // path-style S3 spelling: the images.cocodataset.org website endpoint is http-only
-                ProvEntry(name = "coco-val2017-000000039769.jpg", root = "llm",
-                    url = "https://s3.amazonaws.com/images.cocodataset.org/val2017/000000039769.jpg",
-                    bytes = 173131l, sha256 = "dea9e7ef97386345f7cff32f9055da4982da5471c48d575146c796ab4563b04e")]),
+                    bytes = 175115616l, sha256 = "9b1edfa05b634728ca4bfd60b4e6b278e95166c078fa54ae4fa83e680112fd1d")]),
         ModelSpec(file = "gemma-4-E4B-it-Q8_0.gguf", display = "gemma-4-E4B", official = true,
+            mlx_repo = "mlx-community/gemma-4-e4b-it-8bit", mlx_fmt = "8bit",
             url = "{HF}/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf",
             bytes = 8031242688l, sha256 = "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
             companions <- [
                 ProvEntry(name = "mmproj-gemma-4-E4B-it-BF16.gguf", root = "llm",
                     url = "{HF}/ggml-org/gemma-4-E4B-it-GGUF/resolve/b8093469224f83f5c38f691eb906c380e9e63114/mmproj-gemma-4-E4B-it-BF16.gguf",
-                    bytes = 991552256l, sha256 = "f77995e4b6a569ab8f0d1bfdb7e8da4a0fa5b9e6f309b9bf3bdb76164d75e29f")],
+                    bytes = 991552256l, sha256 = "f77995e4b6a569ab8f0d1bfdb7e8da4a0fa5b9e6f309b9bf3bdb76164d75e29f"),
+                // path-style S3 spelling: the images.cocodataset.org website endpoint is http-only
+                ProvEntry(name = "coco-val2017-000000039769.jpg", root = "llm",
+                    url = "https://s3.amazonaws.com/images.cocodataset.org/val2017/000000039769.jpg",
+                    bytes = 173131l, sha256 = "dea9e7ef97386345f7cff32f9055da4982da5471c48d575146c796ab4563b04e")],
             // PLE (per-layer embeddings) + cross-layer KV sharing over the last 18 layers;
             // dense, so the full 40 hold (verified 40/40 vs simple_ids on the window-engaged
             // 1..320 counting prompt)
@@ -675,10 +695,11 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         // name); its parity fixtures run through test_parity's own shared-load arm — the
         // ~13GB native-mx4 resident is the suite's biggest, loaded once for both fixtures
         ModelSpec(file = "gpt-oss-20b-mxfp4.gguf", display = "gpt-oss-20b", quant_label = "mxfp4", official = true,
+            mlx_repo = "mlx-community/gpt-oss-20b-MXFP4-Q8", mlx_fmt = "mxfp4/q8",
             url = "{HF}/ggml-org/gpt-oss-20b-GGUF/resolve/e1dc459feff949ff451ce107337a2026daa80df8/gpt-oss-20b-mxfp4.gguf",
             bytes = 12109566560l, sha256 = "be37a636aca0fc1aae0d32325f82f6b4d21495f06823b5fbc1898ae0303e9935",
             parity <- ev_gptoss()),
-        ModelSpec(file = "Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf", official = true,
+        ModelSpec(file = "Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf", official = false,
             url = "{HF}/unsloth/Mistral-Small-3.1-24B-Instruct-2503-GGUF/resolve/main/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf",
             bytes = 14333910592l, sha256 = "6d670773c3908584349d41a5048d1472226b593c881fd394e8ac196c802e81e2",
             parity <- ev_mistral_small()),
@@ -687,6 +708,7 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             // top-8-of-128 experts under a custom-normalized router
             parity <- ev_gemma4_26b()),
         ModelSpec(file = "gemma-4-26B-A4B-it-Q4_K_M.gguf", display = "gemma-4-26B-A4B-q4k", quant_label = "q4_k_m", official = true,
+            mlx_repo = "mlx-community/gemma-4-26b-a4b-it-4bit", mlx_fmt = "4bit",
             url = "{HF}/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
             bytes = 16947541728l, sha256 = "f2c28b3dc4776931ac6f879e11f203dec637ea0f14267a86ec8f6165f63f293f",
             // the assistant drafter rides as a companion: the mtp suite and the ruler attach it beside this target; its Q4_0
@@ -705,13 +727,13 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         // the loader mode (q8), the label the on-disk format, like the Q4_K_M rows
         ModelSpec(file = "gemma-4-26B_q4_0-it.gguf", display = "gemma-4-26B-A4B-q40", quant_label = "q4_0",
             parity <- ev_gemma_count([kq_native = true])),
-        ModelSpec(file = "Qwen3.6-27B-MTP-Q4_K_M.gguf", official = true,
+        ModelSpec(file = "Qwen3.6-27B-MTP-Q4_K_M.gguf", official = false,
             url = "{HF}/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf",
             bytes = 17106773120l, sha256 = "a7cbd3ecc0e3f9b333edee61ae66bc87ed713c5d49587a8355814722ed329e0f",
             // plain evidence only (verified per-file 40/40, 2026-08-18): the qwen35-dense arm
             // coverage (chunked deltanet) lives on the 0.8B/4B/27B carriers
             parity <- ev_qwen_count()),
-        ModelSpec(file = "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", display = "Qwen3-30B-A3B", quant_label = "q4_k_m", official = true,
+        ModelSpec(file = "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", display = "Qwen3-30B-A3B", quant_label = "q4_k_m", official = false,
             url = "{HF}/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/resolve/main/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
             bytes = 18556686752l, sha256 = "6c997b8af17debdfb01d890214400ccbab00db6acc0ba8da5de1cc906c4774d0",
             // the MoE arm of the native-kq gate: the grouped prefill gathers per-expert token
@@ -728,6 +750,7 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             bytes = 10756586464l, sha256 = "2e8f5f705355c56311432d0a8a5d14a696dbb7e4b197d05c75ba805fc1857bef",
             parity <- ev_qwen_count([dn_chunked = true, moe_reference = true])),
         ModelSpec(file = "Qwen3.8-27B-Q4_K_M.gguf", display = "Qwen3.8-27B", quant_label = "q4_k_m", official = true,
+            mlx_repo = "mlx-community/Qwen3.8-27B-4bit", mlx_fmt = "4bit",
             url = "{HF}/ggml-org/Qwen3.8-27B-GGUF/resolve/0669b98607d47046c7c2b3f801011d54a08cfccf/Qwen3.8-27B-Q4_K_M.gguf",
             bytes = 18973870432l, sha256 = "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34",
             // the split NextN head rides as a companion: the mtp suite's 3.8-27b fixture and the ruler load it as the trunk's last shard
@@ -744,11 +767,12 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             // prefill paths and the chunked deltanet arm off one load
             parity <- ev_qwen_count([dn_chunked = true, moe_reference = true])),
         ModelSpec(file = "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf", official = true,
+            mlx_repo = "mlx-community/Qwen3.6-35B-A3B-4bit", mlx_fmt = "4bit",
             url = "{HF}/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
             bytes = 22663387424l, sha256 = "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b",
             serve_name = "qwen3.6-35b-a3b", serve_display = "Qwen 3.6 35B-A3B",
             serve_note = "the Qwen MoE - 3B active weights, MTP-ready",
-            serve_ctx = 262144, serve_vram_gb = 24.0, serve_mtp = "vulkan",
+            serve_ctx = 262144, serve_vram_gb = 24.0, serve_mtp = "metal, vulkan",
             // plain evidence only (verified per-file 40/40, 2026-08-18): the qwen35moe arm
             // coverage (chunked deltanet + reference MoE prefill) lives on the plain-stem twin
             parity <- ev_qwen_count()),
@@ -777,13 +801,27 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         // qwen4exp row), while the Vulkan driver sums its routed experts on the host by construction
         // (ARCHITECTURE_GPU_VULKAN_HC.md), so the two homes measure different forms
         ModelSpec(file = "Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
-            display = "Qwen3.8-Flash-Next-iq4xs", quant_label = "iq4_xs",
+            display = "Qwen3.8-Flash-Next-iq4xs", quant_label = "iq4_xs", serve_mtp = "vulkan",
             // the split NextN head (`shared`: its own Q8_0 routed experts inside) rides as a companion: the hc cells pin it as the trunk's head
             companions <- [
                 ProvEntry(name = "Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", root = "llm",
                     url = "{HF}/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
                     bytes = 2786568256l, sha256 = "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6")],
             parity <- ev_qwen_count([dn_chunked = true, moe_reference = true])),
+        // the hyper-connection chain's micro carrier (Lynxpda's random-weight qwen4exp: hc 4, the PLE 3-gram side input,
+        // 8 experts top-2, a NextN head) tests/test_gpu_resident_hc_micro.das holds whole; the published head rides as a
+        // companion, and the `-hcmixer` twin the cells load - the head mixer copied off the shard's own output_hc_* -
+        // is minted off it by the recipe. No board row: random weights say nothing about text
+        ModelSpec(file = "micro-qwen4exp/micro-qwen4exp-realqsa.gguf",
+            url = "{HF}/Lynxpda/micro-qwen4exp/resolve/main/micro-qwen4exp-realqsa.gguf",
+            bytes = 416452160l, sha256 = "b5ea5c6df7b079095bd1d375d477f476a1913df9c87412ed7e9800a8cc3909d7",
+            companions <- [
+                ProvEntry(name = "micro-qwen4exp/micro-qwen4exp-realqsa-mtp.gguf", root = "llm",
+                    url = "{HF}/Lynxpda/micro-qwen4exp/resolve/main/micro-qwen4exp-realqsa-mtp.gguf",
+                    bytes = 148810048l, sha256 = "4b4373fb211fce86a6c4bd0ea02a6e46762512cd4470177f497b4e32baaed924"),
+                ProvEntry(name = "micro-qwen4exp/micro-qwen4exp-realqsa-mtp-hcmixer.gguf", root = "llm",
+                    recipe = "python modules/dasLLAMA/harness/micro_qwen4exp_hcmixer.py micro-qwen4exp-realqsa-mtp.gguf micro-qwen4exp-realqsa-mtp-hcmixer.gguf",
+                    bytes = 150002176l, sha256 = "4fd26c949319887f45e4a7a11ae92831ff2515f5b73909f30150d2986b678ade")]),
         // the Metal sweep's Qwen quant matrix - Qwen text files the M5 box stocks beyond the rows
         // above, not every one; no board row, no provenance, the counting fixture as the
         // correctness gate
@@ -798,7 +836,7 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         ModelSpec(file = "Qwen3.5-9B-IQ4_XS.gguf", display = "Qwen3.5-9B-iq4xs", quant_label = "iq4_xs",
             parity <- ev_qwen_count([kq_native = true, dn_chunked = true])),
         // the 27B at the size a 16 GB card holds whole: the official board's i-quant row
-        ModelSpec(file = "Qwen3.8-27B-UD-IQ4_XS.gguf", display = "Qwen3.8-27B-iq4xs", quant_label = "iq4_xs", official = true,
+        ModelSpec(file = "Qwen3.8-27B-UD-IQ4_XS.gguf", display = "Qwen3.8-27B-iq4xs", quant_label = "iq4_xs", official = false,
             url = "{HF}/unsloth/Qwen3.8-27B-GGUF/resolve/27af057ecb382ddfea5d12837360a8980560e3ed/Qwen3.8-27B-UD-IQ4_XS.gguf",
             bytes = 14252845984l, sha256 = "40fac4050e940397dbf13087afd50f4734a11805bf9d65ef8ddd7483470e6199",
             parity <- ev_qwen_count([dn_chunked = true])),

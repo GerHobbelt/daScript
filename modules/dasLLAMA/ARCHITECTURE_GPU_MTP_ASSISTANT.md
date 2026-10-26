@@ -35,7 +35,8 @@ pass's output rotates back after it.
 The resolver (`gemma_drafter_sidecar`, registered backend-free so every build finds it) takes the trunk's file stem before
 its trailing quant token (`-Q<digit>` or `-IQ<digit>`) and looks for `mtp-<stem>-Q8_0.gguf`, then the same with an unsloth
 `-UD` tag dropped from the stem - the upstream head is named after the plain trunk - then the exact-name `mtp-<file>`
-sibling. The head's quant is chosen apart from the trunk's, and the loader takes Q8_0 tensors alone: a sidecar in any
+sibling, each only where the file's architecture is an assistant's (`gguf_is_assistant`): a split NextN head shares the
+`mtp-` names, and the resolver passes it by. The head's quant is chosen apart from the trunk's, and the loader takes Q8_0 tensors alone: a sidecar in any
 other type refuses naming the tensor and its type, and the trunk serves plain. Every attach asks the trunk check
 (`gemma_drafter_target_why`): a per-layer-embedding trunk (the E-series) refuses first - its verify rows need the side
 input the draft ids index, and no sidecar exists for one - then the hidden width against the drafter's `tdim`, then each
@@ -58,5 +59,8 @@ draft their chain at their own anchor from their own token and carried hidden; o
 the verify's first command buffer, its inputs written into a slot a stream, the token rows a stream's group in one token list. One verify
 then carries every warm stream's [token, drafts]: on Metal the batch driver's same-slab step in groups
 (`verify_batch_groups`, a group a stream's consecutive rows over its own mirror), on Vulkan the N-row token command
-(`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-assistant-drafter`). Each stream's accept walk and host commit are the shared
-pair (`mtp_accept_walk`, `mtp_round_commit_host`); its carry becomes the verify's hidden row at the accepted count.
+(`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-assistant-drafter`). Both homes open the round through one gather
+(`mtp_round_gather`: each stream's round begun, its depth under its cap, the home's cold test answering a plain step or the
+stream's word - the Vulkan region it binds), and each stream's accept walk and host commit are the shared pair
+(`mtp_accept_walk`, `mtp_round_commit_host`); its carry becomes the verify's hidden row at the accepted count. Each home
+keeps its rounds' tallies as one `MtpAssistantStats`, reset at the attach, which its `stats` seam answers.

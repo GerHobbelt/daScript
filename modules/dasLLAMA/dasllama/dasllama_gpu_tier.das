@@ -11,6 +11,7 @@ require dasllama/dasllama_config   // DlimVulkanConfig — the dry-bake seam's c
 require daslib/fio                 // describe_pending_dynamic_modules — the absent-backend diagnostic
 require daslib/algorithm
 require math
+require dasllama/dasllama_gpu_math public   // sel_lane_val: the lane floor the landing's readers share with the kernels
 
 // The device-COOPERATION seam (SPI): hook types, install/unset slots, route/mark/want/status
 // state, and the engine-facing forwarders for GPU tiers that COOPERATE with the CPU forward —
@@ -429,6 +430,8 @@ typedef RdecHotUploadFn = function<(l : int64; slot : int64; wq1 : array<uint8>;
 //! The hits of layer `l`'s routed step: `nhit` pool slots and their routing weights. The device runs their chain while the host
 //! sums the misses, and the next segment adds the hit rows to the host's sum.
 typedef RdecHotSubmitFn = function<(l : int64; nhit : int64; slots : int64 const?; w : float const?) : void>
+//! `open` brackets a run of pool uploads the tier may land in one submit; `false` lands what the bracket holds.
+typedef RdecHotBatchFn = function<(open : bool) : void>
 //! the verify rows' hits of layer `l`: k slot and weight entries a row, a row's hits first, its misses padded at weight 0
 typedef RdecHotSubmitRowsFn = function<(l : int64; nrows : int64; slots : int64 const?; w : float const?) : void>
 
@@ -464,11 +467,49 @@ def public install_moe_gpu_resident_hot(hot_layer : RdecHotLayerFn; hot_upload :
 }
 
 def public rdec_hot_installed() : bool => g_rdec_hot_installed
+
+[unused_argument(open)]
+def private rdec_unset_hot_batch(open : bool) {}   //! a tier without a batch lands every upload as it comes
+
+var g_rdec_hot_batch = @@rdec_unset_hot_batch
+
+//! Install the tier's upload batch for the pool's placement runs - separately, so a tier without one still serves the pool.
+def public install_moe_gpu_resident_hot_batch(hot_batch : RdecHotBatchFn) {
+    g_rdec_hot_batch = hot_batch
+}
+
+def public rdec_hot_batch(open : bool) {
+    invoke(g_rdec_hot_batch, open)
+}
 def public rdec_hot_layer(l, slots : int64; f1, f3, f2 : int) : tuple<base : int64; stride : int64> => invoke(g_rdec_hot_layer, l, slots, f1, f3, f2)
 def public rdec_hot_upload(l, slot : int64; wq1 : array<uint8>; ws1 : array<uint8>; wq3 : array<uint8>; ws3 : array<uint8>; wq2 : array<uint8>; ws2 : array<uint8>) {
     invoke(g_rdec_hot_upload, l, slot, wq1, ws1, wq3, ws3, wq2, ws2)
 }
 def public rdec_hot_submit(l, nhit : int64; slots : int64 const?; w : float const?) { invoke(g_rdec_hot_submit, l, nhit, slots, w) }
+
+//! the DMA fill: expert `e` off the pinned stream stacks of the layer at `woff1` into slot `slot` of layer `l`'s pool, on the transfer
+//! queue into the layer's open batch; false = the tier cannot (no transfer queue, a dry tier, the stacks do not hold it)
+typedef RdecHotDmaFn = function<(l, slot, e, woff1 : int64; f1 : int) : bool>
+//! layer l's open DMA batch submitted on the transfer queue; the layer's next hit chain waits its landing
+typedef RdecHotDmaFlushFn = function<(l : int64) : void>
+
+[unused_argument(l, slot, e, woff1, f1)]
+def private rdec_unset_hot_dma(l, slot, e, woff1 : int64; f1 : int) : bool => false
+
+[unused_argument(l)]
+def private rdec_unset_hot_dma_flush(l : int64) {}
+
+var private g_rdec_hot_dma = @@rdec_unset_hot_dma
+var private g_rdec_hot_dma_flush = @@rdec_unset_hot_dma_flush
+
+def public install_moe_gpu_resident_hot_dma(dma : RdecHotDmaFn; flush : RdecHotDmaFlushFn) {
+    g_rdec_hot_dma = dma
+    g_rdec_hot_dma_flush = flush
+}
+
+def public rdec_hot_dma(l, slot, e, woff1 : int64; f1 : int) : bool => invoke(g_rdec_hot_dma, l, slot, e, woff1, f1)
+
+def public rdec_hot_dma_flush(l : int64) => invoke(g_rdec_hot_dma_flush, l)
 def public rdec_hot_submit_rows(l, nrows : int64; slots : int64 const?; w : float const?) { invoke(g_rdec_hot_submit_rows, l, nrows, slots, w) }
 
 var private g_gpu_resident_route = true
@@ -620,6 +661,36 @@ struct public RdecPfSeg {
     npos : int64
     pos0 : int64
     region : int64
+    seg : int64 = 0l   //! the call's segment this is, or the part of it inside a window, belongs to: the captures name their segment by it
+}
+
+//! A checkpoint stop inside a resident prefill call: segment `seg`'s state after its first `row` rows lands in checkpoint row
+//! `slot` of the segment's region (the state, the conv history as the ring image the row's parity reads, the n-gram ring)
+struct public RdecPfCap {
+    seg : int64
+    row : int64
+    slot : int64
+}
+
+typedef RdecPrefillCapsFn = function<(caps : array<RdecPfCap>) : void>
+
+[unused_argument(caps)]
+def private rdec_unset_prefill_caps(caps : array<RdecPfCap>) {
+    panic("dasLLAMA: a resident prefill's checkpoint captures asked without an installed GPU driver")
+}
+
+var g_rdec_prefill_caps = @@rdec_unset_prefill_caps
+
+//! Install the driver's capture list seat: the stops the next prefill call leaves checkpoints at inside its windows
+[arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]
+def public install_rdec_prefill_caps(caps_fn : RdecPrefillCapsFn) {
+    g_rdec_prefill_caps = caps_fn
+}
+
+//! the captures the next resident prefill call (one session's or segmented) leaves; an empty list asks none
+[arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]
+def public rdec_prefill_caps(caps : array<RdecPfCap>) {
+    invoke(g_rdec_prefill_caps, caps)
 }
 
 //! The segmented resident prefill: every segment's embedded rows (or ids, where the driver gathers) and rope rows back to
@@ -740,6 +811,78 @@ def public install_rdec_verify(verify : RdecVerifyFn; rows : function<() : int64
 }
 
 def public rdec_verify_installed() : bool => g_rdec_verify_installed
+
+//! The selection landing a device driver leaves a sampled stream's step in place of the rows' logits: each row's survivors (the ids
+//! at or above the row's SEL_K-th largest logit, ties kept), its max and softmax denominator at the stream's temperature, and the
+//! logits of the recent-window ids the ask listed - pointers into the driver's mapped landing, good until the driver's next command
+struct SelLanding {
+    rows : int64             //! 0 = nothing landed
+    cap : int64              //! survivor slots a row
+    recent_cap : int64       //! recent-window slots a row
+    hdr : uint const?        //! SEL_HDR words a row: the survivors' count, the overflow flag, the max's bits, the denominator's bits
+    ids : uint const?
+    vals : float const?
+    rec : float const?
+}
+
+let SEL_LANE_LOWEST = -3.4e38   //! the lowest finite lane value: what a NaN or -inf logit reads as on the device and on the CPU alike
+
+
+let SEL_K = 1024l                 //! the survivors a row lands - the candidate-list sampler's cap (the Vulkan kernel's CLS_SELECT_K)
+let SEL_RECENT = 128l             //! the recent-window ids an ask lists a row (CLS_SELECT_RECENT)
+let SEL_CAP = 2048l               //! the landing's slots a row - the compaction's cap, the overflow flagged past it (the template's CAP)
+let SEL_WORDS = SEL_RECENT + 4l   //! one row's ask words (CLS_SEL_WORDS): the `SEL_ASK_*` words, then the recent ids
+let SEL_HDR = 4l                  //! one row's landed header words (CLS_SEL_HDR): the `SEL_HDR_*` words
+let SEL_ASK_TEMP = 0l             //! the ask row's temperature, as float bits
+let SEL_ASK_COUNT = 1l            //! the recent ids the ask row lists
+let SEL_ASK_IDS = 4l              //! the first recent id (two pad words before it)
+let SEL_HDR_COUNT = 0l            //! the survivors the row landed
+let SEL_HDR_OVERFLOW = 1l         //! 1 where the row's ties overflowed its slots
+let SEL_HDR_MAX = 2l              //! the row's max, as float bits
+let SEL_HDR_DEN = 3l              //! the row's softmax denominator at its temperature, as float bits
+
+//! the selection ask for the driver's next command of `nrows` rows, `words` SEL_WORDS a row; false where the device has no selection
+typedef RdecSelAskFn = function<(nrows : int64; words : array<uint>) : bool>
+//! the last command's selection landing (rows = 0 where none was asked)
+typedef RdecSelLandingFn = function<() : SelLanding>
+//! the late landing of the last command's rows `row0 .. row0 + nrows` into `dst`, for a sampler the selection cannot serve
+typedef RdecSelLandRowsFn = function<(row0 : int64; nrows : int64; var dst : array<float>) : void>
+[unused_argument(nrows, words)]
+def private rdec_unset_sel_ask(nrows : int64; words : array<uint>) : bool => false
+def private rdec_unset_sel_landing : SelLanding => SelLanding()
+[unused_argument(row0, nrows, dst)]
+def private rdec_unset_sel_land_rows(row0, nrows : int64; var dst : array<float>) {
+    panic("dasLLAMA: a late landing of the selection's rows with no driver installed - a selection lands only from a driver that asked for one (the program must require dasllama/dasllama_math_vulkan, which installs the Vulkan driver's seats); engine bug")
+}
+var g_rdec_sel_ask = @@rdec_unset_sel_ask
+var g_rdec_sel_landing = @@rdec_unset_sel_landing
+var g_rdec_sel_land_rows = @@rdec_unset_sel_land_rows
+
+//! Install the selection landing beside the token, draft and verify seats
+def public install_rdec_select(ask : RdecSelAskFn; landing : RdecSelLandingFn; land_rows : RdecSelLandRowsFn) {
+    g_rdec_sel_ask = ask
+    g_rdec_sel_landing = landing
+    g_rdec_sel_land_rows = land_rows
+}
+
+//! the three selection seats as installed: a fixture that installs its own puts these back through [[restore_rdec_select]]
+struct RdecSelectPin {
+    ask : RdecSelAskFn
+    landing : RdecSelLandingFn
+    land_rows : RdecSelLandRowsFn
+}
+
+def public rdec_select_pin() : RdecSelectPin => RdecSelectPin(ask = g_rdec_sel_ask, landing = g_rdec_sel_landing, land_rows = g_rdec_sel_land_rows)
+
+def public restore_rdec_select(pin : RdecSelectPin) {
+    install_rdec_select(pin.ask, pin.landing, pin.land_rows)
+}
+
+def public rdec_sel_ask(nrows : int64; words : array<uint>) : bool => invoke(g_rdec_sel_ask, nrows, words)
+def public rdec_sel_landing() : SelLanding => invoke(g_rdec_sel_landing)
+def public rdec_sel_land_rows(row0, nrows : int64; var dst : array<float>) {
+    invoke(g_rdec_sel_land_rows, row0, nrows, dst)
+}
 def public rdec_verify_rows() : int64 => invoke(g_rdec_verify_rows)
 def public rdec_verify_landed_logits() : bool => invoke(g_rdec_verify_landed_logits)
 //! `side` the rows' n-gram side rows and `experts` the host's routed sums of the rows between a hyper-connection chain's segments; empty and unreached elsewhere
@@ -852,6 +995,19 @@ def public install_rdec_dn_peek(peek : RdecDnPeekFn) {
 }
 
 def public rdec_dn_peek(slot : int64; dsts : array<RdecDnDst>) : bool => invoke(g_rdec_dn_peek, slot, dsts)
+
+//! checkpoint row `slot`'s n-gram conv ring (the live region's where `slot` < 0) into `host`: the ring a continuation adopted there reads first
+typedef RdecDnSnapRingFn = function<(slot : int64; var host : float?) : bool>
+
+[unused_argument(slot, host)]
+def private rdec_unset_dn_snap_ring(slot : int64; var host : float?) : bool => false
+var g_rdec_dn_snap_ring = @@rdec_unset_dn_snap_ring
+
+def public install_rdec_dn_snap_ring(ring : RdecDnSnapRingFn) {
+    g_rdec_dn_snap_ring = ring
+}
+
+def public rdec_dn_snap_ring(slot : int64; var host : float?) : bool => invoke(g_rdec_dn_snap_ring, slot, host)
 
 //! One run of a layer's rows between a host cache and the selected region: row `row0` of the run sits `row0` rows past `kp` / `vp`
 struct public RdecKvSpan {
@@ -1382,6 +1538,47 @@ def public set_moe_gpu_ffn_xf_async_hooks(begin : MoeGpuFfnXfBeginFn; join : Moe
 def public moe_gpu_ffn_xf_async_rows(n, nfe : int64) : int64 =>
     invoke(g_moe_gpu_ffn_xf_rows, n, nfe)
 
+//! The meet form of the async chain over a streamed layer: open prepares the window and answers whether the layer's
+//! experts stream (a resident layer answers false), push queues one region to the device - without `wait` it declines
+//! while the ring is full - close ends the chain, and the join above collects; the caller sums the regions it kept.
+typedef MoeGpuFfnXfOpenFn = function<(offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xp : float const?; wp : float const?; invp : uint const?; n : int64; nfe : int64; nrows : int64; npos : int64; f1 : int; f3 : int; f2 : int; is_gelu : bool) : bool>
+typedef MoeGpuFfnXfPushFn = function<(r_lo : int64; r_hi : int64; wait : bool) : bool>
+typedef MoeGpuFfnXfBundleFn = function<(r_lo : int64; r_max : int64) : int64>
+typedef MoeGpuFfnXfCloseFn = function<() : void>
+
+[unused_argument(offs1, offs3, offs2, nregions, xp, wp, invp, n, nfe, nrows, npos, f1, f3, f2, is_gelu)]
+def private moe_gpu_unset_ffn_xf_open(offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64;
+                                      xp : float const?; wp : float const?; invp : uint const?; n, nfe, nrows, npos : int64;
+                                      f1, f3, f2 : int; is_gelu : bool) : bool => false
+
+[unused_argument(r_lo, r_hi, wait)]
+def private moe_gpu_unset_ffn_xf_push(r_lo, r_hi : int64; wait : bool) : bool {
+    panic("dasLLAMA: f16-fed GPU FFN push hit without an installed chain")
+    return false
+}
+
+[unused_argument(r_lo, r_max)]
+def private moe_gpu_unset_ffn_xf_bundle(r_lo, r_max : int64) : int64 {
+    panic("dasLLAMA: f16-fed GPU FFN bundle hit without an installed chain")
+    return 0l
+}
+
+def private moe_gpu_unset_ffn_xf_close {
+    panic("dasLLAMA: f16-fed GPU FFN close hit without an installed chain")
+}
+
+var g_moe_gpu_ffn_xf_open = @@moe_gpu_unset_ffn_xf_open
+var g_moe_gpu_ffn_xf_push = @@moe_gpu_unset_ffn_xf_push
+var g_moe_gpu_ffn_xf_bundle = @@moe_gpu_unset_ffn_xf_bundle
+var g_moe_gpu_ffn_xf_close = @@moe_gpu_unset_ffn_xf_close
+
+def public set_moe_gpu_ffn_xf_meet_hooks(open : MoeGpuFfnXfOpenFn; push : MoeGpuFfnXfPushFn; bundle : MoeGpuFfnXfBundleFn; close : MoeGpuFfnXfCloseFn) {
+    g_moe_gpu_ffn_xf_open = open
+    g_moe_gpu_ffn_xf_push = push
+    g_moe_gpu_ffn_xf_bundle = bundle
+    g_moe_gpu_ffn_xf_close = close
+}
+
 //! Runtime routing gate over the heat cache (the --heat-ab in-process lever; pins/uploads stay).
 def public set_moe_gpu_heat_route(on : bool) {
     g_moe_gpu_heat_route = on
@@ -1746,6 +1943,54 @@ def public gpu_dense_ffn_pin() : int => g_dense_ffn_pin
 def public gpu_want_moe_split : bool
     => g_env_gpu.gpu_moe_split
 
+var private g_pf_stream_pin = -1   //! `set_gpu_want_pf_stream`'s pin: -1 reads the environment
+
+//! The streamed prompt want (`DASLLAMA_GPU_PF_STREAM`): a routed layer whose experts serve on the host streams its stack to the device for the prompt; the pin is a fixture's in-process twin set before its load, -1 lifts it
+def public gpu_want_pf_stream : bool
+    => g_pf_stream_pin >= 0 ? g_pf_stream_pin == 1 : g_env_gpu.gpu_pf_stream
+
+def public set_gpu_want_pf_stream(pin : int) {
+    g_pf_stream_pin = pin
+}
+
+//! the pin as it was written (-1 = none): a fixture puts back what it found
+def public gpu_want_pf_stream_pin : int => g_pf_stream_pin
+
+var private g_hot_share_pin = -1.0   //! `set_gpu_hot_share`'s pin: negative reads the environment
+
+//! the DMA fill's ungated share of a decode step's misses (`DASLLAMA_GPU_HOT_SHARE`); the pin is a fixture's in-process twin
+def public gpu_hot_share : float => g_hot_share_pin >= 0.0 ? g_hot_share_pin : g_env_gpu.gpu_hot_share
+
+def public set_gpu_hot_share(pin : float) {
+    g_hot_share_pin = pin
+    if (pin >= 0.0) {
+        to_log(LOG_INFO, "dasLLAMA GPU tier: set_gpu_hot_share({pin}) - the DMA fill admits that share of a decode step's pool misses past the heat gate{gpu_hot_dma() ? "" : " (ignored: the DMA fill is off, DASLLAMA_GPU_HOT_DMA / set_gpu_hot_dma)"}\n")
+    }
+}
+
+def public gpu_hot_share_pin : float => g_hot_share_pin
+
+var private g_hot_dma_pin = -1    //! `set_gpu_hot_dma`'s pin: -1 reads the environment
+var private g_dec_meet_pin = -1   //! `set_gpu_dec_meet`'s pin: -1 reads the environment
+
+//! the pool's DMA fill (`DASLLAMA_GPU_HOT_DMA`): a decode step's misses copied into the pool on the transfer queue, a prompt window's hits served off the pool first; the pin is a fixture's in-process twin, -1 lifts it
+def public gpu_hot_dma : bool => g_hot_dma_pin >= 0 ? g_hot_dma_pin == 1 : g_env_gpu.gpu_hot_dma
+
+def public set_gpu_hot_dma(pin : int) {
+    g_hot_dma_pin = pin
+}
+
+def public gpu_hot_dma_pin : int => g_hot_dma_pin
+
+//! the decode meet (`DASLLAMA_GPU_DEC_MEET`): a decode token's picks on a streamed layer claimed through the prefill's meet; the pin is a fixture's in-process twin, -1 lifts it
+def public gpu_dec_meet : bool => g_dec_meet_pin >= 0 ? g_dec_meet_pin == 1 : g_env_gpu.gpu_dec_meet
+
+def public set_gpu_dec_meet(pin : int) {
+    g_dec_meet_pin = pin
+}
+
+def public gpu_dec_meet_pin : int => g_dec_meet_pin
+
 def public gpu_want_dnd : bool
     => g_env_gpu.gpu_dnd ?? (g_gpu_want.dnd || gpu_want_auto())
 
@@ -1826,6 +2071,17 @@ def public set_moe_gpu_budget_hooks(budget : function<() : int64>; plane : funct
 
 //! Device-local bytes the armed tier may spend on resident weights (0 = no tier).
 def moe_gpu_weight_budget_() : int64 => invoke(g_moe_gpu_budget_report)
+
+def private moe_gpu_no_carve() : int64 => 0l
+
+var private g_moe_gpu_carve_report = @@moe_gpu_no_carve
+
+//! the bytes the tier carves off its cap before the weight budget: the streamed slot and the decode block's mirrors
+def public moe_gpu_weight_carve_() : int64 => invoke(g_moe_gpu_carve_report)
+
+def public set_moe_gpu_carve_fn(f : function<() : int64>) {
+    g_moe_gpu_carve_report = f
+}
 
 //! The OS's video memory numbers, in bytes (all 0 = no OS answer): this process's dedicated ceiling,
 //! what it holds, what every process holds on the adapter, the system memory the adapter maps - the
@@ -1933,6 +2189,228 @@ def public set_moe_gpu_slice_window_fn(f : function<(woff : int64; fmt : int) : 
 
 def public moe_gpu_slice_window(woff : int64; fmt : int) : MoeGpuSliceWindow => invoke(g_moe_gpu_slice_window, woff, fmt)
 
+//! A baked-plan stream gather's place in the image FILE: the path and the absolute byte offsets of its two planes, so a
+//! streamed stack is read straight into its pinned memory with no mapping touched. path == "" = no source for (woff, fmt).
+typedef MoeGpuStreamSource = tuple<path : string; qoff : int64; qbytes : int64; soff : int64; sbytes : int64>
+
+[unused_argument(woff, fmt)]
+def private moe_gpu_no_stream_source(woff : int64; fmt : int) : MoeGpuStreamSource =>
+    default<MoeGpuStreamSource>
+
+var private g_moe_gpu_stream_source = @@moe_gpu_no_stream_source
+
+//! The loader registers its stream-source provider (populated while slicing a flavor image), which [[moe_gpu_stream_source]] asks
+def public set_moe_gpu_stream_source_fn(f : function<(woff : int64; fmt : int) : MoeGpuStreamSource>) {
+    g_moe_gpu_stream_source = f
+}
+
+def public moe_gpu_stream_source(woff : int64; fmt : int) : MoeGpuStreamSource => invoke(g_moe_gpu_stream_source, woff, fmt)
+
+//! One expert of a streamed stack as the expert cache holds it: the slot's quant and scale pointers for the host's reads, the
+//! slot's buffer handles and offsets for the DMA; `present` false where the expert has no slot (resident or ring)
+typedef MoeGpuStreamExpert = tuple<q : uint8 const?; s : uint8 const?; qbuf : uint64; qoff : int64; sbuf : uint64; soff : int64; present : bool>
+
+[unused_argument(woff, fmt, e)]
+def private moe_gpu_no_stream_expert(woff : int64; fmt : int; e : int64) : MoeGpuStreamExpert => default<MoeGpuStreamExpert>
+
+[unused_argument(woff, fmt, e)]
+def private moe_gpu_no_stream_fetch(woff : int64; fmt : int; e : int64) : bool => false
+
+//! A streamed stack as the expert cache lays it out, for a reader that captures it in the main context and resolves experts
+//! on a job lane (a lane holds every global as zero, so no hook is callable there): the resident slots' planes and the slot
+//! table (`slot_of[e]`: a resident slot, `STREAM_RING_BASE` + a ring slot, or -1), the ring's planes of the stack's kind
+typedef MoeGpuStreamView = tuple<q : uint8 const?; s : uint8 const?; slot_of : int const?; nexp : int64; qlen : int64; slen : int64; qoff : int64; soff : int64; ring_q : uint8 const?; ring_s : uint8 const?; ring_qlen : int64; ring_slen : int64>
+
+//! the page a direct lane read aligns to: a ring slot holds its expert's span widened to it, the expert's bytes `(plane offset + e * plane stride) % STREAM_PAGE` in
+let public STREAM_PAGE = 4096l
+
+//! the lane span of expert `e`'s plane at `off` + e * `len`, widened to the page: a direct read lands it whole in one aligned call
+//! (an unaligned span goes through the handle's bounce band a piece at a time, three times the cost), and the expert's bytes
+//! start `skew` into the slot
+def public stream_page_span(off, len, e : int64) : tuple<aoff : int64; alen : int64; skew : int64> {
+    let o = off + e * len
+    let aoff = o & ~(STREAM_PAGE - 1l)
+    return (aoff = aoff, alen = ((o + len + STREAM_PAGE - 1l) & ~(STREAM_PAGE - 1l)) - aoff, skew = o - aoff)
+}
+
+let STREAM_RING_BASE = 1 << 30   //! `slot_of` values from here name a ring slot of the expert cache's transient ring
+
+[unused_argument(woff, fmt)]
+def private moe_gpu_no_stream_view(woff : int64; fmt : int) : MoeGpuStreamView => default<MoeGpuStreamView>
+
+var private g_moe_gpu_stream_view = @@moe_gpu_no_stream_view
+
+//! the streamed stack at (`woff`, `fmt`) as the cache lays it out; `slot_of` null where none sits there
+def public moe_gpu_stream_view(woff : int64; fmt : int) : MoeGpuStreamView => invoke(g_moe_gpu_stream_view, woff, fmt)
+
+def public set_moe_gpu_stream_view_fn(f : function<(woff : int64; fmt : int) : MoeGpuStreamView>) {
+    g_moe_gpu_stream_view = f
+}
+
+[unused_argument(order)]
+def private moe_gpu_no_stream_cache_order(order : array<int>) {}
+
+var private g_moe_gpu_stream_cache_order = @@moe_gpu_no_stream_cache_order
+
+//! the next streamed layers' experts by heat, the hottest first: a partial stack keeps its quota off this list's head; empty puts the id order back
+def public moe_gpu_stream_cache_order(order : array<int>) => invoke(g_moe_gpu_stream_cache_order, order)
+
+def public set_moe_gpu_stream_cache_order_fn(f : function<(order : array<int>) : void>) {
+    g_moe_gpu_stream_cache_order = f
+}
+
+[unused_argument(copies, npool, l, woff1, fmt1)]
+def private moe_gpu_no_xf_pool_window(copies : int const?; npool, l, woff1 : int64; fmt1 : int) {}
+
+var private g_moe_gpu_xf_pool_window = @@moe_gpu_no_xf_pool_window
+
+//! the next per-expert window's first `npool` regions sit on layer `l`'s pool: `copies[r]` the expert region `r`'s slot takes off the stack at `woff1` before its bundle, -1 a hit; null puts the stream form back
+def public moe_gpu_xf_pool_window(copies : int const?; npool, l, woff1 : int64; fmt1 : int) => invoke(g_moe_gpu_xf_pool_window, copies, npool, l, woff1, fmt1)
+
+def public set_moe_gpu_xf_pool_window_fn(f : function<(copies : int const?; npool, l, woff1 : int64; fmt1 : int) : void>) {
+    g_moe_gpu_xf_pool_window = f
+}
+
+[unused_argument(on)]
+def private moe_gpu_no_mint_dry(on : bool) {}
+
+var private g_moe_gpu_mint_dry = @@moe_gpu_no_mint_dry
+
+//! the live tier's walk run dry for the mint - no pinned stack, no device buffer, no upload; off again before the lane is mapped and the model armed
+def public moe_gpu_mint_dry(on : bool) => invoke(g_moe_gpu_mint_dry, on)
+
+def public set_moe_gpu_mint_dry_fn(f : function<(on : bool) : void>) {
+    g_moe_gpu_mint_dry = f
+}
+
+def private moe_gpu_no_host_bytes : int64 => 0l
+
+var private g_moe_gpu_host_bytes = @@moe_gpu_no_host_bytes
+
+//! the bytes of host-visible buffers the tier holds now (pinned stacks, the ring, staging); 0 with no tier
+def public moe_gpu_host_bytes : int64 => invoke(g_moe_gpu_host_bytes)
+
+def public set_moe_gpu_host_bytes_fn(f : function<() : int64>) {
+    g_moe_gpu_host_bytes = f
+}
+
+def private moe_gpu_no_stream_cache_stats : tuple<fetches : int64; us : int64> => (fetches = 0l, us = 0l)
+
+var private g_moe_gpu_stream_cache_stats = @@moe_gpu_no_stream_cache_stats
+
+//! the expert cache's on-demand reads so far (a plane each) and the time waited on them
+def public moe_gpu_stream_cache_stats : tuple<fetches : int64; us : int64> => invoke(g_moe_gpu_stream_cache_stats)
+
+def public set_moe_gpu_stream_cache_stats_fn(f : function<() : tuple<fetches : int64; us : int64>>) {
+    g_moe_gpu_stream_cache_stats = f
+}
+
+[unused_argument(nexp, quota)]
+def private moe_gpu_no_stream_cache_layer(nexp, quota : int64) {}
+
+[unused_argument(slots, path)]
+def private moe_gpu_no_stream_cache_ring(slots : int64; path : string) {}
+
+def private moe_gpu_no_stream_ring_release {}
+
+var private g_moe_gpu_stream_expert = @@moe_gpu_no_stream_expert
+var private g_moe_gpu_stream_fetch = @@moe_gpu_no_stream_fetch
+var private g_moe_gpu_stream_cache_layer = @@moe_gpu_no_stream_cache_layer
+var private g_moe_gpu_stream_cache_ring = @@moe_gpu_no_stream_cache_ring
+var private g_moe_gpu_stream_ring_release = @@moe_gpu_no_stream_ring_release
+
+//! the expert cache's seats: the expert lookup, the on-demand fetch off the lane, the per-layer quota, the ring and its release
+def public set_moe_gpu_stream_cache_fns(expert : function<(woff : int64; fmt : int; e : int64) : MoeGpuStreamExpert>;
+                                        fetch : function<(woff : int64; fmt : int; e : int64) : bool>;
+                                        layer : function<(nexp, quota : int64) : void>;
+                                        ring : function<(slots : int64; path : string) : void>;
+                                        release : function<() : void>) {
+    g_moe_gpu_stream_expert = expert
+    g_moe_gpu_stream_fetch = fetch
+    g_moe_gpu_stream_cache_layer = layer
+    g_moe_gpu_stream_cache_ring = ring
+    g_moe_gpu_stream_ring_release = release
+}
+
+//! expert `e` of the streamed stack at (`woff`, `fmt`) as the cache holds it; `present` false with no slot
+def public moe_gpu_stream_expert(woff : int64; fmt : int; e : int64) : MoeGpuStreamExpert => invoke(g_moe_gpu_stream_expert, woff, fmt, e)
+
+//! expert `e` of the streamed stack at (`woff`, `fmt`) read off the lane into a ring slot where it has none, the call waiting for the read; true with a slot after
+def public moe_gpu_stream_fetch(woff : int64; fmt : int; e : int64) : bool => invoke(g_moe_gpu_stream_fetch, woff, fmt, e)
+
+[unused_argument(woff, fmt, e)]
+def private moe_gpu_no_stream_request(woff : int64; fmt : int; e : int64) : bool => false
+
+var private g_moe_gpu_stream_request = @@moe_gpu_no_stream_request
+var private g_moe_gpu_stream_ready = @@moe_gpu_no_stream_request
+
+def public set_moe_gpu_stream_request_fns(request : function<(woff : int64; fmt : int; e : int64) : bool>;
+                                          ready : function<(woff : int64; fmt : int; e : int64) : bool>) {
+    g_moe_gpu_stream_request = request
+    g_moe_gpu_stream_ready = ready
+}
+
+//! expert `e` of the streamed stack at (`woff`, `fmt`) queued for a reader thread where it has no slot; true where it will have one
+def public moe_gpu_stream_request(woff : int64; fmt : int; e : int64) : bool => invoke(g_moe_gpu_stream_request, woff, fmt, e)
+
+//! whether expert `e` of the streamed stack at (`woff`, `fmt`) sits in a slot the window may read now (a queued read landed)
+def public moe_gpu_stream_ready(woff : int64; fmt : int; e : int64) : bool => invoke(g_moe_gpu_stream_ready, woff, fmt, e)
+
+//! the next streamed layer's stacks hold `nexp` experts, `quota` resident (0 = every one): set before the layer's upload
+def public moe_gpu_stream_cache_layer(nexp, quota : int64) {
+    invoke(g_moe_gpu_stream_cache_layer, nexp, quota)
+}
+
+//! the transient ring: `slots` experts a plane kind, read off `path` (the lane file)
+def public moe_gpu_stream_cache_ring(slots : int64; path : string) {
+    invoke(g_moe_gpu_stream_cache_ring, slots, path)
+}
+
+//! every ring slot freed: the window or the token that read them is done
+def public moe_gpu_stream_ring_release {
+    invoke(g_moe_gpu_stream_ring_release)
+}
+
+//! The host's rows core over a streamed stack's device-layout planes - the tier's own block decode run on the CPU:
+//! y[rb, re) = the rows' dots with one Q8_K activation row (`xq`, a scale a superblock `xs`) over the quant plane `q` and
+//! scale plane `s` of `n`-wide rows; `twin` is the per-lane handle `moe_gpu_host_twin` makes for the format in the main context
+typedef MoeGpuHostRowsFn = function<(twin : void?; var yp : float?; q : uint8 const?; s : uint8 const?; xq : int8 const?; xs : float const?; n, rb, re : int64) : void>
+typedef MoeGpuHostTwinFn = function<(fmt : int) : void?>
+typedef MoeGpuHostServesFn = function<(fmt : int) : bool>
+
+[unused_argument(twin, yp, q, s, xq, xs, n, rb, re)]
+def private moe_gpu_no_host_rows(twin : void?; var yp : float?; q : uint8 const?; s : uint8 const?; xq : int8 const?; xs : float const?; n, rb, re : int64) {
+    panic("dasLLAMA: no host rows core over device planes is installed")
+}
+
+[unused_argument(fmt)]
+def private moe_gpu_no_host_twin(fmt : int) : void? => null
+
+[unused_argument(fmt)]
+def private moe_gpu_no_host_serves(fmt : int) : bool => false
+
+var private g_moe_gpu_host_rows = @@moe_gpu_no_host_rows
+var private g_moe_gpu_host_twin = @@moe_gpu_no_host_twin
+var private g_moe_gpu_host_serves = @@moe_gpu_no_host_serves
+var private g_moe_gpu_host_rows_on = false
+
+def public set_moe_gpu_host_twin_fns(twin : MoeGpuHostTwinFn; rows : MoeGpuHostRowsFn; serves : MoeGpuHostServesFn) {
+    g_moe_gpu_host_twin = twin
+    g_moe_gpu_host_rows = rows
+    g_moe_gpu_host_serves = serves
+    g_moe_gpu_host_rows_on = true
+}
+
+def public moe_gpu_host_rows_on() : bool => g_moe_gpu_host_rows_on
+def public moe_gpu_host_rows_fn() : MoeGpuHostRowsFn => g_moe_gpu_host_rows
+def public moe_gpu_host_twin(fmt : int) : void? => invoke(g_moe_gpu_host_twin, fmt)
+//! whether the host twin serves the tier's `fmt` (allocates nothing)
+def public moe_gpu_host_twin_serves(fmt : int) : bool => invoke(g_moe_gpu_host_serves, fmt)
+//! the rows core the twin's `fmt` reads the activation in: Q8_K for a superblock format (a scale a superblock), else Q8_0
+def public moe_gpu_host_rows(twin : void?; var yp : float?; q : uint8 const?; s : uint8 const?; xq : int8 const?; xs : float const?; n, rb, re : int64) {
+    invoke(g_moe_gpu_host_rows, twin, yp, q, s, xq, xs, n, rb, re)
+}
+
 [unused_argument(base, bytes)]
 def private moe_gpu_no_unmap_notify(base : void?; bytes : uint64) {}
 
@@ -1986,6 +2464,26 @@ def public moe_gpu_tier_installed : bool => g_moe_gpu_installed
 def public set_moe_gpu_total_layers(n : int64) {
     g_installed_marks.total_layers = n
 }
+
+let MOE_GPU_LAND_EXPERTS = 128l   //! the streamed slot as a ring: at most this many experts' planes - the chain's bundles in flight, four of its widest
+
+var private g_moe_gpu_stream_ring = false
+var private g_moe_gpu_stream_ring_experts = 0l
+
+//! the experts a ring of `n_expert` holds: every expert of a layer under the cap, the cap past it
+def public moe_gpu_ring_experts(n_expert : int64) : int64 => clamp(n_expert, 1l, MOE_GPU_LAND_EXPERTS)
+
+//! the streamed slot is the per-expert chain's ring of `experts` experts, not a whole layer's planes: the driver sets it where the
+//! chain serves every streamed layer it is about to upload, and clears it where the per-op rails serve instead and at the drop
+def public set_moe_gpu_stream_ring(on : bool; experts : int64 = 0l) {
+    g_moe_gpu_stream_ring = on
+    g_moe_gpu_stream_ring_experts = on ? experts : 0l
+}
+
+def public moe_gpu_stream_ring() : bool => g_moe_gpu_stream_ring
+
+//! the ring's experts where the ring form is on, 0 otherwise
+def public moe_gpu_stream_ring_experts() : int64 => g_moe_gpu_stream_ring_experts
 
 var private g_moe_gpu_stream_need = 0l
 
@@ -2272,6 +2770,28 @@ def public matmul_moe_gpu_ffn_combined_xf_begin(offs1 : array<int64>; offs3 : ar
 
 def public matmul_moe_gpu_ffn_combined_xf_join(var gout : array<float>) {
     invoke(g_moe_gpu_ffn_xf_join, unsafe(addr(gout[0])))
+}
+
+//! the meet form's open: false where the layer does not stream (the caller takes another form)
+def public matmul_moe_gpu_ffn_combined_xf_open(offs1 : array<int64>; offs3 : array<int64>; offs2 : array<int64>;
+                                               nregions : int64; x : array<float>; w : array<float>; inv : array<uint>;
+                                               n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) : bool {
+    unsafe {
+        return invoke(g_moe_gpu_ffn_xf_open,
+            addr<int64 const?>(offs1[0]), addr<int64 const?>(offs3[0]), addr<int64 const?>(offs2[0]), nregions,
+            addr<float const?>(x[0]), addr<float const?>(w[0]), addr<uint const?>(inv[0]),
+            n, nfe, nrows, npos, f1, f3, f2, is_gelu)
+    }
+}
+
+//! regions [r_lo, r_hi) of the opened window to the device as one bundle; without `wait` false means the ring is full - ask again later
+def public matmul_moe_gpu_ffn_combined_xf_push(r_lo, r_hi : int64; wait : bool) : bool => invoke(g_moe_gpu_ffn_xf_push, r_lo, r_hi, wait)
+
+//! the end of the bundle starting at region `r_lo`, at most `r_max`: what one command of the chain takes
+def public matmul_moe_gpu_ffn_combined_xf_bundle(r_lo, r_max : int64) : int64 => invoke(g_moe_gpu_ffn_xf_bundle, r_lo, r_max)
+
+def public matmul_moe_gpu_ffn_combined_xf_close {
+    invoke(g_moe_gpu_ffn_xf_close)
 }
 
 // ===== the decode attention block: one submit per layer over the resident q/k/v/o quad =====

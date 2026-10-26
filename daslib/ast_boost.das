@@ -102,6 +102,30 @@ def is_same_or_inherited(parent, child : Structure const?) {
     return false
 }
 
+class private VarRefs : AstVisitor {
+    name : string
+    @do_not_delete refs : array<ExprVar?>
+    def override preVisitExprVar(var expr : ExprVar?) : void {
+        if (empty(name) || expr.name == name) {
+            refs |> push(expr)
+        }
+    }
+}
+
+def find_var_refs(var expr : Expression?; name : string = "") : array<ExprVar?> {
+    //! Returns every ``ExprVar`` under ``expr``; with ``name``, only
+    //! those reading it.
+    var astVisitor = new VarRefs(name = name)
+    make_visitor(*astVisitor) $(adapter) {
+        visit(expr, adapter)
+    }
+    var refs <- astVisitor.refs
+    unsafe {
+        delete astVisitor
+    }
+    return <- refs
+}
+
 def is_class_method(cinfo : StructurePtr; finfo : TypeDeclPtr) {
     //! Returns true if the function type declaration is a method of the given class structure.
     if (finfo.baseType != Type.tFunction
@@ -775,7 +799,10 @@ def private walk_and_convert_variant(data : uint8 const?; info : TypeDeclPtr; at
         let vindex = *reinterpret<int?>(data)
         let offset = get_variant_field_offset(info, vindex)
         var mkVariant = new ExprMakeVariant(at = at, makeType = clone_type(info))
-        var elem = walk_and_convert(data + offset, info.argTypes[vindex], at)
+        var elem : Expression?
+        if (!is_bare_variant_case(info, string(info.argNames[vindex]))) {
+            elem = walk_and_convert(data + offset, info.argTypes[vindex], at)
+        }
         var mkS = new MakeFieldDecl(at = at, name := info.argNames[vindex], value = elem)
         if (!info.argTypes[vindex].canCopy) {
             mkS.flags = MakeFieldDeclFlags.moveSemantics

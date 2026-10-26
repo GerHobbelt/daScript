@@ -26,7 +26,8 @@ A companion's sections are listed in three places: its line in this document's r
 (under `File charters` or `Mechanisms`), the companion's own opening, and the routing sentence of
 any sibling companion that sends a reader to it.
 
-- `ARCHITECTURE_ENGINE.md` - the engine core, arch-registration and support charters.
+- `ARCHITECTURE_ENGINE.md` - the engine core, arch-registration and support charters, and the gates that hold the
+  test folder's documents to its files (`ARCHITECTURE_ENGINE.md#test-folder-gates`).
 - `ARCHITECTURE_ENGINE_MECHANISMS.md` - the RoPE scaling the loader folds into the `Model` once
   (`ARCHITECTURE_ENGINE_MECHANISMS.md#rope-scaling-bake`), and the decode pick tape a parity cell
   pins one arm's routing on another with (`ARCHITECTURE_ENGINE_MECHANISMS.md#moe-pick-tape`).
@@ -62,6 +63,8 @@ Each companion's sections are anchored by topic; a citation spells `<doc>.md#<an
 
 - `ARCHITECTURE_IMAGE_VULKAN.md` - the vulkan lane's mint: the GPU walk inside the streaming save, the job-span view, the
   trimmed lane, the walk's decline
+- `ARCHITECTURE_IMAGE_LEDGER.md` - the image rail's ledgered cases: the assistant drafter's non-image lane and the suite
+  cells that mint a model image by design
 - `ARCHITECTURE_IMAGE.md` - the prepared-image rail, the baked dev-W f16 plane, the lattice-only
   per-format plane table both halves of the rail skip around, the baked tower twin-W plane, the
   layout stamp `REVIEW.das` keeps over the byte-placing code, the meta-field tripwire every
@@ -112,13 +115,18 @@ Each companion's sections are anchored by topic; a citation spells `<doc>.md#<an
   chunks, and the short window's peel through the token commands.
 - `ARCHITECTURE_GPU_VULKAN_GEMM.md` - the cooperative-matrix tiles the Vulkan tier's GEMMs run
   on - the cm2 decode lanes, the tile pick and the coopmat mode ladder, the class-pipeline build
-  seat, the MoE expert chain on those tiles, the KHR arm's hand-staged kq tile - and the decode
-  GEMV family's lane split by row length.
+  seat, the MoE expert chain on those tiles - and the decode GEMV family's lane split by row length.
+- `ARCHITECTURE_GPU_VULKAN_KHR.md` - the KHR arm's hand-staged tile, the window GEMMs over a file's
+  f32 rows that ride it on every coopmat card, and why a K-quant window plane stays on the cm2 tiles.
+- `ARCHITECTURE_GPU_VULKAN_ROOM.md` - the room the residency plan may fill on a card shared with a
+  desktop: the OS's answer and the headroom where none comes, the over-commit guards, and the two
+  allocation shapes the Windows memory manager pages out (the priority tag, the mapped ReBAR type).
 - `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` - what a model has to fit on the card before the driver
   runs - the residency plan, the checkpoints a device-home recurrent stream keeps on the device,
   the token rows' gather off the table's own plane, the GPU-slot marks swap that lets one slot
   serve many models, and the hydrate a call passing to the CPU rails takes first.
-- `ARCHITECTURE_GPU_VULKAN_LANDING.md` - the token command's logits landing on the transfer queue.
+- `ARCHITECTURE_GPU_VULKAN_LANDING.md` - the token command's logits landing on the transfer queue, and
+  the selection landing a sampled stream's step takes in place of its rows.
 - `ARCHITECTURE_GPU_VULKAN_MTP.md` - the NextN draft head the resident driver homes beside the
   trunk: the draft command that steps it, the prompt warm the window chain gives its slab, the
   rollback a rejected device verify takes from the verify command's own copies, the verify
@@ -132,13 +140,20 @@ Each companion's sections are anchored by topic; a citation spells `<doc>.md#<an
   step's two forms it holds bit for bit.
 - `ARCHITECTURE_GPU_VULKAN_HC.md` - the whole-model driver's hyper-connection chain (qwen4exp):
   the wide residual's mixer seams on the device, the n-gram side input, the split token
-  command whose routed experts run on the host between its segments, the hot expert pool, and
-  the NextN head and its verify rows on the chain.
+  command whose routed experts run on the host between its segments, the streamed prompt window
+  the host and the device meet in, and the NextN head and its verify rows on the chain.
+- `ARCHITECTURE_GPU_VULKAN_POOL.md` - the whole-model driver's hot expert pool: the slots a routed
+  layer's hottest experts hold beside the mirror, the decode step's DMA fill of its misses, a
+  prompt window's pool prefix, and the decode meet's window over the pool.
 - `ARCHITECTURE_GPU_VULKAN_DECODE.md` - the per-op tier's decode era - the decode attention block
-  over per-layer K/V mirrors, the streamed expert layer's GPU/CPU split, the whole-token decode
-  span, the deltanet decode step's per-session resident state, and the whole-model driver's
-  hybrid token command and prefill (recurrent layers, gated attention, partial rotary, the
-  prefill-to-decode state handoff).
+  over per-layer K/V mirrors, the whole-token decode span, the deltanet decode step's per-session
+  resident state, and the whole-model driver's hybrid token command and prefill (recurrent
+  layers, gated attention, partial rotary, the prefill-to-decode state handoff).
+- `ARCHITECTURE_GPU_VULKAN_STREAM.md` - the streamed expert layers: the prefill GPU/CPU split of
+  a layer whose stacks live on the host, the per-expert chain its GPU head runs - an expert a
+  transfer submit and a compute submit waiting its own copy - the pinned stacks in the device
+  layout the host reads through row-major kernels, the streamed slot as a ring of experts, and
+  the expert cache whose misses read off the lane on demand.
 - `ARCHITECTURE_GPU_VULKAN_PEROP.md` - the per-op tier's dense FFN rail: a dense layer's FFN triple on the dense rail
   and the decode row it runs on the device; the attention-quad chain's gemma decline
   (`ARCHITECTURE_GPU_VULKAN_PEROP.md#perop-attn-gemma`).
@@ -149,16 +164,21 @@ Each companion's sections are anchored by topic; a citation spells `<doc>.md#<an
   eras take.
 - `ARCHITECTURE_GPU_MTP.md` - the Metal speculative round over the batch driver's same-slab
   verify, and the box knob that sets the depth a round drafts.
+- `ARCHITECTURE_GPU_MTP_ACCEPT.md` - what a sampled stream's round does with its drafts on both homes:
+  the three acceptances, the sampler's seams, the drafter distribution a rejection round records,
+  and the chain cut.
 - `ARCHITECTURE_GPU_KV_RING.md` - both homes' sliding-layer K/V ring: a sliding layer's mirror rows as a ring of its
   window and one command's rows (`ARCHITECTURE_GPU_KV_RING.md#kv-sliding-ring`).
 - `ARCHITECTURE_GPU_MTP_ASSISTANT.md` - the gemma-4 assistant drafter on both GPU homes: one
   drafter step, the sidecar and the attach, and the rounds of a scheduler tick.
 - `ARCHITECTURE_GPU_MTP_DECODE.md` - the kernel argument-alignment contract enforced at every
   dispatch, the K-quant small-batch crown and the row-buffer pad a multi-row verify dispatches
-  under, the single-row driver's greedy chain, and the decode layer encoder.
-- `ARCHITECTURE_RUNTIME.md` - kernel shape, caches, lint policy, knobs, coverage, the GPU ramp,
-  the hybrid worker pool, the MoE region split, the job queue the engine dispatches on, and the
-  mode that dispatches to none.
+  under, and the decode layer encoder.
+- `ARCHITECTURE_GPU_MTP_DECODE_PICK.md` - the single-row driver's greedy chain and the Metal
+  selection landing.
+- `ARCHITECTURE_RUNTIME.md` - kernel shape, caches, lint policy, knobs, coverage, the GPU ramp.
+- `ARCHITECTURE_RUNTIME_JOBQUE.md` - the hybrid worker pool, the MoE region split, the job queue
+  the engine dispatches on, and the mode that dispatches to none.
 - `ARCHITECTURE_MEDIA.md` - the padded tower GEMM widths, the family GPU hooks, the tower weight
   lane, the plain-Model ASR decoders, and the parakeet decode step.
 - `ARCHITECTURE_MEASUREMENT.md` - the benchmark rig, the tune gate, the sanctioned

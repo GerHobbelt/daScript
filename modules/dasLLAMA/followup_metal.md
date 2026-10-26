@@ -414,7 +414,7 @@ buffer already queued, the blocking `waitUntilCompleted` returning about a step 
 that locks per process and that the M5 never enters; the bench process pays it on every
 unchained step too (IQ2_XXS 235.7 against 256.5 t/s). A spin on the command buffer's GPU end
 time removes it (5.66 ms per token, three runs alike; the M5 unchanged), shipped on by default
-as `DASLLAMA_METAL_WAIT_SPIN` (`ARCHITECTURE_GPU_MTP_DECODE.md` 2.38): decode 0.94 -> 1.03 (0.5B),
+as `DASLLAMA_METAL_WAIT_SPIN` (`ARCHITECTURE_GPU_MTP_DECODE_PICK.md#greedy-chain`): decode 0.94 -> 1.03 (0.5B),
 0.96 -> 1.03 (1.5B), 0.95 -> 1.00 (Llama Q8), 0.93 -> 1.00 (Llama Q4_K_M).
 
 The fourth: **the 128-row tall stamps lose on this GPU** (Llama-1B 5%, the 30B 1%, the 9B
@@ -671,7 +671,7 @@ sampler's argmax over four 262144-wide rows 0.19, the driver's setup + sched + h
 wake 0.4. The pipelined submission (`DASLLAMA_METAL_BATCH_PIPE=1`, a bench-only rail: it serves the
 PREVIOUS step's logits) hides all of it - 12.01 against 13.34 ms in the probe - which bounds the
 lever: the next step committed BEFORE the current one lands, on the GPU's own argmax (the rows twin
-of the single-row greedy chain, `ARCHITECTURE_GPU_MTP_DECODE.md#greedy-chain`: argmax rows -> per-row embed gather -> the PLE gather +
+of the single-row greedy chain, `ARCHITECTURE_GPU_MTP_DECODE_PICK.md#greedy-chain`: argmax rows -> per-row embed gather -> the PLE gather +
 model_proj chain of row 13 on device -> the layer stack), verified against the caller's tokens at
 the landing, a miss re-running the step; only rows whose sampler is a bare argmax may chain. The
 elementwise chain's dispatch count (~40 us a layer at four rows) is the second, smaller lever. The
@@ -913,18 +913,6 @@ window was dropped never returns: eight bytes a transcription, for as long as th
 pending mark on the state itself (a flag beside `DecoderState.gpu_uid`, the driver's one pending id beside
 it), so nothing outlives the state; both drivers in one change, the Vulkan one on a Vulkan box.
 
-## 44. A one-row rows-form step drafts differently from the two-row form
-
-The NextN draft rows step keeps two rows for a solo stream (`nrows = max(ng, 2)`,
-`ARCHITECTURE_GPU_MTP.md#mtp-joint-verify`) because a one-row rows-form step drafts other tokens than the
-two-row form on a share of the rounds, while the two- and three-row forms agree
-(`PERF_LEDGER.md`'s 2026-10-05 depth-1 NextN entry). The cause is not found: the shared layer encoder's single-row-driver
-branches keyed on the row count (`ple_side_step`, the `attn_d` gate at one row) do not fire on the model
-measured, and forcing the rows forms on for a one-row draft widened the gap. What a one-row step does
-differently: `mp = 1` buffers under a two-row tile, no `verify` row-total uniforms, the zero-copy logits
-(`acquire_step`). The work: find which of those the rows form reads wrong at one row, key every single-row
-branch on `SINGLE`, then race the one-row draft against the two-row form.
-
 ## 47. A gathered expert form that reads a plane once for an expert's few rows
 
 The gathered route (`ARCHITECTURE_GPU_PREFILL_MOE.md#prefill-moe-gemv-route`) reads an expert's weights once per
@@ -990,21 +978,6 @@ No stocked tower trips a guard; a family added at another geometry would run on 
 the ragged stamps - a row tail on the tile GEMMs and the attention restride, a head-width parameter on the window
 attention - so the guards narrow to what the kernels cannot read.
 
-## 51. A short request's prefill splits at the prefix checkpoints, and the window past the split costs a third of its GPU time
-
-The Metal prefill stops at every planned checkpoint (`prefix_checkpoint_at_`: the stable opening, the system text)
-and runs the remainder as its own window, because a recurrent layer's state at the checkpoint position exists only
-where the scan stops there. On the M1 Max the house replay's short answers (375 uncached tokens, two windows each)
-spend a median 130-167 ms of their 650-680 ms of window time in the windows past the largest: a 51-token window
-costs ~180 ms and a 7-token one ~40, where the 300-token window runs at 1.4 ms a token. The K/V half of a checkpoint
-is positional and already in the mirror; the recurrent half is one scan dispatch over the window (`enc_dn_scan_h`),
-which can run as two - the rows before and after the position, the state buffer copied out between them, the conv
-history at the position the three input rows before it - with everything else in the window, the expert GEMMs above
-all, one pass. The work: the scheduler's chunk-ends-at-checkpoint rule becomes a capture-at-position list for the
-Metal prefill (the CPU prefill keeps stopping), the recurrent layer's scan is segmented at those positions with its
-state copied out, the checkpoint store takes a state snapshot from a device buffer, and the replay's split cost
-leaves the short requests' window time. The figures are `PERF_LEDGER.md`'s 2026-10-09 server-timeline entry.
-
 ## 52. The decode step's time sits outside the expert GEMVs
 
 On the M1 Max a Qwen3.6-35B-A3B decode step is 10.6 ms of GPU time, and the routed expert GEMVs are 1.9 ms of it
@@ -1025,3 +998,10 @@ round apart from the decode step's at a near-tie; the scheduler keeps the step. 
 work: one dispatch a layer over every segment - a segment table the attention tiles and the scan read their row range,
 key extent and slices from, the batched decode's route-table shape lifted to tiles - so a segment costs its rows alone;
 then the rider is a one-row segment of a window that is no stall.
+
+## 54. The block-codec decode attention costs 1.5x the f16 stamp's time a key
+
+`MetalSqAttnDQuantT`'s per-key loop is instruction-bound beside the f16 twin (`harness/attn_d_codec_race.das`, the 30B
+shape; the figures in `PERF_LEDGER.md`'s 2026-10-19 long-prompt entry), and neither a 16-bit word view of the quants nor a
+lane-eight mapping with shuffle reductions beat it - both read slower, the hardware reduction being the cheap part. Done =
+a block-codec stamp within 1.15x of f16 a key on the race at 2048 and 8192, or the lever named that keeps it where it is.

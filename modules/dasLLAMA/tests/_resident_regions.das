@@ -17,7 +17,7 @@ require daslib/fio
 require dasllama/dasllama_math   // with_dasllama_jobque_ (the engine-standard jobque config)
 require dasllama/dasllama_gpu_tier   // moe_gpu_tier_installed / gpu_want_auto: is the tier armed; gpu_cpu_passes_
 require dasllama/dasllama_gpu_resident   // set_gpu_resident_regions_, moe_gpu_resident_active
-require ?vulkan dasllama/dasllama_vulkan_common   // PF_WINDOW, where the module exists
+require ?vulkan dasllama/dasllama_vulkan_common   // the prompt window's rows, where the module exists
 require ?vulkan dasllama/dasllama_vulkan_decode   // vk_rdec_token_n_rows: the N-row command served the batched cells' rows
 require ?vulkan dasllama/dasllama_vulkan_classes   // GEMV_COL_TILE: the groups cell's column tiles
 require ?vulkan dasllama/dasllama_vulkan_classes
@@ -265,7 +265,7 @@ def private prose_ids(n, salt : int64) : array<int64> => <- resident_prompt(n, s
 
 //! the logits of `prompt`'s first `n - 1` tokens on a session of its own, gone before the caller makes the compared pair (two
 //! regions hold two live sessions): the one-token-short control a prefill compare holds its bar against
-def private short_control(tr : Model; prompt : array<int64>; n : int64) : array<float> {
+def short_control(tr : Model; prompt : array<int64>; n : int64) : array<float> {
     var short <- create_session(tr, mirror_kv_dtype())
     var less <- [for (i in range64(n - 1l)); prompt[i]]
     forward_prefill(tr, short, less, n - 1l, 0l)
@@ -276,7 +276,7 @@ def private short_control(tr : Model; prompt : array<int64>; n : int64) : array<
 }
 
 //! `prompt` prefilled in one call against the same prompt prefilled as [0, cut) then [cut, n), then four fed steps on both
-def private continue_at(t : T?; tr : Model; n, cut : int64; rel : float) {
+def continue_at(t : T?; tr : Model; n, cut : int64; rel : float) {
     var prompt <- prose_ids(n, 0l)
     var head <- [for (i in range64(cut)); prompt[i]]
     var tail <- [for (i in range64(n - cut)); prompt[cut + i]]
@@ -319,7 +319,7 @@ def cell_prefill_continues_on_the_device(t : T?; file : string) {
 def cell_prefill_continues_on_the_device(t : T?; file : string; rel : float) {
     t |> run("a prefill from a position past zero runs the window chain over the region's rows") @(t : T?) {
         with_regions_rig(t, file) $(tr) {
-            assert_pf_window(t)
+            return if (!assert_pf_window(t))
             continue_at(t, tr, 57l, 40l, rel)     // a short tail inside the first window
             continue_at(t, tr, PF_WINDOW_ROWS + 88l, PF_WINDOW_ROWS, rel)   // the cut on the window boundary
             continue_at(t, tr, PF_WINDOW_ROWS + 388l, 300l, rel)   // the tail runs a whole window from an unaligned start, then a remainder
@@ -566,31 +566,8 @@ def cell_regions_batched_side_rows(t : T?; file : string) {
 def private batched_rows_logits(t : T?; tr : Model) : array<array<float>> {
     var prompts <- [ <- prompt_a(), <- prompt_b()]
     var feeds <- [ <- feed_a(), <- feed_b()]
-    var sessions : array<Session>
-    sessions |> reserve(2)
-    for (p in prompts) {
-        sessions |> emplace <| create_session(tr, mirror_kv_dtype())
-        eval(tr, sessions[length(sessions) - 1], p)
-    }
-    var sess <- [for (i in range(2)); unsafe(addr(sessions[i]))]
-    var rows : array<array<float>>
-    let steps0 = rdec_nrow_steps()
-    with_batch_rows(tr, sess) $(var ws; var sx) {
-        for (st in range64(STEPS)) {
-            var toks <- [for (i in range(2)); feeds[i][st]]
-            eval_batch(tr, ws, sx, toks)
-            delete toks
-            for (s in sessions) {
-                rows |> push_clone(s.logits)
-            }
-        }
-    }
-    t |> equal(rdec_nrow_steps() - steps0, STEPS, "every batched step went through the N-row command")
+    var rows <- batched_logits_rows(t, tr, prompts, feeds, mirror_kv_dtype(), STEPS) <| $ => rdec_nrow_steps()
     served_every_call(t)
-    unsafe {
-        delete sess
-    }
-    delete sessions
     delete prompts
     delete feeds
     return <- rows
@@ -626,12 +603,7 @@ def cell_regions_batched_embed_gather(t : T?; file : string) {
                     t |> equal(vk_rdec_nrow_embed_gathered() - g0, 0l, "with the gather off no batched row gathered: the counter's control")
                     t |> equal(batch_rows_host_embedded() - h0, 2l * STEPS, "with the gather off the host embedded every batched row")
                     t |> equal(vk_rdec_nrow_side_gathered() - side0, 0l, "with the gather off no side row gathered off an id: the side-rows cell's control")
-                    t |> equal(long_length(dev), long_length(host), "both loads stepped every row")
-                    for (i in range64(min(long_length(dev), long_length(host)))) {
-                        let diff = logits_maxdiff(dev[i], host[i])
-                        log_logits_pair(tr, "step {i / 2l}, row {i % 2l}: the gathered row against the host row", dev[i], host[i], diff)
-                        t |> equal(diff, 0.0, "step {i / 2l}, row {i % 2l}: the gathered rows' logits bit for bit the host rows' (maxdiff {diff})")
-                    }
+                    gathered_rows_bit_same(t, tr, file, dev, host, 2l)
                 }
             }
             delete dev
@@ -772,7 +744,7 @@ def cell_long_prompt_against_cpu(t : T?; file : string; lc : LongCtx) {
 def cell_long_continuation(t : T?; file : string; lc : LongCtx) {
     t |> run("a {lc.split_n}-token prompt cut at {lc.split_cut}: the continued prefill and the steps over it against the one-call prefill") @(t : T?) {
         with_regions_rig(t, file, long_load(lc)) $(tr) {
-            assert_pf_window(t)
+            return if (!assert_pf_window(t))
             rings_armed(t, tr)
             continue_at(t, tr, lc.split_n, lc.split_cut, SPLIT_BAR_REL)
             served_every_call(t)
@@ -1637,6 +1609,19 @@ def cell_ring_floor(t : T?; file : string) {
             s.n_past = 0l
             eval(tr, s, short)
             t |> equal(s.kv_ring_floor, 0l, "a prompt from 0 rebuilds the history: its 40 rows reach no ring, so no floor")
+            s.n_past = 0l
+            eval(tr, s, prompt)
+            t |> equal(s.kv_ring_floor, floor, "the long prompt again raises the floor")
+            s.n_past = 0l
+            var row0 <- [short[0]]
+            eval(tr, s, row0)
+            t |> equal(s.kv_ring_floor, 0l, "a one-token decode of row 0 rebuilds the history too: the claim's high-water mark drops with it, so no floor")
+            let why1 = panic_text() ${
+                var row1 <- [short[1]]
+                eval(tr, s, row1)
+            }
+            t |> equal(why1, "", "and the decode at 1 continues (a bench's tg rows after its pp rows)")
+            delete row0
             delete s
             var d <- device_session(tr)
             eval(tr, d, prompt)

@@ -20,6 +20,8 @@ require dasllama/dasllama_tokenizer   // the tg-real row needs REAL tokens (see 
 require dasllama/dasllama_asr   // --asr: load_asr_model/create_session/transcribe
 require dasllama/dasllama_audio   // --asr: AUDIO_SAMPLE_RATE, the 16 kHz mono contract
 require dasllama/dasllama_tower   // the encode-stage prof rail (set_asr_prof/asr_prof_ms)
+require dasllama/dasllama_styletts2   // --tts: the StyleTTS2 seats' engage counters
+require dasllama/dasllama_pocket   // --tts: the Pocket seats' engage counters
 require ?das_metal dasllama/dasllama_metal_tower   // --asr --ngl: the tower engage counters (anti-sandbag)
 require ?das_metal dasllama/dasllama_metal_asr_dec   // --asr CPU rows pin the wdec driver off (CPU means CPU)
 require ?das_metal dasllama/dasllama_metal_prefill   // --asr --ngl: the chat-decoder prefill engage witness
@@ -37,6 +39,7 @@ require ?llvm dasllama/dasllama_exchange   // nolint:STYLE030,LINT019 — OPTION
 require [tune_framework]   // nolint:STYLE030,LINT019 — OPTIONAL: tune_app_script, the exe-vs-script discriminator behind --for-debug-purposes
 require daslib/jobque_boost
 require daslib/clargs
+require daslib/enum_trait   // to_enum: --mtp-accept by the MtpAccept member's name
 require daslib/fio
 require daslib/md_boost
 require math
@@ -47,6 +50,8 @@ require dasllama/dasllama_env
 //   pp: one batched forward_prefill of -p tokens from an empty cache per rep
 //   tg: -n single-token forwards at pos 0.. per rep, feeding synthetic ids with NO logit read
 //       (llama-bench never samples — sampling cost is excluded by design)
+//   tg-real<n> (--mtp-ab, --tok) drops no warmup round: every rep is timed; tg<n>@<npl> drops none either - each rep's
+//       batched command opens with one untimed warm step inside the rep
 //   ours:   bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m <model.gguf>
 //   theirs: --ref <llama-bench> runs it on the same GGUF with the same -t/-p/-n/-r/--ngl
 // `-o json` emits public bench records (schema: METHODOLOGY.md "The record") on stdout — progress goes to
@@ -97,7 +102,7 @@ struct Args {
     @clarg_doc = "Timed repetitions of the batched row, both engines (default: -r)"
     npl_reps : int = 0
     @clarg_name = "npl-mtp"
-    @clarg_doc = "The batched tg row's streams tick through the self-speculative round (a NextN model), every stream's verify rows in one joint pass; the reference row stays plain decode"
+    @clarg_doc = "The batched tg row's streams tick through the self-speculative round (a NextN model), each stream its own round a tick; the reference row stays plain decode"
     npl_mtp : bool
 
     @clarg_doc = "Arm the accelerate (+AMX/SME) float-batch tier for the das run — the 'cpu + AMX' board row (records flavor 'accel'; CPU only, fails where das_accelerate is not built)"
@@ -144,6 +149,10 @@ struct Args {
     @clarg_doc = "A/B the attention GPU chain in-process: every row runs twice, attention routing OFF then ON. Needs DASLLAMA_GPU_ATTN=1 (uploads + marks); mutually exclusive with the other A/B levers"
     attn_ab : bool
 
+    @clarg_name = "ab-reverse"
+    @clarg_doc = "Run the A/B lever's arms ON then OFF instead of OFF then ON: a box whose clock drifts across a run reads a race in both orders and takes the pair"
+    ab_reverse : bool
+
     @clarg_doc = "A/B the GPU MoE prefill arm in-process: every row runs twice, device-side prefill OFF then ON. Needs resident expert layers (DASLLAMA_GPU_MOE_LAYERS); decode has no npos gate so tg reads as a wash. Mutually exclusive with the other A/B levers"
     prefill_ab : bool
 
@@ -155,6 +164,14 @@ struct Args {
     @clarg_doc = "Speculative depth for the --mtp-ab ON arm: drafts per round (the verify runs depth+1 rows). 0 = the box profile's default for the round kind (runtime.mtp_depth_nextn / mtp_depth_assistant, 1 when unminted)"
     mtp_depth : int = 0
 
+    @clarg_name = "mtp-min-p"
+    @clarg_doc = "The --mtp-ab ON arm's chain cut: a round drafts past a draft only while that draft's probability under the head reaches this (0 = off, the depth alone decides); the head's logits land on the host for the read"
+    mtp_min_p : float = 0.0
+
+    @clarg_name = "mtp-accept"
+    @clarg_doc = "The --mtp-ab ON arm's acceptance under --mtp-temp: rejection (the default: the head samples its draft and records q; accept with min(1, p/q), else the residual), exact (a draft accepted where the row's draw equals it), typical (where the sampler's cuts admit it, whatever the draw) - set_mtp_accept"
+    mtp_accept : string = "rejection"
+
     @clarg_name = "mtp-ab"
     @clarg_doc = "A/B MTP/NextN self-speculation in-process, OFF then ON (needs a NextN head in the GGUF). Runs the tg-real row, NOT the llama-bench tg row — acceptance is meaningless on synthetic ids. Reports the draft accept rate; mutually exclusive with the other A/B levers"
     mtp_ab : bool
@@ -162,6 +179,18 @@ struct Args {
     @clarg_name = "mtp-temp"
     @clarg_doc = "Sampling temperature for BOTH --mtp-ab arms (default 0 = greedy): the off arm samples every token, the on arm's accept walk draws each verify row with the same sampler (sample-and-match), both seeded alike - the sampled speed and acceptance"
     mtp_temp : float = 0.0
+
+    @clarg_name = "mtp-top-p"
+    @clarg_doc = "The nucleus of the --mtp-temp sampler on BOTH arms (default 1 = no cut): what typical acceptance admits, since a sampler with no cut admits every token"
+    mtp_top_p : float = 1.0
+
+    @clarg_name = "mtp-select"
+    @clarg_doc = "A sampled stream's device steps land the rows' survivors, max and denominator instead of the rows (default on; --mtp-select=false lands the rows) - set_select_landing"
+    mtp_select : bool = true
+
+    @clarg_name = "mtp-top-k"
+    @clarg_doc = "The top-k of the --mtp-temp sampler on BOTH arms (default 0 = off): within the candidate-list cap the sampler's cuts, draws and the rejection drafter's q run over k survivors instead of the whole row"
+    mtp_top_k : int = 0
 
     @clarg_doc = "A/B the resident ladder's per-token re-encode in-process: every row runs twice, recorded-once then re-encoded every token. Prices the carrier class twins' push-borne pos/cnt (vulkan resident decode only); mutually exclusive with the other A/B levers"
     rerecord_ab : bool
@@ -179,6 +208,17 @@ struct Args {
     @clarg_name = "asr-clips"
     @clarg_doc = "ASR cell: comma list of corpus clips timed in place of the catalog row's buckets (a lever loop's one clip, or the long clips a row's list stops before)"
     asr_clips : string = ""
+
+    @clarg_doc = "TTS cell mode: -m is a TTS GGUF; synthesizes the g2p corpus's first --tts-sentences sentences at --tts-voice, best-of -r per sentence, and emits one tts:g2p<N>@<voice> test (generation ms and audio seconds, summed)"
+    tts : bool
+
+    @clarg_name = "tts-voice"
+    @clarg_doc = "TTS cell: the voice (default: the TTS catalog's voice for -m's file)"
+    tts_voice : string = ""
+
+    @clarg_name = "tts-sentences"
+    @clarg_doc = "TTS cell: sentences from the head of the g2p corpus (default: 20)"
+    tts_sentences : int = TTS_BENCH_SENTENCES
 
     @clarg_doc = "Parity pregate mode: run -m's frozen pinned-greedy fixture from the model-set table (model_specs.das) and exit — 0 only on token-for-token, with both decoded texts printed; no timings. The board driver runs this before a model's first cell"
     parity : bool
@@ -217,6 +257,42 @@ struct Args {
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
+}
+
+//! The media cells' --accel arm: refused beside --ngl and on a build without das_accelerate,
+//! else the +AMX float-batch tier armed at the shipped defaults, as the LLM leg arms it.
+def private arm_accel_tier(accel, gpu : bool) : bool {
+    return true if (!accel)
+    if (gpu) {
+        print("--accel is a CPU-tier lever - drop it or run with -ngl 0\n")
+        return false
+    }
+    static_if (typeinfo builtin_module_exists(das_accelerate)) {
+        dasllama_accelerate_enable(32l)
+        print("DASLLAMA_ACCEL armed (float-batch tier, min ntok 32) - this row measures the accelerate lane\n")
+        return true
+    } else {
+        print("--accel requested but das_accelerate is not built on this platform - no accel row to measure\n")
+        return false
+    }
+}
+
+//! A media cell's records: written to `json_path` when one is named, and printed.
+def private emit_cell_records(models : array<BenchModel>; json_path : string) {
+    let text = sprint_json(models, true)
+    if (!empty(json_path)) {
+        var wrote = false
+        fopen(json_path, "wb") $(f) {
+            if (f != null) {
+                fwrite(f, text)
+                wrote = true
+            }
+        }
+        if (!wrote) {
+            print("warning: could not open {json_path} for writing - no records file\n")
+        }
+    }
+    print("{text}\n")
 }
 
 // ===== ASR cell mode (--asr) =====
@@ -439,18 +515,7 @@ def private asr_measure_spec(spec : AsrModelSpec; reps, threads : int; var jsonM
 //! prefill engagement, exits the leg non-zero.
 def private asr_cell_main(model, json_path : string; reps, threads : int; gpu, accel : bool; clip_override : string) : bool {
     allow_cpu_prefill()   //! Conformer/planar decoder paths still CPU-prefill by protocol
-    if (accel && gpu) {
-        print("--accel is a CPU-tier lever - drop it or run with -ngl 0\n")
-        return false
-    }
-    if (accel) {
-        static_if (typeinfo builtin_module_exists(das_accelerate)) {
-            dasllama_accelerate_enable(32l)   // the shipped +AMX defaults, same as the LLM leg
-        } else {
-            print("--accel requested but das_accelerate is not built on this platform - no accel row to measure\n")
-            return false
-        }
-    }
+    return false if (!arm_accel_tier(accel, gpu))
     if (gpu) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
             set_metal_mode(MetalMode.when_available)   //! before the loads: the audio-chat decoders mint the blob flavor and ride the Metal rail
@@ -506,20 +571,7 @@ def private asr_cell_main(model, json_path : string; reps, threads : int; gpu, a
         print("lcpp_bench --asr: no catalog model matches '{model}'\n")
         return false
     }
-    let text = sprint_json(jsonModels, true)
-    if (!empty(json_path)) {
-        var wrote = false
-        fopen(json_path, "wb") $(f) {
-            if (f != null) {
-                fwrite(f, text)
-                wrote = true
-            }
-        }
-        if (!wrote) {
-            print("warning: could not open {json_path} for writing - no records file\n")
-        }
-    }
-    print("{text}\n")
+    emit_cell_records(jsonModels, json_path)
     return true
 }
 
@@ -580,19 +632,7 @@ def private image_cell_main(model, mmproj, image, prompt, json_path : string; re
     } else {
         allow_cpu_prefill()   // the CPU arm is CPU by intent — disarm the Metal-build tripwire
     }
-    if (accel && gpu) {
-        print("--accel is a CPU-tier lever - drop it or run with -ngl 0\n")
-        return false
-    }
-    if (accel) {   // the +AMX tier — the tower's bf16 GEMMs are exactly the float-batch shapes it serves
-        static_if (typeinfo builtin_module_exists(das_accelerate)) {
-            dasllama_accelerate_enable(32l)   // the shipped +AMX defaults, same as the LLM leg
-            print("DASLLAMA_ACCEL armed (float-batch tier, min ntok 32) - this row measures the accelerate lane\n")
-        } else {
-            print("--accel requested but das_accelerate is not built on this platform - no accel row to measure\n")
-            return false
-        }
-    }
+    return false if (!arm_accel_tier(accel, gpu))   // the +AMX tier — the tower's bf16 GEMMs are exactly the float-batch shapes it serves
     static_if (typeinfo builtin_module_exists(das_metal)) {
         if (!gpu) {   // a CPU/accel row means CPU: the default-on tower driver would silently GPU-serve the encode
             set_metal_tower(false)
@@ -675,20 +715,123 @@ def private image_cell_main(model, mmproj, image, prompt, json_path : string; re
     if (empty(jsonModels)) {
         return false
     }
-    let text = sprint_json(jsonModels, true)
-    if (!empty(json_path)) {
-        var wrote = false
-        fopen(json_path, "wb") $(f) {
-            if (f != null) {
-                fwrite(f, text)
-                wrote = true
-            }
-        }
-        if (!wrote) {
-            print("warning: could not open {json_path} for writing - no records file\n")
+    emit_cell_records(jsonModels, json_path)
+    return true
+}
+
+// ===== TTS cell mode (--tts) =====
+// The synthesis sibling of the ASR cell: one process, one tune-key demand, one image-identity
+// stamp. The reference packages run in gen_bench_records beside it, as for the other modalities.
+
+//! Calls and serves of every seat of the family's GPU hook record, since the process started.
+def private tts_seat_counts(kind : TtsKind) : tuple<calls : array<int>; served : array<int>> {
+    var inscope seats <- kind == TtsKind.pocket ? pocket_gpu_seats() : styletts2_gpu_seats()
+    var out : tuple<calls : array<int>; served : array<int>>
+    out.calls |> reserve(length(seats))
+    out.served |> reserve(length(seats))
+    for (s in seats) {
+        let st = kind == TtsKind.pocket ? pocket_gpu_stats(s) : styletts2_gpu_stats(s)
+        out.calls |> push(st.calls)
+        out.served |> push(st.served)
+    }
+    return <- out
+}
+
+//! Best-of-`reps` generation wall of one sentence in ms - the wall around the synthesis less its
+//! front end, so the das side times what the reference times - and the audio seconds it spoke.
+def private measure_tts(var m : TtsModel; text, voice : string; reps : int) : tuple<ms : double; audio_s : double> {
+    var best = 1.0e30lf
+    var audio_s = 0.0lf
+    for (_rep in range(reps)) {
+        let t0 = ref_time_ticks()
+        var inscope a <- synthesize(m, text, voice)
+        let ms = double(get_time_usec(t0)) / 1000.0lf - double(a.timings.front_end_us) / 1000.0lf
+        best = min(best, ms)
+        audio_s = double(length(a.pcm)) / double(a.sample_rate)
+    }
+    return (ms = best, audio_s = audio_s)
+}
+
+//! The --tts entry: the corpus head through one model at one voice, one `tts:g2p<N>@<voice>` test
+//! summing each sentence's best-of-`reps` generation ms and its audio seconds. --ngl serves every
+//! chunk on the Metal tower and fails the cell where a seat fell back; a CPU row pins the tower off
+//! on Metal, and on a Vulkan build stamps `vulkan` where the TTS seats served every chunk.
+[arch(at = "../ARCHITECTURE_MEASUREMENT.md#the-tts-reference-instrument")]
+def private tts_cell_main(model, voice_arg, json_path : string; sentences, reps, threads : int; gpu, accel : bool) : bool {
+    return false if (!arm_accel_tier(accel, gpu))
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        set_metal_tower(gpu)   // a CPU/accel row means CPU: the default-on tower would serve the seats
+    } else {
+        if (gpu) {
+            print("lcpp_bench --tts: --ngl needs a Metal build (no das_metal on this platform)\n")
+            return false
         }
     }
-    print("{text}\n")
+    let voice = empty(voice_arg) ? tts_spec_of(model).voice : voice_arg
+    if (empty(voice)) {
+        print("lcpp_bench --tts: {base_name(model)} has no TTS catalog row - name the voice with --tts-voice\n")
+        return false
+    }
+    if (!stat(model).is_valid) {
+        print("lcpp_bench --tts: missing model '{model}'\n")
+        return false
+    }
+    var inscope corpus <- tts_corpus_head(fread(tts_corpus_path()), sentences)
+    if (empty(corpus) || length(corpus) < sentences) {
+        print("lcpp_bench --tts: {tts_corpus_path()} holds {length(corpus)} of the {sentences} sentences asked\n")
+        return false
+    }
+    apply_box_profile_runtime()
+    return false if (!tune_gate())   // never measure on fallback winners
+    var jsonModels : array<BenchModel>
+    var ok = true
+    with_dasllama_jobque_() {
+        print("live: {get_dispatch_lanes()} dispatch lanes ({get_total_hw_jobs()} workers)\n")
+        var inscope m <- load_tts_model(model)
+        var inscope seats0 <- tts_seat_counts(m.kind)
+        measure_tts(m, corpus[0].text, voice, 1)   // warm: JIT + first touch + the seats' slabs
+        var total_ms = 0.0lf
+        var total_audio = 0.0lf
+        for (s in corpus) {
+            let r = measure_tts(m, s.text, voice, reps)
+            total_ms += r.ms
+            total_audio += r.audio_s
+            print("lcpp_bench --tts: {s.id} {r.audio_s} s audio in {r.ms} ms (rtf {r.ms / 1000.0lf / max(r.audio_s, 1e-9lf)})\n")
+        }
+        var inscope seats1 <- tts_seat_counts(m.kind)
+        var inscope dcalls <- [for (a, b in seats0.calls, seats1.calls); b - a]
+        var inscope dserved <- [for (a, b in seats0.served, seats1.served); b - a]
+        let verdict = tts_seat_verdict(dcalls, dserved)
+        print("lcpp_bench --tts: GPU seats {verdict} - calls {dcalls}, served {dserved}\n")
+        var backend = gpu ? "metal" : "cpu"
+        if (gpu && verdict != "all") {
+            print("lcpp_bench --tts: LOUD FAIL - gpu row {base_name(model)} served {verdict} of its seats' calls - a \"metal\" row that measured the CPU\n")
+            ok = false
+        } elif (!gpu && verdict == "partial") {
+            print("lcpp_bench --tts: LOUD FAIL - {base_name(model)}: the GPU seats served some chunks but not all, so the row is neither a CPU row nor a GPU one - no number\n")
+            ok = false
+        } elif (!gpu && verdict == "all") {
+            backend = "vulkan"   // only a Vulkan build reaches here: on Metal the CPU arm pinned the tower off
+        }
+        print("lcpp_bench --tts: {base_name(model)} {voice} {length(corpus)} sentences, {total_audio} s of audio in {total_ms} ms (rtf {total_ms / 1000.0lf / max(total_audio, 1e-9lf)})\n")
+        var run = BenchRun(engine = "das", backend = backend, flavor = flavor_stamp(accel ? "accel" : "tuned"),
+            exec_fmt = "{m.kind} {tts_serves_q8() ? "q8" : "f32"} lane",
+            workload = "tts", box = box_name(), threads = threads,
+            date = format_time(get_clock(), "%Y-%m-%d"), cmd = bench_cmd_line(), env = bench_env_line(),
+            sha = run_capture("git rev-parse --short=9 HEAD", true), version = das_version(),
+            dasllama_version = DASLLAMA_RELEASE,
+            tune = tune_summary(), tune_sha = tune_manifest_sha(), noise = tune_manifest_noise(),
+            hardware = gather_hardware(),
+            files <- [file_identity(model, "weights"), file_identity(tts_corpus_path(), "corpus")])
+        run.tests |> insert(tts_test_key(sentences, voice), BenchTest(ms = total_ms, audio_s = total_audio))
+        let spec = tts_spec_of(model)
+        var cell = BenchModel(gguf = base_name(model), arch = empty(spec.display) ? "{m.kind}" : spec.display,
+                              size_bytes = int64(stat(model).size))
+        cell.runs |> emplace(run)
+        jsonModels |> emplace(cell)
+    }
+    return false if (!ok)
+    emit_cell_records(jsonModels, json_path)
     return true
 }
 
@@ -785,10 +928,7 @@ def rows_ctx_need(plen, ngen, bplen : int64; npl : int; spec_rows : int64) : int
 // Non-private: tests/test_tok_seed.das gates the header walk.
 //! `--mtp-ab` on a model with no NextN head: the assistant drafter beside `mpath` attached to `t` through the facade - false where
 //! no sidecar sits beside the model or no backend takes it, which the bench refuses
-def mtp_ab_drafter_attach(t : Model; mpath : string) : bool {
-    let side = mtp_drafter_sidecar_(mpath)
-    return !empty(side) && empty(attach_mtp_drafter_(t, side))
-}
+def mtp_ab_drafter_attach(t : Model; mpath : string) : bool => !empty(attach_mtp_sidecar_(t, mpath))
 
 //! `--mtp-ab`'s drafter line: the attached drafter's rounds, its draft chain and verify a round, its cold steps' whole time
 def mtp_ab_drafter_line(gs : MtpAssistantStats) : string {
@@ -1170,10 +1310,12 @@ def private argmax_logit(s : Session; vocab : int64) : int64 {
 // ===== The parity pregate (--parity: the board's start-of-model gate) =====
 
 // greedy continuation over the same slice the test fixtures' parity_gen_ok (tests/_model_tier.das) compares
-def private parity_greedy(t : Model; prompt : array<int64>; n_gen : int64) : array<int64> {
+//! `n_gen` greedy tokens past `prompt` on a session of codec `kv`: f32 is the CPU rails' (the --parity pregate), the rows' codec
+//! the served stack's (the timed run's fixture gate - a trimmed lane panics on a call passed to the CPU rails)
+def private parity_greedy(t : Model; prompt : array<int64>; n_gen : int64; kv : KVDtype = KVDtype.f32) : array<int64> {
     var got : array<int64>
     got |> reserve(n_gen)
-    var s <- make_run_state(t.config)
+    var s <- create_session(t, kv)
     let pl = long_length(prompt)
     forward_prefill(t, s, prompt, pl, 0l)
     var pos = pl
@@ -1231,21 +1373,15 @@ def parity_check(model : string; spec : ModelSpec) : bool {
         let n_gen = long_length(spec.parity.gen)
         t.config.seq_len = min(t.config.seq_len, long_length(prompt) + n_gen + 8l)   // KV cap: only these positions run
         var got <- parity_greedy(t, prompt, n_gen)
-        ok = long_length(got) == n_gen
-        if (ok) {
-            for (a, b in got, spec.parity.gen) {
-                if (a != b) {
-                    ok = false
-                    break
-                }
-            }
-        }
+        let same = prefix_match_len(got, spec.parity.gen)
+        ok = long_length(got) == n_gen && fixture_ok(spec.parity.prefix_bar, same, n_gen)
+        let form = spec.parity.prefix_bar ? "opening tokens match (half-span prefix bar)" : "token-for-token"
         print("parity want: {parity_eyeball(t, spec.parity.gen)}\n")
         print("parity got:  {parity_eyeball(t, got)}\n")
         if (ok) {
-            print("parity ok: {base_name(model)} {int(n_gen)}/{int(n_gen)} token-for-token\n")
+            print("parity ok: {base_name(model)} {int(same)}/{int(n_gen)} {form}\n")
         } else {
-            print("PARITY PREGATE: {base_name(model)} diverges from its frozen fixture - this box's engine does not reproduce the pinned continuation, so no cell of this model is measurable\n")
+            print("PARITY PREGATE: {base_name(model)} diverges from its frozen fixture ({int(same)}/{int(n_gen)} {form}) - this box's engine does not reproduce the pinned continuation, so no cell of this model is measurable\n")
         }
         delete got
         delete prompt
@@ -1264,10 +1400,11 @@ def parity_check(model : string; spec : ModelSpec) : bool {
 // wrong (the fat exe dispatching its workers to the baseline clone). The bar is half the
 // checked span as a matching PREFIX: a broken pipeline matches nothing, a genuine near-tie
 // flip on the served stack cascades from one position on, and the confident fixtures hold
-// past the bar. The --parity pregate stays the strict token-for-token rail.
+// past the bar. The --parity pregate is the strict token-for-token rail, except on a `prefix_bar`
+// carrier (model_specs.das), which it holds to this same form over the whole fixture.
 let private FIXTURE_GATE_TOKENS = 8l
 
-def private bench_fixture_gate(var t : Model; spec : ModelSpec; fmt : OutFmt) : bool {
+def private bench_fixture_gate(var t : Model; spec : ModelSpec; fmt : OutFmt; kv : KVDtype) : bool {
     if (empty(spec.parity.gen)) {
         say(fmt, "sanity: no frozen fixture for {spec.file} in the model-set table - the finiteness gate alone stands\n")
         return true
@@ -1277,13 +1414,10 @@ def private bench_fixture_gate(var t : Model; spec : ModelSpec; fmt : OutFmt) : 
     let n_check = min(FIXTURE_GATE_TOKENS, long_length(spec.parity.gen))
     let full_seq = t.config.seq_len
     t.config.seq_len = long_length(prompt) + n_check + 8l   // the run's own KV cap may sit below the fixture; only these positions run
-    var got <- parity_greedy(t, prompt, n_check)
+    var got <- parity_greedy(t, prompt, n_check, kv)
     t.config.seq_len = full_seq
-    var same = 0l
-    while (same < long_length(got) && got[same] == spec.parity.gen[same]) {
-        same++
-    }
-    let ok = same * 2l >= n_check
+    let same = prefix_match_len(got, spec.parity.gen)
+    let ok = fixture_ok(true, same, n_check)
     if (ok) {
         say(fmt, "sanity: frozen fixture - {same}/{n_check} opening tokens match \"{parity_eyeball(t, got)}\"\n")
     } else {
@@ -1296,10 +1430,19 @@ def private bench_fixture_gate(var t : Model; spec : ModelSpec; fmt : OutFmt) : 
 
 //! The timed run's fixture gate on an already-loaded model - public so a test can drive it with
 //! the table's own spec and a deliberately wrong one.
-def fixture_gate_check(var t : Model; spec : ModelSpec) : bool =>
-    bench_fixture_gate(t, spec, OutFmt.txt)
+def fixture_gate_check(var t : Model; spec : ModelSpec; kv : KVDtype = KVDtype.f16) : bool =>
+    bench_fixture_gate(t, spec, OutFmt.txt, kv)
 
 // progress line — stdout in txt mode, stderr when stdout carries the md table / json records
+//! the lever value arm `arm` of an A/B runs at: off then on, or - `reverse`, `--ab-reverse` - on then off
+def ab_arm_on(reverse : bool; arm : int) : bool => reverse ? arm == 0 : arm != 0
+
+//! every row refused up front: the REFUSED line says why, the panic names it
+def private refuse_every_row(fmt : OutFmt; why : string) {
+    say(fmt, "REFUSED every row - {why}\n")
+    panic("lcpp_bench: refused every row - see the REFUSED line")
+}
+
 def private say(fmt : OutFmt; text : string) {
     if (fmt == OutFmt.txt) {
         print(text)
@@ -1448,6 +1591,26 @@ def main() : int {
         levers |> resize(1)
     }
     let ab = !empty(levers)
+    if (cfg.ab_reverse && !ab) {
+        print("warning: --ab-reverse is inert without an A/B lever (--<lever>-ab)\n")
+    }
+    if (cfg.mtp_min_p > 0.0 && !cfg.mtp_ab) {
+        print("warning: --mtp-min-p is inert without --mtp-ab (the chain cut acts on the speculative arm alone)\n")
+    }
+    if (cfg.mtp_temp <= 0.0) {   // a greedy sampler takes no cut, no acceptance mode and no selection landing
+        if (cfg.mtp_top_p != 1.0) {
+            print("warning: --mtp-top-p is inert at --mtp-temp 0 (the greedy sampler takes no nucleus)\n")
+        }
+        if (cfg.mtp_top_k != 0) {
+            print("warning: --mtp-top-k is inert at --mtp-temp 0 (the greedy sampler takes no top-k)\n")
+        }
+        if (cfg.mtp_accept != "rejection") {
+            print("warning: --mtp-accept is inert at --mtp-temp 0 (the greedy walk accepts on the argmax alone)\n")
+        }
+        if (!cfg.mtp_select) {
+            print("warning: --mtp-select is inert at --mtp-temp 0 (a greedy step lands its pick, never a selection)\n")
+        }
+    }
     let real_row = ab && levers[0].real
     var fmt = cfg.output
     if (cfg.tok) {
@@ -1530,6 +1693,9 @@ def main() : int {
     say(fmt, "regime: {threads} lanes ({max(threads - 1, 1)} pool workers + main), affinity {pinned ? pin_desc : (is_some(g_env_core.jobque_affinity) ? "env override" : "off (platform default)")}\n")
     if (cfg.asr) {   // the audio cell shares every lane decision above, then runs its own protocol
         return asr_cell_main(cfg.model, cfg.json_path, reps, threads, gpu, cfg.accel, cfg.asr_clips) ? 0 : 1
+    }
+    if (cfg.tts) {   // the synthesis cell, same deal
+        return tts_cell_main(cfg.model, cfg.tts_voice, cfg.json_path, max(cfg.tts_sentences, 1), reps, threads, gpu, cfg.accel) ? 0 : 1
     }
     if (!empty(cfg.image)) {   // the vision cell, same deal
         if (empty(cfg.image_mmproj)) {
@@ -1618,10 +1784,15 @@ def main() : int {
             }
         }
         set_gpu_kv_dtype(cfg.kv)   // the mirror arms at the rows' codec, or the rows pass to the CPU rails as a codec mismatch
+        if (cfg.mtp_depth > 0) {
+            set_mtp_depth(int64(cfg.mtp_depth))   //! before the load: the whole-model driver prepares its verify rows at the knob then
+        }
+        set_mtp_chain_min_p(cfg.mtp_min_p)
+        set_select_landing(cfg.mtp_select)
+        set_mtp_accept(to_enum(type<MtpAccept>, cfg.mtp_accept))   // an unknown name panics naming the enum's members
         var t <- load_model_cached(mpath, cfg.quant)
         if (gpu_device_sessions() > 0l && gpu_device_session_dtype() != cfg.kv) {
-            say(fmt, "REFUSED every row - --kv {cfg.kv} asked and the whole-model driver's mirror armed {gpu_device_session_dtype()} (the load log says why): the rows' sessions would run on the CPU rails under the device's stamp\n")
-            panic("lcpp_bench: the K/V codec --kv asked did not arm - see the REFUSED line")
+            refuse_every_row(fmt, "--kv {cfg.kv} asked and the whole-model driver's mirror armed {gpu_device_session_dtype()} (the load log says why): the rows' sessions would run on the CPU rails under the device's stamp")
         }
         set_gpu_ctx_max(0l)   //! the pin served this load; the next model's row sets its own
         var sched_ctx = 0l   //! the batched row's context: the flat rows' session narrows `seq_len` to its own rows, the scheduler's streams need theirs back
@@ -1654,9 +1825,6 @@ def main() : int {
                 panic("lcpp_bench: --mtp-ab needs a NextN draft head or an assistant drafter sidecar, and {mpath} has neither")
             }
         }
-        if (cfg.mtp_depth > 0) {
-            set_mtp_depth(int64(cfg.mtp_depth))
-        }
         // the exec REQUEST (exe-native / -jit / interpreted) + the armed GPU tier are stamped;
         // a jit run that produced nothing logs its own LLVM JIT error beside this
         let exec_state = is_standalone_exe() ? "exe-native" : (jit_enabled() ? "jit" : "INTERPRETED")
@@ -1666,11 +1834,15 @@ def main() : int {
         activeB = active_params_b(t)
         execFmt = model_exec_fmt(t)
         {
+            let codec_why = kv_codec_serving_why(t.config, cfg.kv)   //! a codec the model cannot serve would step down under the row: the bench measures what was asked or nothing
+            if (!empty(codec_why)) {
+                refuse_every_row(fmt, "--kv {cfg.kv} cannot serve {base_name(mpath)}: {codec_why}")
+            }
             var inscope spec <- spec_by_file(base_name(mpath))
             if (empty(spec.file)) {
                 spec.file = base_name(mpath)
             }
-            if (!bench_fixture_gate(t, spec, fmt)) {
+            if (!bench_fixture_gate(t, spec, fmt, cfg.kv)) {
                 panic("lcpp_bench: the frozen-fixture gate refused {base_name(mpath)} - see the REFUSED line")
             }
         }
@@ -1678,19 +1850,25 @@ def main() : int {
             dispatch_census(t, fmt)
         }
         var s <- bench_session(t, flat_row_plen(plen, ngen, t.config.seq_len, real_row), ngen, cfg.kv, cfg.kv)   // the cap above already bounds t.config at the rows' size; nothing serves this model afterwards, so nothing restores it
-        var inscope pp_off : array<double>
+        var inscope pp_off, pp_on : array<double>   // per prompt: each arm's rate, the on arm's drafts and accepts - one row a prompt once both arms ran
+        var inscope pp_on_dr, pp_on_ac : array<int64>
         pp_off |> resize(length(toks))
+        pp_on |> resize(length(toks))
+        pp_on_dr |> resize(length(toks))
+        pp_on_ac |> resize(length(toks))
+        var ab_refused = false
         for (arm in range(ab ? 2 : 1)) {
             var dtag = ""
+            let lever_on = ab_arm_on(cfg.ab_reverse, arm)
             if (ab) {
-                dtag = " {levers[0].tag}={arm == 0 ? "off" : "on"}"
-                invoke(levers[0].route, arm != 0)
+                dtag = " {levers[0].tag}={lever_on ? "on" : "off"}"
+                invoke(levers[0].route, lever_on)
             }
             if (real_row) {
                 // REAL greedy continuation: fresh session per prompt (no KV/recurrent bleed),
                 // prefill untimed as llama-bench excludes the prompt, the sample inside the timed loop
                 // (both arms pay it, so it cancels). NOT comparable to the synthetic tg row.
-                let mtp_on = cfg.mtp_ab && arm != 0
+                let mtp_on = cfg.mtp_ab && lever_on
                 var drafted = 0l
                 var accepted = 0l
                 var parked = 0l   // rounds whose sampled walk parked the next draw: the --mtp-temp lever's engagement witness
@@ -1701,7 +1879,7 @@ def main() : int {
                 pp_gen |> resize(length(toks))
                 pp_dr |> resize(length(toks))
                 pp_ac |> resize(length(toks))
-                var sp = SamplingParams(temp = cfg.mtp_temp)
+                var sp = SamplingParams(temp = cfg.mtp_temp, top_p = cfg.mtp_top_p, top_k = int64(cfg.mtp_top_k))
                 let ask = sampler_is_argmax(sp)
                 var refused = ""   // one rep with no figure, or one served off the row's backend stamp, drops the whole row
                 let vk_stamp = !gpu && moe_gpu_tier_installed()   // the row records the armed Vulkan tier as its backend: a call the driver passed to the CPU rails ran off it
@@ -1765,6 +1943,7 @@ def main() : int {
                 if (!empty(refused)) {
                     say(fmt, "REFUSED tg-real{ngen}{dtag} - {refused}\n")
                     g_refused_rows++
+                    ab_refused = true
                     delete tps
                     delete pp_us
                     delete pp_gen
@@ -1777,26 +1956,31 @@ def main() : int {
                 }
                 let st = bench_row("tg-real{ngen}{dtag}", tps)
                 say(fmt, "{st.test}: {st.mean:.2f} ± {st.sd:.2f} tok/s ({reps} reps, {length(toks)} prompts)\n")
-                if (!mtp_on) {
-                    for (pi in range(length(toks))) {
-                        pp_off[pi] = pp_us[pi] > 0l ? double(pp_gen[pi]) * 1.0e6lf / double(pp_us[pi]) : 0.0lf
+                for (pi in range(length(toks))) {
+                    let tps_pi = pp_us[pi] > 0l ? double(pp_gen[pi]) * 1.0e6lf / double(pp_us[pi]) : 0.0lf
+                    if (mtp_on) {
+                        pp_on[pi] = tps_pi
+                        pp_on_dr[pi] = pp_dr[pi]
+                        pp_on_ac[pi] = pp_ac[pi]
+                    } else {
+                        pp_off[pi] = tps_pi
                     }
                 }
                 if (mtp_on) {
                     let rate = drafted > 0l ? double(accepted) * 100.0lf / double(drafted) : 0.0lf
-                    let walk = sp.temp > 0.0 ? " (sampled walk, temp {sp.temp})" : ""
-                    say(fmt, "  mtp: {accepted}/{drafted} drafts accepted ({rate:.1f}%) at depth {get_mtp_depth()}{walk}; {mtp_pos_report()}\n")
+                    let walk = sp.temp > 0.0 ? " ({get_mtp_accept()} acceptance, temp {sp.temp})" : ""
+                    let cut = get_mtp_chain_min_p() > 0.0 ? " (chain cut at p {get_mtp_chain_min_p()})" : ""
+                    say(fmt, "  mtp: {accepted}/{drafted} drafts accepted ({rate:.1f}%) at depth {get_mtp_depth()}{cut}{walk}; {mtp_pos_report()}\n")
                     mtp_pos_reset()
-                    if (length(toks) > 1) {
-                        for (pi in range(length(toks))) {
-                            let on_tps = pp_us[pi] > 0l ? double(pp_gen[pi]) * 1.0e6lf / double(pp_us[pi]) : 0.0lf
-                            let ratio = pp_off[pi] > 0.0lf ? on_tps / pp_off[pi] : 0.0lf
-                            let prate = pp_dr[pi] > 0l ? double(pp_ac[pi]) * 100.0lf / double(pp_dr[pi]) : 0.0lf
-                            say(fmt, "    prompt {pi}: off {pp_off[pi]:.1f} -> on {on_tps:.1f} tok/s (x{ratio:.2f}), accept {pp_ac[pi]}/{pp_dr[pi]} ({prate:.1f}%)\n")
-                        }
-                    }
                     if (mtp_assistant_attached(t)) {
                         say(fmt, mtp_ab_drafter_line(mtp_drafter_stats_(t)))
+                    }
+                }
+                if (cfg.mtp_ab && arm == 1 && !ab_refused && length(toks) > 1) {   //! one row a prompt once both arms' rates are in, whichever arm ran last
+                    for (pi in range(length(toks))) {
+                        let ratio = pp_off[pi] > 0.0lf ? pp_on[pi] / pp_off[pi] : 0.0lf
+                        let prate = pp_on_dr[pi] > 0l ? double(pp_on_ac[pi]) * 100.0lf / double(pp_on_dr[pi]) : 0.0lf
+                        say(fmt, "    prompt {pi}: off {pp_off[pi]:.1f} -> on {pp_on[pi]:.1f} tok/s (x{ratio:.2f}), accept {pp_on_ac[pi]}/{pp_on_dr[pi]} ({prate:.1f}%)\n")
                     }
                 }
                 results |> push(st)
@@ -1885,7 +2069,7 @@ def main() : int {
                 tps |> reserve(breps)
                 var refused = ""
                 let prev_spec = get_mtp_spec()
-                if (cfg.npl_mtp) {   //! the streams draft and verify together; a model with no NextN head refuses the row below
+                if (cfg.npl_mtp) {   //! each stream its own round a tick; a model with no NextN head refuses the row below
                     set_mtp_spec(true)
                     if (t.config.n_layer_nextn <= 0l) {
                         refused = "--npl-mtp asks the speculative round of a model with no NextN head"

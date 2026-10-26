@@ -20,13 +20,14 @@ require daslib/env_registry   // nolint:STYLE030,LINT019 - env_is_set, inside th
 require daslib/jobque_boost
 require daslib/fio   // nolint:STYLE030,LINT019 - path_join, inside the das_metal halves
 require _model_tier
+require _resident_feed   // batched_logits_rows: the batched gather cell's sessions and steps
 
 // The batched bench row on the Metal batched driver: `bench_tg_batched_rep` homes its streams on the
 // host where no whole-model driver homes them, and every timed step goes through ONE batched
 // dispatch - the llama carrier, the E-series (PLE rows form), the shared-expert MoE (rows site),
 // the deltanet hybrid (recurrent rows against per-session mirrors) and the NextN carrier (GPU
 // logits, the carry landed per row) each serve at a rate; the self-speculative streams tick through
-// one joint verify, token-exact against each stream alone. Skips off the JIT, without dasMetal,
+// their own rounds, token-exact against each stream alone. Skips off the JIT, without dasMetal,
 // without the carrier under models_dir(), and on the large-tier shexp carrier unless
 // DASLLAMA_PARITY_FULL=1; the refusal contract lives in test_batch_decode.das.
 
@@ -97,28 +98,9 @@ def private metal_batched_logits(t : T?; tr : Model) : array<array<float>> {   /
         var prompts <- [ <- encode(tr, "Count from one to twenty: one, two, three,", true, false),
                          <- encode(tr, "The letters of the alphabet in order: a, b, c, d,", true, false),
                          <- encode(tr, "List the days of the week: Monday, Tuesday,", true, false)]
-        var sessions : array<Session>
-        sessions |> reserve(3)
-        for (p in prompts) {
-            sessions |> emplace <| create_session(tr, KVDtype.f16)
-            eval(tr, sessions[length(sessions) - 1], p)
-        }
-        var sess <- [for (i in range(3)); unsafe(addr(sessions[i]))]
-        var ws <- create_batch_workspace(tr)
-        rows |> reserve(3l * GATHER_STEPS)
-        let steps0 = metal_batch_decode_stats().steps
-        for (st in range64(GATHER_STEPS)) {
-            var toks <- [for (i in range(3)); 400l + 37l * st + 11l * int64(i)]
-            eval_batch(tr, ws, sess, toks)
-            delete toks
-            for (s in sessions) {
-                rows |> push_clone(s.logits)
-            }
-        }
-        t |> equal(metal_batch_decode_stats().steps - steps0, GATHER_STEPS, "every batched step went through the Metal batched driver")
-        sess |> clear()   // borrowed handles: a delete of array<T?> frees the pointees
-        delete ws
-        delete sessions
+        var feeds <- [for (i in range(3)); [for (st in range64(GATHER_STEPS)); 400l + 37l * st + 11l * int64(i)]]
+        rows <- batched_logits_rows(t, tr, prompts, feeds, KVDtype.f16, GATHER_STEPS) <| $ => metal_batch_decode_stats().steps
+        delete feeds
         delete prompts
     }
     return <- rows
@@ -152,12 +134,7 @@ def private metal_batch_gather_cell(t : T?; file, family : string) {
                 t |> equal(metal_batch_rows_gathered() - g1, 0l, "with the gather off no batched row gathered: the counter's control")
                 t |> equal(batch_rows_host_embedded() - h1, 3l * GATHER_STEPS, "with the gather off the host embedded every batched row")
                 set_metal_batch_gather(gather0)
-                t |> equal(long_length(dev), long_length(host), "both runs stepped every row")
-                for (i in range64(min(long_length(dev), long_length(host)))) {
-                    let diff = logits_maxdiff(dev[i], host[i])
-                    log_logits_pair(tr, "{file} step {i / 3l}, row {i % 3l}: the gathered row against the host row", dev[i], host[i], diff)
-                    t |> equal(diff, 0.0, "step {i / 3l}, row {i % 3l}: the gathered rows' logits bit for bit the host rows' (maxdiff {diff})")
-                }
+                gathered_rows_bit_same(t, tr, file, dev, host, 3l)
                 delete dev
                 delete host
             }
@@ -259,8 +236,8 @@ def test_metal_batched_row_shexp_sameslab(t : T?) {
                     var d = 0.0
                     var doff = 0.0
                     for (v in range64(vocab)) {
-                        d = max(d, abs(sa.logits[v] - sb.mtp_logits_b[v]))
-                        doff = max(doff, abs(prev[v] - sb.mtp_logits_b[v]))
+                        d = max(d, nan_wide_diff(sa.logits[v], sb.mtp_logits_b[v]))
+                        doff = max(doff, nan_wide_diff(prev[v], sb.mtp_logits_b[v]))
                     }
                     maxd = max(maxd, d)
                     off_min = min(off_min, doff)
@@ -343,7 +320,7 @@ def test_metal_batched_row_nextn_plain(t : T?) {
 
 [test]
 def test_metal_batched_row_mtp(t : T?) {
-    t |> run("the batched row serves self-speculative streams through one joint verify a tick (Qwen3.5-0.8B-MTP Q8)") <| @(t : T?) {
+    t |> run("the batched row refuses self-speculative streams: each stream runs its own round a tick, no batched step (Qwen3.5-0.8B-MTP Q8)") <| @(t : T?) {
         if (!family_on(t, "qwen35")) return
         static_if (typeinfo builtin_module_exists(das_metal)) {
             let path = path_join(models_dir(), "Qwen3.5-0.8B-MTP-Q8_0.gguf")
@@ -357,10 +334,10 @@ def test_metal_batched_row_mtp(t : T?) {
                 let census0 = batch_step_census()
                 let served = bench_tg_batched_rep(tr, 4l, 32l, 8l, 1l, true)
                 set_mtp_spec(prev_spec)
-                t |> equal(served.why, "", "the row is served: {served.why}")
-                t |> success(served.tps > 0.0lf, "... at a rate ({served.tps:.1f} tok/s summed over 4 streams)")
+                t |> success(find(served.why, "one at a time") >= 0, "the row refuses by name - a speculative tick runs each stream's round alone: {served.why}")
+                t |> equal(served.tps, 0.0lf, "... and reads no rate")
                 let census1 = batch_step_census()
-                t |> success(census1.device - census0.device >= 8l, "the timed ticks each rode one joint verify ({census1.device - census0.device} device steps)")
+                t |> equal(census1.device - census0.device, 0l, "no tick counted as a batched device step ({census1.device - census0.device})")
                 t |> equal(census1.cpu_stack, census0.cpu_stack, "no tick reached the CPU batched stack")
             }
             set_metal_mode(prior_mode)
@@ -415,8 +392,64 @@ def test_metal_batched_row_mtp_depth2(t : T?) {
 }
 
 [test]
+def test_metal_pick_ask(t : T?) {
+    t |> run("a greedy stream's steps land their pick in the logits' place and emit what generate() emits; a sampling stream lands none (Qwen3.5-0.8B-MTP Q8)") <| @(t : T?) {
+        if (!family_on(t, "qwen35")) return
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            let path = path_join(models_dir(), "Qwen3.5-0.8B-MTP-Q8_0.gguf")
+            return if (!jit_model_available(t, path))
+            let prior_mode = get_metal_mode()
+            set_metal_mode(MetalMode.when_available)
+            var tr <- blob_twin(t, path, 512l)
+            with_dasllama_jobque_() {
+                let prev_spec = get_mtp_spec()
+                set_mtp_spec(false)   //! the plain step's pick alone: a round's picks are the verify seat's
+                var prompt <- encode(tr, "Count from one to twenty: one, two, three,", true, false)
+                var none : array<int64>
+                let greedy = SamplingParams()
+                var ref : array<int64>
+                var rs <- create_session(tr)
+                generate(tr, rs, prompt, greedy, 20l) $(id, _pc) {
+                    ref |> push(id)
+                    return true
+                }
+                delete rs
+                let picks0 = metal_picks_landed()
+                var sch <- create_scheduler(tr, 1l, 4l, 64l, 0l, 0l, KVDtype.f16, false)
+                var events : array<SchedEvent>
+                t |> success(submit(tr, sch, make_req(1l, prompt, greedy, 20l, none)), "greedy stream queued")
+                drain(tr, sch, events)
+                let landed = metal_picks_landed() - picks0
+                var got <- toks_of(events, 1l)
+                log_gen_texts(tr, "pick ask (generate, scheduler)", ref, got)
+                t |> success(ids_equal(got, ref), "the greedy stream's tokens == generate()'s, which reads its rows on the host")
+                t |> success(landed > 0l && landed <= long_length(got), "the stream's steps landed their picks ({landed} picks over {length(got)} tokens)")
+                delete sch
+                delete events
+                delete got
+                let picks1 = metal_picks_landed()
+                var sch2 <- create_scheduler(tr, 1l, 4l, 64l, 0l, 0l, KVDtype.f16, false)
+                var events2 : array<SchedEvent>
+                t |> success(submit(tr, sch2, make_req(2l, prompt, SamplingParams(temp = 0.7, top_k = 1l, penalty = 1.1), 20l, none)), "sampling stream queued")
+                drain(tr, sch2, events2)
+                t |> equal(metal_picks_landed() - picks1, 0l, "a stream whose sampler is not a bare argmax lands no pick (the control)")
+                set_mtp_spec(prev_spec)
+                delete sch2
+                delete events2
+                delete ref
+                delete prompt
+            }
+            set_metal_mode(prior_mode)
+            delete tr
+        } else {
+            t |> skip("dasMetal not built")
+        }
+    }
+}
+
+[test]
 def test_metal_batched_row_mtp_joint_invariance(t : T?) {
-    t |> run("three self-speculative streams verified together emit what each emits alone (Qwen3.5-0.8B-MTP Q8)") <| @(t : T?) {
+    t |> run("three self-speculative streams through one scheduler emit what each emits alone (Qwen3.5-0.8B-MTP Q8)") <| @(t : T?) {
         if (!family_on(t, "qwen35")) return
         static_if (typeinfo builtin_module_exists(das_metal)) {
             let path = path_join(models_dir(), "Qwen3.5-0.8B-MTP-Q8_0.gguf")
@@ -447,9 +480,7 @@ def test_metal_batched_row_mtp_joint_invariance(t : T?) {
                     delete sch0
                     delete events0
                 }
-                //! the solo rounds draft on the two-row tile, the joint ones on a wider tile: the same drafts, so the same accepts
                 t |> success(solo_accepted * 2l > solo_drafted, "the solo rounds accept more than half their drafts ({solo_accepted} of {solo_drafted})")
-                // together: one joint verify a tick over every stream's rows
                 var sch <- create_scheduler(tr, 3l, 4l, 64l, 0l, 0l, KVDtype.f16, true)
                 var events : array<SchedEvent>
                 for (pi in range64(3l)) {
@@ -459,7 +490,7 @@ def test_metal_batched_row_mtp_joint_invariance(t : T?) {
                 drain(tr, sch, events)
                 let census1 = batch_step_census()
                 set_mtp_spec(prev_spec)
-                t |> equal(sch.mtp_joined_max, 3l, "one joint verify carried all three streams (the widest tick carried {sch.mtp_joined_max})")
+                t |> equal(sch.mtp_joined_max, 0l, "every tick steps its streams through their own rounds (the widest tick carried {sch.mtp_joined_max})")
                 for (pi in range64(3l)) {
                     var got <- toks_of(events, 10l + pi)
                     log_gen_texts(tr, "joint stream {pi} (solo, joint)", refs[pi], got)
@@ -469,7 +500,7 @@ def test_metal_batched_row_mtp_joint_invariance(t : T?) {
                 t |> success(sch.mtp_drafted > 0l, "the joint ticks drafted ({sch.mtp_drafted} drafts)")
                 t |> equal(sch.mtp_drafted, solo_drafted, "the joint ticks drafted what the three solo streams drafted together ({sch.mtp_drafted} against {solo_drafted})")
                 t |> equal(sch.mtp_accepted, solo_accepted, "... and accepted the same drafts ({sch.mtp_accepted} against {solo_accepted})")
-                t |> success(census1.device - census0.device > 0l, "ticks with every stream decoding rode one joint verify ({census1.device - census0.device} device steps)")
+                t |> equal(census1.device - census0.device, 0l, "a tick of three speculating streams is no batched step: each stream runs its own round ({census1.device - census0.device} device steps)")
                 delete sch
                 delete events
                 delete refs
@@ -485,7 +516,7 @@ def test_metal_batched_row_mtp_joint_invariance(t : T?) {
 
 [test]
 def test_metal_batched_row_mtp_joint_staggered(t : T?) {
-    t |> run("a joint verify whose streams sit at different depths across a 64-row chunk boundary emits what each stream emits alone (Qwen3.5-0.8B-MTP Q8)") <| @(t : T?) {
+    t |> run("three speculating streams at different depths across a 64-row chunk boundary emit what each emits alone (Qwen3.5-0.8B-MTP Q8)") <| @(t : T?) {
         if (!family_on(t, "qwen35")) return
         static_if (typeinfo builtin_module_exists(das_metal)) {
             let path = path_join(models_dir(), "Qwen3.5-0.8B-MTP-Q8_0.gguf")
@@ -525,7 +556,7 @@ def test_metal_batched_row_mtp_joint_staggered(t : T?) {
                 }
                 drain(tr, sch, events)
                 set_mtp_spec(prev_spec)
-                t |> equal(sch.mtp_joined_max, 3l, "one joint verify carried all three streams (the widest tick carried {sch.mtp_joined_max})")
+                t |> equal(sch.mtp_joined_max, 0l, "every tick steps its streams through their own rounds (the widest tick carried {sch.mtp_joined_max})")
                 for (pi in range64(3l)) {
                     var got <- toks_of(events, 10l + pi)
                     log_gen_texts(tr, "staggered stream {pi} (solo, joint)", refs[pi], got)
@@ -864,7 +895,7 @@ def private fed_steps(tr : Model; var s : Session; pos, n, miss_every : int64; v
 }
 
 //! The single row's greedy chain on a recurrent hybrid: the chained step reads the recurrent region the step in flight writes and
-//! writes the other, so a step the chain mispredicted leaves the live state whole (`ARCHITECTURE_GPU_MTP_DECODE.md#greedy-chain`)
+//! writes the other, so a step the chain mispredicted leaves the live state whole (`ARCHITECTURE_GPU_MTP_DECODE_PICK.md#greedy-chain`)
 [test]
 def test_metal_deltanet_greedy_chain(t : T?) {
     t |> run("the greedy chain serves a deltanet hybrid: chained steps token for token the plain steps, and a mispredicted step's rerun reads the state the chain did not touch (Qwen3.5-0.8B Q8)") <| @(t : T?) {
@@ -943,7 +974,7 @@ def test_metal_paged_mtp(t : T?) {
                 var none : array<int64>
                 let greedy = SamplingParams()
                 var toks : array<array<int64>>
-                t |> equal(chunk_defaults(tr).idle, METAL_IDLE_CHUNK_TOKENS, "a Metal-served model's idle prefill quantum is the wide one")
+                t |> equal(chunk_defaults(tr).idle, GPU_IDLE_CHUNK_TOKENS, "a Metal-served model's idle prefill quantum is the wide one")
                 t |> equal(chunk_defaults(tr).chunk, DEFAULT_CHUNK_TOKENS, "and its chunk beside a decoding stream is one window")
                 for (page_rows in [0l, 64l]) {
                     let kind = page_rows == 0l ? "flat" : "paged"
@@ -1043,7 +1074,6 @@ def test_metal_prefix_checkpoint(t : T?) {
                 t |> success(ids_equal(xc.toks, rc.toks), "the attached stream's tokens are the whole prefill's")
                 t |> success(ids_equal(xb.toks, rb.toks), "the stream that left the checkpoint emits what it emits with no cache")
                 t |> success(!ids_equal(rb.toks, rc.toks), "the second and third replies differ, so a replayed session would show")
-                // a checkpoint within a chunk and a half is taken in one window; the idle quantum is off, so every tick takes the chunk
                 let chunk = cut * 3l / 4l
                 var near <- create_scheduler(tr, 1l, 4l, chunk, 64l, 0l, KVDtype.f16, true, 0l)
                 var events : array<SchedEvent>
@@ -1052,8 +1082,12 @@ def test_metal_prefix_checkpoint(t : T?) {
                 req.stable_at = cut
                 t |> success(submit(tr, near, req), "the request marked at its opening queued")
                 scheduler_step(tr, near, events)
-                t |> equal(near.prefill_tokens, cut, "a checkpoint {cut} tokens out lands in the first window of a {chunk}-token chunk")
+                t |> equal(near.prefill_tokens, chunk, "the first window is the {chunk}-token chunk: a checkpoint {cut} tokens out no longer ends it")
+                t |> equal(near.prefix.n_state_inserts, 0l, "... and no checkpoint stands yet")
+                scheduler_step(tr, near, events)
+                t |> success(near.prefix.n_state_inserts >= 1l, "the second window carried the stop at {cut} inside it and left its checkpoint ({near.prefix.n_state_inserts} standing)")
                 drain(tr, near, events)
+                to_log(LOG_INFO, "near: {near.prefix.n_state_inserts} checkpoints inserted over the prompt and the finished turn\n")
                 t |> equal(near.prefix.n_state_inserts, 2l, "the opening's checkpoint stands, and the finished turn's after it")
                 delete events
                 delete near
@@ -1191,6 +1225,110 @@ def test_metal_prefix_checkpoint_logits(t : T?) {
                 delete blank
                 delete cache
                 delete pool
+                delete head
+                delete tail
+                delete prompt
+                set_mtp_spec(prev_spec)
+            }
+            set_metal_mode(prior_mode)
+            delete tr
+        } else {
+            t |> skip("dasMetal not built")
+        }
+    }
+}
+
+//! one request marked at `cut` through `sch`, its whole prompt one prefill window: the checkpoint at `cut` is the window's
+//! capture
+def private serve_marked_one_window(t : T?; tr : Model; var sch : Scheduler; prompt : array<int64>; cut : int64) {
+    let np = long_length(prompt)
+    t |> success(chunk_defaults(tr).idle >= np, "the idle quantum ({chunk_defaults(tr).idle}) takes the whole {np}-token prompt as one window")
+    var events : array<SchedEvent>
+    var none : array<int64>
+    var req <- make_req(1l, prompt, SamplingParams(), CKPT_NEW, none)
+    req.stable_at = cut
+    t |> success(submit(tr, sch, req), "the request marked at {cut} queued")
+    scheduler_step(tr, sch, events)
+    t |> equal(sch.prefill_evals, 1l, "the prompt took one prefill call")
+    t |> equal(sch.prefill_tokens, np, "... over the whole prompt, the stop at {cut} inside it")
+    t |> equal(sch.prefix.n_state_inserts, 1l, "the window left the checkpoint at its stop: a capture")
+    drain(tr, sch, events)
+    var at_cut = 0
+    for (st in sch.prefix.states) {
+        if (long_length(st.tokens) == cut) {
+            at_cut++
+        }
+    }
+    t |> equal(at_cut, 1, "one checkpoint stands at the stop ({length(sch.prefix.states)} standing)")
+    delete events
+}
+
+//! the capture cell's bar, of the largest logit: the capture stands inside a window of the whole prompt and the reference's
+//! state at the end of a window of the opening alone, so the two scans and the GEMM tiles round apart - 0.055 % on the M5
+//! Max, the prompt as one window 0.049 % off the reference, the capture with its state zeroed 17.5 %
+let CAPTURE_BAR_REL = 0.002
+
+//! A checkpoint a stop inside one prefill window leaves is the arena's capture, not the window's end state, so its contents
+//! are held on the logits.
+[test]
+def test_metal_prefix_checkpoint_capture_logits(t : T?) {
+    t |> run("a session attached at a checkpoint captured inside one prefill window lands an uncached prefill's logits, and the capture with its recurrent state zeroed does not (Qwen3.5-0.8B-MTP Q8)") <| @(t : T?) {
+        if (!family_on(t, "qwen35")) return
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            let path = path_join(models_dir(), "Qwen3.5-0.8B-MTP-Q8_0.gguf")
+            return if (!jit_model_available(t, path))
+            let prior_mode = get_metal_mode()
+            set_metal_mode(MetalMode.when_available)
+            var tr <- blob_twin(t, path, 512l)
+            with_dasllama_jobque_() {
+                let prev_spec = get_mtp_spec()
+                set_mtp_spec(true)
+                let opening = repeat("You are a careful assistant. Answer briefly and precisely. ", 12)
+                var prompt <- encode(tr, "{opening}Gamma: list the days of the week: Monday,", true, false)
+                let np = long_length(prompt)
+                let cut = np - 11l
+                t |> success(cut > 128l && cut % 64l != 0l, "the stop sits past two 64-row pages and off a page boundary ({cut} of {np} tokens)")
+                var head <- [for (i in range64(cut)); prompt[i]]
+                var tail <- [for (i in range64(cut, np)); prompt[i]]
+                var sch <- create_scheduler(tr, 1l, 4l, 64l, 64l, 0l, KVDtype.f16, true)
+                serve_marked_one_window(t, tr, sch, prompt, cut)
+                var cold <- create_session(tr, sch.pool)
+                eval(tr, cold, head)
+                eval(tr, cold, tail)
+                var warm <- create_session(tr, sch.pool)
+                t |> equal(prefix_attach(sch.prefix, sch.pool, warm, prompt), cut, "the capture attaches at the stop ({cut} of {np} tokens)")
+                eval(tr, warm, tail)
+                to_log(LOG_INFO, "next token after the tail - uncached: '{eyeball_text(tr, [argmax_of(cold.logits)])}' attached: '{eyeball_text(tr, [argmax_of(warm.logits)])}'\n")
+                var whole <- create_session(tr, sch.pool)
+                eval(tr, whole, prompt)
+                let top = logits_maxabs(cold.logits)
+                let bar = CAPTURE_BAR_REL * top
+                let near = logits_maxdiff(warm.logits, cold.logits)
+                to_log(LOG_INFO, "attached at the capture: logits off the uncached prefill's by {near} of a largest {top} (bar {bar}); the prompt as one window sits {logits_maxdiff(whole.logits, cold.logits)} off it\n")
+                t |> success(near <= bar, "the logits attached at the capture sit within {bar} of the uncached prefill's ({near})")
+                release_kv_pages(whole)
+                delete whole
+                for (st in sch.prefix.states) {
+                    if (long_length(st.tokens) == cut) {
+                        for (v in st.snap.state) {
+                            v = 0.0
+                        }
+                    }
+                }
+                var blank <- create_session(tr, sch.pool)
+                t |> equal(prefix_attach(sch.prefix, sch.pool, blank, prompt), cut, "the zeroed capture attaches too")
+                eval(tr, blank, tail)
+                t |> success(all_finite(blank.logits), "the zeroed capture's logits are finite")
+                let off = logits_maxdiff(blank.logits, cold.logits)
+                to_log(LOG_INFO, "zeroed captured state: logits off by {off} of a largest {top}, next token '{eyeball_text(tr, [argmax_of(blank.logits)])}'\n")
+                t |> success(off > 0.05 * top, "a capture with its recurrent state zeroed lands logits past the bar ({off} of {top})")
+                release_kv_pages(cold)
+                release_kv_pages(warm)
+                release_kv_pages(blank)
+                delete cold
+                delete warm
+                delete blank
+                delete sch
                 delete head
                 delete tail
                 delete prompt
