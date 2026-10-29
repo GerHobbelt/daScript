@@ -1338,6 +1338,7 @@ SET(LIBDASCRIPT_COMPILER_SRC
     src/ast/ast_parse.cpp
     src/ast/ast_optimize.cpp
     src/ast/ast_const_folding.cpp
+    src/ast/ast_effects.cpp
     src/ast/ast_block_folding.cpp
     src/ast/ast_bound_check_elision.cpp
     src/ast/ast_unused.cpp
@@ -2212,6 +2213,7 @@ install(FILES ${DAS_LLAMA_SERVER_FILES}
 
 # Install dasllama-convert (offline GGUF -> .dlim model prep)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/dasllama-convert/main.das
+    ${PROJECT_SOURCE_DIR}/utils/dasllama-convert/convert_sniff.das
     DESTINATION utils/dasllama-convert
 )
 
