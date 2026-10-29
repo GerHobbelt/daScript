@@ -21,6 +21,10 @@ namespace das {
         }
     }
 
+    static bool mayHaveAddressTaken ( const ProgramPtr & program, const FunctionPtr & func ) {
+        return func->addressTaken || ( func->module != program->thisModule.get() && ( !func->privateFunction || func->fromGeneric ) );
+    }
+
     bool isCompatibleFunction ( const FunctionPtr & func, const TypeDeclPtr & inv ) {
         if ( func->arguments.size()!=inv->argTypes.size() ) return false;
         if ( !inv->firstType->isSameType(*func->result, RefMatters::yes, ConstMatters::yes, TemporaryMatters::yes) ) {
@@ -40,7 +44,7 @@ namespace das {
             mod->functions.foreach([&](const FunctionPtr & gfunc){
                 // not built-in, used, address taken, can potentially alias, compatible
                 if ( gfunc->isTemplate ) return;
-                if ( !gfunc->builtIn && gfunc->addressTaken && !gfunc->aliasCMRES && program->isUsed(gfunc) && isCompatibleFunction(gfunc, inv) ) {
+                if ( !gfunc->builtIn && mayHaveAddressTaken(program, gfunc) && !gfunc->aliasCMRES && program->isUsed(gfunc) && isCompatibleFunction(gfunc, inv) ) {
                     appendIndVariables(gfunc, sources, accessed);
                 }
             });
@@ -67,7 +71,7 @@ namespace das {
             mod->functions.foreach([&](const FunctionPtr & gfunc){
                 // not built-in, used, address taken, can potentially alias, compatible
                 if ( gfunc->isTemplate ) return;
-                if ( !gfunc->builtIn && gfunc->addressTaken && !gfunc->aliasCMRES && gfunc->lambda && program->isUsed(gfunc) && isCompatibleLambdaFunction(gfunc, inv) ) {
+                if ( !gfunc->builtIn && mayHaveAddressTaken(program, gfunc) && !gfunc->aliasCMRES && gfunc->lambda && program->isUsed(gfunc) && isCompatibleLambdaFunction(gfunc, inv) ) {
                     appendIndVariables(gfunc, sources, accessed);
                 }
             });
@@ -489,6 +493,16 @@ namespace das {
                 }
                 // we never get invoke(@@....,....) because its converted into a call
                 // we can analyze functions by signature, and collect all global variables referenced by matching functions
+                if ( anyGlobals && program->thisModule->isModule ) {
+                    if ( checkAliasing ) {
+                        program->error("invoke result potentially aliases a global through a function of a module that requires this one",
+                            "some form of ... global ... = invoke( ... ) in a module", "",
+                                expr->at, CompilationError::invalid_argument_global);
+                    } else {
+                        expr->cmresAlias = true;
+                    }
+                    return;
+                }
                 if ( anyGlobals) {
                     IndirectSources globSrc;
                     if ( argT->isGoodFunctionType() ) {
